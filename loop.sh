@@ -131,14 +131,18 @@ iterate() {
   gh issue edit "$issue" --add-label in-progress --remove-label ready >/dev/null
 
   # Dispatch ONE fresh claude -p task. No self-repair in v0 — observe the raw outcome.
+  # stream-json (+ --verbose, required in print mode) emits one JSONL event per turn as the
+  # agent works, instead of a single blob at exit — so a human can `tail -f` it live. Bash
+  # only reads the exit code, never the stream (the raw outcome stays the signal). Follow
+  # nicely with: harness/tail-claude.sh
   local claude_log="$LOG_DIR/issue-${issue}-iter${n}.claude.log"
-  log "dispatching claude -p (timeout ${ITER_TIMEOUT}s) -> $claude_log"
+  log "dispatching claude -p (timeout ${ITER_TIMEOUT}s) -> $claude_log  [tail: harness/tail-claude.sh]"
   local rc=0
+  local claude_flags=(-p "$prompt" --output-format stream-json --verbose --dangerously-skip-permissions)
   if [[ -n "$TIMEOUT_BIN" ]]; then
-    "$TIMEOUT_BIN" "$ITER_TIMEOUT" \
-      claude -p "$prompt" --dangerously-skip-permissions >"$claude_log" 2>&1 || rc=$?
+    "$TIMEOUT_BIN" "$ITER_TIMEOUT" claude "${claude_flags[@]}" >"$claude_log" 2>&1 || rc=$?
   else
-    claude -p "$prompt" --dangerously-skip-permissions >"$claude_log" 2>&1 || rc=$?
+    claude "${claude_flags[@]}" >"$claude_log" 2>&1 || rc=$?
   fi
   [[ "$rc" == "124" ]] && log "WARNING: claude -p hit the ${ITER_TIMEOUT}s timeout"
   log "claude -p exited rc=$rc"

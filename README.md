@@ -60,6 +60,19 @@ DRY_RUN=1 harness/loop.sh
 
 Env: `MAX_ITERS` (default 1), `ITER_TIMEOUT` seconds (default 1800), `DRY_RUN=1`.
 
+## Watching a live run
+
+The `claude -p` step runs `--output-format stream-json --verbose`, so it emits one JSONL
+event per turn *as it works* (not a single blob at exit). Follow it live in another shell:
+
+```bash
+harness/tail-claude.sh              # follows the newest logs/*.claude.log
+```
+
+Renders one line per event — `🗣` prose, `🔧` tool calls, `↳` results, `──` markers. Purely
+passive: bash reads only the iteration's exit code, never the stream, so the raw outcome
+stays the signal (the loop never reacts to mid-flight events).
+
 ## Labels the state machine queries
 
 `ready` · `blocked` · `in-progress` · `planned` · `needs-review` · `needs-human` +
