@@ -23,8 +23,13 @@ issue other than this one.
   use case defines its own error enum that is the only error type crossing into the
   application layer; keep the `copy/` onion package layout (domain / application / adapter /
   infrastructure).
-- Write tests for every acceptance criterion. Tests are in-memory only — use the existing
-  in-memory fixtures / stubs. Do NOT write Testcontainers tests in this iteration.
+- Write tests for every acceptance criterion. Prefer in-memory unit/acceptance tests (existing
+  in-memory fixtures / stubs) in `src/test/scala`.
+- **Test-placement rule (tier split).** Integration tests that need a real database
+  (Testcontainers / a JDBC round-trip against Postgres) live in `src/it/scala`. In-memory unit
+  and acceptance tests live in `src/test/scala`. Never put a Docker-dependent test in
+  `src/test` — it will not run in the fast gate and will break the tier split. Only add an
+  `src/it` test if the acceptance criteria require a real Postgres round-trip.
 - The project compiles under `-Werror`. Warnings are build failures. Keep it clean.
 - Do NOT weaken, delete, disable, or `@nowarn`-silence existing tests to make the build pass
   or to satisfy the reviewer. Deleting a failing test is the failure this loop exists to
@@ -37,8 +42,10 @@ issue other than this one.
 
 - The failure above is resolved.
 - The acceptance criteria in the issue are implemented.
-- `sbt -Werror compile` is clean and `sbt test` is green locally.
+- `sbt -Werror compile` is clean and `sbt test` (the fast in-memory tier) is green locally.
+- If any `src/it` test exists, `sbt It/test` (the real-Postgres tier) is green locally too.
 - Every acceptance criterion maps to at least one test.
 
-When you believe you are done, stop. The harness will re-run the compile + test gate and the
-independent reviewer. You do not report success — the gate and the reviewer do.
+When you believe you are done, stop. The harness re-runs the fast (in-memory) gate, then the IT
+(real-Postgres) gate, then the independent reviewer. You do not report success — the gates and
+the reviewer do.

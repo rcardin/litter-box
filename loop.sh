@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 #
-# v1 Ralph loop — independent reviewer + tamper check + bounded self-repair.
-# Implements step v1 of docs/autonomous-loop-harness.md and
-# docs/superpowers/specs/2026-07-01-harness-v1-reviewer-design.md.
+# v2 Ralph loop — v1 (reviewer + tamper + self-repair) + Testcontainers tier split.
+# Implements step v2 of docs/autonomous-loop-harness.md and
+# docs/superpowers/specs/2026-07-01-harness-v2-testcontainers-split-design.md.
+# Builds on v1 (docs/superpowers/specs/2026-07-01-harness-v1-reviewer-design.md).
 #
-# Adds over v0:
+# v1 gave us:
 #   - bounded self-repair: a shared budget of 2 fix iterations per US, spent by EITHER a
 #     RED gate OR a reviewer REQUEST_CHANGES.
 #   - test-tamper check: diff the test tree vs origin/main and surface it to the reviewer.
@@ -13,9 +14,18 @@
 #   - `needs-human` terminal: budget exhaustion (RED or REQUEST_CHANGES) still opens a PR for
 #     the audit trail but flips the issue to needs-human instead of needs-review.
 #
-# Still NOT in v1 (see the spec's "deliberately excludes"): Testcontainers gate split (v2),
-# GitHub Actions / branch protection (v3), auto-merge (v4), convention-lint gate step,
-# rebase-on-main-and-rerun. v1 STILL STOPS AT PR — a human merges.
+# v2 splits the single gate into two tiers by source directory (src/test = in-memory,
+# Docker-free; src/it = Testcontainers real-PG):
+#   - FAST gate (GATE_CMD, `sbt compile test`) runs only src/test — no Docker on every iter.
+#   - IT gate (IT_GATE_CMD, `sbt It/test`) runs only src/it and fires AFTER fast-GREEN and
+#     BEFORE the reviewer, so the reviewer only ever judges a unit+IT-green diff.
+#   - fast-RED short-circuits the IT gate (Docker never paid for a unit-failing iter).
+#   - the repair budget stays SHARED and stays 2: fast-RED, IT-RED, and REQUEST_CHANGES all
+#     draw from the same pool. The tamper diff now also covers src/it.
+#
+# Still NOT in v2 (see the spec's "deliberately excludes"): GitHub Actions / branch protection
+# (v3), auto-merge (v4), convention-lint gate step, rebase-on-main-and-rerun. v2 STILL STOPS
+# AT PR — a human merges.
 #
 # The loop never lets the model choose what to work on: bash resolves all state with `gh`
 # queries and dispatches narrow, fresh `claude -p` tasks. Every dispatch is fresh context.
@@ -23,11 +33,13 @@
 # Usage:   harness/loop.sh
 # Env:     MAX_ITERS      hard cap on US count               (default 1)
 #          ITER_TIMEOUT   per-dispatch claude -p timeout, s  (default 1800)
-#          GATE_TIMEOUT   per-gate sbt budget, s             (default 900)
+#          GATE_TIMEOUT   per-fast-gate sbt budget, s        (default 900)
+#          IT_GATE_TIMEOUT per-IT-gate sbt budget, s         (default 1200 — container startup)
 #          DRY_RUN        1 = stop before invoking claude -p and before any push/PR
 #          REPAIR_BUDGET  shared fix budget per US           (default 2)
 #          -- test seams (default to the real thing; overridden by the state-machine test) --
-#          GATE_CMD       the gate command                   (default sbt compile test)
+#          GATE_CMD       the fast (src/test) gate command   (default sbt compile test)
+#          IT_GATE_CMD    the IT (src/it) gate command       (default sbt It/test)
 #          IMPL_CMD       stub for the worker dispatch       (default: real claude -p)
 #          FIX_CMD        stub for the fix dispatch          (default: real claude -p)
 #          REVIEW_CMD     stub for the reviewer dispatch     (default: real claude -p)
@@ -40,7 +52,8 @@ cd "$REPO_ROOT"
 
 MAX_ITERS="${MAX_ITERS:-1}"
 ITER_TIMEOUT="${ITER_TIMEOUT:-1800}"   # per-dispatch claude -p budget, seconds
-GATE_TIMEOUT="${GATE_TIMEOUT:-900}"    # per-gate sbt compile+test budget, seconds
+GATE_TIMEOUT="${GATE_TIMEOUT:-900}"    # per-fast-gate sbt compile+test budget, seconds
+IT_GATE_TIMEOUT="${IT_GATE_TIMEOUT:-1200}"  # per-IT-gate budget, seconds (Docker container startup)
 DRY_RUN="${DRY_RUN:-0}"
 REPAIR_BUDGET="${REPAIR_BUDGET:-2}"    # shared across gate-RED and REQUEST_CHANGES per US
 ITERATE_PROMPT="$SCRIPT_DIR/iterate-prompt.md"
@@ -53,6 +66,7 @@ mkdir -p "$LOG_DIR"
 # Test seams: default empty -> real `claude -p`; the state-machine test overrides them with
 # deterministic stubs so it can force RED / REQUEST_CHANGES / budget exhaustion for free.
 GATE_CMD="${GATE_CMD:-sbt -batch -no-colors compile test}"
+IT_GATE_CMD="${IT_GATE_CMD:-sbt -batch -no-colors It/test}"
 IMPL_CMD="${IMPL_CMD:-}"
 FIX_CMD="${FIX_CMD:-}"
 REVIEW_CMD="${REVIEW_CMD:-}"
@@ -107,15 +121,16 @@ render_template() {
   done
 }
 
-# --- the gate: compile under -Werror, then full test suite -----------------------------
+# --- the gate: run a tier command, capture its log -------------------------------------
 # Returns 0 = green, non-zero = red. -Werror is already in build.sbt scalacOptions.
-# NOTE: v1 still runs the FULL suite incl. the Testcontainers IT (needs Docker, set above);
-# the in-memory/IT split is deferred to v2 (see spec). GATE_CMD is a test seam.
+# Parametrised over (label, command, timeout, logfile) so both tiers share the timeout-
+# wrapping logic: the FAST tier (GATE_CMD, src/test — Docker-free after the v2 split) and
+# the IT tier (IT_GATE_CMD, src/it — real PG via Testcontainers). Both are test seams.
 run_gate() {
-  local logfile="$1"
-  log "gate: $GATE_CMD (timeout ${GATE_TIMEOUT}s) -> $logfile"
-  local g="$GATE_CMD"
-  [[ -n "$TIMEOUT_BIN" ]] && g="$TIMEOUT_BIN $GATE_TIMEOUT $g"
+  local label="$1" cmd="$2" tmo="$3" logfile="$4"
+  log "$label gate: $cmd (timeout ${tmo}s) -> $logfile"
+  local g="$cmd"
+  [[ -n "$TIMEOUT_BIN" ]] && g="$TIMEOUT_BIN $tmo $g"
   if $g >"$logfile" 2>&1; then
     return 0
   fi
@@ -179,12 +194,14 @@ dispatch_review() {
 }
 
 # --- test-tamper check -----------------------------------------------------------------
-# Diff the (staged) test tree against origin/main. All tests live under src/test (verified).
-# Bash does NOT block on tamper — it surfaces the raw numstat plus a one-line summary to the
-# reviewer, who is the judgment. numstat rows are: added<TAB>deleted<TAB>path ('-' = binary).
+# Diff the (staged) test tree against origin/main. All tests live under src/test (in-memory)
+# or src/it (Testcontainers IT); v2 covers both so a repair iter cannot gut the IT to go green
+# without the reviewer seeing it. Bash does NOT block on tamper — it surfaces the raw numstat
+# plus a one-line summary to the reviewer, who is the judgment. numstat rows are:
+# added<TAB>deleted<TAB>path ('-' = binary).
 tamper_report() {
   local out="$1" raw touched=0 net_del=0 add del path
-  raw="$(git diff --cached --numstat origin/main -- src/test || true)"
+  raw="$(git diff --cached --numstat origin/main -- src/test src/it || true)"
   if [[ -n "$raw" ]]; then
     while IFS=$'\t' read -r add del path; do
       [[ -z "$path" ]] && continue
@@ -194,7 +211,7 @@ tamper_report() {
     done <<< "$raw"
   fi
   {
-    printf '# Test-tamper report (git diff --numstat origin/main -- src/test)\n\n'
+    printf '# Test-tamper report (git diff --numstat origin/main -- src/test src/it)\n\n'
     printf '**Summary: %s test file(s) touched, %s with net deletions.**\n\n' "$touched" "$net_del"
     printf 'Raw numstat (added  deleted  path; a deleted file shows all lines as deletions):\n\n'
     if [[ -n "$raw" ]]; then
@@ -279,18 +296,42 @@ iterate() {
     pass=$((pass + 1))
     git add -A                                        # stage so new files show in diff/gate/tamper
 
+    # --- FAST tier: src/test only (no Docker after the v2 split) -----------------------
     local gate_log="$LOG_DIR/issue-${issue}-pass${pass}.gate.log"
-    if ! run_gate "$gate_log"; then
+    if ! run_gate "FAST" "$GATE_CMD" "$GATE_TIMEOUT" "$gate_log"; then
       gate_status="RED"; failure_kind="gate-RED"
-      log "gate RED (pass $pass, see $gate_log)"
+      log "FAST gate RED (pass $pass, see $gate_log)"
       if (( budget == 0 )); then outcome="FAIL"; break; fi
       budget=$((budget - 1))
-      log "self-repair: budget now $budget — dispatching FIX for gate-RED"
+      log "self-repair: budget now $budget — dispatching FIX for gate-RED (IT gate short-circuited)"
       local fail_file="$LOG_DIR/issue-${issue}-pass${pass}.failure.md"
       {
-        printf '## Gate failure — `%s` (compile under -Werror, then tests)\n\n' "$GATE_CMD"
-        printf 'Tail of the gate log:\n\n```\n'
+        printf '## Fast-gate failure — `%s` (compile under -Werror, then in-memory tests)\n\n' "$GATE_CMD"
+        printf 'Tail of the fast-gate log:\n\n```\n'
         tail -n 200 "$gate_log"
+        printf '\n```\n'
+      } >"$fail_file"
+      local fix_prompt_file="$LOG_DIR/issue-${issue}-pass${pass}.fix.prompt.txt"
+      render_template "$FIX_PROMPT" "$fix_prompt_file" ISSUE "$body_file" FAILURE "$fail_file"
+      dispatch_worker FIX "$(cat "$fix_prompt_file")" "$LOG_DIR/issue-${issue}-pass${pass}.fix.claude.log"
+      continue                                        # short-circuits the IT gate — no Docker paid
+    fi
+    log "FAST gate GREEN (pass $pass) — running IT gate (real PG)"
+
+    # --- IT tier: src/it only (Testcontainers real PG). Only reached on fast-GREEN. ----
+    local it_gate_log="$LOG_DIR/issue-${issue}-pass${pass}.it-gate.log"
+    if ! run_gate "IT" "$IT_GATE_CMD" "$IT_GATE_TIMEOUT" "$it_gate_log"; then
+      gate_status="IT-RED"; failure_kind="IT-gate-RED"
+      log "IT gate RED (pass $pass, see $it_gate_log)"
+      if (( budget == 0 )); then outcome="FAIL"; break; fi
+      budget=$((budget - 1))
+      log "self-repair: budget now $budget — dispatching FIX for IT-gate-RED"
+      local fail_file="$LOG_DIR/issue-${issue}-pass${pass}.failure.md"
+      {
+        printf '## IT-gate failure — `%s` (Testcontainers real-Postgres integration tests)\n\n' "$IT_GATE_CMD"
+        printf 'The in-memory fast tier passed; the real-PG integration tier (src/it) failed.\n\n'
+        printf 'Tail of the IT-gate log:\n\n```\n'
+        tail -n 200 "$it_gate_log"
         printf '\n```\n'
       } >"$fail_file"
       local fix_prompt_file="$LOG_DIR/issue-${issue}-pass${pass}.fix.prompt.txt"
@@ -300,7 +341,7 @@ iterate() {
     fi
 
     gate_status="GREEN"
-    log "gate GREEN (pass $pass) — running tamper check + cold reviewer"
+    log "FAST + IT gates GREEN (pass $pass) — running tamper check + cold reviewer"
 
     # Tamper check feeds the reviewer (bash surfaces, does not block).
     local tamper_file="$LOG_DIR/issue-${issue}-tamper.md"
@@ -357,7 +398,7 @@ iterate() {
   if [[ "$outcome" == "SUCCESS" ]]; then
     label="needs-review"
     commit_tag="reviewer APPROVE, gate ${gate_status}"
-    pr_note="**Reviewer: APPROVE** · gate ${gate_status}. The cold independent reviewer approved; a human still merges (v1 stops at PR)."
+    pr_note="**Reviewer: APPROVE** · gate ${gate_status} (in-memory + real-PG IT tiers both green). The cold independent reviewer approved; a human still merges (v2 stops at PR)."
   else
     label="needs-human"
     commit_tag="self-repair budget exhausted (${failure_kind}), gate ${gate_status}"
@@ -367,7 +408,7 @@ iterate() {
   git commit --quiet -m "feat(US-${issue}): autonomous iteration — ${commit_tag}
 
 Refs #${issue}. Loop iteration ${n}, ${pass} gate pass(es). Outcome: ${outcome}.
-This commit was produced by an unattended claude -p iteration (harness v1).
+This commit was produced by an unattended claude -p iteration (harness v2).
 
 Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 
@@ -375,14 +416,14 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 
   local pr_body_file; pr_body_file="$LOG_DIR/issue-${issue}.pr-body.md"
   {
-    printf 'Autonomous harness (v1) iteration %s for #%s.\n\n' "$n" "$issue"
+    printf 'Autonomous harness (v2) iteration %s for #%s.\n\n' "$n" "$issue"
     printf '%s\n\n' "$pr_note"
     if (( reviewed )); then
       printf '<details><summary>Independent reviewer output</summary>\n\n```\n'
       cat "$review_file"
       printf '\n```\n\n</details>\n\n'
     fi
-    printf 'v1 stops at PR: no CI, no auto-merge. A human reviews and merges.\n\n'
+    printf 'v2 stops at PR: no CI, no auto-merge. A human reviews and merges.\n\n'
     printf 'Closes #%s\n' "$issue"
   } >"$pr_body_file"
 
@@ -395,7 +436,7 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 }
 
 # --- driver ----------------------------------------------------------------------------
-log "v1 loop start (MAX_ITERS=$MAX_ITERS, ITER_TIMEOUT=${ITER_TIMEOUT}s, REPAIR_BUDGET=$REPAIR_BUDGET, DRY_RUN=$DRY_RUN)"
+log "v2 loop start (MAX_ITERS=$MAX_ITERS, ITER_TIMEOUT=${ITER_TIMEOUT}s, REPAIR_BUDGET=$REPAIR_BUDGET, DRY_RUN=$DRY_RUN)"
 for ((i = 1; i <= MAX_ITERS; i++)); do
   rc=0
   iterate "$i" || rc=$?

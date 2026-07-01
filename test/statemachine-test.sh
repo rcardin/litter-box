@@ -28,9 +28,10 @@ setup_sandbox() {
   cd "$WORK"
   git config user.email t@t; git config user.name t
   git config commit.gpgsign false
-  mkdir -p src/main/scala src/test/scala
+  mkdir -p src/main/scala src/test/scala src/it/scala
   echo 'object Base'                 > src/main/scala/Base.scala
   printf 'class BaseTest {\n  // baseline assertion line 1\n  // line 2\n}\n' > src/test/scala/BaseTest.scala
+  printf 'class BaseIT {\n  // baseline IT assertion line 1\n  // line 2\n}\n' > src/it/scala/BaseIT.scala
   # copy the harness under test into the sandbox repo
   cp -R "$SRC_HARNESS" "$WORK/harness"
   rm -rf "$WORK/harness/logs"; mkdir -p "$WORK/harness/logs"
@@ -80,21 +81,24 @@ teardown
 echo "== Scenario A: APPROVE happy path -> needs-review, exit 0 =="
 setup_sandbox
 export GATE_CMD=true
+export IT_GATE_CMD=true
 export IMPL_CMD='mkdir -p src/main/scala && printf "object Slice\n" > src/main/scala/Slice.scala'
 export FIX_CMD='true'
 export REVIEW_CMD='printf "checked AC1/AC2, tests present.\nVERDICT: APPROVE\n"'
 run_loop
 check "exit code 0 (APPROVE)" 0 "$RC"
-checkc "one gate pass only" "pass1.gate.log" <(ls "$WORK/harness/logs")
+checkc "one fast-gate pass only" "pass1.gate.log" <(ls "$WORK/harness/logs")
+checkc "IT gate ran after fast-GREEN (pass1)" "pass1.it-gate.log" <(ls "$WORK/harness/logs")
 check "no pass2 gate (no repair)" "" "$(ls "$WORK/harness/logs" | grep pass2 || true)"
 checkc "issue -> needs-review" "issue edit 999 --add-label needs-review" "$GH_CALLS"
 checkc "PR created" "pr create" "$GH_CALLS"
-unset GATE_CMD IMPL_CMD FIX_CMD REVIEW_CMD
+unset GATE_CMD IT_GATE_CMD IMPL_CMD FIX_CMD REVIEW_CMD
 teardown
 
 echo "== Scenario B: forced REQUEST_CHANGES -> exactly one fix, re-gate, re-review APPROVE =="
 setup_sandbox
 export GATE_CMD=true
+export IT_GATE_CMD=true
 export IMPL_CMD='printf "object Slice\n" > src/main/scala/Slice.scala'
 export FIX_CMD='printf "object SliceFixed\n" > src/main/scala/Slice.scala'
 # REVIEW: first call REQUEST_CHANGES, second APPROVE (counter file in sandbox)
@@ -102,30 +106,81 @@ export REVIEW_CMD='c="$PWD/harness/logs/.revcount"; n=$(cat "$c" 2>/dev/null || 
 run_loop
 check "exit code 0 (eventual APPROVE)" 0 "$RC"
 check "exactly one FIX dispatch" "1" "$(ls "$WORK/harness/logs" | grep -c '\.fix\.claude\.log' || true)"
-checkc "two gate passes (re-gate)" "pass2.gate.log" <(ls "$WORK/harness/logs")
+checkc "two fast-gate passes (re-gate)" "pass2.gate.log" <(ls "$WORK/harness/logs")
+checkc "two IT-gate passes (re-gate)" "pass2.it-gate.log" <(ls "$WORK/harness/logs")
 check "no third pass" "" "$(ls "$WORK/harness/logs" | grep pass3 || true)"
 checkc "issue -> needs-review" "issue edit 999 --add-label needs-review" "$GH_CALLS"
-unset GATE_CMD IMPL_CMD FIX_CMD REVIEW_CMD
+unset GATE_CMD IT_GATE_CMD IMPL_CMD FIX_CMD REVIEW_CMD
 teardown
 
-echo "== Scenario C: forced gate-RED, shared budget 2 -> needs-human + PR, exit 40 =="
+echo "== Scenario C: forced fast-gate-RED, shared budget 2 -> needs-human + PR, IT never runs =="
 setup_sandbox
 export GATE_CMD=false
+export IT_GATE_CMD=false   # must never be reached: fast-RED short-circuits the IT gate
 export IMPL_CMD='printf "object Slice\n" > src/main/scala/Slice.scala'
 export FIX_CMD='printf "// touch %s\n" "$RANDOM" >> src/main/scala/Slice.scala'
-export REVIEW_CMD='echo "VERDICT: APPROVE"'   # never reached (gate always RED)
+export REVIEW_CMD='echo "VERDICT: APPROVE"'   # never reached (fast gate always RED)
 run_loop
 # Driver treats needs-human (iterate rc=40) as a handled outcome and continues the loop, so
 # the SCRIPT exits 0; the FAIL path is proven by needs-human + PR + 2 fixes below.
 check "script exits 0 (needs-human handled, not aborted)" 0 "$RC"
 checkc "driver logged budget-exhausted terminal" "needs-human" "$SB/loop.out"
 check "exactly two FIX dispatches (budget 2)" "2" "$(ls "$WORK/harness/logs" | grep -c '\.fix\.claude\.log' || true)"
-checkc "three gate passes (2 fixes + final RED)" "pass3.gate.log" <(ls "$WORK/harness/logs")
+checkc "three fast-gate passes (2 fixes + final RED)" "pass3.gate.log" <(ls "$WORK/harness/logs")
+check "IT gate NEVER ran (fast-RED short-circuits, no Docker paid)" "" "$(ls "$WORK/harness/logs" | grep 'it-gate.log' || true)"
 check "no fourth pass" "" "$(ls "$WORK/harness/logs" | grep pass4 || true)"
 check "reviewer never ran (RED never renders a review prompt)" "" "$(ls "$WORK/harness/logs" | grep 'review.prompt.txt' || true)"
 checkc "issue -> needs-human" "issue edit 999 --add-label needs-human" "$GH_CALLS"
 checkc "PR still opened (audit trail)" "pr create" "$GH_CALLS"
-unset GATE_CMD IMPL_CMD FIX_CMD REVIEW_CMD
+unset GATE_CMD IT_GATE_CMD IMPL_CMD FIX_CMD REVIEW_CMD
+teardown
+
+echo "== Scenario D: forced IT-gate-RED -> exactly one fix from shared budget, re-gate green =="
+setup_sandbox
+export GATE_CMD=true                                   # fast tier always green
+export IMPL_CMD='printf "object Slice\n" > src/main/scala/Slice.scala'
+export FIX_CMD='printf "object SliceFixed\n" > src/main/scala/Slice.scala'
+# IT: first call RED, second GREEN. run_gate execs the cmd word-split (no shell eval), so the
+# stateful stub is a script on PATH, not an inline compound. Counter under the loop cwd (WORK).
+cat > "$FAKEBIN/it-flaky" <<'ITEOF'
+#!/usr/bin/env bash
+c="harness/logs/.itcount"
+n=$(cat "$c" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$c"
+[ "$n" -ge 2 ]
+ITEOF
+chmod +x "$FAKEBIN/it-flaky"
+export IT_GATE_CMD=it-flaky
+export REVIEW_CMD='echo "VERDICT: APPROVE"'
+run_loop
+check "exit code 0 (IT green after one fix, then APPROVE)" 0 "$RC"
+check "exactly one FIX dispatch (from shared budget)" "1" "$(ls "$WORK/harness/logs" | grep -c '\.fix\.claude\.log' || true)"
+checkc "two fast-gate passes (re-gate after IT-RED)" "pass2.gate.log" <(ls "$WORK/harness/logs")
+checkc "two IT-gate passes (RED then GREEN)" "pass2.it-gate.log" <(ls "$WORK/harness/logs")
+check "reviewer ran only after IT-GREEN (no pass1 review)" "" "$(ls "$WORK/harness/logs" | grep 'pass1.review.prompt.txt' || true)"
+checkc "reviewer ran on pass2 (unit+IT green)" "pass2.review.prompt.txt" <(ls "$WORK/harness/logs")
+checkc "issue -> needs-review" "issue edit 999 --add-label needs-review" "$GH_CALLS"
+unset GATE_CMD IT_GATE_CMD IMPL_CMD FIX_CMD REVIEW_CMD
+teardown
+
+echo "== Scenario E: IT-gate-RED exhausts shared budget 2 -> needs-human + PR, reviewer never runs =="
+setup_sandbox
+export GATE_CMD=true                                   # fast tier always green
+export IT_GATE_CMD=false                               # IT tier always RED
+export IMPL_CMD='printf "object Slice\n" > src/main/scala/Slice.scala'
+export FIX_CMD='printf "// touch %s\n" "$RANDOM" >> src/main/scala/Slice.scala'
+export REVIEW_CMD='echo "VERDICT: APPROVE"'            # never reached (IT always RED)
+run_loop
+check "script exits 0 (needs-human handled)" 0 "$RC"
+checkc "driver logged budget-exhausted terminal" "needs-human" "$SB/loop.out"
+checkc "failure kind is IT-gate-RED" "IT-gate-RED" "$SB/loop.out"
+check "exactly two FIX dispatches (budget 2)" "2" "$(ls "$WORK/harness/logs" | grep -c '\.fix\.claude\.log' || true)"
+checkc "three fast-gate passes (all GREEN)" "pass3.gate.log" <(ls "$WORK/harness/logs")
+checkc "three IT-gate passes (2 fixes + final RED)" "pass3.it-gate.log" <(ls "$WORK/harness/logs")
+check "no fourth pass" "" "$(ls "$WORK/harness/logs" | grep pass4 || true)"
+check "reviewer never ran (IT-RED never renders a review prompt)" "" "$(ls "$WORK/harness/logs" | grep 'review.prompt.txt' || true)"
+checkc "issue -> needs-human" "issue edit 999 --add-label needs-human" "$GH_CALLS"
+checkc "PR still opened (audit trail)" "pr create" "$GH_CALLS"
+unset GATE_CMD IT_GATE_CMD IMPL_CMD FIX_CMD REVIEW_CMD
 teardown
 
 echo
