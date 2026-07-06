@@ -227,7 +227,10 @@ iterate() {
   local n="$1"
 
   # Guards --------------------------------------------------------------------
-  [[ -f "$REPO_ROOT/STOP.md" ]] && { log "STOP.md present — exiting"; return 10; }
+  # STOP.md is a *manual* kill-switch only: create it by hand to halt the loop.
+  # The loop never writes it itself — "no ready issue" is a transient idle state
+  # (a US parked in human review), not a terminal one, so it must not latch.
+  [[ -f "$REPO_ROOT/STOP.md" ]] && { log "STOP.md present (manual kill-switch) — exiting"; return 10; }
 
   # Pick US (deterministic, no LLM): resume an in-progress one, else next ready.
   local issue
@@ -237,10 +240,8 @@ iterate() {
               --jq 'sort_by(.createdAt) | .[0].number')"
   fi
   if [[ -z "$issue" ]]; then
-    log "no in-progress or ready issue — writing STOP.md"
-    printf '# STOP\n\nNo `ready` issues left for the loop at %s.\n' "$(date -u +%FT%TZ)" \
-      >"$REPO_ROOT/STOP.md"
-    return 10
+    log "no in-progress or ready issue — idle, exiting (next tick resumes when one goes ready)"
+    return 11
   fi
   log "iteration $n -> issue #$issue"
 
@@ -443,7 +444,8 @@ for ((i = 1; i <= MAX_ITERS; i++)); do
   case "$rc" in
     0)  log "iteration $i done (APPROVE, PR opened -> needs-review)";;
     40) log "iteration $i done (budget exhausted, PR opened -> needs-human)";;
-    10) log "loop exhausted/stopped — exiting"; exit 0;;
+    10) log "manual STOP.md — exiting"; exit 0;;
+    11) log "no actionable issue — idle, exiting"; exit 0;;
     20) log "dry run reached its stop point — exiting"; exit 0;;
     30) log "iteration $i produced nothing — exiting for inspection"; exit 1;;
     *)  log "iteration $i failed rc=$rc — exiting for inspection"; exit "$rc";;

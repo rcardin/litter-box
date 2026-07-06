@@ -183,6 +183,46 @@ checkc "PR still opened (audit trail)" "pr create" "$GH_CALLS"
 unset GATE_CMD IT_GATE_CMD IMPL_CMD FIX_CMD REVIEW_CMD
 teardown
 
+echo "== Scenario F: no ready issue idles WITHOUT latching -> exit 0, no STOP.md, resumes next tick =="
+setup_sandbox
+# Override the gh stub so BOTH in-progress and ready lists come back empty (fully idle).
+cat > "$FAKEBIN/gh" <<GHEOF
+#!/usr/bin/env bash
+echo "gh \$*" >> "$GH_CALLS"
+case "\$1 \$2" in
+  "issue list") echo "" ;;
+  *) : ;;
+esac
+GHEOF
+chmod +x "$FAKEBIN/gh"
+run_loop
+check "exit code 0 (idle, no work)" 0 "$RC"
+checkc "logged idle (not STOP)" "idle, exiting" "$SB/loop.out"
+check "no STOP.md written (idle must not latch)" "" "$(ls "$WORK/STOP.md" 2>/dev/null || true)"
+check "no issue edit (nothing started)" "0" "$(grep -c 'issue edit' "$GH_CALLS" || true)"
+# Now a US goes ready: the very next tick must resume on its own (no manual cleanup needed).
+cat > "$FAKEBIN/gh" <<GHEOF
+#!/usr/bin/env bash
+echo "gh \$*" >> "$GH_CALLS"
+case "\$1 \$2" in
+  "issue list")
+    if [[ "\$*" == *"--label in-progress"* ]]; then echo "";
+    elif [[ "\$*" == *"--label ready"* ]]; then echo "999"; fi ;;
+  "issue view") printf '# US-999 sample\n\nAC1: implement the slice.\n' ;;
+  *) : ;;
+esac
+GHEOF
+chmod +x "$FAKEBIN/gh"
+export GATE_CMD=true IT_GATE_CMD=true
+export IMPL_CMD='printf "object Slice\n" > src/main/scala/Slice.scala'
+export FIX_CMD='true'
+export REVIEW_CMD='printf "VERDICT: APPROVE\n"'
+run_loop
+check "resumes next tick without manual cleanup (exit 0)" 0 "$RC"
+checkc "picked the newly-ready issue" "issue edit 999 --add-label in-progress" "$GH_CALLS"
+unset GATE_CMD IT_GATE_CMD IMPL_CMD FIX_CMD REVIEW_CMD
+teardown
+
 echo
 echo "==== $pass passed, $fail failed ===="
 [[ "$fail" -eq 0 ]]

@@ -53,9 +53,11 @@ exhaustion (fast-RED, IT-RED, or `REQUEST_CHANGES`) opens a PR too (audit trail)
 
 ## Control flow (what `loop.sh` does)
 
-1. Guard: `STOP.md` present or `MAX_ITERS` hit → exit.
-2. Pick US (deterministic): resume an `in-progress` issue, else oldest `ready`. None → write
-   `STOP.md`, exit.
+1. Guard: `STOP.md` present (a **manual** kill-switch — create it by hand to halt the loop) or
+   `MAX_ITERS` hit → exit.
+2. Pick US (deterministic): resume an `in-progress` issue, else oldest `ready`. None → log idle,
+   exit `11`. This is transient (a US parked in human review), not terminal: the loop writes **no**
+   sentinel, so the next tick resumes on its own once an issue goes `ready`.
 3. Require a clean tree; branch `us-<n>` off `origin/main`; flip issue `ready`→`in-progress`.
 4. Dispatch the fresh **IMPL** `claude -p` (v0 worker prompt). Nothing produced → leave
    in-progress, no PR.
