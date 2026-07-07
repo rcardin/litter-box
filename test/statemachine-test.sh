@@ -71,7 +71,9 @@ run_loop() { # run_loop -> sets RC; env vars for seams passed by caller
 echo "== Scenario DRY: DRY_RUN renders worker prompt, no mutation =="
 setup_sandbox
 RC=0; cd "$WORK"
-DRY_RUN=1 MAX_ITERS=1 "$WORK/harness/loop.sh" >"$SB/loop.out" 2>&1 || RC=$?
+# IT_GATE_CMD overridden so the docker preflight is skipped: the suite must not depend on
+# a live docker daemon on the machine running it.
+DRY_RUN=1 MAX_ITERS=1 IT_GATE_CMD=true "$WORK/harness/loop.sh" >"$SB/loop.out" 2>&1 || RC=$?
 check "exit code 0 (dry run)" 0 "$RC"
 checkc "worker prompt rendered" "AC1: implement the slice" "$WORK/harness/logs/issue-999.prompt.txt"
 check "no gh issue edit (no label mutation)" "0" "$(grep -c 'issue edit' "$GH_CALLS" || true; )"
@@ -220,6 +222,68 @@ export REVIEW_CMD='printf "VERDICT: APPROVE\n"'
 run_loop
 check "resumes next tick without manual cleanup (exit 0)" 0 "$RC"
 checkc "picked the newly-ready issue" "issue edit 999 --add-label in-progress" "$GH_CALLS"
+unset GATE_CMD IT_GATE_CMD IMPL_CMD FIX_CMD REVIEW_CMD
+teardown
+
+echo "== Scenario G: protected-path violation -> needs-human + PR, no FIX, reviewer never runs =="
+setup_sandbox
+export GATE_CMD=true
+export IT_GATE_CMD=true
+# The worker touches a protected file (harness/) AND a normal src file. harness/logs is the
+# only gitignored part of harness/, so any other harness file trips the check.
+export IMPL_CMD='printf "x" >> harness/fix-prompt.md && printf "object Slice\n" > src/main/scala/Slice.scala'
+export FIX_CMD='false'                                 # must never run (fixer = violating agent class)
+export REVIEW_CMD='echo "VERDICT: APPROVE"'            # must never run
+run_loop
+check "script exits 0 (needs-human handled, not aborted)" 0 "$RC"
+checkc "driver output mentions protected-path" "protected-path" "$SB/loop.out"
+check "no FIX dispatch" "0" "$(ls "$WORK/harness/logs" | grep -c '\.fix\.claude\.log' || true)"
+check "reviewer never ran" "" "$(ls "$WORK/harness/logs" | grep 'review.prompt.txt' || true)"
+check "gates never ran (violation short-circuits the gates)" "" "$(ls "$WORK/harness/logs" | grep 'gate.log' || true)"
+checkc "issue -> needs-human" "issue edit 999 --add-label needs-human" "$GH_CALLS"
+checkc "PR still opened (audit trail)" "pr create" "$GH_CALLS"
+unset GATE_CMD IT_GATE_CMD IMPL_CMD FIX_CMD REVIEW_CMD
+teardown
+
+echo "== Scenario H: empty reviewer output = infra fault -> exit 50, issue stays in-progress =="
+setup_sandbox
+export GATE_CMD=true
+export IT_GATE_CMD=true
+export IMPL_CMD='printf "object Slice\n" > src/main/scala/Slice.scala'
+export FIX_CMD='false'                                 # must never run (no budget spent)
+export REVIEW_CMD='true'                               # empty review file: crashed/timed-out reviewer
+run_loop
+check "exit code 50 (infra fault)" 50 "$RC"
+checkc "driver logged infra fault" "infra fault — exiting for inspection" "$SB/loop.out"
+check "no FIX dispatch (no budget spent)" "0" "$(ls "$WORK/harness/logs" | grep -c '\.fix\.claude\.log' || true)"
+check "no needs-human label" "" "$(grep 'needs-human' "$GH_CALLS" || true)"
+check "no PR created" "" "$(grep 'pr create' "$GH_CALLS" || true)"
+checkc "issue marked in-progress" "issue edit 999 --add-label in-progress" "$GH_CALLS"
+check "in-progress never removed (resumable next tick)" "0" "$(grep -c 'remove-label in-progress' "$GH_CALLS" || true)"
+unset GATE_CMD IT_GATE_CMD IMPL_CMD FIX_CMD REVIEW_CMD
+teardown
+
+echo "== Scenario I: gate timeout (rc 124) = infra fault -> exit 50, no budget spent =="
+setup_sandbox
+# run_gate execs the cmd word-split (no shell eval), so the 124-stub is a script on PATH,
+# same trick as the it-flaky stub in Scenario D.
+cat > "$FAKEBIN/gate-timeout" <<'GTEOF'
+#!/usr/bin/env bash
+exit 124
+GTEOF
+chmod +x "$FAKEBIN/gate-timeout"
+export GATE_CMD=gate-timeout
+export IT_GATE_CMD=false                               # must never be reached
+export IMPL_CMD='printf "object Slice\n" > src/main/scala/Slice.scala'
+export FIX_CMD='false'                                 # must never run (no budget spent)
+export REVIEW_CMD='echo "VERDICT: APPROVE"'            # must never run
+run_loop
+check "exit code 50 (infra fault)" 50 "$RC"
+checkc "gate-timeout logged as infra fault" "infra fault, not a code failure" "$SB/loop.out"
+check "zero FIX dispatches (no budget spent)" "0" "$(ls "$WORK/harness/logs" | grep -c '\.fix\.claude\.log' || true)"
+check "no PR created" "" "$(grep 'pr create' "$GH_CALLS" || true)"
+check "no needs-human label" "" "$(grep 'needs-human' "$GH_CALLS" || true)"
+check "IT gate never ran" "" "$(ls "$WORK/harness/logs" | grep 'it-gate.log' || true)"
 unset GATE_CMD IT_GATE_CMD IMPL_CMD FIX_CMD REVIEW_CMD
 teardown
 

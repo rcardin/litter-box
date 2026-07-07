@@ -6,6 +6,12 @@ building on v1 (`docs/superpowers/specs/2026-07-01-harness-v1-reviewer-design.md
 
 > `v2: + Testcontainers gate split`
 
+This revision also hardens v2 on top of the same design: an infra-fault terminal (rc `50`), a
+Docker preflight, protected-path enforcement in bash, and a fatal stale-base guard — see
+**Infra faults vs code failures** below. None of this changes the v2 state machine; it closes
+gaps where infra problems or prompt violations were previously indistinguishable from code
+failures.
+
 **v1** gave the reviewer stack (all unchanged in v2):
 
 - **Cold independent reviewer** — a separate, fresh `claude -p` that never shared context
@@ -33,10 +39,13 @@ building on v1 (`docs/superpowers/specs/2026-07-01-harness-v1-reviewer-design.md
   unit+IT-green diff. **fast-RED short-circuits the IT gate** — Docker is never paid for an
   iteration whose unit tests already fail. IT-RED draws from the same shared budget of 2.
 
-**Still NOT in v2:** GitHub Actions / branch protection (v3), auto-merge (v4), convention-lint
-gate step, rebase-on-main-and-rerun. **v2 still stops at PR — a human merges.** Budget
-exhaustion (fast-RED, IT-RED, or `REQUEST_CHANGES`) opens a PR too (audit trail) but flips
-`needs-human`.
+**v3 (GitHub Actions CI `build` check + branch protection on `main`) has shipped**, outside this
+script — `ci.yml` is merged and `main` is protected on the `build` check. **Still not
+implemented:** auto-merge (v4), a convention-lint gate step, rebase-on-main-and-rerun. **The
+loop still stops at PR — a human merges.** Budget exhaustion (fast-RED, IT-RED, or
+`REQUEST_CHANGES`) opens a PR too (audit trail) but flips `needs-human` — as does a
+protected-path violation (see **Infra faults vs code failures** below), which skips the gate
+and the reviewer entirely.
 
 ## Pieces
 
@@ -44,41 +53,86 @@ exhaustion (fast-RED, IT-RED, or `REQUEST_CHANGES`) opens a PR too (audit trail)
 |---|---|
 | `build.sbt` | Defines the `It` custom config (`config("it") extend Test` + `inConfig(It)(Defaults.testSettings)`, forked + serial + `-oDF`). `sbt test` = `src/test`; `sbt It/test` = `src/it`. |
 | `src/it/scala/.../PostgresJdbcEventStoreSpec.scala` | The one Testcontainers IT (real PG + Flyway), moved out of `src/test` so it no longer runs in the fast gate. |
-| `loop.sh` | Bash state machine. Picks one issue via `gh`, dispatches fresh `claude -p` tasks, runs the fast gate + IT gate + repair loop + reviewer, opens a PR, stops. The model never chooses the task. |
+| `loop.sh` | Bash state machine. Docker preflight at startup, picks one issue via `gh`, dispatches fresh `claude -p` tasks, enforces the protected-path guard, runs the fast gate + IT gate + repair loop + reviewer, opens a PR, stops. Timeouts and other infra faults exit `50` without spending repair budget. The model never chooses the task. |
 | `iterate-prompt.md` | The narrow worker prompt (unchanged from v0). `{{ISSUE}}` is spliced with the issue body. |
 | `fix-prompt.md` | The fix-iteration prompt. Splices `{{ISSUE}}` + `{{FAILURE}}` (gate-log tail **or** reviewer reasons + tamper). Same hard rules as the worker (no test weakening, `-Werror`, no `gh`/branch ops). |
 | `review-prompt.md` | The cold reviewer prompt. Splices `{{ISSUE}}`, `{{CONVENTIONS}}` (`CONTEXT.md`), `{{TAMPER}}`, `{{DIFF}}`. Adversarial. Last line MUST be `VERDICT: APPROVE` or `VERDICT: REQUEST_CHANGES`. |
-| `test/statemachine-test.sh` | Drives the whole state machine in a throwaway sandbox (fake `gh`, stubbed gate + dispatches) — no real GitHub, no Opus tokens. Verifies the spec's done-criteria. |
+| `test/statemachine-test.sh` | Drives the whole state machine in a throwaway sandbox (fake `gh`, stubbed gate + dispatches) — no real GitHub, no Opus tokens. Scenarios A–I plus a DRY_RUN check (APPROVE, REQUEST_CHANGES, fast-RED, IT-RED, budget exhaustion, idle-no-latch, protected-path, empty-review, gate-timeout), 68 assertions total. |
 | `logs/` | Per-pass `claude -p` logs, gate logs, rendered prompts, tamper + review + diff artefacts. Git-ignored. |
 
 ## Control flow (what `loop.sh` does)
 
+0. Startup: unless `IT_GATE_CMD` is overridden (test seam), `docker info` must succeed or the
+   whole loop `die`s before touching any issue — an unreachable Docker daemon must never
+   surface mid-run as a false IT-RED.
 1. Guard: `STOP.md` present (a **manual** kill-switch — create it by hand to halt the loop) or
    `MAX_ITERS` hit → exit.
 2. Pick US (deterministic): resume an `in-progress` issue, else oldest `ready`. None → log idle,
    exit `11`. This is transient (a US parked in human review), not terminal: the loop writes **no**
    sentinel, so the next tick resumes on its own once an issue goes `ready`.
-3. Require a clean tree; branch `us-<n>` off `origin/main`; flip issue `ready`→`in-progress`.
-4. Dispatch the fresh **IMPL** `claude -p` (v0 worker prompt). Nothing produced → leave
-   in-progress, no PR.
-5. **Repair loop** (shared budget of 2):
-   - Run the **FAST gate** (`sbt compile -Werror` + `sbt test`, `src/test` only, no Docker).
+3. Require a clean tree. `git fetch origin main` and branching `us-<n>` off `origin/main` are
+   both **fatal** on failure (`die`) — every diff, tamper report, gate run and PR downstream is
+   measured against `origin/main`, so a stale local base is never silently tolerated. Flip issue
+   `ready`→`in-progress`.
+4. Dispatch the fresh **IMPL** `claude -p` (v0 worker prompt). A `124` timeout → infra fault,
+   exit `50` (a half-finished worker must never reach the gates). Otherwise, nothing produced →
+   leave in-progress, no PR (exit `30`).
+5. **Repair loop** (shared budget of 2), each pass:
+   - **Protected-path guard** (bash, not the prompt — the worker/fixer runs with permissions
+     skipped): if the staged diff vs `origin/main` touches `harness/`, `docs/`, `.github/`,
+     `PROMPT.md`, `CONTEXT.md` or `STOP.md`, terminate immediately as `FAIL(needs-human)`, gate
+     `SKIPPED`, **no FIX dispatched** (the fixer is the same agent class that just broke the
+     rule) — a PR is still opened, marked do-not-merge, for the audit trail.
+   - Run the **FAST gate** (`sbt compile -Werror` + `sbt test`, `src/test` only, no Docker). A
+     `124` timeout → infra fault, exit `50`, no budget spent.
      - **RED** → budget 0? terminate `FAIL(needs-human)`. Else spend one, dispatch **FIX**
-       (fast-gate-log tail spliced), re-loop. **This short-circuits the IT gate** — no Docker.
-     - **GREEN** → run the **IT gate** (`sbt It/test`, `src/it` only, real PG).
+       (fast-gate-log tail spliced; a FIX timeout is also infra fault, exit `50`), re-loop.
+       **This short-circuits the IT gate** — no Docker.
+     - **GREEN** → run the **IT gate** (`sbt It/test`, `src/it` only, real PG). A `124` timeout
+       → infra fault, exit `50`.
        - **IT-RED** → budget 0? terminate `FAIL(needs-human)`. Else spend one, dispatch **FIX**
          (IT-gate-log tail spliced), re-loop.
        - **IT-GREEN** → run the **tamper check** (`src/test` + `src/it`), then dispatch the
-         cold **REVIEWER**. Grep the `VERDICT:` sentinel (missing → `REQUEST_CHANGES`, fail-safe):
+         cold **REVIEWER**. A `124` timeout, or an empty/whitespace-only review, is an infra
+         fault (crashed/timed-out reviewer) → exit `50`, no budget spent. Grep the `VERDICT:`
+         sentinel on a non-empty review (missing → `REQUEST_CHANGES`, fail-safe — this is model
+         misbehavior, real signal, not an infra fault):
          - `APPROVE` → terminate `SUCCESS`.
          - `REQUEST_CHANGES` → budget 0? terminate `FAIL(needs-human)`. Else spend one,
            dispatch **FIX** (review reasons + tamper spliced), re-loop.
 6. **Terminal (still stop-at-PR):** commit, push, `gh pr create`. `SUCCESS` records the
-   APPROVE + review and flips `needs-review`. `FAIL` records the last failure + review and
-   flips `needs-human`. A human merges either way.
+   APPROVE + review and flips `needs-review`. `FAIL` (budget exhaustion or protected-path)
+   records the last failure and flips `needs-human`. A human merges either way. An exit-`50`
+   infra fault instead commits nothing and opens no PR — the issue simply stays `in-progress`
+   for the next tick or for manual inspection.
 
 Every `claude -p` (IMPL, FIX, REVIEW) is a **fresh context**: the failure reason or the diff
 it needs is spliced into its prompt, never remembered.
+
+## Infra faults vs code failures
+
+Not every non-zero outcome is a code failure. `loop.sh` distinguishes **infra faults**, which
+must never cost repair budget or bury the real signal under `needs-human`, from actual code or
+review failures:
+
+- **rc `50` — infra-fault terminal.** A gate timeout (rc `124`), a worker or reviewer
+  `claude -p` timeout (rc `124`), or an empty/whitespace-only reviewer output all exit the
+  *whole loop* with `50`. The issue **keeps its `in-progress` label** (resumable next tick), **no
+  repair-budget unit is spent**, **no FIX is dispatched**, and **no PR is opened**. A non-empty
+  review that is simply missing the `VERDICT:` sentinel is treated differently — that is model
+  misbehavior, real signal — and still fail-safes to `REQUEST_CHANGES`, spending budget as usual.
+- **Docker preflight.** At startup, if `IT_GATE_CMD` is still the real `sbt It/test` (the test
+  seam not overridden), `docker info` must succeed or the loop dies immediately: "docker
+  unreachable (colima running?) — IT gate would fail for infra reasons". Skipped when the seam
+  is overridden.
+- **Protected-path enforcement.** Enforced in bash after every `git add -A` in the repair loop,
+  not just in the prompt, because the worker/fixer runs with `--dangerously-skip-permissions`.
+  A staged diff vs `origin/main` touching `harness/`, `docs/`, `.github/`, `PROMPT.md`,
+  `CONTEXT.md` or `STOP.md` terminates the US as `FAIL(needs-human)` immediately: gate
+  `SKIPPED`, no FIX dispatched, PR still opened (do-not-merge, audit trail only).
+  `harness/logs/` is gitignored so the harness's own log writes never trip this.
+- **Fatal stale-base guard.** `git fetch origin main` failing, or being unable to branch off
+  `origin/main`, is fatal (`die`) rather than a silent fallback to a stale local base.
 
 ## Environment the gate needs
 
@@ -128,4 +182,6 @@ grep — never the mid-flight stream — so the raw outcome stays the signal.
 
 `ready` · `blocked` · `in-progress` · `planned` · `needs-review` · `needs-human` +
 `class-1|2|3`. `needs-review` = reviewer APPROVE, human merges. `needs-human` = budget
-exhausted (fast-RED, IT-RED, or `REQUEST_CHANGES`), human takes over. Created in the repo already.
+exhausted (fast-RED, IT-RED, or `REQUEST_CHANGES`) or a protected-path violation, human takes
+over. An rc-`50` infra fault touches no label — the issue stays `in-progress` for the next
+tick or manual inspection. Created in the repo already.

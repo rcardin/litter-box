@@ -23,9 +23,15 @@
 #   - the repair budget stays SHARED and stays 2: fast-RED, IT-RED, and REQUEST_CHANGES all
 #     draw from the same pool. The tamper diff now also covers src/it.
 #
-# Still NOT in v2 (see the spec's "deliberately excludes"): GitHub Actions / branch protection
-# (v3), auto-merge (v4), convention-lint gate step, rebase-on-main-and-rerun. v2 STILL STOPS
-# AT PR — a human merges.
+# v3 (GitHub Actions CI `build` check + branch protection on main) shipped OUTSIDE this
+# script. This revision adds hardening on top: an infra-fault terminal (rc 50 — timeouts and
+# empty reviewer output exit for inspection WITHOUT spending the repair budget), a docker
+# preflight before the real IT gate, protected-path enforcement in bash (harness/, docs/,
+# .github/, PROMPT.md, CONTEXT.md, STOP.md), and a fatal stale-base guard (fetch and branch
+# off origin/main must succeed).
+#
+# Still NOT here (see the spec's "deliberately excludes"): auto-merge (v4), convention-lint
+# gate step, rebase-on-main-and-rerun. The loop STILL STOPS AT PR — a human merges.
 #
 # The loop never lets the model choose what to work on: bash resolves all state with `gh`
 # queries and dispatches narrow, fresh `claude -p` tasks. Every dispatch is fresh context.
@@ -65,6 +71,10 @@ mkdir -p "$LOG_DIR"
 
 # Test seams: default empty -> real `claude -p`; the state-machine test overrides them with
 # deterministic stubs so it can force RED / REQUEST_CHANGES / budget exhaustion for free.
+# Capture whether the IT gate seam was overridden BEFORE applying the default: the docker
+# preflight below only applies to the real `sbt It/test` gate, never to test stubs.
+IT_GATE_OVERRIDDEN=0
+if [[ -n "${IT_GATE_CMD:-}" ]]; then IT_GATE_OVERRIDDEN=1; fi
 GATE_CMD="${GATE_CMD:-sbt -batch -no-colors compile test}"
 IT_GATE_CMD="${IT_GATE_CMD:-sbt -batch -no-colors It/test}"
 IMPL_CMD="${IMPL_CMD:-}"
@@ -98,6 +108,12 @@ export TESTCONTAINERS_RYUK_DISABLED="${TESTCONTAINERS_RYUK_DISABLED:-true}"
 command -v gh    >/dev/null || die "gh not found"
 command -v sbt   >/dev/null || die "sbt not found"
 command -v claude >/dev/null || die "claude not found"
+# Docker preflight: the REAL IT gate (Testcontainers) needs a reachable docker daemon
+# (colima). Failing it mid-run would look like a RED gate and burn repair budget on an
+# infra problem, so refuse to start instead. Skipped when the seam is overridden (tests).
+if [[ "$IT_GATE_OVERRIDDEN" == "0" ]]; then
+  docker info >/dev/null 2>&1 || die "docker unreachable (colima running?) — IT gate would fail for infra reasons"
+fi
 for f in "$ITERATE_PROMPT" "$FIX_PROMPT" "$REVIEW_PROMPT"; do
   [[ -f "$f" ]] || die "missing prompt template: $f"
 done
@@ -122,7 +138,9 @@ render_template() {
 }
 
 # --- the gate: run a tier command, capture its log -------------------------------------
-# Returns 0 = green, non-zero = red. -Werror is already in build.sbt scalacOptions.
+# Returns the ACTUAL command exit code: 0 = green, 124 = timeout (an infra fault — callers
+# must treat it as terminal, not RED, and must NOT spend repair budget on it), any other
+# non-zero = red. -Werror is already in build.sbt scalacOptions.
 # Parametrised over (label, command, timeout, logfile) so both tiers share the timeout-
 # wrapping logic: the FAST tier (GATE_CMD, src/test — Docker-free after the v2 split) and
 # the IT tier (IT_GATE_CMD, src/it — real PG via Testcontainers). Both are test seams.
@@ -131,16 +149,18 @@ run_gate() {
   log "$label gate: $cmd (timeout ${tmo}s) -> $logfile"
   local g="$cmd"
   [[ -n "$TIMEOUT_BIN" ]] && g="$TIMEOUT_BIN $tmo $g"
-  if $g >"$logfile" 2>&1; then
-    return 0
-  fi
-  return 1
+  local rc=0
+  $g >"$logfile" 2>&1 || rc=$?
+  return $rc
 }
 
 # --- claude dispatch (worker / fixer) --------------------------------------------------
 # Writes a stream-json JSONL log (one event per turn) so harness/tail-claude.sh can follow it
 # live; bash reads only the exit code. Honours the IMPL_CMD / FIX_CMD seams (a stub command
 # that ignores the prompt and simulates the agent).
+# Real path: returns 124 when claude -p hits the timeout (infra fault — the caller must not
+# let a half-finished worker fall through to the gates), 0 otherwise. Stub overrides keep
+# the always-return-0 behavior: they simulate the agent, their rc is meaningless.
 dispatch_worker() {
   local role="$1" prompt="$2" logf="$3" override="" rc=0
   case "$role" in
@@ -159,7 +179,10 @@ dispatch_worker() {
   else
     claude "${args[@]}" >"$logf" 2>&1 || rc=$?
   fi
-  [[ "$rc" == "124" ]] && log "WARNING: $role claude -p hit the ${ITER_TIMEOUT}s timeout"
+  if [[ "$rc" == "124" ]]; then
+    log "WARNING: $role claude -p hit the ${ITER_TIMEOUT}s timeout"
+    return 124
+  fi
   log "$role claude -p exited rc=$rc"
   return 0
 }
@@ -188,7 +211,10 @@ dispatch_review() {
   else
     claude -p "$prompt" --dangerously-skip-permissions "${REVIEWER_DENY[@]}" >"$review_file" 2>"$review_file.stderr" || rc=$?
   fi
-  [[ "$rc" == "124" ]] && log "WARNING: REVIEWER claude -p hit the ${ITER_TIMEOUT}s timeout"
+  if [[ "$rc" == "124" ]]; then
+    log "WARNING: REVIEWER claude -p hit the ${ITER_TIMEOUT}s timeout"
+    return 124
+  fi
   log "REVIEWER claude -p exited rc=$rc"
   return 0
 }
@@ -261,22 +287,28 @@ iterate() {
 
   # Require a clean tree on a fresh branch off main. Serial loop: one US at a time.
   [[ -z "$(git status --porcelain)" ]] || die "working tree not clean — refusing to start"
-  git fetch --quiet origin main || true
+  # Stale-base guard: everything downstream (diff, tamper, gates, PR) is measured against
+  # origin/main. A fetch failure or a branch off local HEAD would silently measure against
+  # a stale base, so both are fatal — no fallback.
+  git fetch --quiet origin main || die "cannot fetch origin/main — refusing to run against a stale base"
   local branch="us-${issue}"
   if git show-ref --verify --quiet "refs/heads/$branch"; then
     log "branch $branch exists — checking it out"
     git checkout --quiet "$branch"
   else
-    git checkout --quiet -b "$branch" origin/main 2>/dev/null \
-      || git checkout --quiet -b "$branch"
+    git checkout --quiet -b "$branch" origin/main || die "cannot branch off origin/main"
   fi
 
   # Mark in-progress so a crashed run resumes the same US next tick.
   gh issue edit "$issue" --add-label in-progress --remove-label ready >/dev/null
 
   # Initial worker dispatch (fresh context). ----------------------------------
-  local worker_prompt; worker_prompt="$(cat "$worker_prompt_file")"
-  dispatch_worker IMPL "$worker_prompt" "$LOG_DIR/issue-${issue}-iter${n}.claude.log"
+  local worker_prompt impl_rc=0; worker_prompt="$(cat "$worker_prompt_file")"
+  dispatch_worker IMPL "$worker_prompt" "$LOG_DIR/issue-${issue}-iter${n}.claude.log" || impl_rc=$?
+  if (( impl_rc == 124 )); then
+    log "IMPL worker timed out — infra fault; a half-finished worker must not reach the gates"
+    return 50
+  fi
 
   # Nothing produced at all → same v0 semantics: leave in-progress, no PR.
   git add -A
@@ -297,9 +329,27 @@ iterate() {
     pass=$((pass + 1))
     git add -A                                        # stage so new files show in diff/gate/tamper
 
+    # --- protected-path enforcement (bash, not the prompt) -----------------------------
+    # Worker prompts forbid touching the harness, docs and control files, but the worker
+    # runs with permissions skipped, so bash enforces it. No FIX dispatch: the fixer is the
+    # same agent class that violated the rule. Straight to the FAIL terminal (PR opened for
+    # the audit trail, label needs-human). harness/logs/ is gitignored, so the harness's
+    # own log writes never trip this.
+    if ! git diff --cached --quiet origin/main -- harness/ docs/ .github/ PROMPT.md CONTEXT.md STOP.md; then
+      log "protected-path violation: staged diff touches harness/, docs/, .github/, PROMPT.md, CONTEXT.md or STOP.md — no FIX dispatched"
+      outcome="FAIL"; failure_kind="protected-path"; gate_status="SKIPPED"
+      break
+    fi
+
     # --- FAST tier: src/test only (no Docker after the v2 split) -----------------------
     local gate_log="$LOG_DIR/issue-${issue}-pass${pass}.gate.log"
-    if ! run_gate "FAST" "$GATE_CMD" "$GATE_TIMEOUT" "$gate_log"; then
+    local gate_rc=0
+    run_gate "FAST" "$GATE_CMD" "$GATE_TIMEOUT" "$gate_log" || gate_rc=$?
+    if (( gate_rc == 124 )); then
+      log "WARNING: FAST gate hit the ${GATE_TIMEOUT}s timeout — infra fault, not a code failure"
+      return 50
+    fi
+    if (( gate_rc != 0 )); then
       gate_status="RED"; failure_kind="gate-RED"
       log "FAST gate RED (pass $pass, see $gate_log)"
       if (( budget == 0 )); then outcome="FAIL"; break; fi
@@ -314,14 +364,25 @@ iterate() {
       } >"$fail_file"
       local fix_prompt_file="$LOG_DIR/issue-${issue}-pass${pass}.fix.prompt.txt"
       render_template "$FIX_PROMPT" "$fix_prompt_file" ISSUE "$body_file" FAILURE "$fail_file"
-      dispatch_worker FIX "$(cat "$fix_prompt_file")" "$LOG_DIR/issue-${issue}-pass${pass}.fix.claude.log"
+      local fix_rc=0
+      dispatch_worker FIX "$(cat "$fix_prompt_file")" "$LOG_DIR/issue-${issue}-pass${pass}.fix.claude.log" || fix_rc=$?
+      if (( fix_rc == 124 )); then
+        log "FIX worker timed out — infra fault; exiting without spending further budget"
+        return 50
+      fi
       continue                                        # short-circuits the IT gate — no Docker paid
     fi
     log "FAST gate GREEN (pass $pass) — running IT gate (real PG)"
 
     # --- IT tier: src/it only (Testcontainers real PG). Only reached on fast-GREEN. ----
     local it_gate_log="$LOG_DIR/issue-${issue}-pass${pass}.it-gate.log"
-    if ! run_gate "IT" "$IT_GATE_CMD" "$IT_GATE_TIMEOUT" "$it_gate_log"; then
+    local it_gate_rc=0
+    run_gate "IT" "$IT_GATE_CMD" "$IT_GATE_TIMEOUT" "$it_gate_log" || it_gate_rc=$?
+    if (( it_gate_rc == 124 )); then
+      log "WARNING: IT gate hit the ${IT_GATE_TIMEOUT}s timeout — infra fault, not a code failure"
+      return 50
+    fi
+    if (( it_gate_rc != 0 )); then
       gate_status="IT-RED"; failure_kind="IT-gate-RED"
       log "IT gate RED (pass $pass, see $it_gate_log)"
       if (( budget == 0 )); then outcome="FAIL"; break; fi
@@ -337,7 +398,12 @@ iterate() {
       } >"$fail_file"
       local fix_prompt_file="$LOG_DIR/issue-${issue}-pass${pass}.fix.prompt.txt"
       render_template "$FIX_PROMPT" "$fix_prompt_file" ISSUE "$body_file" FAILURE "$fail_file"
-      dispatch_worker FIX "$(cat "$fix_prompt_file")" "$LOG_DIR/issue-${issue}-pass${pass}.fix.claude.log"
+      local fix_rc=0
+      dispatch_worker FIX "$(cat "$fix_prompt_file")" "$LOG_DIR/issue-${issue}-pass${pass}.fix.claude.log" || fix_rc=$?
+      if (( fix_rc == 124 )); then
+        log "FIX worker timed out — infra fault; exiting without spending further budget"
+        return 50
+      fi
       continue
     fi
 
@@ -355,8 +421,21 @@ iterate() {
     local review_prompt_file="$LOG_DIR/issue-${issue}-pass${pass}.review.prompt.txt"
     render_template "$REVIEW_PROMPT" "$review_prompt_file" \
       ISSUE "$body_file" CONVENTIONS "$CONVENTIONS" TAMPER "$tamper_file" DIFF "$diff_file"
-    dispatch_review "$(cat "$review_prompt_file")" "$review_file"
+    local review_rc=0
+    dispatch_review "$(cat "$review_prompt_file")" "$review_file" || review_rc=$?
+    if (( review_rc == 124 )); then
+      log "REVIEWER timed out — infra fault; exiting without spending budget"
+      return 50
+    fi
     reviewed=1
+
+    # An empty (or whitespace-only) review is a crashed/timed-out reviewer, not a verdict:
+    # infra fault. Distinct from a non-empty review missing the sentinel (model misbehavior,
+    # handled fail-safe below).
+    if ! grep -q '[^[:space:]]' "$review_file"; then
+      log "reviewer produced no output — infra fault (crashed or timed-out reviewer)"
+      return 50
+    fi
 
     # Grep, not parse. Missing sentinel → REQUEST_CHANGES (fail safe, never auto-approve).
     verdict="$(grep -oE 'VERDICT: (APPROVE|REQUEST_CHANGES)' "$review_file" | tail -1 | awk '{print $2}')"
@@ -384,7 +463,12 @@ iterate() {
     } >"$fail_file"
     local fix_prompt_file="$LOG_DIR/issue-${issue}-pass${pass}.fix.prompt.txt"
     render_template "$FIX_PROMPT" "$fix_prompt_file" ISSUE "$body_file" FAILURE "$fail_file"
-    dispatch_worker FIX "$(cat "$fix_prompt_file")" "$LOG_DIR/issue-${issue}-pass${pass}.fix.claude.log"
+    local fix_rc=0
+    dispatch_worker FIX "$(cat "$fix_prompt_file")" "$LOG_DIR/issue-${issue}-pass${pass}.fix.claude.log" || fix_rc=$?
+    if (( fix_rc == 124 )); then
+      log "FIX worker timed out — infra fault; exiting without spending further budget"
+      return 50
+    fi
     continue
   done
 
@@ -400,6 +484,10 @@ iterate() {
     label="needs-review"
     commit_tag="reviewer APPROVE, gate ${gate_status}"
     pr_note="**Reviewer: APPROVE** · gate ${gate_status} (in-memory + real-PG IT tiers both green). The cold independent reviewer approved; a human still merges (v2 stops at PR)."
+  elif [[ "$failure_kind" == "protected-path" ]]; then
+    label="needs-human"
+    commit_tag="protected-path violation, gate ${gate_status}"
+    pr_note="**Needs human** — the agent modified protected files (harness/, docs/, .github/, PROMPT.md, CONTEXT.md or STOP.md). Opened for the audit trail ONLY; this diff must NOT be merged."
   else
     label="needs-human"
     commit_tag="self-repair budget exhausted (${failure_kind}), gate ${gate_status}"
@@ -448,6 +536,7 @@ for ((i = 1; i <= MAX_ITERS; i++)); do
     11) log "no actionable issue — idle, exiting"; exit 0;;
     20) log "dry run reached its stop point — exiting"; exit 0;;
     30) log "iteration $i produced nothing — exiting for inspection"; exit 1;;
+    50) log "infra fault — exiting for inspection (issue stays in-progress)"; exit 50;;
     *)  log "iteration $i failed rc=$rc — exiting for inspection"; exit "$rc";;
   esac
 done
