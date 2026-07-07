@@ -41,11 +41,53 @@ failures.
 
 **v3 (GitHub Actions CI `build` check + branch protection on `main`) has shipped**, outside this
 script — `ci.yml` is merged and `main` is protected on the `build` check. **Still not
-implemented:** auto-merge (v4), a convention-lint gate step, rebase-on-main-and-rerun. **The
-loop still stops at PR — a human merges.** Budget exhaustion (fast-RED, IT-RED, or
-`REQUEST_CHANGES`) opens a PR too (audit trail) but flips `needs-human` — as does a
-protected-path violation (see **Infra faults vs code failures** below), which skips the gate
-and the reviewer entirely.
+implemented:** a convention-lint gate step, rebase-on-main-and-rerun. **For class-2/3, the
+loop still stops at PR — a human merges** (class-1 is auto-merged as of v4, below). Budget
+exhaustion (fast-RED, IT-RED, or `REQUEST_CHANGES`) opens a PR too (audit trail) but flips
+`needs-human` — as does a protected-path violation (see **Infra faults vs code failures**
+below), which skips the gate and the reviewer entirely.
+
+## v4: auto-merge (class-1 only)
+
+A class-1 issue that ends in reviewer APPROVE is merged unattended:
+
+1. The loop opens the PR as before, then waits for the required `build` check
+   (`gh pr checks --watch`, bounded by `CI_WAIT_TIMEOUT`, default 900 s).
+   Hitting the bound is an infra fault (rc 50): the loop exits for inspection,
+   the PR stays open, the issue keeps `in-progress`.
+2. CI red after green local gates → the issue flips to `needs-human` and the loop
+   moves on. There is no self-repair against the independent check (the v3
+   hands-off rule): local gates were green, so red CI means environment drift or
+   a real independence catch — a human looks either way.
+3. CI green → `gh pr merge --squash --delete-branch`, then the loop verifies the
+   PR state is actually MERGED (an unverified merge is rc 50). The PR body's
+   `Closes #N` closes the issue.
+
+Class-2/3 SUCCESS keeps the stop-at-PR terminal: `needs-review`, human merges.
+Auto-merge for the harder classes is earned by class-1 track record, not assumed.
+
+### blocked → ready
+
+After a verified merge the loop scans open `blocked` issues for the sentinel line
+
+    Blocked-by: #N
+
+and flips `blocked` → `ready` when every referenced issue is closed (the
+just-merged one counts immediately). Issues without the sentinel are never
+touched. File dependent slices with the sentinel or flip them by hand.
+
+### Notifications
+
+Set `NTFY_TOPIC` (an https://ntfy.sh topic) to get a push on: every
+`needs-human` terminal, every infra-fault exit (rc 50), and every auto-merge.
+Unset = log-only. `NOTIFY_CMD` overrides the channel entirely (test seam,
+eval'd with `$msg` in scope). Notify failures never change loop behavior.
+
+### Branch protection
+
+`strict: true` is set on the required `build` check: a PR must be up to date
+with main before merging. The loop is serial and always branches off fresh
+origin/main, so this only ever bites out-of-band PRs.
 
 ## Pieces
 
@@ -100,11 +142,13 @@ and the reviewer entirely.
          - `APPROVE` → terminate `SUCCESS`.
          - `REQUEST_CHANGES` → budget 0? terminate `FAIL(needs-human)`. Else spend one,
            dispatch **FIX** (review reasons + tamper spliced), re-loop.
-6. **Terminal (still stop-at-PR):** commit, push, `gh pr create`. `SUCCESS` records the
-   APPROVE + review and flips `needs-review`. `FAIL` (budget exhaustion or protected-path)
-   records the last failure and flips `needs-human`. A human merges either way. An exit-`50`
-   infra fault instead commits nothing and opens no PR — the issue simply stays `in-progress`
-   for the next tick or for manual inspection.
+6. **Terminal:** commit, push, `gh pr create`. `SUCCESS` on a **class-1** issue hands off to
+   **v4 auto-merge** (below) instead of flipping a label — the merge or a CI-red `needs-human`
+   decides its fate. `SUCCESS` on **class-2/3** records the APPROVE + review and flips
+   `needs-review`; a human merges. `FAIL` (budget exhaustion or protected-path) records the
+   last failure and flips `needs-human` regardless of class. An exit-`50` infra fault instead
+   commits nothing and opens no PR — the issue simply stays `in-progress` for the next tick or
+   for manual inspection.
 
 Every `claude -p` (IMPL, FIX, REVIEW) is a **fresh context**: the failure reason or the diff
 it needs is spliced into its prompt, never remembered.
@@ -181,7 +225,9 @@ grep — never the mid-flight stream — so the raw outcome stays the signal.
 ## Labels the state machine queries
 
 `ready` · `blocked` · `in-progress` · `planned` · `needs-review` · `needs-human` +
-`class-1|2|3`. `needs-review` = reviewer APPROVE, human merges. `needs-human` = budget
-exhausted (fast-RED, IT-RED, or `REQUEST_CHANGES`) or a protected-path violation, human takes
-over. An rc-`50` infra fault touches no label — the issue stays `in-progress` for the next
-tick or manual inspection. Created in the repo already.
+`class-1|2|3`. `needs-review` = reviewer APPROVE on a **class-2/3** issue, human merges
+(class-1 APPROVE skips this label — see **v4: auto-merge** above). `needs-human` = budget
+exhausted (fast-RED, IT-RED, or `REQUEST_CHANGES`), a protected-path violation, or CI red
+after a class-1 auto-merge attempt; human takes over. An rc-`50` infra fault touches no label
+— the issue stays `in-progress` for the next tick or manual inspection. Created in the repo
+already.

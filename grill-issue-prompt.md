@@ -74,6 +74,10 @@ First the issue body (this literal shape, matching the proven US-2/#7 issue):
 
     **Dependencies:** <prior US + status>.
 
+    <ONLY if a dependency issue is still open — one line per open dependency, exactly this
+    shape (the harness machine-reads it; prose like "blocked by #14" is NOT recognized):>
+    Blocked-by: #<issue-number>
+
     ### Context
     Follow the `copy/` onion structure and the US-1 (`Register`) slice as the template.
     Honour `CONTEXT.md`: domain errors stay internal; the use case defines its own
@@ -101,10 +105,16 @@ Then the exact command to file it (label it `ready` + its class; the loop picks 
 
     gh issue create --title "US-<n> — <title>" --label ready --label class-<n> --body-file <file>
 
+If the body carries any `Blocked-by: #<issue-number>` line (an open dependency), file with
+`--label blocked` INSTEAD of `--label ready`: the harness flips `blocked` -> `ready`
+automatically once every referenced issue is closed.
+
 ## Self-check before you emit
 - Is every AC independently testable (a wrong impl makes a concrete test fail)?
 - Are ALL rejection cases enumerated, not just the happy path?
 - Is the persistence tier (slot 7) stated, so the test lands in the right gate?
+- If any dependency (slot 3) is still open: does the body carry the exact `Blocked-by: #<n>`
+  sentinel line(s), and is the filing command labeled `blocked` instead of `ready`?
 - Could an adversarial reviewer, seeing ONLY this body + the diff, decide APPROVE vs
   REQUEST_CHANGES without guessing? If not, tighten it.
 ```
@@ -117,3 +127,11 @@ Then the exact command to file it (label it `ready` + its class; the loop picks 
 - **Class-2/3 earn this prompt's keep.** #7 was class-1 (trivially airtight). Patron
   aggregate / borrow process-manager / return choreography will resist one-iteration scope —
   the grill must force a split when a story can't finish in a single cold pass.
+- If the story depends on another issue (a prefactor slice, an earlier US), label it
+  `blocked` instead of `ready` and put one line per dependency in the body, exactly:
+
+      Blocked-by: #<issue-number>
+
+  The harness machine-reads this sentinel: when every referenced issue is closed, the
+  loop flips the label `blocked` -> `ready` automatically. Prose like "blocked by #14"
+  is NOT recognized.

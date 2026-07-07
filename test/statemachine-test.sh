@@ -49,10 +49,27 @@ echo "gh \$*" >> "$GH_CALLS"
 case "\$1 \$2" in
   "issue list")
     if [[ "\$*" == *"--label in-progress"* ]]; then echo "";
-    elif [[ "\$*" == *"--label ready"* ]]; then echo "999"; fi ;;
-  "issue view") printf '# US-999 sample\n\nAC1: implement the slice.\nAC2: cover it with a test.\n' ;;
+    elif [[ "\$*" == *"--label ready"* ]]; then echo "999";
+    elif [[ "\$*" == *"--label blocked"* ]]; then
+      for b in \${STUB_BLOCKED_ISSUES:-}; do echo "\$b"; done
+    fi ;;
+  "issue view")
+    if [[ "\$*" == *"--json title,body"* ]]; then
+      printf '# US-999 sample\n\nAC1: implement the slice.\nAC2: cover it with a test.\n'
+    elif [[ "\$*" == *"--json labels"* ]]; then
+      echo "\${STUB_ISSUE_LABELS:-ready}"
+    elif [[ "\$*" == *"--json body"* ]]; then
+      if [[ "\$3" == "555" ]]; then printf 'Blocked-by: #999\n';
+      elif [[ "\$3" == "666" ]]; then printf 'Blocked-by: #999\nBlocked-by: #777\n'; fi
+    elif [[ "\$*" == *"--json state"* ]]; then
+      echo "\${STUB_DEP_STATE:-CLOSED}"
+    fi ;;
   "issue edit") : ;;
-  "pr create") : ;;
+  "pr create") echo "https://github.com/test/test/pull/123" ;;
+  "pr checks") exit "\${STUB_CI_RC:-0}" ;;
+  "pr merge") : ;;
+  "pr view") echo "\${STUB_PR_STATE:-MERGED}" ;;
+  "pr comment") : ;;
   *) : ;;
 esac
 GHEOF
@@ -122,6 +139,8 @@ export IT_GATE_CMD=false   # must never be reached: fast-RED short-circuits the 
 export IMPL_CMD='printf "object Slice\n" > src/main/scala/Slice.scala'
 export FIX_CMD='printf "// touch %s\n" "$RANDOM" >> src/main/scala/Slice.scala'
 export REVIEW_CMD='echo "VERDICT: APPROVE"'   # never reached (fast gate always RED)
+NOTIFY_LOG="$SB/notify-c.log"; : >"$NOTIFY_LOG"
+export NOTIFY_CMD='printf "%s\n" "$msg" >> '"$NOTIFY_LOG"
 run_loop
 # Driver treats needs-human (iterate rc=40) as a handled outcome and continues the loop, so
 # the SCRIPT exits 0; the FAIL path is proven by needs-human + PR + 2 fixes below.
@@ -134,7 +153,9 @@ check "no fourth pass" "" "$(ls "$WORK/harness/logs" | grep pass4 || true)"
 check "reviewer never ran (RED never renders a review prompt)" "" "$(ls "$WORK/harness/logs" | grep 'review.prompt.txt' || true)"
 checkc "issue -> needs-human" "issue edit 999 --add-label needs-human" "$GH_CALLS"
 checkc "PR still opened (audit trail)" "pr create" "$GH_CALLS"
-unset GATE_CMD IT_GATE_CMD IMPL_CMD FIX_CMD REVIEW_CMD
+checkc "notify fired on needs-human" "needs-human" "$NOTIFY_LOG"
+check  "notify fired exactly once"   "1" "$(wc -l < "$NOTIFY_LOG" | tr -d ' ')"
+unset GATE_CMD IT_GATE_CMD IMPL_CMD FIX_CMD REVIEW_CMD NOTIFY_CMD
 teardown
 
 echo "== Scenario D: forced IT-gate-RED -> exactly one fix from shared budget, re-gate green =="
@@ -211,6 +232,7 @@ case "\$1 \$2" in
     if [[ "\$*" == *"--label in-progress"* ]]; then echo "";
     elif [[ "\$*" == *"--label ready"* ]]; then echo "999"; fi ;;
   "issue view") printf '# US-999 sample\n\nAC1: implement the slice.\n' ;;
+  "pr create") echo "https://github.com/test/test/pull/321" ;;
   *) : ;;
 esac
 GHEOF
@@ -277,6 +299,8 @@ export IT_GATE_CMD=false                               # must never be reached
 export IMPL_CMD='printf "object Slice\n" > src/main/scala/Slice.scala'
 export FIX_CMD='false'                                 # must never run (no budget spent)
 export REVIEW_CMD='echo "VERDICT: APPROVE"'            # must never run
+NOTIFY_LOG_I="$SB/notify-i.log"; : >"$NOTIFY_LOG_I"
+export NOTIFY_CMD='printf "%s\n" "$msg" >> '"$NOTIFY_LOG_I"
 run_loop
 check "exit code 50 (infra fault)" 50 "$RC"
 checkc "gate-timeout logged as infra fault" "infra fault, not a code failure" "$SB/loop.out"
@@ -284,7 +308,127 @@ check "zero FIX dispatches (no budget spent)" "0" "$(ls "$WORK/harness/logs" | g
 check "no PR created" "" "$(grep 'pr create' "$GH_CALLS" || true)"
 check "no needs-human label" "" "$(grep 'needs-human' "$GH_CALLS" || true)"
 check "IT gate never ran" "" "$(ls "$WORK/harness/logs" | grep 'it-gate.log' || true)"
-unset GATE_CMD IT_GATE_CMD IMPL_CMD FIX_CMD REVIEW_CMD
+checkc "notify fired on infra fault" "infra fault" "$NOTIFY_LOG_I"
+unset GATE_CMD IT_GATE_CMD IMPL_CMD FIX_CMD REVIEW_CMD NOTIFY_CMD
+teardown
+
+echo "== Scenario J: class-1 SUCCESS + CI green -> auto-merge, notify, exit 0 =="
+setup_sandbox
+NOTIFY_LOG="$SB/notify-j.log"; : >"$NOTIFY_LOG"
+export STUB_ISSUE_LABELS="ready class-1"
+export STUB_BLOCKED_ISSUES="555 666"
+export STUB_DEP_STATE=OPEN
+export GATE_CMD=true
+export IT_GATE_CMD=true
+export IMPL_CMD='mkdir -p src/main/scala && printf "object Slice\n" > src/main/scala/Slice.scala'
+export FIX_CMD='true'
+export REVIEW_CMD='printf "checked AC1/AC2, tests present.\nVERDICT: APPROVE\n"'
+export NOTIFY_CMD='printf "%s\n" "$msg" >> '"$NOTIFY_LOG"
+run_loop
+check  "exit code 0 (merged)" 0 "$RC"
+checkc "CI wait ran (default gh pr checks through stub)" "pr checks" "$GH_CALLS"
+checkc "merge invoked (default gh pr merge through stub)" "pr merge 123 --squash --delete-branch" "$GH_CALLS"
+checkc "merge verified (pr view state)" "pr view 123" "$GH_CALLS"
+check  "issue NOT flipped to needs-review (auto-merge path)" "" "$(grep 'add-label needs-review' "$GH_CALLS" || true)"
+checkc "in-progress label removed after merge" "issue edit 999 --remove-label in-progress" "$GH_CALLS"
+checkc "notify says auto-merged" "auto-merged" "$NOTIFY_LOG"
+checkc "blocked dependent flipped to ready (all deps closed)" "issue edit 555 --add-label ready --remove-label blocked" "$GH_CALLS"
+check  "dependent with an open dep NOT flipped" "" "$(grep 'issue edit 666 --add-label ready' "$GH_CALLS" || true)"
+unset STUB_ISSUE_LABELS STUB_BLOCKED_ISSUES STUB_DEP_STATE GATE_CMD IT_GATE_CMD IMPL_CMD FIX_CMD REVIEW_CMD NOTIFY_CMD
+teardown
+
+echo "== Scenario K: class-1 SUCCESS + CI RED -> needs-human, NO merge, no self-repair =="
+setup_sandbox
+NOTIFY_LOG="$SB/notify-k.log"; : >"$NOTIFY_LOG"
+export STUB_ISSUE_LABELS="ready class-1"
+export STUB_CI_RC=1
+export GATE_CMD=true
+export IT_GATE_CMD=true
+export IMPL_CMD='mkdir -p src/main/scala && printf "object Slice\n" > src/main/scala/Slice.scala'
+export FIX_CMD='false'   # must never run: no self-repair against the independent check
+export REVIEW_CMD='printf "checked AC1/AC2, tests present.\nVERDICT: APPROVE\n"'
+export NOTIFY_CMD='printf "%s\n" "$msg" >> '"$NOTIFY_LOG"
+run_loop
+check  "script exits 0 (CI-red handled, not aborted)" 0 "$RC"
+check  "NO merge attempted" "" "$(grep 'pr merge' "$GH_CALLS" || true)"
+checkc "PR comment explains CI red" "pr comment" "$GH_CALLS"
+checkc "issue -> needs-human" "issue edit 999 --add-label needs-human" "$GH_CALLS"
+check  "no FIX dispatched (never self-repair against CI)" "0" "$(ls "$WORK/harness/logs" | grep -c '\.fix\.claude\.log' || true)"
+checkc "notify says CI RED" "CI RED" "$NOTIFY_LOG"
+unset STUB_ISSUE_LABELS STUB_CI_RC GATE_CMD IT_GATE_CMD IMPL_CMD FIX_CMD REVIEW_CMD NOTIFY_CMD
+teardown
+
+echo "== Scenario L: class-1 SUCCESS + CI wait timeout -> rc 50, issue stays in-progress =="
+setup_sandbox
+NOTIFY_LOG="$SB/notify-l.log"; : >"$NOTIFY_LOG"
+export STUB_ISSUE_LABELS="ready class-1"
+export STUB_CI_RC=124
+export GATE_CMD=true
+export IT_GATE_CMD=true
+export IMPL_CMD='mkdir -p src/main/scala && printf "object Slice\n" > src/main/scala/Slice.scala'
+export FIX_CMD='true'
+export REVIEW_CMD='printf "checked AC1/AC2, tests present.\nVERDICT: APPROVE\n"'
+export NOTIFY_CMD='printf "%s\n" "$msg" >> '"$NOTIFY_LOG"
+run_loop
+check  "exit code 50 (infra fault)" 50 "$RC"
+check  "NO merge attempted" "" "$(grep 'pr merge' "$GH_CALLS" || true)"
+check  "issue NOT flipped (stays in-progress for resume)" "" "$(grep -E 'issue edit 999 --(add-label needs-|remove-label in-progress)' "$GH_CALLS" || true)"
+checkc "notify fired (infra fault)" "infra fault" "$NOTIFY_LOG"
+unset STUB_ISSUE_LABELS STUB_CI_RC GATE_CMD IT_GATE_CMD IMPL_CMD FIX_CMD REVIEW_CMD NOTIFY_CMD
+teardown
+
+echo "== Scenario M: class-2 SUCCESS -> stop-at-PR path unchanged, no CI wait, no merge =="
+setup_sandbox
+export STUB_ISSUE_LABELS="ready class-2"
+export GATE_CMD=true
+export IT_GATE_CMD=true
+export IMPL_CMD='mkdir -p src/main/scala && printf "object Slice\n" > src/main/scala/Slice.scala'
+export FIX_CMD='true'
+export REVIEW_CMD='printf "checked AC1/AC2, tests present.\nVERDICT: APPROVE\n"'
+run_loop
+check  "exit code 0" 0 "$RC"
+checkc "issue -> needs-review (human merges)" "issue edit 999 --add-label needs-review" "$GH_CALLS"
+check  "no CI wait" "" "$(grep 'pr checks' "$GH_CALLS" || true)"
+check  "no merge" "" "$(grep 'pr merge' "$GH_CALLS" || true)"
+unset STUB_ISSUE_LABELS GATE_CMD IT_GATE_CMD IMPL_CMD FIX_CMD REVIEW_CMD
+teardown
+
+echo "== Scenario N: merge not verified (pr view != MERGED) -> rc 50 =="
+setup_sandbox
+NOTIFY_LOG="$SB/notify-n.log"; : >"$NOTIFY_LOG"
+export STUB_ISSUE_LABELS="ready class-1"
+export STUB_PR_STATE=OPEN
+export GATE_CMD=true
+export IT_GATE_CMD=true
+export IMPL_CMD='mkdir -p src/main/scala && printf "object Slice\n" > src/main/scala/Slice.scala'
+export FIX_CMD='true'
+export REVIEW_CMD='printf "checked AC1/AC2, tests present.\nVERDICT: APPROVE\n"'
+export NOTIFY_CMD='printf "%s\n" "$msg" >> '"$NOTIFY_LOG"
+run_loop
+check  "exit code 50 (unverified merge = infra fault)" 50 "$RC"
+checkc "merge WAS attempted" "pr merge" "$GH_CALLS"
+check  "in-progress NOT removed (unverified)" "" "$(grep 'issue edit 999 --remove-label in-progress' "$GH_CALLS" || true)"
+checkc "notify fired (infra fault)" "infra fault" "$NOTIFY_LOG"
+unset STUB_ISSUE_LABELS STUB_PR_STATE GATE_CMD IT_GATE_CMD IMPL_CMD FIX_CMD REVIEW_CMD NOTIFY_CMD
+teardown
+
+echo "== Scenario O: merge command fails -> rc 50, in-progress kept =="
+setup_sandbox
+NOTIFY_LOG="$SB/notify-o.log"; : >"$NOTIFY_LOG"
+export STUB_ISSUE_LABELS="ready class-1"
+export MERGE_CMD=false
+export GATE_CMD=true
+export IT_GATE_CMD=true
+export IMPL_CMD='mkdir -p src/main/scala && printf "object Slice\n" > src/main/scala/Slice.scala'
+export FIX_CMD='true'
+export REVIEW_CMD='printf "checked AC1/AC2, tests present.\nVERDICT: APPROVE\n"'
+export NOTIFY_CMD='printf "%s\n" "$msg" >> '"$NOTIFY_LOG"
+run_loop
+check  "exit code 50 (merge command failed = infra fault)" 50 "$RC"
+check  "no pr view (verify not reached)" "" "$(grep 'pr view' "$GH_CALLS" || true)"
+check  "in-progress NOT removed" "" "$(grep 'issue edit 999 --remove-label in-progress' "$GH_CALLS" || true)"
+checkc "notify fired (infra fault)" "infra fault" "$NOTIFY_LOG"
+unset STUB_ISSUE_LABELS MERGE_CMD GATE_CMD IT_GATE_CMD IMPL_CMD FIX_CMD REVIEW_CMD NOTIFY_CMD
 teardown
 
 echo
