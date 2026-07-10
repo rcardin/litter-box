@@ -62,6 +62,9 @@
 #          NOTIFY_CMD     test seam: eval'd with $msg in scope, replaces the ntfy call
 #          CI_WAIT_TIMEOUT  bound on the required-CI wait, s   (default 900)
 #          CI_WAIT_CMD    test seam for the CI wait            (default: gh pr checks --watch)
+#          CI_APPEAR_TIMEOUT  bound on a check REGISTERING, s  (default 300)
+#          CI_APPEAR_INTERVAL poll period while it registers,s (default 10)
+#          CI_APPEAR_CMD  test seam: prints the rollup size    (default: gh pr view --json ...)
 #          MERGE_CMD      test seam for the merge              (default: gh pr merge --squash)
 set -euo pipefail
 
@@ -77,6 +80,8 @@ IT_GATE_TIMEOUT="${IT_GATE_TIMEOUT:-1200}"  # per-IT-gate budget, seconds (Docke
 DRY_RUN="${DRY_RUN:-0}"
 REPAIR_BUDGET="${REPAIR_BUDGET:-2}"    # shared across gate-RED and REQUEST_CHANGES per US
 CI_WAIT_TIMEOUT="${CI_WAIT_TIMEOUT:-900}"   # bound on waiting for the required CI check, seconds
+CI_APPEAR_TIMEOUT="${CI_APPEAR_TIMEOUT:-300}"  # bound on waiting for a check to REGISTER, seconds
+CI_APPEAR_INTERVAL="${CI_APPEAR_INTERVAL:-10}" # poll period while waiting for it to register
 ITERATE_PROMPT="$SCRIPT_DIR/iterate-prompt.md"
 FIX_PROMPT="$SCRIPT_DIR/fix-prompt.md"
 REVIEW_PROMPT="$SCRIPT_DIR/review-prompt.md"
@@ -96,6 +101,7 @@ IMPL_CMD="${IMPL_CMD:-}"
 FIX_CMD="${FIX_CMD:-}"
 REVIEW_CMD="${REVIEW_CMD:-}"
 CI_WAIT_CMD="${CI_WAIT_CMD:-}"   # test seam; default (empty) -> gh pr checks <pr> --watch --fail-fast
+CI_APPEAR_CMD="${CI_APPEAR_CMD:-}"  # test seam; default (empty) -> gh pr view <pr> --json statusCheckRollup
 MERGE_CMD="${MERGE_CMD:-}"       # test seam; default (empty) -> gh pr merge <pr> --squash --delete-branch
 
 log() { printf '[loop %s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
@@ -345,12 +351,41 @@ flip_blocked() {
 # Returns: 0 merged (issue auto-closes via the PR's "Closes #N"), 40 CI red -> needs-human
 # (the loop never self-repairs against the independent check), 50 infra fault (timeout,
 # merge failure, or unverified merge — exit for inspection, issue stays in-progress).
+
+# `gh pr checks` exits nonzero for two different worlds: a check ran and FAILED, and no check
+# has registered yet ("no checks reported on the '<branch>' branch"). A push races the workflow
+# scheduler, so a fresh PR routinely reports zero checks for a few seconds — reading that as red
+# burns the issue to needs-human against a build that then goes green (PR #28 / issue #26).
+# Discriminate on data, not on the exit code: block until the rollup is non-empty, and only then
+# let `gh pr checks --watch` judge the result. A check that never registers is a scheduler/infra
+# problem, not a code failure, so the caller maps the timeout to rc 50 (resumable), never rc 40.
+# Returns: 0 once >=1 check is registered, 1 on timeout.
+wait_for_checks() {
+  local pr_num="$1"
+  local cmd="${CI_APPEAR_CMD:-gh pr view $pr_num --json statusCheckRollup --jq '.statusCheckRollup | length'}"
+  local waited=0 n=""
+  while (( waited < CI_APPEAR_TIMEOUT )); do
+    n="$(eval "$cmd" 2>/dev/null || true)"
+    if [[ "$n" =~ ^[0-9]+$ ]] && (( n > 0 )); then
+      log "CI check registered on PR #$pr_num after ${waited}s"
+      return 0
+    fi
+    sleep "$CI_APPEAR_INTERVAL"
+    waited=$(( waited + CI_APPEAR_INTERVAL ))
+  done
+  return 1
+}
+
 auto_merge() {
   local issue="$1" branch="$2" pr_num="$3"
   local ci_cmd="${CI_WAIT_CMD:-gh pr checks $pr_num --watch --fail-fast}"
   local ci_log="$LOG_DIR/issue-${issue}.ci-wait.log"
   local ci_rc=0
   phase CI_WAIT start "$ci_log"
+  if ! wait_for_checks "$pr_num"; then
+    log "no CI check registered on PR #$pr_num within ${CI_APPEAR_TIMEOUT}s — infra fault; PR open, issue stays in-progress"
+    return 50
+  fi
   run_gate "CI-WAIT" "$ci_cmd" "$CI_WAIT_TIMEOUT" "$ci_log" || ci_rc=$?
   if (( ci_rc == 124 )); then
     log "CI wait hit the ${CI_WAIT_TIMEOUT}s bound — infra fault; PR open, issue stays in-progress"

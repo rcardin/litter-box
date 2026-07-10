@@ -51,10 +51,15 @@ below), which skips the gate and the reviewer entirely.
 
 A class-1 issue that ends in reviewer APPROVE is merged unattended:
 
-1. The loop opens the PR as before, then waits for the required `build` check
-   (`gh pr checks --watch`, bounded by `CI_WAIT_TIMEOUT`, default 900 s).
-   Hitting the bound is an infra fault (rc 50): the loop exits for inspection,
-   the PR stays open, the issue keeps `in-progress`.
+1. The loop opens the PR as before, then waits for the required `build` check to
+   **register** — a push races the workflow scheduler, so a fresh PR reports zero
+   checks for a few seconds, and `gh pr checks` exits nonzero there exactly as it
+   does for a failed check. The loop polls `statusCheckRollup` until it is non-empty
+   (bounded by `CI_APPEAR_TIMEOUT`, default 300 s) before letting `gh pr checks
+   --watch` judge the result (bounded by `CI_WAIT_TIMEOUT`, default 900 s).
+   Hitting either bound is an infra fault (rc 50): the loop exits for inspection,
+   the PR stays open, the issue keeps `in-progress`. A check that never registers is
+   a scheduler problem, never a code failure — it must not reach `needs-human`.
 2. CI red after green local gates → the issue flips to `needs-human` and the loop
    moves on. There is no self-repair against the independent check (the v3
    hands-off rule): local gates were green, so red CI means environment drift or

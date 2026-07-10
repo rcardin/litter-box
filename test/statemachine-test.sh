@@ -86,7 +86,9 @@ case "\$1 \$2" in
   "pr create") echo "https://github.com/test/test/pull/123" ;;
   "pr checks") exit "\${STUB_CI_RC:-0}" ;;
   "pr merge") : ;;
-  "pr view") echo "\${STUB_PR_STATE:-MERGED}" ;;
+  "pr view")
+    if [[ "\$*" == *"statusCheckRollup"* ]]; then echo "\${STUB_CHECK_COUNT:-1}";
+    else echo "\${STUB_PR_STATE:-MERGED}"; fi ;;
   "pr comment") : ;;
   *) : ;;
 esac
@@ -460,10 +462,61 @@ export REVIEW_CMD='printf "checked AC1/AC2, tests present.\nVERDICT: APPROVE\n"'
 export NOTIFY_CMD='printf "%s\n" "$msg" >> '"$NOTIFY_LOG"
 run_loop
 check  "exit code 50 (merge command failed = infra fault)" 50 "$RC"
-check  "no pr view (verify not reached)" "" "$(grep 'pr view' "$GH_CALLS" || true)"
+check  "no merge-verify pr view (verify not reached)" "" "$(grep 'pr view 123 --json state' "$GH_CALLS" || true)"
 check  "in-progress NOT removed" "" "$(grep 'issue edit 999 --remove-label in-progress' "$GH_CALLS" || true)"
 checkc "notify fired (infra fault)" "infra fault" "$NOTIFY_LOG"
 unset STUB_ISSUE_LABELS MERGE_CMD GATE_CMD IT_GATE_CMD IMPL_CMD FIX_CMD REVIEW_CMD NOTIFY_CMD
+teardown
+
+# A push races the workflow scheduler: for the first few seconds the PR has zero checks and
+# `gh pr checks` exits nonzero with "no checks reported". That is not a red build. Regression
+# for the false needs-human burn on PR #28 (issue #26).
+echo "== Scenario P: CI check registers late -> loop waits, then merges =="
+setup_sandbox
+NOTIFY_LOG="$SB/notify-p.log"; : >"$NOTIFY_LOG"
+COUNTER="$SB/appear.count"; printf '0\n' >"$COUNTER"
+export STUB_ISSUE_LABELS="ready class-1"
+# rollup is empty on the first two polls, then the check registers
+export CI_APPEAR_CMD='n=$(cat '"$COUNTER"'); printf "%s\n" $((n+1)) > '"$COUNTER"'; [ "$n" -ge 2 ] && echo 1 || echo 0'
+export CI_APPEAR_INTERVAL=1
+export CI_APPEAR_TIMEOUT=30
+export GATE_CMD=true
+export IT_GATE_CMD=true
+export IMPL_CMD='mkdir -p src/main/scala && printf "object Slice\n" > src/main/scala/Slice.scala'
+export FIX_CMD='true'
+export REVIEW_CMD='printf "checked AC1/AC2, tests present.\nVERDICT: APPROVE\n"'
+export NOTIFY_CMD='printf "%s\n" "$msg" >> '"$NOTIFY_LOG"
+run_loop
+check  "exit code 0 (waited for the check, then merged)" 0 "$RC"
+check  "polled until the check registered" "3" "$(cat "$COUNTER")"
+checkc "CI wait ran only after the check appeared" "pr checks" "$GH_CALLS"
+checkc "merge invoked" "pr merge 123 --squash --delete-branch" "$GH_CALLS"
+check  "NOT flipped to needs-human (empty rollup is not a red build)" "" "$(grep 'needs-human' "$GH_CALLS" || true)"
+check  "no CI-red PR comment" "" "$(grep 'pr comment' "$GH_CALLS" || true)"
+unset STUB_ISSUE_LABELS CI_APPEAR_CMD CI_APPEAR_INTERVAL CI_APPEAR_TIMEOUT GATE_CMD IT_GATE_CMD IMPL_CMD FIX_CMD REVIEW_CMD NOTIFY_CMD
+teardown
+
+echo "== Scenario Q: CI check never registers -> rc 50 infra fault, NOT needs-human =="
+setup_sandbox
+NOTIFY_LOG="$SB/notify-q.log"; : >"$NOTIFY_LOG"
+export STUB_ISSUE_LABELS="ready class-1"
+export CI_APPEAR_CMD='echo 0'   # rollup stays empty forever
+export CI_APPEAR_INTERVAL=1
+export CI_APPEAR_TIMEOUT=3
+export GATE_CMD=true
+export IT_GATE_CMD=true
+export IMPL_CMD='mkdir -p src/main/scala && printf "object Slice\n" > src/main/scala/Slice.scala'
+export FIX_CMD='true'
+export REVIEW_CMD='printf "checked AC1/AC2, tests present.\nVERDICT: APPROVE\n"'
+export NOTIFY_CMD='printf "%s\n" "$msg" >> '"$NOTIFY_LOG"
+run_loop
+check  "exit code 50 (never registered = infra fault, not a code failure)" 50 "$RC"
+check  "CI wait never ran (nothing to watch)" "" "$(grep 'pr checks' "$GH_CALLS" || true)"
+check  "NO merge attempted" "" "$(grep 'pr merge' "$GH_CALLS" || true)"
+check  "NOT flipped to needs-human" "" "$(grep 'needs-human' "$GH_CALLS" || true)"
+check  "issue stays in-progress for resume" "" "$(grep 'issue edit 999 --remove-label in-progress' "$GH_CALLS" || true)"
+checkc "notify fired (infra fault)" "infra fault" "$NOTIFY_LOG"
+unset STUB_ISSUE_LABELS CI_APPEAR_CMD CI_APPEAR_INTERVAL CI_APPEAR_TIMEOUT GATE_CMD IT_GATE_CMD IMPL_CMD FIX_CMD REVIEW_CMD NOTIFY_CMD
 teardown
 
 echo
