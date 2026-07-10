@@ -231,3 +231,48 @@ exhausted (fast-RED, IT-RED, or `REQUEST_CHANGES`), a protected-path violation, 
 after a class-1 auto-merge attempt; human takes over. An rc-`50` infra fault touches no label
 — the issue stays `in-progress` for the next tick or manual inspection. Created in the repo
 already.
+
+## Observability
+
+The loop writes one JSON event per phase transition to `harness/logs/status.jsonl`
+(gitignored). It is a pure append: the loop's behaviour, exit codes and merge decisions do not
+depend on it, and nothing reads it back.
+
+Watch a run from a second terminal:
+
+```bash
+harness/watch.sh
+```
+
+A four-line banner pins the current phase, gate pass and remaining repair budget to the top of
+the terminal, and the pane below follows whichever log the current phase is writing: agent
+dispatches rendered as prose, tool calls and tool results; gates and the CI wait as raw output.
+The pane switches on its own when the loop moves from the worker to a gate to the reviewer.
+
+The watcher is passive. Attach it, kill it, reattach it, run without it: the loop cannot tell.
+
+Banner states:
+
+| Banner                          | Meaning                                                     |
+| ------------------------------- | ----------------------------------------------------------- |
+| `▶ IT 4m12s`                    | that phase is running, and has been for four minutes         |
+| `✗ fast` with `↺ fix 2`         | the fast gate went red twice and the repair budget is spent  |
+| `STALE (loop died in IT)`       | the loop's pid is gone and it never wrote a terminal event   |
+| `DONE rc=0` / `rc=40` / `rc=50` | clean terminal: merged or needs-review / needs-human / infra fault |
+
+Liveness is a `kill -0` on the pid carried by each event, not a heartbeat. The IT gate blocks
+for up to twenty minutes waiting on a Testcontainers Postgres, so a heartbeat would need a
+child process inside the gate, and that child would outlive a `SIGKILL`ed loop and lie. The
+terminal `DONE` event is written by the driver's exit-code dispatch rather than by a
+`trap EXIT`, precisely so that a killed loop leaves none and the pid check catches it.
+
+To follow a single agent dispatch without the banner, `harness/tail-claude.sh` still works and
+takes an explicit log file.
+
+### The reviewer pane
+
+`dispatch_review` runs `claude -p` *without* `--output-format stream-json`, because the
+reviewer's stdout **is** the product: its last line carries the `VERDICT:` sentinel the loop
+greps for. The review pane therefore stays empty until the reviewer finishes, then shows the
+finished markdown. Streaming it live would mean restructuring the dispatch the verdict depends
+on, which is a control-plane change for a cosmetic gain.

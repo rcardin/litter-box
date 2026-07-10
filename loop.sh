@@ -101,6 +101,35 @@ MERGE_CMD="${MERGE_CMD:-}"       # test seam; default (empty) -> gh pr merge <pr
 log() { printf '[loop %s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 die() { log "FATAL: $*"; exit 1; }
 
+# --- phase events (observability, passive) -----------------------------------------------
+# One JSON line per state transition, appended to $STATUS_FILE, read by harness/watch.sh.
+# This is a PURE APPEND: no branch here, no caller reads a return value, no exit code moves.
+# A wrong phase() call produces a wrong banner, never a wrong merge.
+#
+# The four CUR_* globals are the event's context. iterate() keeps them current; phase() only
+# reads them, so a terminal DONE emitted from the driver still carries the right issue.
+STATUS_FILE="$LOG_DIR/status.jsonl"
+RUN_ID="$(date +%s)"      # stamped once per process; the watcher renders only the newest run
+CUR_ISSUE=""; CUR_ITER=0; CUR_PASS=0; CUR_BUDGET=0
+
+# phase PHASE STATE [LOGFILE] [DETAIL]
+# Each event is one printf, well under PIPE_BUF, appended with >>. An O_APPEND write below
+# PIPE_BUF is atomic, so a reader never sees a torn line.
+phase() {
+  local ph="$1" st="$2" lf="${3:-}" detail="${4:-}"
+  # logfile is a contract with the watcher: repo-relative, never absolute. Call sites pass
+  # $LOG_DIR/... which expands absolute (LOG_DIR is $SCRIPT_DIR/logs, and SCRIPT_DIR is a
+  # pwd). Normalize here, the single choke point, so no call site has to remember. An empty
+  # lf stays empty; a path not under $REPO_ROOT/ passes through unchanged.
+  lf="${lf#$REPO_ROOT/}"
+  # Never model-controlled: only loop-internal values and the already-grepped verdict token
+  # reach `detail`. Strip anything that could break out of the JSON string anyway.
+  detail="${detail//\\/}"; detail="${detail//\"/}"; detail="${detail//$'\n'/ }"
+  printf '{"ts":%s,"pid":%s,"run":"%s","iter":%s,"issue":"%s","phase":"%s","state":"%s","pass":%s,"budget":%s,"logfile":"%s","detail":"%s"}\n' \
+    "$(date +%s)" "$$" "$RUN_ID" "$CUR_ITER" "$CUR_ISSUE" "$ph" "$st" "$CUR_PASS" "$CUR_BUDGET" "$lf" "$detail" \
+    >>"$STATUS_FILE" 2>/dev/null || true
+}
+
 # `timeout` is gnu coreutils on the Mac via `gtimeout`; fall back gracefully.
 TIMEOUT_BIN="$(command -v timeout || command -v gtimeout || true)"
 
@@ -321,12 +350,14 @@ auto_merge() {
   local ci_cmd="${CI_WAIT_CMD:-gh pr checks $pr_num --watch --fail-fast}"
   local ci_log="$LOG_DIR/issue-${issue}.ci-wait.log"
   local ci_rc=0
+  phase CI_WAIT start "$ci_log"
   run_gate "CI-WAIT" "$ci_cmd" "$CI_WAIT_TIMEOUT" "$ci_log" || ci_rc=$?
   if (( ci_rc == 124 )); then
     log "CI wait hit the ${CI_WAIT_TIMEOUT}s bound — infra fault; PR open, issue stays in-progress"
     return 50
   fi
   if (( ci_rc != 0 )); then
+    phase CI_WAIT red "$ci_log"
     log "CI RED on PR #$pr_num after local gates green — needs-human, no merge, no self-repair"
     gh pr comment "$pr_num" --body "CI red after local gates were green. The loop never self-repairs against the independent check (v3 hands-off rule) — a human must look." >/dev/null 2>&1 || true
     gh issue edit "$issue" --add-label needs-human --remove-label in-progress >/dev/null 2>&1 \
@@ -334,8 +365,10 @@ auto_merge() {
     notify "harness: #${issue} CI RED -> needs-human (PR #${pr_num})"
     return 40
   fi
+  phase CI_WAIT ok "$ci_log"
   local merge_cmd="${MERGE_CMD:-gh pr merge $pr_num --squash --delete-branch}"
   log "CI green — merging PR #$pr_num"
+  phase MERGE start ""
   local merge_rc=0
   $merge_cmd >>"$ci_log" 2>&1 || merge_rc=$?
   if (( merge_rc != 0 )); then
@@ -348,6 +381,7 @@ auto_merge() {
     log "merge NOT verified (PR state '${state:-unknown}') — infra fault"
     return 50
   fi
+  phase MERGE ok "" "pr=$pr_num"
   gh issue edit "$issue" --remove-label in-progress >/dev/null 2>&1 || true
   flip_blocked "$issue"
   git fetch --quiet origin main || log "post-merge fetch failed (next iteration re-fetches anyway)"
@@ -377,6 +411,8 @@ iterate() {
     return 11
   fi
   log "iteration $n -> issue #$issue"
+  CUR_ITER="$n"; CUR_ISSUE="$issue"; CUR_PASS=0; CUR_BUDGET="$REPAIR_BUDGET"
+  phase PICK ok "" "issue=$issue"
 
   # Render the worker prompt with the issue body injected (read-only).
   local body_file worker_prompt_file
@@ -416,11 +452,15 @@ iterate() {
 
   # Initial worker dispatch (fresh context). ----------------------------------
   local worker_prompt impl_rc=0; worker_prompt="$(cat "$worker_prompt_file")"
-  dispatch_worker IMPL "$worker_prompt" "$LOG_DIR/issue-${issue}-iter${n}.claude.log" || impl_rc=$?
+  local impl_log="$LOG_DIR/issue-${issue}-iter${n}.claude.log"
+  phase IMPL start "$impl_log"
+  dispatch_worker IMPL "$worker_prompt" "$impl_log" || impl_rc=$?
   if (( impl_rc == 124 )); then
+    phase IMPL red "$impl_log" "timeout"
     log "IMPL worker timed out — infra fault; a half-finished worker must not reach the gates"
     return 50
   fi
+  phase IMPL ok "$impl_log"
 
   # Nothing produced at all → same v0 semantics: leave in-progress, no PR.
   git add -A
@@ -432,6 +472,7 @@ iterate() {
   # --- bounded self-repair loop --------------------------------------------------------
   # budget is shared: each RED or REQUEST_CHANGES that is not the last one spends one unit.
   local budget="$REPAIR_BUDGET" pass=0
+  CUR_BUDGET="$budget"
   local outcome="" gate_status="" verdict="" failure_kind=""
   local review_file="$LOG_DIR/issue-${issue}-review.md"
   : >"$review_file"                                   # empty until the first review
@@ -449,13 +490,16 @@ iterate() {
     # own log writes never trip this.
     if ! git diff --cached --quiet origin/main -- harness/ docs/ .github/ PROMPT.md CONTEXT.md STOP.md; then
       log "protected-path violation: staged diff touches harness/, docs/, .github/, PROMPT.md, CONTEXT.md or STOP.md — no FIX dispatched"
+      phase FAST_GATE skip "" "protected-path violation"
       outcome="FAIL"; failure_kind="protected-path"; gate_status="SKIPPED"
       break
     fi
 
     # --- FAST tier: src/test only (no Docker after the v2 split) -----------------------
+    CUR_PASS="$pass"
     local gate_log="$LOG_DIR/issue-${issue}-pass${pass}.gate.log"
     local gate_rc=0
+    phase FAST_GATE start "$gate_log"
     run_gate "FAST" "$GATE_CMD" "$GATE_TIMEOUT" "$gate_log" || gate_rc=$?
     if (( gate_rc == 124 )); then
       log "WARNING: FAST gate hit the ${GATE_TIMEOUT}s timeout — infra fault, not a code failure"
@@ -463,9 +507,10 @@ iterate() {
     fi
     if (( gate_rc != 0 )); then
       gate_status="RED"; failure_kind="gate-RED"
+      phase FAST_GATE red "$gate_log"
       log "FAST gate RED (pass $pass, see $gate_log)"
       if (( budget == 0 )); then outcome="FAIL"; break; fi
-      budget=$((budget - 1))
+      budget=$((budget - 1)); CUR_BUDGET="$budget"
       log "self-repair: budget now $budget — dispatching FIX for gate-RED (IT gate short-circuited)"
       local fail_file="$LOG_DIR/issue-${issue}-pass${pass}.failure.md"
       {
@@ -477,18 +522,24 @@ iterate() {
       local fix_prompt_file="$LOG_DIR/issue-${issue}-pass${pass}.fix.prompt.txt"
       render_template "$FIX_PROMPT" "$fix_prompt_file" ISSUE "$body_file" FAILURE "$fail_file"
       local fix_rc=0
-      dispatch_worker FIX "$(cat "$fix_prompt_file")" "$LOG_DIR/issue-${issue}-pass${pass}.fix.claude.log" || fix_rc=$?
+      local fix_log="$LOG_DIR/issue-${issue}-pass${pass}.fix.claude.log"
+      phase FIX start "$fix_log"
+      dispatch_worker FIX "$(cat "$fix_prompt_file")" "$fix_log" || fix_rc=$?
       if (( fix_rc == 124 )); then
+        phase FIX red "$fix_log" "timeout"
         log "FIX worker timed out — infra fault; exiting without spending further budget"
         return 50
       fi
+      phase FIX ok "$fix_log"
       continue                                        # short-circuits the IT gate — no Docker paid
     fi
     log "FAST gate GREEN (pass $pass) — running IT gate (real PG)"
+    phase FAST_GATE ok "$gate_log"
 
     # --- IT tier: src/it only (Testcontainers real PG). Only reached on fast-GREEN. ----
     local it_gate_log="$LOG_DIR/issue-${issue}-pass${pass}.it-gate.log"
     local it_gate_rc=0
+    phase IT_GATE start "$it_gate_log"
     run_gate "IT" "$IT_GATE_CMD" "$IT_GATE_TIMEOUT" "$it_gate_log" || it_gate_rc=$?
     if (( it_gate_rc == 124 )); then
       log "WARNING: IT gate hit the ${IT_GATE_TIMEOUT}s timeout — infra fault, not a code failure"
@@ -496,9 +547,10 @@ iterate() {
     fi
     if (( it_gate_rc != 0 )); then
       gate_status="IT-RED"; failure_kind="IT-gate-RED"
+      phase IT_GATE red "$it_gate_log"
       log "IT gate RED (pass $pass, see $it_gate_log)"
       if (( budget == 0 )); then outcome="FAIL"; break; fi
-      budget=$((budget - 1))
+      budget=$((budget - 1)); CUR_BUDGET="$budget"
       log "self-repair: budget now $budget — dispatching FIX for IT-gate-RED"
       local fail_file="$LOG_DIR/issue-${issue}-pass${pass}.failure.md"
       {
@@ -511,16 +563,21 @@ iterate() {
       local fix_prompt_file="$LOG_DIR/issue-${issue}-pass${pass}.fix.prompt.txt"
       render_template "$FIX_PROMPT" "$fix_prompt_file" ISSUE "$body_file" FAILURE "$fail_file"
       local fix_rc=0
-      dispatch_worker FIX "$(cat "$fix_prompt_file")" "$LOG_DIR/issue-${issue}-pass${pass}.fix.claude.log" || fix_rc=$?
+      local fix_log="$LOG_DIR/issue-${issue}-pass${pass}.fix.claude.log"
+      phase FIX start "$fix_log"
+      dispatch_worker FIX "$(cat "$fix_prompt_file")" "$fix_log" || fix_rc=$?
       if (( fix_rc == 124 )); then
+        phase FIX red "$fix_log" "timeout"
         log "FIX worker timed out — infra fault; exiting without spending further budget"
         return 50
       fi
+      phase FIX ok "$fix_log"
       continue
     fi
 
     gate_status="GREEN"
     log "FAST + IT gates GREEN (pass $pass) — running tamper check + cold reviewer"
+    phase IT_GATE ok "$it_gate_log"
 
     # Tamper check feeds the reviewer (bash surfaces, does not block).
     local tamper_file="$LOG_DIR/issue-${issue}-tamper.md"
@@ -534,8 +591,10 @@ iterate() {
     render_template "$REVIEW_PROMPT" "$review_prompt_file" \
       ISSUE "$body_file" CONVENTIONS "$CONVENTIONS" TAMPER "$tamper_file" DIFF "$diff_file"
     local review_rc=0
+    phase REVIEW start "$review_file"
     dispatch_review "$(cat "$review_prompt_file")" "$review_file" || review_rc=$?
     if (( review_rc == 124 )); then
+      phase REVIEW red "$review_file" "timeout"
       log "REVIEWER timed out — infra fault; exiting without spending budget"
       return 50
     fi
@@ -545,6 +604,7 @@ iterate() {
     # infra fault. Distinct from a non-empty review missing the sentinel (model misbehavior,
     # handled fail-safe below).
     if ! grep -q '[^[:space:]]' "$review_file"; then
+      phase REVIEW red "$review_file" "empty review"
       log "reviewer produced no output — infra fault (crashed or timed-out reviewer)"
       return 50
     fi
@@ -556,6 +616,7 @@ iterate() {
       log "reviewer emitted no VERDICT sentinel — fail-safe REQUEST_CHANGES"
     fi
     log "reviewer verdict: $verdict (pass $pass)"
+    phase REVIEW ok "$review_file" "verdict=$verdict"
 
     if [[ "$verdict" == "APPROVE" ]]; then
       outcome="SUCCESS"; break
@@ -564,7 +625,7 @@ iterate() {
     # REQUEST_CHANGES — spend from the same shared budget.
     failure_kind="REQUEST_CHANGES"
     if (( budget == 0 )); then outcome="FAIL"; break; fi
-    budget=$((budget - 1))
+    budget=$((budget - 1)); CUR_BUDGET="$budget"
     log "self-repair: budget now $budget — dispatching FIX for REQUEST_CHANGES"
     local fail_file="$LOG_DIR/issue-${issue}-pass${pass}.failure.md"
     {
@@ -576,11 +637,15 @@ iterate() {
     local fix_prompt_file="$LOG_DIR/issue-${issue}-pass${pass}.fix.prompt.txt"
     render_template "$FIX_PROMPT" "$fix_prompt_file" ISSUE "$body_file" FAILURE "$fail_file"
     local fix_rc=0
-    dispatch_worker FIX "$(cat "$fix_prompt_file")" "$LOG_DIR/issue-${issue}-pass${pass}.fix.claude.log" || fix_rc=$?
+    local fix_log="$LOG_DIR/issue-${issue}-pass${pass}.fix.claude.log"
+    phase FIX start "$fix_log"
+    dispatch_worker FIX "$(cat "$fix_prompt_file")" "$fix_log" || fix_rc=$?
     if (( fix_rc == 124 )); then
+      phase FIX red "$fix_log" "timeout"
       log "FIX worker timed out — infra fault; exiting without spending further budget"
       return 50
     fi
+    phase FIX ok "$fix_log"
     continue
   done
 
@@ -650,6 +715,7 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
     return 50
   fi
   log "PR #${pr_num} opened for #$issue (outcome ${outcome})"
+  phase PR ok "" "pr=$pr_num outcome=$outcome"
 
   if [[ "$outcome" == "SUCCESS" && "$is_class1" == "1" ]]; then
     local am_rc=0
@@ -667,6 +733,7 @@ log "v2 loop start (MAX_ITERS=$MAX_ITERS, ITER_TIMEOUT=${ITER_TIMEOUT}s, REPAIR_
 for ((i = 1; i <= MAX_ITERS; i++)); do
   rc=0
   iterate "$i" || rc=$?
+  phase DONE end "" "rc=$rc"
   case "$rc" in
     0)  log "iteration $i done (SUCCESS — auto-merged, or PR -> needs-review)";;
     40) log "iteration $i done (FAIL terminal -> needs-human, PR open for audit)";;

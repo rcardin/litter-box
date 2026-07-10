@@ -17,6 +17,24 @@ checkc() { # checkc DESC NEEDLE FILE
   else printf '  FAIL %s (missing %q in %s)\n' "$1" "$2" "$3"; fail=$((fail+1)); fi
 }
 
+# The phase sequence with consecutive duplicates collapsed: a phase that emits start+ok
+# shows once. Asserting on this, not on raw events, keeps the expectation readable.
+phase_seq() { # phase_seq STATUS_FILE
+  grep -o '"phase":"[A-Z_]*"' "$1" 2>/dev/null \
+    | sed 's/^"phase":"//; s/"$//' \
+    | awk 'NR==1 || $0!=prev { printf "%s ", $0 } { prev=$0 }'
+}
+
+# phase_seq is state-blind: a phase that emitted "red" where "ok" was expected still shows
+# up as the same bare token, so a wrong outcome at the right position goes undetected. This
+# variant keeps the state, collapsing only exact consecutive phase:state duplicates, so a
+# flipped outcome (e.g. IT_GATE:ok where IT_GATE:red was required) changes the string.
+phase_state_seq() { # phase_state_seq STATUS_FILE
+  grep -o '"phase":"[A-Z_]*","state":"[a-z]*"' "$1" 2>/dev/null \
+    | sed -E 's/"phase":"([A-Z_]*)","state":"([a-z]*)"/\1:\2/' \
+    | awk 'NR==1 || $0!=prev { printf "%s ", $0 } { prev=$0 }'
+}
+
 setup_sandbox() {
   SB="$(mktemp -d)"
   BARE="$SB/origin.git"; WORK="$SB/work"; FAKEBIN="$SB/bin"
@@ -111,6 +129,8 @@ checkc "IT gate ran after fast-GREEN (pass1)" "pass1.it-gate.log" <(ls "$WORK/ha
 check "no pass2 gate (no repair)" "" "$(ls "$WORK/harness/logs" | grep pass2 || true)"
 checkc "issue -> needs-review" "issue edit 999 --add-label needs-review" "$GH_CALLS"
 checkc "PR created" "pr create" "$GH_CALLS"
+check "logfile fields are repo-relative, never absolute" "" \
+  "$(grep -o '"logfile":"/[^"]*"' "$WORK/harness/logs/status.jsonl" || true)"
 unset GATE_CMD IT_GATE_CMD IMPL_CMD FIX_CMD REVIEW_CMD
 teardown
 
@@ -182,6 +202,18 @@ checkc "two IT-gate passes (RED then GREEN)" "pass2.it-gate.log" <(ls "$WORK/har
 check "reviewer ran only after IT-GREEN (no pass1 review)" "" "$(ls "$WORK/harness/logs" | grep 'pass1.review.prompt.txt' || true)"
 checkc "reviewer ran on pass2 (unit+IT green)" "pass2.review.prompt.txt" <(ls "$WORK/harness/logs")
 checkc "issue -> needs-review" "issue edit 999 --add-label needs-review" "$GH_CALLS"
+check "FIX sits between two gate passes, budget decremented" \
+  "PICK IMPL FAST_GATE IT_GATE FIX FAST_GATE IT_GATE REVIEW PR DONE " \
+  "$(phase_seq "$WORK/harness/logs/status.jsonl")"
+checkc "budget decremented to 1 on the FIX event" '"budget":1' \
+  "$WORK/harness/logs/status.jsonl"
+# phase_seq above collapses IT_GATE:start,IT_GATE:red,...,IT_GATE:start,IT_GATE:ok into a
+# single bare "IT_GATE" token twice: it would pass identically even if the driver had wrongly
+# emitted "ok" on the first pass instead of "red". This state-aware assertion is the one that
+# actually proves the RED path fired, not just that IT_GATE ran twice.
+check "phase:state sequence proves the first IT-gate pass was RED, not just that IT_GATE ran" \
+  "PICK:ok IMPL:start IMPL:ok FAST_GATE:start FAST_GATE:ok IT_GATE:start IT_GATE:red FIX:start FIX:ok FAST_GATE:start FAST_GATE:ok IT_GATE:start IT_GATE:ok REVIEW:start REVIEW:ok PR:ok DONE:end " \
+  "$(phase_state_seq "$WORK/harness/logs/status.jsonl")"
 unset GATE_CMD IT_GATE_CMD IMPL_CMD FIX_CMD REVIEW_CMD
 teardown
 
@@ -334,6 +366,9 @@ checkc "in-progress label removed after merge" "issue edit 999 --remove-label in
 checkc "notify says auto-merged" "auto-merged" "$NOTIFY_LOG"
 checkc "blocked dependent flipped to ready (all deps closed)" "issue edit 555 --add-label ready --remove-label blocked" "$GH_CALLS"
 check  "dependent with an open dep NOT flipped" "" "$(grep 'issue edit 666 --add-label ready' "$GH_CALLS" || true)"
+check "phase sequence covers the full auto-merge path" \
+  "PICK IMPL FAST_GATE IT_GATE REVIEW PR CI_WAIT MERGE DONE " \
+  "$(phase_seq "$WORK/harness/logs/status.jsonl")"
 unset STUB_ISSUE_LABELS STUB_BLOCKED_ISSUES STUB_DEP_STATE GATE_CMD IT_GATE_CMD IMPL_CMD FIX_CMD REVIEW_CMD NOTIFY_CMD
 teardown
 
