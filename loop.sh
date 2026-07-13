@@ -39,8 +39,23 @@
 # fires the notify seam (NTFY_TOPIC / NOTIFY_CMD; also fired on every needs-human terminal
 # and every rc 50 exit).
 #
+# v6 slice 1 (this revision) containerizes the FAST gate only (worker, fixer, reviewer, and
+# the IT gate are untouched — this is slice 1 of a bigger rollout, see issue #33/#34). GATE_CMD
+# now defaults to harness/sandbox/run-fast-gate.sh: it snapshots the staged index via
+# `git write-tree` + `git archive` into a throwaway dir (no live bind mount, no .git in the
+# container), then runs `sbt compile test` inside a pinned, non-root, no-credentials image on
+# an isolated Docker network (fes-sandbox-net) that can reach nothing but an egress-
+# allowlisting proxy sidecar (fes-sandbox-proxy — versioned allowlist at
+# harness/sandbox/proxy/allowlist). A self-populating named volume caches coursier downloads
+# across runs; it is mounted only inside gate containers, never by any host sbt process. The
+# gate seam contract is untouched: GATE_CMD is still a single overridable command string, and
+# the wrapper reuses the existing rc-124-is-infra-fault convention for every infra problem
+# (missing image, dead proxy, unreachable Docker) so run_gate()'s dispatch logic needed zero
+# changes. See harness/README.md "Containerized FAST gate" for the full design.
+#
 # Still NOT here (deferred): convention-lint gate step, auto-merge for class-2/3, cost cap
-# in dollars (MAX_ITERS is the ceiling), container isolation.
+# in dollars (MAX_ITERS is the ceiling), container isolation for worker/fixer/reviewer/IT gate
+# (planned as #35/#36/#37).
 #
 # The loop never lets the model choose what to work on: bash resolves all state with `gh`
 # queries and dispatches narrow, fresh `claude -p` tasks. Every dispatch is fresh context.
@@ -53,7 +68,8 @@
 #          DRY_RUN        1 = stop before invoking claude -p and before any push/PR
 #          REPAIR_BUDGET  shared fix budget per US           (default 2)
 #          -- test seams (default to the real thing; overridden by the state-machine test) --
-#          GATE_CMD       the fast (src/test) gate command   (default sbt compile test)
+#          GATE_CMD       the fast (src/test) gate command   (default: harness/sandbox/run-fast-gate.sh,
+#                                                              a containerized `sbt compile test` — v6 slice 1)
 #          IT_GATE_CMD    the IT (src/it) gate command       (default sbt It/test)
 #          IMPL_CMD       stub for the worker dispatch       (default: real claude -p)
 #          FIX_CMD        stub for the fix dispatch          (default: real claude -p)
@@ -91,11 +107,17 @@ mkdir -p "$LOG_DIR"
 
 # Test seams: default empty -> real `claude -p`; the state-machine test overrides them with
 # deterministic stubs so it can force RED / REQUEST_CHANGES / budget exhaustion for free.
-# Capture whether the IT gate seam was overridden BEFORE applying the default: the docker
-# preflight below only applies to the real `sbt It/test` gate, never to test stubs.
+# Capture whether the FAST/IT gate seams were overridden BEFORE applying their defaults: the
+# sandbox/docker preflights below only apply to the real gate commands, never to test stubs.
+GATE_OVERRIDDEN=0
+if [[ -n "${GATE_CMD:-}" ]]; then GATE_OVERRIDDEN=1; fi
 IT_GATE_OVERRIDDEN=0
 if [[ -n "${IT_GATE_CMD:-}" ]]; then IT_GATE_OVERRIDDEN=1; fi
-GATE_CMD="${GATE_CMD:-sbt -batch -no-colors compile test}"
+# v6 slice 1: the FAST gate now runs in a container (harness/sandbox/) instead of on the host
+# — see harness/sandbox/run-fast-gate.sh and the changelog paragraph above. Exit code contract
+# is unchanged (0 green, 124 infra fault, anything else red), so run_gate()/iterate() needed
+# no changes at all.
+GATE_CMD="${GATE_CMD:-$SCRIPT_DIR/sandbox/run-fast-gate.sh}"
 IT_GATE_CMD="${IT_GATE_CMD:-sbt -batch -no-colors It/test}"
 IMPL_CMD="${IMPL_CMD:-}"
 FIX_CMD="${FIX_CMD:-}"
@@ -160,11 +182,23 @@ export TESTCONTAINERS_RYUK_DISABLED="${TESTCONTAINERS_RYUK_DISABLED:-true}"
 command -v gh    >/dev/null || die "gh not found"
 command -v sbt   >/dev/null || die "sbt not found"
 command -v claude >/dev/null || die "claude not found"
-# Docker preflight: the REAL IT gate (Testcontainers) needs a reachable docker daemon
-# (colima). Failing it mid-run would look like a RED gate and burn repair budget on an
-# infra problem, so refuse to start instead. Skipped when the seam is overridden (tests).
-if [[ "$IT_GATE_OVERRIDDEN" == "0" ]]; then
-  docker info >/dev/null 2>&1 || die "docker unreachable (colima running?) — IT gate would fail for infra reasons"
+# Docker reachability probe — needed if EITHER the IT gate or the FAST-gate sandbox will run
+# containerized (both need a reachable colima daemon; a mid-run failure looks like a false
+# gate-RED and burns repair budget, so refuse to start instead). Skipped only when BOTH
+# seams are overridden (state-machine tests touch no Docker).
+if [[ "$IT_GATE_OVERRIDDEN" == "0" || "$GATE_OVERRIDDEN" == "0" ]]; then
+  docker info >/dev/null 2>&1 || die "docker unreachable (colima running?) — gates would fail for infra reasons"
+fi
+# FAST-gate sandbox preflight (v6 slice 1): build the image, start the proxy sidecar, and make
+# sure it always stops on loop exit — normal exit or any die(). A dead/missing sidecar or a
+# stale image would otherwise surface as a false gate-RED, burning repair budget on what is
+# really an infra problem; run-fast-gate.sh itself also re-checks all three at gate time and
+# exits 124 (infra fault, no budget spent) if anything has gone stale mid-run. Skipped when
+# GATE_CMD is overridden — the state-machine test never touches Docker for the FAST-gate seam.
+if [[ "$GATE_OVERRIDDEN" == "0" ]]; then
+  "$SCRIPT_DIR/sandbox/build-image.sh" || die "FAST-gate sandbox image build failed"
+  "$SCRIPT_DIR/sandbox/start-proxy.sh" || die "FAST-gate sandbox proxy failed to start"
+  trap '"$SCRIPT_DIR/sandbox/stop-proxy.sh" >/dev/null 2>&1 || true' EXIT
 fi
 for f in "$ITERATE_PROMPT" "$FIX_PROMPT" "$REVIEW_PROMPT"; do
   [[ -f "$f" ]] || die "missing prompt template: $f"

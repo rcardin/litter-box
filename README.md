@@ -100,11 +100,13 @@ origin/main, so this only ever bites out-of-band PRs.
 |---|---|
 | `build.sbt` | Defines the `It` custom config (`config("it") extend Test` + `inConfig(It)(Defaults.testSettings)`, forked + serial + `-oDF`). `sbt test` = `src/test`; `sbt It/test` = `src/it`. |
 | `src/it/scala/.../PostgresJdbcEventStoreSpec.scala` | The one Testcontainers IT (real PG + Flyway), moved out of `src/test` so it no longer runs in the fast gate. |
-| `loop.sh` | Bash state machine. Docker preflight at startup, picks one issue via `gh`, dispatches fresh `claude -p` tasks, enforces the protected-path guard, runs the fast gate + IT gate + repair loop + reviewer, opens a PR, stops. Timeouts and other infra faults exit `50` without spending repair budget. The model never chooses the task. |
+| `loop.sh` | Bash state machine. Docker preflight at startup (IT gate) plus the FAST-gate sandbox preflight (v6 slice 1: build image, start proxy sidecar), picks one issue via `gh`, dispatches fresh `claude -p` tasks, enforces the protected-path guard, runs the fast gate + IT gate + repair loop + reviewer, opens a PR, stops. Timeouts and other infra faults exit `50` without spending repair budget. The model never chooses the task. |
 | `iterate-prompt.md` | The narrow worker prompt (unchanged from v0). `{{ISSUE}}` is spliced with the issue body. |
 | `fix-prompt.md` | The fix-iteration prompt. Splices `{{ISSUE}}` + `{{FAILURE}}` (gate-log tail **or** reviewer reasons + tamper). Same hard rules as the worker (no test weakening, `-Werror`, no `gh`/branch ops). |
 | `review-prompt.md` | The cold reviewer prompt. Splices `{{ISSUE}}`, `{{CONVENTIONS}}` (`CONTEXT.md`), `{{TAMPER}}`, `{{DIFF}}`. Adversarial. Last line MUST be `VERDICT: APPROVE` or `VERDICT: REQUEST_CHANGES`. |
-| `test/statemachine-test.sh` | Drives the whole state machine in a throwaway sandbox (fake `gh`, stubbed gate + dispatches) — no real GitHub, no Opus tokens. Scenarios A–I plus a DRY_RUN check (APPROVE, REQUEST_CHANGES, fast-RED, IT-RED, budget exhaustion, idle-no-latch, protected-path, empty-review, gate-timeout), 68 assertions total. |
+| `sandbox/` | v6 slice 1: the containerized FAST-gate sandbox — gate image `Dockerfile`, proxy sidecar (`proxy/`), `build-image.sh`, `start-proxy.sh` / `stop-proxy.sh`, and the `GATE_CMD` default `run-fast-gate.sh`. See **Containerized FAST gate** below. |
+| `test/statemachine-test.sh` | Drives the whole state machine in a throwaway sandbox (fake `gh`, stubbed gate + dispatches) — no real GitHub, no Opus tokens, no Docker (both `GATE_CMD` and `IT_GATE_CMD` are always stubbed). Scenarios A–Q plus a DRY_RUN check (APPROVE, REQUEST_CHANGES, fast-RED, IT-RED, budget exhaustion, idle-no-latch, protected-path, empty-review, gate-timeout, class-1 auto-merge + CI red/timeout/late-registering-check/unverified-merge/merge-failure, class-2 stop-at-PR), 119 assertions total. |
+| `sandbox/test/` | Manual/local Docker-dependent checks for the sandbox itself (image smoke test, proxy allowlist test, coursier-cache speed check) — not part of `sbt test` or `statemachine-test.sh`, same category as the pre-existing IT gate. Run `sandbox/test/run-all.sh`. |
 | `logs/` | Per-pass `claude -p` logs, gate logs, rendered prompts, tamper + review + diff artefacts. Git-ignored. |
 
 ## Control flow (what `loop.sh` does)
@@ -173,7 +175,14 @@ review failures:
 - **Docker preflight.** At startup, if `IT_GATE_CMD` is still the real `sbt It/test` (the test
   seam not overridden), `docker info` must succeed or the loop dies immediately: "docker
   unreachable (colima running?) — IT gate would fail for infra reasons". Skipped when the seam
-  is overridden.
+  is overridden. The FAST gate has the identical `GATE_OVERRIDDEN`-gated preflight (v6 slice
+  1): `docker info`, then `sandbox/build-image.sh` and `sandbox/start-proxy.sh`, both
+  die-on-failure, plus a `trap ... EXIT` that always runs `sandbox/stop-proxy.sh` when the loop
+  exits (normal exit or any `die`). At gate *time* (every pass, not just startup),
+  `sandbox/run-fast-gate.sh` re-checks Docker reachability, image presence and proxy liveness
+  itself and exits `124` — the loop's pre-existing rc-124-is-infra-fault convention — on any of
+  the three, so a sidecar that dies mid-run is never mistaken for a code failure. See
+  **Containerized FAST gate** below.
 - **Protected-path enforcement.** Enforced in bash after every `git add -A` in the repair loop,
   not just in the prompt, because the worker/fixer runs with `--dangerously-skip-permissions`.
   A staged diff vs `origin/main` touching `harness/`, `docs/`, `.github/`, `PROMPT.md`,
@@ -183,6 +192,59 @@ review failures:
 - **Fatal stale-base guard.** `git fetch origin main` failing, or being unable to branch off
   `origin/main`, is fatal (`die`) rather than a silent fallback to a stale local base.
 
+## Containerized FAST gate (v6 slice 1)
+
+The FAST gate (`GATE_CMD`) no longer runs `sbt compile test` on the host. `build.sbt` is
+agent-authored, so a hostile or merely buggy worker/fixer iteration could make a *host* gate
+lie. v6 reframes the threat model (issue #33/#34): the sandbox protects the host, GH Actions CI
+protects `main`, and a local gate is a productivity signal only — so the FAST gate now runs
+inside a locked-down container. This slice touches **only** the FAST gate: the worker, fixer,
+reviewer and IT gate are unchanged and still run on the host.
+
+- **The image** (`sandbox/Dockerfile`, tag `fes-harness-sandbox:v6`) — `eclipse-temurin:25-jdk`
+  (matches the host's `.sdkmanrc` JDK 25 pin) plus sbt 1.12.9 (matches
+  `project/build.properties`, installed from the official release tarball), `git`, and the
+  Claude Code CLI (installed via its native installer, currently reporting the same
+  `2.1.207` the host runs — the CLI does not need to authenticate in this slice, only to
+  report `claude --version`). Runs as a non-root `gate` user with `--cap-drop=ALL
+  --security-opt=no-new-privileges` at `docker run` time.
+- **The egress proxy sidecar** (`sandbox/proxy/`, container `fes-sandbox-proxy`) — a tiny
+  `alpine` + `tinyproxy` image on a Docker `--internal` network (`fes-sandbox-net`, no route to
+  the outside world) that the proxy *also* joins the default `bridge` network for its own real
+  egress. Gate containers join `fes-sandbox-net` only, so the proxy is the only host they can
+  reach at all. The hostname allowlist lives in `sandbox/proxy/allowlist` (one hostname per
+  line — `api.anthropic.com`, `repo1.maven.org`, `repo.maven.apache.org`,
+  `repo.scala-sbt.org`, `oss.sonatype.org`), enforced by tinyproxy's `Filter` +
+  `FilterDefaultDeny yes` on both plain HTTP and HTTPS `CONNECT` (no MITM — the hostname in the
+  `CONNECT` line is enough to filter on). **To extend it**: edit `sandbox/proxy/allowlist`,
+  bump the `# version:` comment at the top of `sandbox/proxy/tinyproxy.conf`, then
+  `sandbox/build-image.sh && sandbox/stop-proxy.sh && sandbox/start-proxy.sh` (or just restart
+  `loop.sh`, which does both). The sidecar starts as part of `loop.sh`'s startup preflight and
+  stops via a `trap ... EXIT`, so it never outlives the loop.
+- **The coursier cache volume** (`fes-sandbox-coursier-cache`, a Docker named volume) — mounted
+  only at `/home/gate/.cache/coursier` inside gate containers. It self-populates on first use
+  and measurably speeds up subsequent gate runs (observed on this repo: ~27s cold, ~19s warm).
+  Nothing on the host — no `sbt` config, no env var — references this volume, so by
+  construction it can never be mounted by a host `sbt` process.
+- **The read-only clone** — rather than a live bind mount of the real working tree,
+  `run-fast-gate.sh` runs `git write-tree` (loop.sh already does `git add -A` immediately
+  before every gate call, so the index reflects the worker's current output) then `git
+  archive` into a throwaway `mktemp` directory with **no `.git` at all**. Only that disposable
+  copy is bind-mounted read-write into the container (needed for `target/`); the real
+  repository, its history, and its hooks never enter the container.
+- **No credentials, ever.** The gate container gets exactly two env vars
+  (`JAVA_TOOL_OPTIONS` pointing coursier/sbt's JVM at the proxy via
+  `-Dhttp(s).proxyHost/-Port` — a JVM does not read `HTTP_PROXY`/`HTTPS_PROXY` on its own).
+  No `ANTHROPIC_API_KEY`, no `GH_TOKEN`, no `gh` config mount — the `gh` binary is not even
+  installed in the image, so there is nothing for a compromised gate container to reach for.
+- **Infra faults, not code failures.** `run-fast-gate.sh` reuses the loop's existing
+  rc-124-is-infra-fault convention for the three ways this slice can break: Docker
+  unreachable, the image missing, or the proxy sidecar dead — see **Infra faults vs code
+  failures** above.
+- **The seam is untouched.** `GATE_CMD` is still a single overridable command string
+  (`GATE_OVERRIDDEN` mirrors the pre-existing `IT_GATE_OVERRIDDEN` pattern); `run_gate()` and
+  every rc-handling branch in `iterate()` needed zero changes.
+
 ## Environment the gate needs
 
 `loop.sh` exports these itself (override via env if your paths differ):
@@ -190,10 +252,15 @@ review failures:
 - **JDK 25** (`.sdkmanrc` pins `java=25.0.2-open`). yaes 0.20.0 binds JDK 25's
   `StructuredTaskScope` API; under a newer default JDK (e.g. 26) **every** test aborts with
   `NoSuchMethodError` — a false RED that masks the real signal. `JAVA_HOME_PINNED` overrides.
+  (The FAST-gate container pins the same JDK 25 in its own image, independent of the host.)
 - **colima docker socket** (`DOCKER_HOST`, `TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE`,
   `TESTCONTAINERS_RYUK_DISABLED`) so the Testcontainers IT finds Docker. **colima must be
-  running** (`colima start`) for the **IT gate**. The **fast gate** (`sbt test`) needs no
-  Docker after the v2 split — only the IT gate (`sbt It/test`) does.
+  running** (`colima start`) for the **IT gate** — and, as of v6 slice 1, for the **FAST
+  gate** too (it now runs its own sandbox container). Note: under colima, only `$HOME` is
+  mounted into the VM by default, so `run-fast-gate.sh` roots its throwaway clone under
+  `$HOME/.cache/fes-harness-sandbox` rather than the system `TMPDIR` — a plain `/tmp` (or
+  macOS's real `TMPDIR`, `/var/folders/...`) is invisible to the Docker daemon there and would
+  silently bind-mount an empty directory into the container.
 
 ## Run it
 

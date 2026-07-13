@@ -108,9 +108,9 @@ run_loop() { # run_loop -> sets RC; env vars for seams passed by caller
 echo "== Scenario DRY: DRY_RUN renders worker prompt, no mutation =="
 setup_sandbox
 RC=0; cd "$WORK"
-# IT_GATE_CMD overridden so the docker preflight is skipped: the suite must not depend on
-# a live docker daemon on the machine running it.
-DRY_RUN=1 MAX_ITERS=1 IT_GATE_CMD=true "$WORK/harness/loop.sh" >"$SB/loop.out" 2>&1 || RC=$?
+# GATE_CMD / IT_GATE_CMD overridden so the docker preflights (FAST-gate sandbox + IT-gate) are
+# both skipped: the suite must not depend on a live docker daemon on the machine running it.
+DRY_RUN=1 MAX_ITERS=1 GATE_CMD=true IT_GATE_CMD=true "$WORK/harness/loop.sh" >"$SB/loop.out" 2>&1 || RC=$?
 check "exit code 0 (dry run)" 0 "$RC"
 checkc "worker prompt rendered" "AC1: implement the slice" "$WORK/harness/logs/issue-999.prompt.txt"
 check "no gh issue edit (no label mutation)" "0" "$(grep -c 'issue edit' "$GH_CALLS" || true; )"
