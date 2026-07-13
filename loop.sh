@@ -53,9 +53,22 @@
 # (missing image, dead proxy, unreachable Docker) so run_gate()'s dispatch logic needed zero
 # changes. See harness/README.md "Containerized FAST gate" for the full design.
 #
+# v6 slice 2 (this revision) reworks the code path so agent output crosses an inspect-then-apply
+# boundary instead of being committed straight from the tree the agent edited (prefactor: the
+# worker still runs on the host, but its output now leaves as a PATCH — a future slice swaps the
+# host tree edit for a container that hands back a patch the same way). After every worker/fixer
+# dispatch, stage_patch() takes the cumulative diff against origin/main as a size-capped patch
+# file, resets the tree to a pristine base, guards the patch (protected-path guard now reads the
+# PATCH and spells out CI workflows/.github, harness code/harness, and the constitution CONTEXT.md;
+# plus a byte-size cap MAX_PATCH_BYTES), and applies it with `git apply --index`. A patch that will
+# not apply is an infra fault (rc 50, no budget), NOT a gate failure; a guard rejection routes to
+# needs-human exactly as the original tree guard did. The test-tamper numstat check now reads the
+# patch too. The worker/fixer STUB contract changes: a stub PRODUCES a patch at $PATCH_OUT instead
+# of editing the tree in place — the patch-extraction point is the seam boundary.
+#
 # Still NOT here (deferred): convention-lint gate step, auto-merge for class-2/3, cost cap
 # in dollars (MAX_ITERS is the ceiling), container isolation for worker/fixer/reviewer/IT gate
-# (planned as #35/#36/#37).
+# (planned as #36/#37).
 #
 # The loop never lets the model choose what to work on: bash resolves all state with `gh`
 # queries and dispatches narrow, fresh `claude -p` tasks. Every dispatch is fresh context.
@@ -67,6 +80,7 @@
 #          IT_GATE_TIMEOUT per-IT-gate sbt budget, s         (default 1200 — container startup)
 #          DRY_RUN        1 = stop before invoking claude -p and before any push/PR
 #          REPAIR_BUDGET  shared fix budget per US           (default 2)
+#          MAX_PATCH_BYTES size cap on an extracted patch, B  (default 1000000 — v6 slice 2)
 #          -- test seams (default to the real thing; overridden by the state-machine test) --
 #          GATE_CMD       the fast (src/test) gate command   (default: harness/sandbox/run-fast-gate.sh,
 #                                                              a containerized `sbt compile test` — v6 slice 1)
@@ -95,6 +109,7 @@ GATE_TIMEOUT="${GATE_TIMEOUT:-900}"    # per-fast-gate sbt compile+test budget, 
 IT_GATE_TIMEOUT="${IT_GATE_TIMEOUT:-1200}"  # per-IT-gate budget, seconds (Docker container startup)
 DRY_RUN="${DRY_RUN:-0}"
 REPAIR_BUDGET="${REPAIR_BUDGET:-2}"    # shared across gate-RED and REQUEST_CHANGES per US
+MAX_PATCH_BYTES="${MAX_PATCH_BYTES:-1000000}"  # size cap (bytes) on an extracted agent patch (v6 slice 2)
 CI_WAIT_TIMEOUT="${CI_WAIT_TIMEOUT:-900}"   # bound on waiting for the required CI check, seconds
 CI_APPEAR_TIMEOUT="${CI_APPEAR_TIMEOUT:-300}"  # bound on waiting for a check to REGISTER, seconds
 CI_APPEAR_INTERVAL="${CI_APPEAR_INTERVAL:-10}" # poll period while waiting for it to register
@@ -247,15 +262,20 @@ run_gate() {
 # Real path: returns 124 when claude -p hits the timeout (infra fault — the caller must not
 # let a half-finished worker fall through to the gates), 0 otherwise. Stub overrides keep
 # the always-return-0 behavior: they simulate the agent, their rc is meaningless.
+# v6 slice 2: the dispatch's OUTPUT is a patch file at $patch_out — the seam boundary. The
+# real worker/fixer still edits the host tree, but bash immediately snapshots the cumulative
+# diff against origin/main into $patch_out (stage_patch() then resets the tree and re-applies
+# it under inspection). A stub honours the same contract by writing $PATCH_OUT itself instead
+# of editing the tree, so the state-machine test drives the patch seam without a real agent.
 dispatch_worker() {
-  local role="$1" prompt="$2" logf="$3" override="" rc=0
+  local role="$1" prompt="$2" logf="$3" patch_out="$4" override="" rc=0
   case "$role" in
     IMPL) override="$IMPL_CMD";;
     FIX)  override="$FIX_CMD";;
   esac
-  log "dispatching $role claude -p -> $logf"
+  log "dispatching $role claude -p -> $logf (patch -> $patch_out)"
   if [[ -n "$override" ]]; then
-    ( eval "$override" ) >"$logf" 2>&1 || rc=$?
+    ( export PATCH_OUT="$patch_out"; eval "$override" ) >"$logf" 2>&1 || rc=$?
     log "$role stub exited rc=$rc"
     return 0
   fi
@@ -270,6 +290,11 @@ dispatch_worker() {
     return 124
   fi
   log "$role claude -p exited rc=$rc"
+  # Extract the agent's work as a patch (cumulative diff against the base branch). This is the
+  # ONLY thing that leaves the dispatch — stage_patch() inspects and applies it; the tree the
+  # agent edited is never committed directly.
+  git add -A
+  git diff --cached origin/main > "$patch_out"
   return 0
 }
 
@@ -306,14 +331,17 @@ dispatch_review() {
 }
 
 # --- test-tamper check -----------------------------------------------------------------
-# Diff the (staged) test tree against origin/main. All tests live under src/test (in-memory)
-# or src/it (Testcontainers IT); v2 covers both so a repair iter cannot gut the IT to go green
-# without the reviewer seeing it. Bash does NOT block on tamper — it surfaces the raw numstat
-# plus a one-line summary to the reviewer, who is the judgment. numstat rows are:
+# Numstat the test files in the APPLIED PATCH (v6 slice 2: computed from $CURRENT_PATCH via
+# `git apply --numstat`, not from the staged tree — same verdicts, now derived from the same
+# artifact the guard and git-apply see). All tests live under src/test (in-memory) or src/it
+# (Testcontainers IT); v2 covers both so a repair iter cannot gut the IT to go green without
+# the reviewer seeing it. Bash does NOT block on tamper — it surfaces the raw numstat plus a
+# one-line summary to the reviewer, who is the judgment. numstat rows are:
 # added<TAB>deleted<TAB>path ('-' = binary).
 tamper_report() {
   local out="$1" raw touched=0 net_del=0 add del path
-  raw="$(git diff --cached --numstat origin/main -- src/test src/it || true)"
+  raw="$(git apply --numstat "$CURRENT_PATCH" 2>/dev/null \
+          | awk -F'\t' '$3 ~ /^src\/(test|it)\// { print }' || true)"
   if [[ -n "$raw" ]]; then
     while IFS=$'\t' read -r add del path; do
       [[ -z "$path" ]] && continue
@@ -323,7 +351,7 @@ tamper_report() {
     done <<< "$raw"
   fi
   {
-    printf '# Test-tamper report (git diff --numstat origin/main -- src/test src/it)\n\n'
+    printf '# Test-tamper report (git apply --numstat on the applied patch, filtered to src/test, src/it)\n\n'
     printf '**Summary: %s test file(s) touched, %s with net deletions.**\n\n' "$touched" "$net_del"
     printf 'Raw numstat (added  deleted  path; a deleted file shows all lines as deletions):\n\n'
     if [[ -n "$raw" ]]; then
@@ -458,6 +486,104 @@ auto_merge() {
   return 0
 }
 
+# --- protected-path patch guard (v6 slice 2) -------------------------------------------
+# Reads the file list straight out of the PATCH (git apply --numstat), so it guards what the
+# agent PRODUCED, independent of the tree. Spells out the three classes the sandbox must never
+# let an agent rewrite — CI workflow files (.github/), harness code (harness/), and the
+# constitution (CONTEXT.md) — and keeps docs/, PROMPT.md and STOP.md protected as the original
+# tree guard did. Returns 0 if the patch touches a protected path, 1 if it is clean.
+patch_touches_protected() { # patch_touches_protected PATCH
+  local patch="$1" p
+  while IFS=$'\t' read -r _ _ p; do
+    [[ -z "$p" ]] && continue
+    case "$p" in
+      .github/*|harness/*|docs/*|CONTEXT.md|PROMPT.md|STOP.md) return 0 ;;
+    esac
+  done < <(git apply --numstat "$patch" 2>/dev/null)
+  return 1
+}
+
+# On a guard rejection the tree is left pristine — a hostile or oversized patch is NEVER
+# applied. Stage a small tracked marker so the terminal still has a diff to open the audit PR
+# with; the routing (needs-human + PR) matches the original protected-path guard. The marker,
+# not the rejected change, is what lands on the throwaway branch.
+write_reject_marker() { # write_reject_marker REASON PATCH
+  local reason="$1" patch="$2"
+  {
+    printf '# Patch rejected by the harness guard\n\n'
+    printf '%s\n\n' "$reason"
+    printf 'This branch is opened for the audit trail ONLY and must NOT be merged. The rejected\n'
+    printf 'patch was never applied to the tree. Numstat of the rejected patch (added deleted path):\n\n```\n'
+    git apply --numstat "$patch" 2>/dev/null | head -100
+    printf '\n```\n'
+  } > "$REPO_ROOT/PATCH-REJECTED.md"
+  git add "$REPO_ROOT/PATCH-REJECTED.md"
+}
+
+# --- the patch seam (v6 slice 2) -------------------------------------------------------
+# Every agent dispatch (worker or fixer) crosses this boundary: produce a patch, reset the tree
+# to a pristine base, inspect the patch, then git-apply it. The tree the agent edited is NEVER
+# committed directly. Sets STAGE_RESULT and, on OK, CURRENT_PATCH (the artifact the tamper check
+# and reviewer read).
+#   OK         patch inspected + applied+staged; the change is live in the tree
+#   EMPTY      the agent produced no diff
+#   TIMEOUT    the dispatch hit ITER_TIMEOUT (infra fault)
+#   APPLY_FAIL git apply refused the patch (infra fault — NOT a gate failure, NO budget spent)
+#   PROTECTED  patch touches a protected path (reject; marker staged for the audit PR)
+#   OVERSIZE   patch exceeds MAX_PATCH_BYTES (reject; marker staged for the audit PR)
+STAGE_RESULT=""; CURRENT_PATCH=""
+stage_patch() { # stage_patch ROLE PROMPT LOGF PATCH_FILE
+  local role="$1" prompt="$2" logf="$3" patch="$4" rc=0
+  dispatch_worker "$role" "$prompt" "$logf" "$patch" || rc=$?
+  if (( rc == 124 )); then STAGE_RESULT=TIMEOUT; return 0; fi
+  # Reset to the pristine base: the agent's working tree is data to inspect, never trusted. The
+  # patch file lives under harness/logs (gitignored), so clean -fd never removes it.
+  git reset -q --hard origin/main
+  git clean -qfd
+  if [[ ! -s "$patch" ]]; then STAGE_RESULT=EMPTY; return 0; fi
+  # --- inspect, THEN apply (PRD: the host inspects the patch before it touches the tree) ------
+  local bytes; bytes="$(wc -c < "$patch" | tr -d ' ')"
+  if (( bytes > MAX_PATCH_BYTES )); then
+    log "patch guard: ${bytes}B exceeds the ${MAX_PATCH_BYTES}B cap — rejecting oversized patch (not applied)"
+    write_reject_marker "Oversized patch: ${bytes} bytes exceeds the ${MAX_PATCH_BYTES}-byte cap." "$patch"
+    STAGE_RESULT=OVERSIZE; return 0
+  fi
+  if patch_touches_protected "$patch"; then
+    log "patch guard: patch touches a protected path (.github/, harness/, docs/, CONTEXT.md, PROMPT.md or STOP.md) — rejecting (not applied)"
+    write_reject_marker "Patch touches a protected path (CI workflow, harness code, docs, or a control/constitution file)." "$patch"
+    STAGE_RESULT=PROTECTED; return 0
+  fi
+  # Inspection passed — apply on the fresh branch. A patch that will not apply is an infra fault,
+  # not a gate failure: exit for inspection WITHOUT spending repair budget.
+  if ! git apply --index "$patch" >"$patch.apply.err" 2>&1; then
+    log "git apply refused the patch (see $patch.apply.err) — infra fault, no budget spent"
+    STAGE_RESULT=APPLY_FAIL; return 0
+  fi
+  CURRENT_PATCH="$patch"
+  STAGE_RESULT=OK; return 0
+}
+
+# --- fixer dispatch across the patch seam ----------------------------------------------
+# Renders the FIX prompt, stages the fixer's patch, and emits the FIX phase event with the state
+# stage_patch reached. Reads iterate()'s $issue and $body_file via bash dynamic scope, exactly as
+# the inline gate/review blocks already do. The caller branches on STAGE_RESULT.
+dispatch_fix() { # dispatch_fix PASS FAILFILE
+  local pass="$1" fail_file="$2"
+  local fix_prompt_file="$LOG_DIR/issue-${issue}-pass${pass}.fix.prompt.txt"
+  render_template "$FIX_PROMPT" "$fix_prompt_file" ISSUE "$body_file" FAILURE "$fail_file"
+  local fix_log="$LOG_DIR/issue-${issue}-pass${pass}.fix.claude.log"
+  local fix_patch="$LOG_DIR/issue-${issue}-pass${pass}.fix.patch"
+  phase FIX start "$fix_log"
+  stage_patch FIX "$(cat "$fix_prompt_file")" "$fix_log" "$fix_patch"
+  case "$STAGE_RESULT" in
+    TIMEOUT)    phase FIX red "$fix_log" "timeout" ;;
+    APPLY_FAIL) phase FIX red "$fix_log" "patch apply conflict" ;;
+    PROTECTED)  phase FIX red "$fix_log" "protected-path" ;;
+    OVERSIZE)   phase FIX red "$fix_log" "oversized patch" ;;
+    *)          phase FIX ok  "$fix_log" ;;
+  esac
+}
+
 # --- one US, start to terminal ---------------------------------------------------------
 iterate() {
   local n="$1"
@@ -519,27 +645,10 @@ iterate() {
   # Mark in-progress so a crashed run resumes the same US next tick.
   gh issue edit "$issue" --add-label in-progress --remove-label ready >/dev/null
 
-  # Initial worker dispatch (fresh context). ----------------------------------
-  local worker_prompt impl_rc=0; worker_prompt="$(cat "$worker_prompt_file")"
-  local impl_log="$LOG_DIR/issue-${issue}-iter${n}.claude.log"
-  phase IMPL start "$impl_log"
-  dispatch_worker IMPL "$worker_prompt" "$impl_log" || impl_rc=$?
-  if (( impl_rc == 124 )); then
-    phase IMPL red "$impl_log" "timeout"
-    log "IMPL worker timed out — infra fault; a half-finished worker must not reach the gates"
-    return 50
-  fi
-  phase IMPL ok "$impl_log"
-
-  # Nothing produced at all → same v0 semantics: leave in-progress, no PR.
-  git add -A
-  if git diff --cached --quiet origin/main; then
-    log "no changes produced by the iteration — leaving issue in-progress, not opening a PR"
-    return 30
-  fi
-
-  # --- bounded self-repair loop --------------------------------------------------------
-  # budget is shared: each RED or REQUEST_CHANGES that is not the last one spends one unit.
+  # --- bounded self-repair state -------------------------------------------------------
+  # budget is shared: each RED or REQUEST_CHANGES that is not the last one spends one unit. The
+  # state is declared BEFORE the initial dispatch because a patch-guard rejection on the very
+  # first worker patch sets outcome/failure_kind and skips the loop straight to the terminal.
   local budget="$REPAIR_BUDGET" pass=0
   CUR_BUDGET="$budget"
   local outcome="" gate_status="" verdict="" failure_kind=""
@@ -547,22 +656,45 @@ iterate() {
   : >"$review_file"                                   # empty until the first review
   local reviewed=0
 
-  while :; do
+  # Initial worker dispatch (fresh context), crossing the patch seam. -----------
+  # stage_patch resets the tree and applies the worker's patch under inspection; the tree the
+  # worker edited is never committed directly.
+  local worker_prompt; worker_prompt="$(cat "$worker_prompt_file")"
+  local impl_log="$LOG_DIR/issue-${issue}-iter${n}.claude.log"
+  local impl_patch="$LOG_DIR/issue-${issue}-iter${n}.impl.patch"
+  phase IMPL start "$impl_log"
+  stage_patch IMPL "$worker_prompt" "$impl_log" "$impl_patch"
+  case "$STAGE_RESULT" in
+    TIMEOUT)
+      phase IMPL red "$impl_log" "timeout"
+      log "IMPL worker timed out — infra fault; a half-finished worker must not reach the gates"
+      return 50 ;;
+    APPLY_FAIL)
+      phase IMPL red "$impl_log" "patch apply conflict"
+      log "IMPL patch did not apply — infra fault, no budget spent"
+      return 50 ;;
+    EMPTY)
+      phase IMPL ok "$impl_log" "no diff"
+      log "no changes produced by the iteration — leaving issue in-progress, not opening a PR"
+      return 30 ;;
+    PROTECTED)
+      phase IMPL red "$impl_log" "protected-path"
+      log "patch guard rejected the initial worker patch (protected-path) — routing to needs-human"
+      outcome="FAIL"; failure_kind="protected-path"; gate_status="SKIPPED" ;;
+    OVERSIZE)
+      phase IMPL red "$impl_log" "oversized patch"
+      log "patch guard rejected the initial worker patch (oversized-patch) — routing to needs-human"
+      outcome="FAIL"; failure_kind="oversized-patch"; gate_status="SKIPPED" ;;
+    *)
+      phase IMPL ok "$impl_log" ;;
+  esac
+
+  # --- bounded self-repair loop --------------------------------------------------------
+  # Skipped entirely if the initial patch was already rejected (outcome set above): the guard
+  # rejection routes straight to the needs-human terminal, exactly as the old tree guard did.
+  while [[ -z "$outcome" ]]; do
     pass=$((pass + 1))
     git add -A                                        # stage so new files show in diff/gate/tamper
-
-    # --- protected-path enforcement (bash, not the prompt) -----------------------------
-    # Worker prompts forbid touching the harness, docs and control files, but the worker
-    # runs with permissions skipped, so bash enforces it. No FIX dispatch: the fixer is the
-    # same agent class that violated the rule. Straight to the FAIL terminal (PR opened for
-    # the audit trail, label needs-human). harness/logs/ is gitignored, so the harness's
-    # own log writes never trip this.
-    if ! git diff --cached --quiet origin/main -- harness/ docs/ .github/ PROMPT.md CONTEXT.md STOP.md; then
-      log "protected-path violation: staged diff touches harness/, docs/, .github/, PROMPT.md, CONTEXT.md or STOP.md — no FIX dispatched"
-      phase FAST_GATE skip "" "protected-path violation"
-      outcome="FAIL"; failure_kind="protected-path"; gate_status="SKIPPED"
-      break
-    fi
 
     # --- FAST tier: src/test only (no Docker after the v2 split) -----------------------
     CUR_PASS="$pass"
@@ -588,18 +720,13 @@ iterate() {
         tail -n 200 "$gate_log"
         printf '\n```\n'
       } >"$fail_file"
-      local fix_prompt_file="$LOG_DIR/issue-${issue}-pass${pass}.fix.prompt.txt"
-      render_template "$FIX_PROMPT" "$fix_prompt_file" ISSUE "$body_file" FAILURE "$fail_file"
-      local fix_rc=0
-      local fix_log="$LOG_DIR/issue-${issue}-pass${pass}.fix.claude.log"
-      phase FIX start "$fix_log"
-      dispatch_worker FIX "$(cat "$fix_prompt_file")" "$fix_log" || fix_rc=$?
-      if (( fix_rc == 124 )); then
-        phase FIX red "$fix_log" "timeout"
-        log "FIX worker timed out — infra fault; exiting without spending further budget"
-        return 50
-      fi
-      phase FIX ok "$fix_log"
+      dispatch_fix "$pass" "$fail_file"
+      case "$STAGE_RESULT" in
+        TIMEOUT)    log "FIX worker timed out — infra fault; exiting without spending further budget"; return 50 ;;
+        APPLY_FAIL) log "FIX patch did not apply — infra fault, no budget spent"; return 50 ;;
+        PROTECTED)  outcome="FAIL"; failure_kind="protected-path"; break ;;
+        OVERSIZE)   outcome="FAIL"; failure_kind="oversized-patch"; break ;;
+      esac
       continue                                        # short-circuits the IT gate — no Docker paid
     fi
     log "FAST gate GREEN (pass $pass) — running IT gate (real PG)"
@@ -629,18 +756,13 @@ iterate() {
         tail -n 200 "$it_gate_log"
         printf '\n```\n'
       } >"$fail_file"
-      local fix_prompt_file="$LOG_DIR/issue-${issue}-pass${pass}.fix.prompt.txt"
-      render_template "$FIX_PROMPT" "$fix_prompt_file" ISSUE "$body_file" FAILURE "$fail_file"
-      local fix_rc=0
-      local fix_log="$LOG_DIR/issue-${issue}-pass${pass}.fix.claude.log"
-      phase FIX start "$fix_log"
-      dispatch_worker FIX "$(cat "$fix_prompt_file")" "$fix_log" || fix_rc=$?
-      if (( fix_rc == 124 )); then
-        phase FIX red "$fix_log" "timeout"
-        log "FIX worker timed out — infra fault; exiting without spending further budget"
-        return 50
-      fi
-      phase FIX ok "$fix_log"
+      dispatch_fix "$pass" "$fail_file"
+      case "$STAGE_RESULT" in
+        TIMEOUT)    log "FIX worker timed out — infra fault; exiting without spending further budget"; return 50 ;;
+        APPLY_FAIL) log "FIX patch did not apply — infra fault, no budget spent"; return 50 ;;
+        PROTECTED)  outcome="FAIL"; failure_kind="protected-path"; break ;;
+        OVERSIZE)   outcome="FAIL"; failure_kind="oversized-patch"; break ;;
+      esac
       continue
     fi
 
@@ -703,18 +825,13 @@ iterate() {
       printf '\n\n'
       cat "$tamper_file"
     } >"$fail_file"
-    local fix_prompt_file="$LOG_DIR/issue-${issue}-pass${pass}.fix.prompt.txt"
-    render_template "$FIX_PROMPT" "$fix_prompt_file" ISSUE "$body_file" FAILURE "$fail_file"
-    local fix_rc=0
-    local fix_log="$LOG_DIR/issue-${issue}-pass${pass}.fix.claude.log"
-    phase FIX start "$fix_log"
-    dispatch_worker FIX "$(cat "$fix_prompt_file")" "$fix_log" || fix_rc=$?
-    if (( fix_rc == 124 )); then
-      phase FIX red "$fix_log" "timeout"
-      log "FIX worker timed out — infra fault; exiting without spending further budget"
-      return 50
-    fi
-    phase FIX ok "$fix_log"
+    dispatch_fix "$pass" "$fail_file"
+    case "$STAGE_RESULT" in
+      TIMEOUT)    log "FIX worker timed out — infra fault; exiting without spending further budget"; return 50 ;;
+      APPLY_FAIL) log "FIX patch did not apply — infra fault, no budget spent"; return 50 ;;
+      PROTECTED)  outcome="FAIL"; failure_kind="protected-path"; break ;;
+      OVERSIZE)   outcome="FAIL"; failure_kind="oversized-patch"; break ;;
+    esac
     continue
   done
 
@@ -734,10 +851,10 @@ iterate() {
     label="needs-review"
     commit_tag="reviewer APPROVE, gate ${gate_status}"
     pr_note="**Reviewer: APPROVE** · gate ${gate_status} (in-memory + real-PG IT tiers both green). Not class-1, so not auto-merged: a human reviews and merges."
-  elif [[ "$failure_kind" == "protected-path" ]]; then
+  elif [[ "$failure_kind" == "protected-path" || "$failure_kind" == "oversized-patch" ]]; then
     label="needs-human"
-    commit_tag="protected-path violation, gate ${gate_status}"
-    pr_note="**Needs human** — the agent modified protected files (harness/, docs/, .github/, PROMPT.md, CONTEXT.md or STOP.md). Opened for the audit trail ONLY; this diff must NOT be merged."
+    commit_tag="patch guard rejection (${failure_kind}), gate ${gate_status}"
+    pr_note="**Needs human** — the patch guard rejected the agent's patch (${failure_kind}: a CI workflow / harness / docs / control-or-constitution file, or a patch over the size cap). The rejected change was NOT applied; this branch holds only a rejection marker and must NOT be merged."
   else
     label="needs-human"
     commit_tag="self-repair budget exhausted (${failure_kind}), gate ${gate_status}"

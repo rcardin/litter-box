@@ -35,6 +35,23 @@ phase_state_seq() { # phase_state_seq STATUS_FILE
     | awk 'NR==1 || $0!=prev { printf "%s ", $0 } { prev=$0 }'
 }
 
+# v6 slice 2: the worker/fixer stub contract is "produce a patch at $PATCH_OUT", not "edit the
+# tree". This helper writes a new-file unified diff, the shape every stub here needs (none of the
+# fixtures touch a file that already exists in the base — the loop resets to a pristine base and
+# git-applies the cumulative patch, so a new-file patch always applies). Exported so loop.sh's
+# eval'd stubs (which run in the loop's process, a child of this shell) can call it.
+newfile_patch() { # newfile_patch PATH CONTENT   (writes to $PATCH_OUT)
+  local p="$1" content="$2" n
+  n=$(printf '%s\n' "$content" | wc -l | tr -d ' ')
+  {
+    printf 'diff --git a/%s b/%s\n' "$p" "$p"
+    printf 'new file mode 100644\n--- /dev/null\n+++ b/%s\n' "$p"
+    printf '@@ -0,0 +1,%s @@\n' "$n"
+    printf '%s\n' "$content" | sed 's/^/+/'
+  } > "$PATCH_OUT"
+}
+export -f newfile_patch
+
 setup_sandbox() {
   SB="$(mktemp -d)"
   BARE="$SB/origin.git"; WORK="$SB/work"; FAKEBIN="$SB/bin"
@@ -121,7 +138,7 @@ echo "== Scenario A: APPROVE happy path -> needs-review, exit 0 =="
 setup_sandbox
 export GATE_CMD=true
 export IT_GATE_CMD=true
-export IMPL_CMD='mkdir -p src/main/scala && printf "object Slice\n" > src/main/scala/Slice.scala'
+export IMPL_CMD='newfile_patch src/main/scala/Slice.scala "object Slice"'
 export FIX_CMD='true'
 export REVIEW_CMD='printf "checked AC1/AC2, tests present.\nVERDICT: APPROVE\n"'
 run_loop
@@ -140,8 +157,8 @@ echo "== Scenario B: forced REQUEST_CHANGES -> exactly one fix, re-gate, re-revi
 setup_sandbox
 export GATE_CMD=true
 export IT_GATE_CMD=true
-export IMPL_CMD='printf "object Slice\n" > src/main/scala/Slice.scala'
-export FIX_CMD='printf "object SliceFixed\n" > src/main/scala/Slice.scala'
+export IMPL_CMD='newfile_patch src/main/scala/Slice.scala "object Slice"'
+export FIX_CMD='newfile_patch src/main/scala/Slice.scala "object SliceFixed"'
 # REVIEW: first call REQUEST_CHANGES, second APPROVE (counter file in sandbox)
 export REVIEW_CMD='c="$PWD/harness/logs/.revcount"; n=$(cat "$c" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$c"; if [ "$n" -eq 1 ]; then echo "VERDICT: REQUEST_CHANGES"; else echo "VERDICT: APPROVE"; fi'
 run_loop
@@ -158,8 +175,8 @@ echo "== Scenario C: forced fast-gate-RED, shared budget 2 -> needs-human + PR, 
 setup_sandbox
 export GATE_CMD=false
 export IT_GATE_CMD=false   # must never be reached: fast-RED short-circuits the IT gate
-export IMPL_CMD='printf "object Slice\n" > src/main/scala/Slice.scala'
-export FIX_CMD='printf "// touch %s\n" "$RANDOM" >> src/main/scala/Slice.scala'
+export IMPL_CMD='newfile_patch src/main/scala/Slice.scala "object Slice"'
+export FIX_CMD='newfile_patch src/main/scala/Slice.scala "object Slice$RANDOM"'
 export REVIEW_CMD='echo "VERDICT: APPROVE"'   # never reached (fast gate always RED)
 NOTIFY_LOG="$SB/notify-c.log"; : >"$NOTIFY_LOG"
 export NOTIFY_CMD='printf "%s\n" "$msg" >> '"$NOTIFY_LOG"
@@ -183,8 +200,8 @@ teardown
 echo "== Scenario D: forced IT-gate-RED -> exactly one fix from shared budget, re-gate green =="
 setup_sandbox
 export GATE_CMD=true                                   # fast tier always green
-export IMPL_CMD='printf "object Slice\n" > src/main/scala/Slice.scala'
-export FIX_CMD='printf "object SliceFixed\n" > src/main/scala/Slice.scala'
+export IMPL_CMD='newfile_patch src/main/scala/Slice.scala "object Slice"'
+export FIX_CMD='newfile_patch src/main/scala/Slice.scala "object SliceFixed"'
 # IT: first call RED, second GREEN. run_gate execs the cmd word-split (no shell eval), so the
 # stateful stub is a script on PATH, not an inline compound. Counter under the loop cwd (WORK).
 cat > "$FAKEBIN/it-flaky" <<'ITEOF'
@@ -223,8 +240,8 @@ echo "== Scenario E: IT-gate-RED exhausts shared budget 2 -> needs-human + PR, r
 setup_sandbox
 export GATE_CMD=true                                   # fast tier always green
 export IT_GATE_CMD=false                               # IT tier always RED
-export IMPL_CMD='printf "object Slice\n" > src/main/scala/Slice.scala'
-export FIX_CMD='printf "// touch %s\n" "$RANDOM" >> src/main/scala/Slice.scala'
+export IMPL_CMD='newfile_patch src/main/scala/Slice.scala "object Slice"'
+export FIX_CMD='newfile_patch src/main/scala/Slice.scala "object Slice$RANDOM"'
 export REVIEW_CMD='echo "VERDICT: APPROVE"'            # never reached (IT always RED)
 run_loop
 check "script exits 0 (needs-human handled)" 0 "$RC"
@@ -272,7 +289,7 @@ esac
 GHEOF
 chmod +x "$FAKEBIN/gh"
 export GATE_CMD=true IT_GATE_CMD=true
-export IMPL_CMD='printf "object Slice\n" > src/main/scala/Slice.scala'
+export IMPL_CMD='newfile_patch src/main/scala/Slice.scala "object Slice"'
 export FIX_CMD='true'
 export REVIEW_CMD='printf "VERDICT: APPROVE\n"'
 run_loop
@@ -281,13 +298,14 @@ checkc "picked the newly-ready issue" "issue edit 999 --add-label in-progress" "
 unset GATE_CMD IT_GATE_CMD IMPL_CMD FIX_CMD REVIEW_CMD
 teardown
 
-echo "== Scenario G: protected-path violation -> needs-human + PR, no FIX, reviewer never runs =="
+echo "== Scenario G: protected-path patch -> needs-human + PR, no FIX, reviewer never runs =="
 setup_sandbox
 export GATE_CMD=true
 export IT_GATE_CMD=true
-# The worker touches a protected file (harness/) AND a normal src file. harness/logs is the
-# only gitignored part of harness/, so any other harness file trips the check.
-export IMPL_CMD='printf "x" >> harness/fix-prompt.md && printf "object Slice\n" > src/main/scala/Slice.scala'
+# The worker's PATCH touches a protected file (harness/). The guard reads the patch's file list,
+# so any harness/ path (other than gitignored harness/logs) trips it — the rejected patch is
+# never applied to the tree.
+export IMPL_CMD='newfile_patch harness/evil.txt "pwned"'
 export FIX_CMD='false'                                 # must never run (fixer = violating agent class)
 export REVIEW_CMD='echo "VERDICT: APPROVE"'            # must never run
 run_loop
@@ -296,6 +314,7 @@ checkc "driver output mentions protected-path" "protected-path" "$SB/loop.out"
 check "no FIX dispatch" "0" "$(ls "$WORK/harness/logs" | grep -c '\.fix\.claude\.log' || true)"
 check "reviewer never ran" "" "$(ls "$WORK/harness/logs" | grep 'review.prompt.txt' || true)"
 check "gates never ran (violation short-circuits the gates)" "" "$(ls "$WORK/harness/logs" | grep 'gate.log' || true)"
+check "rejected patch NOT applied (no harness/evil.txt in the tree)" "" "$(ls "$WORK/harness/evil.txt" 2>/dev/null || true)"
 checkc "issue -> needs-human" "issue edit 999 --add-label needs-human" "$GH_CALLS"
 checkc "PR still opened (audit trail)" "pr create" "$GH_CALLS"
 unset GATE_CMD IT_GATE_CMD IMPL_CMD FIX_CMD REVIEW_CMD
@@ -305,7 +324,7 @@ echo "== Scenario H: empty reviewer output = infra fault -> exit 50, issue stays
 setup_sandbox
 export GATE_CMD=true
 export IT_GATE_CMD=true
-export IMPL_CMD='printf "object Slice\n" > src/main/scala/Slice.scala'
+export IMPL_CMD='newfile_patch src/main/scala/Slice.scala "object Slice"'
 export FIX_CMD='false'                                 # must never run (no budget spent)
 export REVIEW_CMD='true'                               # empty review file: crashed/timed-out reviewer
 run_loop
@@ -330,7 +349,7 @@ GTEOF
 chmod +x "$FAKEBIN/gate-timeout"
 export GATE_CMD=gate-timeout
 export IT_GATE_CMD=false                               # must never be reached
-export IMPL_CMD='printf "object Slice\n" > src/main/scala/Slice.scala'
+export IMPL_CMD='newfile_patch src/main/scala/Slice.scala "object Slice"'
 export FIX_CMD='false'                                 # must never run (no budget spent)
 export REVIEW_CMD='echo "VERDICT: APPROVE"'            # must never run
 NOTIFY_LOG_I="$SB/notify-i.log"; : >"$NOTIFY_LOG_I"
@@ -354,7 +373,7 @@ export STUB_BLOCKED_ISSUES="555 666"
 export STUB_DEP_STATE=OPEN
 export GATE_CMD=true
 export IT_GATE_CMD=true
-export IMPL_CMD='mkdir -p src/main/scala && printf "object Slice\n" > src/main/scala/Slice.scala'
+export IMPL_CMD='newfile_patch src/main/scala/Slice.scala "object Slice"'
 export FIX_CMD='true'
 export REVIEW_CMD='printf "checked AC1/AC2, tests present.\nVERDICT: APPROVE\n"'
 export NOTIFY_CMD='printf "%s\n" "$msg" >> '"$NOTIFY_LOG"
@@ -381,7 +400,7 @@ export STUB_ISSUE_LABELS="ready class-1"
 export STUB_CI_RC=1
 export GATE_CMD=true
 export IT_GATE_CMD=true
-export IMPL_CMD='mkdir -p src/main/scala && printf "object Slice\n" > src/main/scala/Slice.scala'
+export IMPL_CMD='newfile_patch src/main/scala/Slice.scala "object Slice"'
 export FIX_CMD='false'   # must never run: no self-repair against the independent check
 export REVIEW_CMD='printf "checked AC1/AC2, tests present.\nVERDICT: APPROVE\n"'
 export NOTIFY_CMD='printf "%s\n" "$msg" >> '"$NOTIFY_LOG"
@@ -402,7 +421,7 @@ export STUB_ISSUE_LABELS="ready class-1"
 export STUB_CI_RC=124
 export GATE_CMD=true
 export IT_GATE_CMD=true
-export IMPL_CMD='mkdir -p src/main/scala && printf "object Slice\n" > src/main/scala/Slice.scala'
+export IMPL_CMD='newfile_patch src/main/scala/Slice.scala "object Slice"'
 export FIX_CMD='true'
 export REVIEW_CMD='printf "checked AC1/AC2, tests present.\nVERDICT: APPROVE\n"'
 export NOTIFY_CMD='printf "%s\n" "$msg" >> '"$NOTIFY_LOG"
@@ -419,7 +438,7 @@ setup_sandbox
 export STUB_ISSUE_LABELS="ready class-2"
 export GATE_CMD=true
 export IT_GATE_CMD=true
-export IMPL_CMD='mkdir -p src/main/scala && printf "object Slice\n" > src/main/scala/Slice.scala'
+export IMPL_CMD='newfile_patch src/main/scala/Slice.scala "object Slice"'
 export FIX_CMD='true'
 export REVIEW_CMD='printf "checked AC1/AC2, tests present.\nVERDICT: APPROVE\n"'
 run_loop
@@ -437,7 +456,7 @@ export STUB_ISSUE_LABELS="ready class-1"
 export STUB_PR_STATE=OPEN
 export GATE_CMD=true
 export IT_GATE_CMD=true
-export IMPL_CMD='mkdir -p src/main/scala && printf "object Slice\n" > src/main/scala/Slice.scala'
+export IMPL_CMD='newfile_patch src/main/scala/Slice.scala "object Slice"'
 export FIX_CMD='true'
 export REVIEW_CMD='printf "checked AC1/AC2, tests present.\nVERDICT: APPROVE\n"'
 export NOTIFY_CMD='printf "%s\n" "$msg" >> '"$NOTIFY_LOG"
@@ -456,7 +475,7 @@ export STUB_ISSUE_LABELS="ready class-1"
 export MERGE_CMD=false
 export GATE_CMD=true
 export IT_GATE_CMD=true
-export IMPL_CMD='mkdir -p src/main/scala && printf "object Slice\n" > src/main/scala/Slice.scala'
+export IMPL_CMD='newfile_patch src/main/scala/Slice.scala "object Slice"'
 export FIX_CMD='true'
 export REVIEW_CMD='printf "checked AC1/AC2, tests present.\nVERDICT: APPROVE\n"'
 export NOTIFY_CMD='printf "%s\n" "$msg" >> '"$NOTIFY_LOG"
@@ -482,7 +501,7 @@ export CI_APPEAR_INTERVAL=1
 export CI_APPEAR_TIMEOUT=30
 export GATE_CMD=true
 export IT_GATE_CMD=true
-export IMPL_CMD='mkdir -p src/main/scala && printf "object Slice\n" > src/main/scala/Slice.scala'
+export IMPL_CMD='newfile_patch src/main/scala/Slice.scala "object Slice"'
 export FIX_CMD='true'
 export REVIEW_CMD='printf "checked AC1/AC2, tests present.\nVERDICT: APPROVE\n"'
 export NOTIFY_CMD='printf "%s\n" "$msg" >> '"$NOTIFY_LOG"
@@ -505,7 +524,7 @@ export CI_APPEAR_INTERVAL=1
 export CI_APPEAR_TIMEOUT=3
 export GATE_CMD=true
 export IT_GATE_CMD=true
-export IMPL_CMD='mkdir -p src/main/scala && printf "object Slice\n" > src/main/scala/Slice.scala'
+export IMPL_CMD='newfile_patch src/main/scala/Slice.scala "object Slice"'
 export FIX_CMD='true'
 export REVIEW_CMD='printf "checked AC1/AC2, tests present.\nVERDICT: APPROVE\n"'
 export NOTIFY_CMD='printf "%s\n" "$msg" >> '"$NOTIFY_LOG"
@@ -517,6 +536,73 @@ check  "NOT flipped to needs-human" "" "$(grep 'needs-human' "$GH_CALLS" || true
 check  "issue stays in-progress for resume" "" "$(grep 'issue edit 999 --remove-label in-progress' "$GH_CALLS" || true)"
 checkc "notify fired (infra fault)" "infra fault" "$NOTIFY_LOG"
 unset STUB_ISSUE_LABELS CI_APPEAR_CMD CI_APPEAR_INTERVAL CI_APPEAR_TIMEOUT GATE_CMD IT_GATE_CMD IMPL_CMD FIX_CMD REVIEW_CMD NOTIFY_CMD
+teardown
+
+# v6 slice 2: the patch guard is the choke point every agent change crosses. R/S/T exercise the
+# three new rejection modes — a protected CI-workflow path, a patch that will not apply, and an
+# oversized patch. All three are computed from the extracted patch, before it can be merged.
+echo "== Scenario R: patch touching a CI workflow -> needs-human + PR, guard rejects, not applied =="
+setup_sandbox
+export GATE_CMD=true
+export IT_GATE_CMD=true
+# The guard reads the patch's file list; a .github/ path is a protected CI-workflow class.
+export IMPL_CMD='newfile_patch .github/workflows/evil.yml "on: push"'
+export FIX_CMD='false'                                 # must never run
+export REVIEW_CMD='echo "VERDICT: APPROVE"'            # must never run
+run_loop
+check "script exits 0 (needs-human handled)" 0 "$RC"
+checkc "driver output mentions protected-path" "protected-path" "$SB/loop.out"
+check "no FIX dispatch" "0" "$(ls "$WORK/harness/logs" | grep -c '\.fix\.claude\.log' || true)"
+check "reviewer never ran" "" "$(ls "$WORK/harness/logs" | grep 'review.prompt.txt' || true)"
+check "gates never ran (guard rejection short-circuits the gates)" "" "$(ls "$WORK/harness/logs" | grep 'gate.log' || true)"
+check "CI workflow NOT applied (no .github/workflows/evil.yml in the tree)" "" "$(ls "$WORK/.github/workflows/evil.yml" 2>/dev/null || true)"
+checkc "issue -> needs-human" "issue edit 999 --add-label needs-human" "$GH_CALLS"
+checkc "PR still opened (audit trail)" "pr create" "$GH_CALLS"
+unset GATE_CMD IT_GATE_CMD IMPL_CMD FIX_CMD REVIEW_CMD
+teardown
+
+echo "== Scenario S: patch that fails to apply -> rc 50 infra fault, no budget spent =="
+setup_sandbox
+NOTIFY_LOG_S="$SB/notify-s.log"; : >"$NOTIFY_LOG_S"
+export GATE_CMD=true
+export IT_GATE_CMD=true
+# A 'new file' patch for a path that already exists in the base cannot apply (git apply: already
+# exists in index). An apply conflict is an infra fault, not a gate failure — no budget spent.
+export IMPL_CMD='newfile_patch src/main/scala/Base.scala "object Dup"'
+export FIX_CMD='false'                                 # must never run (no budget spent)
+export REVIEW_CMD='echo "VERDICT: APPROVE"'            # must never run
+export NOTIFY_CMD='printf "%s\n" "$msg" >> '"$NOTIFY_LOG_S"
+run_loop
+check "exit code 50 (apply conflict = infra fault)" 50 "$RC"
+checkc "driver logged infra fault" "infra fault — exiting for inspection" "$SB/loop.out"
+check "zero FIX dispatches (no budget spent)" "0" "$(ls "$WORK/harness/logs" | grep -c '\.fix\.claude\.log' || true)"
+check "no PR created" "" "$(grep 'pr create' "$GH_CALLS" || true)"
+check "no needs-human label" "" "$(grep 'needs-human' "$GH_CALLS" || true)"
+check "gates never ran (apply precedes the gates)" "" "$(ls "$WORK/harness/logs" | grep 'gate.log' || true)"
+checkc "issue marked in-progress" "issue edit 999 --add-label in-progress" "$GH_CALLS"
+check "in-progress never removed (resumable next tick)" "0" "$(grep -c 'remove-label in-progress' "$GH_CALLS" || true)"
+checkc "notify fired on infra fault" "infra fault" "$NOTIFY_LOG_S"
+unset GATE_CMD IT_GATE_CMD IMPL_CMD FIX_CMD REVIEW_CMD NOTIFY_CMD
+teardown
+
+echo "== Scenario T: oversized patch -> needs-human + PR, guard rejects, not applied =="
+setup_sandbox
+export GATE_CMD=true
+export IT_GATE_CMD=true
+export MAX_PATCH_BYTES=10                              # any real patch exceeds this tiny cap
+export IMPL_CMD='newfile_patch src/main/scala/Slice.scala "object Slice"'
+export FIX_CMD='false'                                 # must never run
+export REVIEW_CMD='echo "VERDICT: APPROVE"'            # must never run
+run_loop
+check "script exits 0 (needs-human handled)" 0 "$RC"
+checkc "driver output mentions oversized-patch" "oversized-patch" "$SB/loop.out"
+check "no FIX dispatch" "0" "$(ls "$WORK/harness/logs" | grep -c '\.fix\.claude\.log' || true)"
+check "reviewer never ran" "" "$(ls "$WORK/harness/logs" | grep 'review.prompt.txt' || true)"
+check "gates never ran (guard rejection short-circuits the gates)" "" "$(ls "$WORK/harness/logs" | grep 'gate.log' || true)"
+check "oversized patch NOT applied (no Slice.scala in the tree)" "" "$(ls "$WORK/src/main/scala/Slice.scala" 2>/dev/null || true)"
+checkc "issue -> needs-human" "issue edit 999 --add-label needs-human" "$GH_CALLS"
+checkc "PR still opened (audit trail)" "pr create" "$GH_CALLS"
+unset GATE_CMD IT_GATE_CMD MAX_PATCH_BYTES IMPL_CMD FIX_CMD REVIEW_CMD
 teardown
 
 echo

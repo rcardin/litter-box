@@ -105,7 +105,7 @@ origin/main, so this only ever bites out-of-band PRs.
 | `fix-prompt.md` | The fix-iteration prompt. Splices `{{ISSUE}}` + `{{FAILURE}}` (gate-log tail **or** reviewer reasons + tamper). Same hard rules as the worker (no test weakening, `-Werror`, no `gh`/branch ops). |
 | `review-prompt.md` | The cold reviewer prompt. Splices `{{ISSUE}}`, `{{CONVENTIONS}}` (`CONTEXT.md`), `{{TAMPER}}`, `{{DIFF}}`. Adversarial. Last line MUST be `VERDICT: APPROVE` or `VERDICT: REQUEST_CHANGES`. |
 | `sandbox/` | v6 slice 1: the containerized FAST-gate sandbox — gate image `Dockerfile`, proxy sidecar (`proxy/`), `build-image.sh`, `start-proxy.sh` / `stop-proxy.sh`, and the `GATE_CMD` default `run-fast-gate.sh`. See **Containerized FAST gate** below. |
-| `test/statemachine-test.sh` | Drives the whole state machine in a throwaway sandbox (fake `gh`, stubbed gate + dispatches) — no real GitHub, no Opus tokens, no Docker (both `GATE_CMD` and `IT_GATE_CMD` are always stubbed). Scenarios A–Q plus a DRY_RUN check (APPROVE, REQUEST_CHANGES, fast-RED, IT-RED, budget exhaustion, idle-no-latch, protected-path, empty-review, gate-timeout, class-1 auto-merge + CI red/timeout/late-registering-check/unverified-merge/merge-failure, class-2 stop-at-PR), 119 assertions total. |
+| `test/statemachine-test.sh` | Drives the whole state machine in a throwaway sandbox (fake `gh`, stubbed gate + dispatches) — no real GitHub, no Opus tokens, no Docker (both `GATE_CMD` and `IT_GATE_CMD` are always stubbed). Scenarios A–T plus a DRY_RUN check (APPROVE, REQUEST_CHANGES, fast-RED, IT-RED, budget exhaustion, idle-no-latch, protected-path, empty-review, gate-timeout, class-1 auto-merge + CI red/timeout/late-registering-check/unverified-merge/merge-failure, class-2 stop-at-PR, plus v6-slice-2 patch-guard CI-workflow rejection / apply-conflict / oversized-patch), 145 assertions total. Stubs produce patch files at `$PATCH_OUT` (the slice-2 seam contract). |
 | `sandbox/test/` | Manual/local Docker-dependent checks for the sandbox itself (image smoke test, proxy allowlist test, coursier-cache speed check) — not part of `sbt test` or `statemachine-test.sh`, same category as the pre-existing IT gate. Run `sandbox/test/run-all.sh`. |
 | `logs/` | Per-pass `claude -p` logs, gate logs, rendered prompts, tamper + review + diff artefacts. Git-ignored. |
 
@@ -123,15 +123,14 @@ origin/main, so this only ever bites out-of-band PRs.
    both **fatal** on failure (`die`) — every diff, tamper report, gate run and PR downstream is
    measured against `origin/main`, so a stale local base is never silently tolerated. Flip issue
    `ready`→`in-progress`.
-4. Dispatch the fresh **IMPL** `claude -p` (v0 worker prompt). A `124` timeout → infra fault,
-   exit `50` (a half-finished worker must never reach the gates). Otherwise, nothing produced →
-   leave in-progress, no PR (exit `30`).
+4. Dispatch the fresh **IMPL** `claude -p` (v0 worker prompt) **across the patch seam** (v6
+   slice 2, below): the worker edits the tree, but its output leaves only as an extracted patch
+   that the harness resets, inspects and `git apply`s. A `124` timeout → infra fault, exit `50`
+   (a half-finished worker must never reach the gates). A patch that will not apply → infra
+   fault, exit `50`, no budget spent. Nothing produced (empty patch) → leave in-progress, no PR
+   (exit `30`). A **patch-guard rejection** (protected path or oversized) terminates as
+   `FAIL(needs-human)` without entering the repair loop.
 5. **Repair loop** (shared budget of 2), each pass:
-   - **Protected-path guard** (bash, not the prompt — the worker/fixer runs with permissions
-     skipped): if the staged diff vs `origin/main` touches `harness/`, `docs/`, `.github/`,
-     `PROMPT.md`, `CONTEXT.md` or `STOP.md`, terminate immediately as `FAIL(needs-human)`, gate
-     `SKIPPED`, **no FIX dispatched** (the fixer is the same agent class that just broke the
-     rule) — a PR is still opened, marked do-not-merge, for the audit trail.
    - Run the **FAST gate** (`sbt compile -Werror` + `sbt test`, `src/test` only, no Docker). A
      `124` timeout → infra fault, exit `50`, no budget spent.
      - **RED** → budget 0? terminate `FAIL(needs-human)`. Else spend one, dispatch **FIX**
@@ -152,7 +151,8 @@ origin/main, so this only ever bites out-of-band PRs.
 6. **Terminal:** commit, push, `gh pr create`. `SUCCESS` on a **class-1** issue hands off to
    **v4 auto-merge** (below) instead of flipping a label — the merge or a CI-red `needs-human`
    decides its fate. `SUCCESS` on **class-2/3** records the APPROVE + review and flips
-   `needs-review`; a human merges. `FAIL` (budget exhaustion or protected-path) records the
+   `needs-review`; a human merges. `FAIL` (budget exhaustion, or a patch-guard rejection —
+protected-path or oversized) records the
    last failure and flips `needs-human` regardless of class. An exit-`50` infra fault instead
    commits nothing and opens no PR — the issue simply stays `in-progress` for the next tick or
    for manual inspection.
@@ -167,8 +167,8 @@ must never cost repair budget or bury the real signal under `needs-human`, from 
 review failures:
 
 - **rc `50` — infra-fault terminal.** A gate timeout (rc `124`), a worker or reviewer
-  `claude -p` timeout (rc `124`), or an empty/whitespace-only reviewer output all exit the
-  *whole loop* with `50`. The issue **keeps its `in-progress` label** (resumable next tick), **no
+  `claude -p` timeout (rc `124`), a **patch that fails to `git apply`** (v6 slice 2), or an
+  empty/whitespace-only reviewer output all exit the *whole loop* with `50`. The issue **keeps its `in-progress` label** (resumable next tick), **no
   repair-budget unit is spent**, **no FIX is dispatched**, and **no PR is opened**. A non-empty
   review that is simply missing the `VERDICT:` sentinel is treated differently — that is model
   misbehavior, real signal — and still fail-safes to `REQUEST_CHANGES`, spending budget as usual.
@@ -183,14 +183,50 @@ review failures:
   itself and exits `124` — the loop's pre-existing rc-124-is-infra-fault convention — on any of
   the three, so a sidecar that dies mid-run is never mistaken for a code failure. See
   **Containerized FAST gate** below.
-- **Protected-path enforcement.** Enforced in bash after every `git add -A` in the repair loop,
-  not just in the prompt, because the worker/fixer runs with `--dangerously-skip-permissions`.
-  A staged diff vs `origin/main` touching `harness/`, `docs/`, `.github/`, `PROMPT.md`,
-  `CONTEXT.md` or `STOP.md` terminates the US as `FAIL(needs-human)` immediately: gate
-  `SKIPPED`, no FIX dispatched, PR still opened (do-not-merge, audit trail only).
-  `harness/logs/` is gitignored so the harness's own log writes never trip this.
+- **Patch seam (v6 slice 2).** Every agent dispatch (IMPL and each FIX) crosses an
+  inspect-then-apply boundary rather than being committed straight from the tree the agent
+  edited (prefactor for the containerized worker: the worker still runs on the host here, but
+  its output already leaves as data). `stage_patch()` snapshots the cumulative diff vs
+  `origin/main` as a size-capped patch file, resets the tree to a pristine base, inspects the
+  patch, then `git apply --index`es it. The worker/fixer **stub contract** matches: a stub
+  writes `$PATCH_OUT` instead of editing the tree. A patch that will not apply is an **infra
+  fault** (exit `50`, no budget spent), never a gate failure.
+- **Protected-path / oversized patch guard.** Enforced in bash, reading the file list straight
+  out of the **patch** (`git apply --numstat`), because the worker/fixer runs with
+  `--dangerously-skip-permissions`. A patch touching `harness/` (harness code), `.github/` (CI
+  workflows), `docs/`, `CONTEXT.md` (the constitution), `PROMPT.md` or `STOP.md`, **or** a patch
+  over `MAX_PATCH_BYTES` (default 1 MB), terminates the US as `FAIL(needs-human)` immediately:
+  gate `SKIPPED`, no FIX dispatched, the rejected patch **never applied**, PR still opened with a
+  rejection marker (do-not-merge, audit trail only). `harness/logs/` is gitignored so the
+  harness's own log writes never enter a patch.
 - **Fatal stale-base guard.** `git fetch origin main` failing, or being unable to branch off
   `origin/main`, is fatal (`die`) rather than a silent fallback to a stale local base.
+
+## Patch seam (v6 slice 2)
+
+Agent output no longer reaches the branch straight from the tree the agent edited. This is a
+**prefactor**: the worker still runs on the host, but its changes already cross an
+inspect-then-apply boundary, so a later slice can swap the host tree edit for a container that
+hands back a patch the same way.
+
+Every IMPL and FIX dispatch funnels through `stage_patch()`:
+
+1. **Produce a patch.** The dispatch's output is a patch file at `$PATCH_OUT` — the seam
+   boundary. A real worker/fixer edits the host tree and bash snapshots the cumulative diff vs
+   `origin/main`; a test **stub** writes `$PATCH_OUT` itself (the slice-2 stub contract) so the
+   state machine is driven with no real agent.
+2. **Reset to a pristine base.** `git reset --hard origin/main` + `git clean -fd` — the tree the
+   agent edited is never trusted or committed directly. (`harness/logs/` is gitignored, so the
+   extracted patch file survives the clean.)
+3. **Inspect, then apply.** Size cap (`MAX_PATCH_BYTES`, default 1 MB) and the protected-path
+   guard both read the **patch** (`git apply --numstat`), not the tree. A rejection routes to
+   `needs-human` (rejected patch never applied; a marker is committed for the audit PR). A clean
+   patch is applied with `git apply --index` on the branch; a patch that will not apply is an
+   **infra fault** (rc `50`, no repair budget spent), not a gate failure.
+
+The **test-tamper numstat check** is reworked to read the same applied patch, so its verdicts
+are unchanged but now derive from the one artifact the guard and `git apply` also see. See the
+patch-guard / apply-conflict / oversized scenarios (R/S/T) in `test/statemachine-test.sh`.
 
 ## Containerized FAST gate (v6 slice 1)
 
