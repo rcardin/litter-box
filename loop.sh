@@ -294,7 +294,11 @@ dispatch_worker() {
   # ONLY thing that leaves the dispatch — stage_patch() inspects and applies it; the tree the
   # agent edited is never committed directly.
   git add -A
-  git diff --cached origin/main > "$patch_out"
+  # --no-renames is what keeps the protected-path guard rename-proof: with rename detection ON,
+  # a file renamed INTO a protected dir emits a brace token (harness/foo => harness/evil or
+  # {old => harness/evil}) that harness/* would NOT match, slipping past the guard. --no-renames
+  # records a rename as a delete plus an add, so the concrete destination path appears literally.
+  git diff --cached --no-renames origin/main > "$patch_out"
   return 0
 }
 
@@ -491,15 +495,16 @@ auto_merge() {
 # agent PRODUCED, independent of the tree. Spells out the three classes the sandbox must never
 # let an agent rewrite — CI workflow files (.github/), harness code (harness/), and the
 # constitution (CONTEXT.md) — and keeps docs/, PROMPT.md and STOP.md protected as the original
-# tree guard did. Returns 0 if the patch touches a protected path, 1 if it is clean.
-patch_touches_protected() { # patch_touches_protected PATCH
-  local patch="$1" p
+# tree guard did. Returns 0 if the patch touches a protected path, 1 if it is clean. Takes the
+# pre-computed numstat text (stage_patch runs git apply --numstat once and feeds it here).
+patch_touches_protected() { # patch_touches_protected NUMSTAT
+  local numstat="$1" p
   while IFS=$'\t' read -r _ _ p; do
     [[ -z "$p" ]] && continue
     case "$p" in
       .github/*|harness/*|docs/*|CONTEXT.md|PROMPT.md|STOP.md) return 0 ;;
     esac
-  done < <(git apply --numstat "$patch" 2>/dev/null)
+  done <<< "$numstat"
   return 1
 }
 
@@ -507,14 +512,14 @@ patch_touches_protected() { # patch_touches_protected PATCH
 # applied. Stage a small tracked marker so the terminal still has a diff to open the audit PR
 # with; the routing (needs-human + PR) matches the original protected-path guard. The marker,
 # not the rejected change, is what lands on the throwaway branch.
-write_reject_marker() { # write_reject_marker REASON PATCH
-  local reason="$1" patch="$2"
+write_reject_marker() { # write_reject_marker REASON NUMSTAT
+  local reason="$1" numstat="$2"
   {
     printf '# Patch rejected by the harness guard\n\n'
     printf '%s\n\n' "$reason"
     printf 'This branch is opened for the audit trail ONLY and must NOT be merged. The rejected\n'
     printf 'patch was never applied to the tree. Numstat of the rejected patch (added deleted path):\n\n```\n'
-    git apply --numstat "$patch" 2>/dev/null | head -100
+    printf '%s\n' "$numstat" | head -100
     printf '\n```\n'
   } > "$REPO_ROOT/PATCH-REJECTED.md"
   git add "$REPO_ROOT/PATCH-REJECTED.md"
@@ -542,15 +547,21 @@ stage_patch() { # stage_patch ROLE PROMPT LOGF PATCH_FILE
   git clean -qfd
   if [[ ! -s "$patch" ]]; then STAGE_RESULT=EMPTY; return 0; fi
   # --- inspect, THEN apply (PRD: the host inspects the patch before it touches the tree) ------
+  # Compute the numstat ONCE here and feed it to both the guard and the reject marker (avoids
+  # re-running git apply --numstat 2-3 times per patch). Fail-open is DELIBERATE and backstopped:
+  # if git apply --numstat yields nothing (an unparseable patch) the guard sees an empty file list
+  # and returns clean, but the real git apply --index below then fails, so STAGE_RESULT=APPLY_FAIL
+  # (infra fault, no repair budget spent). A malformed patch therefore never reaches the gates.
+  local numstat; numstat="$(git apply --numstat "$patch" 2>/dev/null)"
   local bytes; bytes="$(wc -c < "$patch" | tr -d ' ')"
   if (( bytes > MAX_PATCH_BYTES )); then
     log "patch guard: ${bytes}B exceeds the ${MAX_PATCH_BYTES}B cap — rejecting oversized patch (not applied)"
-    write_reject_marker "Oversized patch: ${bytes} bytes exceeds the ${MAX_PATCH_BYTES}-byte cap." "$patch"
+    write_reject_marker "Oversized patch: ${bytes} bytes exceeds the ${MAX_PATCH_BYTES}-byte cap." "$numstat"
     STAGE_RESULT=OVERSIZE; return 0
   fi
-  if patch_touches_protected "$patch"; then
+  if patch_touches_protected "$numstat"; then
     log "patch guard: patch touches a protected path (.github/, harness/, docs/, CONTEXT.md, PROMPT.md or STOP.md) — rejecting (not applied)"
-    write_reject_marker "Patch touches a protected path (CI workflow, harness code, docs, or a control/constitution file)." "$patch"
+    write_reject_marker "Patch touches a protected path (CI workflow, harness code, docs, or a control/constitution file)." "$numstat"
     STAGE_RESULT=PROTECTED; return 0
   fi
   # Inspection passed — apply on the fresh branch. A patch that will not apply is an infra fault,
@@ -580,8 +591,26 @@ dispatch_fix() { # dispatch_fix PASS FAILFILE
     APPLY_FAIL) phase FIX red "$fix_log" "patch apply conflict" ;;
     PROTECTED)  phase FIX red "$fix_log" "protected-path" ;;
     OVERSIZE)   phase FIX red "$fix_log" "oversized patch" ;;
+    EMPTY)      phase FIX red "$fix_log" "empty fix" ;;
     *)          phase FIX ok  "$fix_log" ;;
   esac
+}
+
+# Maps the STAGE_RESULT of a fixer dispatch onto the self-repair loop's control flow. Sets
+# iterate()'s outcome/failure_kind locals through bash dynamic scope, exactly as the inline
+# gate/review blocks already do (see the comment above dispatch_fix). The three copy-pasted
+# post-dispatch switches used to inline this; centralising them keeps the control flow single-sourced.
+# Returns: 50 = infra fault, caller must `return 50`; 2 = terminal FAIL, caller must `break`;
+# 0 = the fix applied, caller continues the loop.
+handle_fix_result() {
+  case "$STAGE_RESULT" in
+    TIMEOUT)    log "FIX worker timed out (infra fault); exiting without spending further budget"; return 50 ;;
+    APPLY_FAIL) log "FIX patch did not apply (infra fault, no budget spent)"; return 50 ;;
+    PROTECTED)  outcome="FAIL"; failure_kind="protected-path"; return 2 ;;
+    OVERSIZE)   outcome="FAIL"; failure_kind="oversized-patch"; return 2 ;;
+    EMPTY)      log "FIX produced no diff (the fixer reverted all prior work); routing to needs-human"; outcome="FAIL"; failure_kind="empty-fix"; return 2 ;;
+  esac
+  return 0
 }
 
 # --- one US, start to terminal ---------------------------------------------------------
@@ -721,13 +750,10 @@ iterate() {
         printf '\n```\n'
       } >"$fail_file"
       dispatch_fix "$pass" "$fail_file"
-      case "$STAGE_RESULT" in
-        TIMEOUT)    log "FIX worker timed out — infra fault; exiting without spending further budget"; return 50 ;;
-        APPLY_FAIL) log "FIX patch did not apply — infra fault, no budget spent"; return 50 ;;
-        PROTECTED)  outcome="FAIL"; failure_kind="protected-path"; break ;;
-        OVERSIZE)   outcome="FAIL"; failure_kind="oversized-patch"; break ;;
-      esac
-      continue                                        # short-circuits the IT gate — no Docker paid
+      handle_fix_result; local hf=$?
+      (( hf == 50 )) && return 50
+      (( hf == 2 ))  && break
+      continue                                        # short-circuits the IT gate (no Docker paid)
     fi
     log "FAST gate GREEN (pass $pass) — running IT gate (real PG)"
     phase FAST_GATE ok "$gate_log"
@@ -757,12 +783,9 @@ iterate() {
         printf '\n```\n'
       } >"$fail_file"
       dispatch_fix "$pass" "$fail_file"
-      case "$STAGE_RESULT" in
-        TIMEOUT)    log "FIX worker timed out — infra fault; exiting without spending further budget"; return 50 ;;
-        APPLY_FAIL) log "FIX patch did not apply — infra fault, no budget spent"; return 50 ;;
-        PROTECTED)  outcome="FAIL"; failure_kind="protected-path"; break ;;
-        OVERSIZE)   outcome="FAIL"; failure_kind="oversized-patch"; break ;;
-      esac
+      handle_fix_result; local hf=$?
+      (( hf == 50 )) && return 50
+      (( hf == 2 ))  && break
       continue
     fi
 
@@ -826,16 +849,27 @@ iterate() {
       cat "$tamper_file"
     } >"$fail_file"
     dispatch_fix "$pass" "$fail_file"
-    case "$STAGE_RESULT" in
-      TIMEOUT)    log "FIX worker timed out — infra fault; exiting without spending further budget"; return 50 ;;
-      APPLY_FAIL) log "FIX patch did not apply — infra fault, no budget spent"; return 50 ;;
-      PROTECTED)  outcome="FAIL"; failure_kind="protected-path"; break ;;
-      OVERSIZE)   outcome="FAIL"; failure_kind="oversized-patch"; break ;;
-    esac
+    handle_fix_result; local hf=$?
+    (( hf == 50 )) && return 50
+    (( hf == 2 ))  && break
     continue
   done
 
   # --- terminal: commit, push, PR (SUCCESS -> needs-review, FAIL -> needs-human) --------
+  # A fixer that produced no diff (failure_kind=empty-fix) left the tree pristine: stage_patch
+  # reset to origin/main before it saw the empty patch, so the "nothing staged" guard below would
+  # otherwise fire first and mask the routing. Stage a small tracked marker so the needs-human audit
+  # PR still opens, mirroring the patch-guard reject marker. In the cumulative-patch model an empty
+  # fix reverts all prior work, so this branch legitimately holds only the marker.
+  if [[ "$failure_kind" == "empty-fix" ]]; then
+    {
+      printf '# Fixer produced no diff\n\n'
+      printf 'The self-repair fixer returned an empty patch. In the cumulative-patch model that\n'
+      printf 'reverts all prior work on this branch, so the loop routed the issue to human review\n'
+      printf 'instead of re-gating an empty tree. Opened for the audit trail ONLY; do NOT merge.\n'
+    } > "$REPO_ROOT/FIX-EMPTY.md"
+    git add "$REPO_ROOT/FIX-EMPTY.md"
+  fi
   git add -A
   if git diff --cached --quiet HEAD; then
     log "nothing staged at terminal — unexpected; leaving in-progress"
@@ -855,6 +889,10 @@ iterate() {
     label="needs-human"
     commit_tag="patch guard rejection (${failure_kind}), gate ${gate_status}"
     pr_note="**Needs human** — the patch guard rejected the agent's patch (${failure_kind}: a CI workflow / harness / docs / control-or-constitution file, or a patch over the size cap). The rejected change was NOT applied; this branch holds only a rejection marker and must NOT be merged."
+  elif [[ "$failure_kind" == "empty-fix" ]]; then
+    label="needs-human"
+    commit_tag="fixer produced no diff (empty-fix), gate ${gate_status}"
+    pr_note="**Needs human**: the self-repair fixer produced no diff. In the cumulative-patch model that reverts all prior work, so this branch holds only an audit marker (the prior implementation is NOT on it). Opened for the audit trail; do NOT merge."
   else
     label="needs-human"
     commit_tag="self-repair budget exhausted (${failure_kind}), gate ${gate_status}"
