@@ -39,6 +39,13 @@ failures.
   unit+IT-green diff. **fast-RED short-circuits the IT gate** — Docker is never paid for an
   iteration whose unit tests already fail. IT-RED draws from the same shared budget of 2.
 
+> **v6 slice 3 removed the LOCAL IT gate.** The `src/it` tier is now judged **only by GitHub
+> Actions** (the required `build` check runs `sbt It/test` on the PR). The loop runs the FAST
+> gate as its sole local gate; an IT failure surfaces as **CI-red** on the class-1 auto-merge
+> path (→ needs-human, no local self-repair), exactly the existing CI-red route. The paragraphs
+> above describe the historical v2 two-tier loop; see **Containerized worker/fixer (v6 slice 3)**
+> below for the current shape. The tamper diff still covers `src/it`.
+
 **v3 (GitHub Actions CI `build` check + branch protection on `main`) has shipped**, outside this
 script — `ci.yml` is merged and `main` is protected on the `build` check. **Still not
 implemented:** a convention-lint gate step, rebase-on-main-and-rerun. **For class-2/3, the
@@ -99,21 +106,23 @@ origin/main, so this only ever bites out-of-band PRs.
 | File | Role |
 |---|---|
 | `build.sbt` | Defines the `It` custom config (`config("it") extend Test` + `inConfig(It)(Defaults.testSettings)`, forked + serial + `-oDF`). `sbt test` = `src/test`; `sbt It/test` = `src/it`. |
-| `src/it/scala/.../PostgresJdbcEventStoreSpec.scala` | The one Testcontainers IT (real PG + Flyway), moved out of `src/test` so it no longer runs in the fast gate. |
-| `loop.sh` | Bash state machine. Docker preflight at startup (IT gate) plus the FAST-gate sandbox preflight (v6 slice 1: build image, start proxy sidecar), picks one issue via `gh`, dispatches fresh `claude -p` tasks, enforces the protected-path guard, runs the fast gate + IT gate + repair loop + reviewer, opens a PR, stops. Timeouts and other infra faults exit `50` without spending repair budget. The model never chooses the task. |
+| `src/it/scala/.../PostgresJdbcEventStoreSpec.scala` | The one Testcontainers IT (real PG + Flyway). Judged by **CI** (`sbt It/test` in `ci.yml`), never by a local gate — the loop has no local IT gate as of v6 slice 3. |
+| `loop.sh` | Bash state machine. Sandbox preflight at startup (v6: build image, start proxy sidecar; requires `ANTHROPIC_API_KEY`), picks one issue via `gh`, dispatches fresh `claude -p` tasks **inside the sandbox** (worker/fixer, v6 slice 3), enforces the protected-path patch guard, runs the FAST gate + repair loop + reviewer, opens a PR, stops. Timeouts and other infra faults exit `50` without spending repair budget. The model never chooses the task. |
 | `iterate-prompt.md` | The narrow worker prompt (unchanged from v0). `{{ISSUE}}` is spliced with the issue body. |
 | `fix-prompt.md` | The fix-iteration prompt. Splices `{{ISSUE}}` + `{{FAILURE}}` (gate-log tail **or** reviewer reasons + tamper). Same hard rules as the worker (no test weakening, `-Werror`, no `gh`/branch ops). |
 | `review-prompt.md` | The cold reviewer prompt. Splices `{{ISSUE}}`, `{{CONVENTIONS}}` (`CONTEXT.md`), `{{TAMPER}}`, `{{DIFF}}`. Adversarial. Last line MUST be `VERDICT: APPROVE` or `VERDICT: REQUEST_CHANGES`. |
-| `sandbox/` | v6 slice 1: the containerized FAST-gate sandbox — gate image `Dockerfile`, proxy sidecar (`proxy/`), `build-image.sh`, `start-proxy.sh` / `stop-proxy.sh`, and the `GATE_CMD` default `run-fast-gate.sh`. See **Containerized FAST gate** below. |
-| `test/statemachine-test.sh` | Drives the whole state machine in a throwaway sandbox (fake `gh`, stubbed gate + dispatches) — no real GitHub, no Opus tokens, no Docker (both `GATE_CMD` and `IT_GATE_CMD` are always stubbed). Scenarios A–T plus a DRY_RUN check (APPROVE, REQUEST_CHANGES, fast-RED, IT-RED, budget exhaustion, idle-no-latch, protected-path, empty-review, gate-timeout, class-1 auto-merge + CI red/timeout/late-registering-check/unverified-merge/merge-failure, class-2 stop-at-PR, plus v6-slice-2 patch-guard CI-workflow rejection / apply-conflict / oversized-patch), 145 assertions total. Stubs produce patch files at `$PATCH_OUT` (the slice-2 seam contract). |
-| `sandbox/test/` | Manual/local Docker-dependent checks for the sandbox itself (image smoke test, proxy allowlist test, coursier-cache speed check) — not part of `sbt test` or `statemachine-test.sh`, same category as the pre-existing IT gate. Run `sandbox/test/run-all.sh`. |
+| `sandbox/` | The containerized sandbox — image `Dockerfile`, proxy sidecar (`proxy/`), `build-image.sh`, `start-proxy.sh` / `stop-proxy.sh`, the `GATE_CMD` default `run-fast-gate.sh` (v6 slice 1), and the worker/fixer dispatch `run-agent.sh` + `agent-entrypoint.sh` (v6 slice 3). See **Containerized FAST gate** and **Containerized worker/fixer** below. |
+| `test/statemachine-test.sh` | Drives the whole state machine in a throwaway sandbox (fake `gh`, stubbed gate + dispatches) — no real GitHub, no Opus tokens, no Docker (`GATE_CMD` and the `IMPL/FIX/REVIEW` seams are always stubbed). Scenarios A–T plus a DRY_RUN check (APPROVE, REQUEST_CHANGES, fast-RED, **container-dispatch timeout for worker + fixer**, budget exhaustion, idle-no-latch, protected-path, empty-review, gate-timeout, class-1 auto-merge + CI red/timeout/late-registering-check/unverified-merge/merge-failure, class-2 stop-at-PR, plus patch-guard CI-workflow rejection / apply-conflict / oversized-patch), 142 assertions total. Stubs produce patch files at `$PATCH_OUT`; a stub that exits `124` simulates a container-dispatch timeout. |
+| `sandbox/test/` | Manual/local Docker-dependent checks for the sandbox itself (image smoke test, proxy allowlist test, FAST-gate and worker/fixer infra-fault checks, coursier-cache speed check) — not part of `sbt test` or `statemachine-test.sh`. Run `sandbox/test/run-all.sh`. |
 | `logs/` | Per-pass `claude -p` logs, gate logs, rendered prompts, tamper + review + diff artefacts. Git-ignored. |
 
 ## Control flow (what `loop.sh` does)
 
-0. Startup: unless `IT_GATE_CMD` is overridden (test seam), `docker info` must succeed or the
-   whole loop `die`s before touching any issue — an unreachable Docker daemon must never
-   surface mid-run as a false IT-RED.
+0. Startup: unless `GATE_CMD` is overridden (test seam), the loop builds the sandbox image,
+   starts the proxy sidecar, and requires `ANTHROPIC_API_KEY` (the dedicated key handed to the
+   containerized worker/fixer) — any failure `die`s before touching an issue. There is no longer
+   a loop-level Docker preflight: `run-fast-gate.sh` and `run-agent.sh` each re-check Docker /
+   image / proxy at dispatch time and exit `124` (infra fault) if anything is stale.
 1. Guard: `STOP.md` present (a **manual** kill-switch — create it by hand to halt the loop) or
    `MAX_ITERS` hit → exit.
 2. Pick US (deterministic): resume an `in-progress` issue, else oldest `ready`. None → log idle,
@@ -123,31 +132,34 @@ origin/main, so this only ever bites out-of-band PRs.
    both **fatal** on failure (`die`) — every diff, tamper report, gate run and PR downstream is
    measured against `origin/main`, so a stale local base is never silently tolerated. Flip issue
    `ready`→`in-progress`.
-4. Dispatch the fresh **IMPL** `claude -p` (v0 worker prompt) **across the patch seam** (v6
-   slice 2, below): the worker edits the tree, but its output leaves only as an extracted patch
-   that the harness resets, inspects and `git apply`s. A `124` timeout → infra fault, exit `50`
-   (a half-finished worker must never reach the gates). A patch that will not apply → infra
-   fault, exit `50`, no budget spent. Nothing produced (empty patch) → leave in-progress, no PR
-   (exit `30`). A **patch-guard rejection** (protected path or oversized) terminates as
-   `FAIL(needs-human)` without entering the repair loop.
+4. Dispatch the fresh **IMPL** worker **inside the sandbox container** (v6 slice 3) **across the
+   patch seam** (v6 slice 2, below): `run-agent.sh` clones `origin/main` read-only, runs `claude
+   -p` with a dedicated `ANTHROPIC_API_KEY` reaching the network only through the proxy, and
+   returns the cumulative patch, which the harness resets, inspects and `git apply`s. A `124`
+   timeout → the container is **killed** and it exits infra fault `50` (a half-finished worker
+   must never reach the gates). A patch that will not apply → infra fault, exit `50`, no budget
+   spent. Nothing produced (empty patch) → leave in-progress, no PR (exit `30`). A **patch-guard
+   rejection** (protected path or oversized) terminates as `FAIL(needs-human)` without entering
+   the repair loop.
 5. **Repair loop** (shared budget of 2), each pass:
-   - Run the **FAST gate** (`sbt compile -Werror` + `sbt test`, `src/test` only, no Docker). A
-     `124` timeout → infra fault, exit `50`, no budget spent.
-     - **RED** → budget 0? terminate `FAIL(needs-human)`. Else spend one, dispatch **FIX**
-       (fast-gate-log tail spliced; a FIX timeout is also infra fault, exit `50`), re-loop.
-       **This short-circuits the IT gate** — no Docker.
-     - **GREEN** → run the **IT gate** (`sbt It/test`, `src/it` only, real PG). A `124` timeout
-       → infra fault, exit `50`.
-       - **IT-RED** → budget 0? terminate `FAIL(needs-human)`. Else spend one, dispatch **FIX**
-         (IT-gate-log tail spliced), re-loop.
-       - **IT-GREEN** → run the **tamper check** (`src/test` + `src/it`), then dispatch the
-         cold **REVIEWER**. A `124` timeout, or an empty/whitespace-only review, is an infra
-         fault (crashed/timed-out reviewer) → exit `50`, no budget spent. Grep the `VERDICT:`
-         sentinel on a non-empty review (missing → `REQUEST_CHANGES`, fail-safe — this is model
-         misbehavior, real signal, not an infra fault):
-         - `APPROVE` → terminate `SUCCESS`.
-         - `REQUEST_CHANGES` → budget 0? terminate `FAIL(needs-human)`. Else spend one,
-           dispatch **FIX** (review reasons + tamper spliced), re-loop.
+   - Run the **FAST gate** (`sbt compile -Werror` + `sbt test`, `src/test` only, containerized).
+     A `124` timeout → infra fault, exit `50`, no budget spent.
+     - **RED** → budget 0? terminate `FAIL(needs-human)`. Else spend one, dispatch **FIX** (in
+       the sandbox; fast-gate-log tail spliced; a FIX timeout is also infra fault, exit `50`),
+       re-loop.
+     - **GREEN** → run the **tamper check** (`src/test` + `src/it`), then dispatch the cold
+       **REVIEWER** (on the host — it authors no code; all mutating tools are denied). A `124`
+       timeout, or an empty/whitespace-only review, is an infra fault (crashed/timed-out
+       reviewer) → exit `50`, no budget spent. Grep the `VERDICT:` sentinel on a non-empty review
+       (missing → `REQUEST_CHANGES`, fail-safe — model misbehavior, real signal, not an infra
+       fault):
+       - `APPROVE` → terminate `SUCCESS`.
+       - `REQUEST_CHANGES` → budget 0? terminate `FAIL(needs-human)`. Else spend one, dispatch
+         **FIX** (review reasons + tamper spliced), re-loop.
+
+   The `src/it` integration tier has **no local gate**: it is judged by CI on the PR. On a
+   class-1 SUCCESS the auto-merge step waits for the required `build` check, and an **IT failure
+   there is CI-red → `needs-human`, no local self-repair** (the existing CI-red route).
 6. **Terminal:** commit, push, `gh pr create`. `SUCCESS` on a **class-1** issue hands off to
    **v4 auto-merge** (below) instead of flipping a label — the merge or a CI-red `needs-human`
    decides its fate. `SUCCESS` on **class-2/3** records the APPROVE + review and flips
@@ -166,31 +178,32 @@ Not every non-zero outcome is a code failure. `loop.sh` distinguishes **infra fa
 must never cost repair budget or bury the real signal under `needs-human`, from actual code or
 review failures:
 
-- **rc `50` — infra-fault terminal.** A gate timeout (rc `124`), a worker or reviewer
-  `claude -p` timeout (rc `124`), a **patch that fails to `git apply`** (v6 slice 2), or an
-  empty/whitespace-only reviewer output all exit the *whole loop* with `50`. The issue **keeps its `in-progress` label** (resumable next tick), **no
-  repair-budget unit is spent**, **no FIX is dispatched**, and **no PR is opened**. A non-empty
-  review that is simply missing the `VERDICT:` sentinel is treated differently — that is model
-  misbehavior, real signal — and still fail-safes to `REQUEST_CHANGES`, spending budget as usual.
-- **Docker preflight.** At startup, if `IT_GATE_CMD` is still the real `sbt It/test` (the test
-  seam not overridden), `docker info` must succeed or the loop dies immediately: "docker
-  unreachable (colima running?) — IT gate would fail for infra reasons". Skipped when the seam
-  is overridden. The FAST gate has the identical `GATE_OVERRIDDEN`-gated preflight (v6 slice
-  1): `docker info`, then `sandbox/build-image.sh` and `sandbox/start-proxy.sh`, both
-  die-on-failure, plus a `trap ... EXIT` that always runs `sandbox/stop-proxy.sh` when the loop
-  exits (normal exit or any `die`). At gate *time* (every pass, not just startup),
-  `sandbox/run-fast-gate.sh` re-checks Docker reachability, image presence and proxy liveness
-  itself and exits `124` — the loop's pre-existing rc-124-is-infra-fault convention — on any of
-  the three, so a sidecar that dies mid-run is never mistaken for a code failure. See
-  **Containerized FAST gate** below.
+- **rc `50` — infra-fault terminal.** A gate timeout (rc `124`), a **worker/fixer container
+  dispatch timeout** (rc `124` — the container is killed, no orphan) or reviewer timeout, a
+  missing sandbox image / dead proxy / unreachable Docker / missing API key at dispatch time, a
+  **patch that fails to `git apply`** (v6 slice 2), or an empty/whitespace-only reviewer output
+  all exit the *whole loop* with `50`. The issue **keeps its `in-progress` label** (resumable
+  next tick), **no repair-budget unit is spent**, **no FIX is dispatched**, and **no PR is
+  opened**. A non-empty review that is simply missing the `VERDICT:` sentinel is treated
+  differently — that is model misbehavior, real signal — and still fail-safes to
+  `REQUEST_CHANGES`, spending budget as usual.
+- **Sandbox preflight (v6).** At startup, when `GATE_CMD` is not overridden, the loop requires
+  `ANTHROPIC_API_KEY`, then runs `sandbox/build-image.sh` and `sandbox/start-proxy.sh` (both
+  die-on-failure), plus a `trap ... EXIT` that always runs `sandbox/stop-proxy.sh` when the loop
+  exits (normal exit or any `die`). There is **no loop-level `docker info` preflight** any more
+  (v6 slice 3 deleted it together with the local IT gate). At dispatch *time*,
+  `sandbox/run-fast-gate.sh` (the FAST gate) and `sandbox/run-agent.sh` (the worker/fixer) each
+  re-check Docker reachability, image presence and proxy liveness and exit `124` — the loop's
+  rc-124-is-infra-fault convention — on any failure, so a sidecar that dies mid-run is never
+  mistaken for a code failure. See **Containerized FAST gate** and **Containerized worker/fixer**
+  below.
 - **Patch seam (v6 slice 2).** Every agent dispatch (IMPL and each FIX) crosses an
   inspect-then-apply boundary rather than being committed straight from the tree the agent
-  edited (prefactor for the containerized worker: the worker still runs on the host here, but
-  its output already leaves as data). `stage_patch()` snapshots the cumulative diff vs
-  `origin/main` as a size-capped patch file, resets the tree to a pristine base, inspects the
-  patch, then `git apply --index`es it. The worker/fixer **stub contract** matches: a stub
-  writes `$PATCH_OUT` instead of editing the tree. A patch that will not apply is an **infra
-  fault** (exit `50`, no budget spent), never a gate failure.
+  edited. As of v6 slice 3 the agent runs **in the sandbox**: `run-agent.sh` returns the
+  cumulative diff vs `origin/main` as a patch file, which `stage_patch()` inspects (protected
+  path, size cap) then `git apply --index`es onto a pristine base. The worker/fixer **stub
+  contract** matches: a stub writes `$PATCH_OUT` instead of running a container. A patch that
+  will not apply is an **infra fault** (exit `50`, no budget spent), never a gate failure.
 - **Protected-path / oversized patch guard.** Enforced in bash, reading the file list straight
   out of the **patch** (`git apply --numstat`), because the worker/fixer runs with
   `--dangerously-skip-permissions`. A patch touching `harness/` (harness code), `.github/` (CI
@@ -234,8 +247,10 @@ The FAST gate (`GATE_CMD`) no longer runs `sbt compile test` on the host. `build
 agent-authored, so a hostile or merely buggy worker/fixer iteration could make a *host* gate
 lie. v6 reframes the threat model (issue #33/#34): the sandbox protects the host, GH Actions CI
 protects `main`, and a local gate is a productivity signal only — so the FAST gate now runs
-inside a locked-down container. This slice touches **only** the FAST gate: the worker, fixer,
-reviewer and IT gate are unchanged and still run on the host.
+inside a locked-down container. Slice 1 containerized **only** the FAST gate; v6 slice 3 then
+moved the **worker and fixer** into the same image (see **Containerized worker/fixer** below) and
+deleted the local IT gate. Only the reviewer still runs on the host — it authors no code (all
+mutating tools denied).
 
 - **The image** (`sandbox/Dockerfile`, tag `fes-harness-sandbox:v6`) — `eclipse-temurin:25-jdk`
   (matches the host's `.sdkmanrc` JDK 25 pin) plus sbt 1.12.9 (matches
@@ -278,22 +293,56 @@ reviewer and IT gate are unchanged and still run on the host.
   unreachable, the image missing, or the proxy sidecar dead — see **Infra faults vs code
   failures** above.
 - **The seam is untouched.** `GATE_CMD` is still a single overridable command string
-  (`GATE_OVERRIDDEN` mirrors the pre-existing `IT_GATE_OVERRIDDEN` pattern); `run_gate()` and
-  every rc-handling branch in `iterate()` needed zero changes.
+  (`GATE_OVERRIDDEN`); `run_gate()` and every rc-handling branch in `iterate()` needed zero
+  changes.
 
-## Environment the gate needs
+## Containerized worker/fixer (v6 slice 3)
 
-`loop.sh` exports these itself (override via env if your paths differ):
+The worker and fixer no longer run `claude -p` on the host — the last place agent-authored code
+executed outside a sandbox. `dispatch_worker()`'s real path calls `sandbox/run-agent.sh`, which:
+
+- **Clones `origin/main` read-only** via `git archive` into a throwaway `$HOME/.cache/...`
+  directory (no host `.git` ever enters the container — stronger than a `:ro` bind mount). The
+  in-container `agent-entrypoint.sh` commits that tree as the base (`HEAD == origin/main`), then
+  overlays the **prior cumulative patch** (`$CURRENT_PATCH`, empty on the initial IMPL) so a FIX
+  builds on prior work. The agent's diff is therefore cumulative-vs-`origin/main`, exactly what
+  `stage_patch()` applies onto a pristine base.
+- **Passes a dedicated, spend-capped `ANTHROPIC_API_KEY`** as a container env var — the only
+  credential in the container. No `GH_TOKEN`, no host `gh`/claude config, no host keychain. The
+  container joins `fes-sandbox-net` only, so it reaches the network **only through the proxy**
+  (`api.anthropic.com` is on the allowlist); `HTTP(S)_PROXY` + JVM proxy props are set so both
+  `claude`'s fetch and any `sbt` the agent runs go through it. Same non-root `gate` user,
+  `--cap-drop=ALL`, `--security-opt=no-new-privileges`, and coursier cache volume as the gate.
+- **Leaves its result as a patch** on an output volume (`/output/agent.patch`), copied back to
+  the harness's `$patch_out`. Only that patch crosses the boundary; the host tree is never
+  written by the agent.
+- **Is detached and awaited under `ITER_TIMEOUT`.** `gtimeout` kills only the docker *client*, so
+  on expiry `run-agent.sh`'s signal trap **kills the container** and exits `124` (infra fault) —
+  a client-side timeout alone would orphan a full claude container in the VM. Every infra fault
+  (timeout, missing image, dead proxy, unreachable Docker, missing API key, a prior patch that
+  will not apply) exits `124`, which `dispatch_worker()` maps to an rc-`50` terminal that spends
+  no repair budget.
+
+The state-machine test drives this seam with stubs (a stub writing `$PATCH_OUT`, or exiting
+`124` to simulate the dispatch timeout); `sandbox/test/agent-infra-fault-test.sh` covers the
+real `run-agent.sh` infra-fault exit codes without a live daemon.
+
+## Environment the loop needs
+
+`loop.sh` pins/exports these itself (override via env if your paths differ):
 
 - **JDK 25** (`.sdkmanrc` pins `java=25.0.2-open`). yaes 0.20.0 binds JDK 25's
   `StructuredTaskScope` API; under a newer default JDK (e.g. 26) **every** test aborts with
   `NoSuchMethodError` — a false RED that masks the real signal. `JAVA_HOME_PINNED` overrides.
-  (The FAST-gate container pins the same JDK 25 in its own image, independent of the host.)
-- **colima docker socket** (`DOCKER_HOST`, `TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE`,
-  `TESTCONTAINERS_RYUK_DISABLED`) so the Testcontainers IT finds Docker. **colima must be
-  running** (`colima start`) for the **IT gate** — and, as of v6 slice 1, for the **FAST
-  gate** too (it now runs its own sandbox container). Note: under colima, only `$HOME` is
-  mounted into the VM by default, so `run-fast-gate.sh` roots its throwaway clone under
+  (The sandbox image pins the same JDK 25 in its own image, independent of the host.)
+- **`ANTHROPIC_API_KEY`** — the dedicated, spend-capped key handed to the containerized
+  worker/fixer. Required at startup (the loop `die`s without it); nothing else from the host
+  environment enters the agent container.
+- **Docker via colima** — the loop no longer exports `DOCKER_HOST` or any `TESTCONTAINERS_*`
+  var (v6 slice 3 deleted that plumbing along with the local IT gate). The sandbox containers
+  reach the daemon through the docker CLI's active context (colima's socket on this setup), so
+  **colima must be running** (`colima start`). Note: under colima only `$HOME` is mounted into
+  the VM, so `run-fast-gate.sh` / `run-agent.sh` root their throwaway clones under
   `$HOME/.cache/fes-harness-sandbox` rather than the system `TMPDIR` — a plain `/tmp` (or
   macOS's real `TMPDIR`, `/var/folders/...`) is invisible to the Docker daemon there and would
   silently bind-mount an empty directory into the container.
@@ -309,13 +358,16 @@ harness/test/statemachine-test.sh   # exercise the state machine offline (no gh,
 ```
 
 Env: `MAX_ITERS` (default 1), `ITER_TIMEOUT` s (default 1800), `GATE_TIMEOUT` s (default 900),
-`IT_GATE_TIMEOUT` s (default 1200 — container startup), `REPAIR_BUDGET` (default 2), `DRY_RUN=1`.
+`REPAIR_BUDGET` (default 2), `DRY_RUN=1`. `ANTHROPIC_API_KEY` is required (handed to the
+containerized worker/fixer).
 
 **Test seams** (default to the real thing; used by `statemachine-test.sh` to force outcomes):
-`GATE_CMD` (fast tier), `IT_GATE_CMD` (IT tier), `IMPL_CMD`, `FIX_CMD`, `REVIEW_CMD`. A stub
-ignores the prompt and simulates the gate / agent — e.g. `IT_GATE_CMD=false` forces IT-RED,
-`REVIEW_CMD='echo "VERDICT: REQUEST_CHANGES"'`. Note: the gate seams run word-split (not shell
-`eval`), so a **stateful** gate stub must be a script on `PATH`, not an inline compound.
+`GATE_CMD` (FAST tier), `IMPL_CMD`, `FIX_CMD`, `REVIEW_CMD`. A stub ignores the prompt and
+simulates the gate / agent — e.g. `GATE_CMD=false` forces fast-RED, `IMPL_CMD='exit 124'`
+simulates a container-dispatch timeout, `REVIEW_CMD='echo "VERDICT: REQUEST_CHANGES"'`. Note:
+the gate seam runs word-split (not shell `eval`), so a **stateful** gate stub must be a script on
+`PATH`, not an inline compound. Overriding `GATE_CMD` also skips the sandbox preflight, so the
+suite needs neither Docker nor an API key.
 
 ## Watching a live run
 

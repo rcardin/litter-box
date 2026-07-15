@@ -23,6 +23,8 @@ fail=0
 "$SCRIPT_DIR/test/image-smoke-test.sh" || fail=1
 "$SCRIPT_DIR/test/proxy-allowlist-test.sh" || fail=1
 "$SCRIPT_DIR/test/infra-fault-test.sh" || fail=1
+"$SCRIPT_DIR/test/agent-infra-fault-test.sh" || fail=1
+"$SCRIPT_DIR/test/agent-entrypoint-test.sh" || fail=1
 
 echo "== AC6: coursier cache volume speed check (first run vs second run) ==" >&2
 cd "$REPO_ROOT"

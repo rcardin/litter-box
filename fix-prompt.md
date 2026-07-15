@@ -42,10 +42,11 @@ issue other than this one.
 
 - The failure above is resolved.
 - The acceptance criteria in the issue are implemented.
-- `sbt -Werror compile` is clean and `sbt test` (the fast in-memory tier) is green locally.
-- If any `src/it` test exists, `sbt It/test` (the real-Postgres tier) is green locally too.
+- `sbt -Werror compile` is clean and `sbt test` (the fast in-memory tier) is green.
+- If any `src/it` test exists, keep it correct: CI (a real-Postgres runner) judges it, not a
+  local gate, so it must be self-contained and pass against a fresh Postgres.
 - Every acceptance criterion maps to at least one test.
 
-When you believe you are done, stop. The harness re-runs the fast (in-memory) gate, then the IT
-(real-Postgres) gate, then the independent reviewer. You do not report success — the gates and
-the reviewer do.
+When you believe you are done, stop. The harness re-runs the fast (in-memory) gate, then the
+independent reviewer, and lets CI run the real-Postgres integration tests. You do not report
+success — the gate, the reviewer, and CI do.

@@ -14,19 +14,17 @@
 #   - `needs-human` terminal: budget exhaustion (RED or REQUEST_CHANGES) still opens a PR for
 #     the audit trail but flips the issue to needs-human instead of needs-review.
 #
-# v2 splits the single gate into two tiers by source directory (src/test = in-memory,
-# Docker-free; src/it = Testcontainers real-PG):
-#   - FAST gate (GATE_CMD, `sbt compile test`) runs only src/test — no Docker on every iter.
-#   - IT gate (IT_GATE_CMD, `sbt It/test`) runs only src/it and fires AFTER fast-GREEN and
-#     BEFORE the reviewer, so the reviewer only ever judges a unit+IT-green diff.
-#   - fast-RED short-circuits the IT gate (Docker never paid for a unit-failing iter).
-#   - the repair budget stays SHARED and stays 2: fast-RED, IT-RED, and REQUEST_CHANGES all
-#     draw from the same pool. The tamper diff now also covers src/it.
+# v2 split the single gate into two tiers by source directory (src/test = in-memory; src/it =
+# Testcontainers real-PG). v6 slice 3 REMOVED the local IT tier (see below): the loop now runs
+# only the FAST gate (GATE_CMD, `sbt compile test`, src/test), and the real-PG src/it tier is
+# judged by GitHub Actions on the PR. The repair budget stays SHARED and stays 2: fast-RED and
+# REQUEST_CHANGES draw from the same pool. The tamper diff still covers src/it (an agent must
+# not gut an IT to dodge the CI judge).
 #
 # v3 (GitHub Actions CI `build` check + branch protection on main) shipped OUTSIDE this
 # script, followed by a hardening pass: infra-fault terminal rc 50 (timeouts and empty
-# reviewer output exit for inspection WITHOUT spending the repair budget), a docker
-# preflight before the real IT gate, protected-path enforcement in bash (harness/, docs/,
+# reviewer output exit for inspection WITHOUT spending the repair budget), protected-path
+# enforcement in bash (harness/, docs/,
 # .github/, PROMPT.md, CONTEXT.md, STOP.md), and a fatal stale-base guard.
 #
 # v4 (this revision) adds the auto-merge terminal, class-1 only: on reviewer APPROVE the
@@ -39,52 +37,54 @@
 # fires the notify seam (NTFY_TOPIC / NOTIFY_CMD; also fired on every needs-human terminal
 # and every rc 50 exit).
 #
-# v6 slice 1 (this revision) containerizes the FAST gate only (worker, fixer, reviewer, and
-# the IT gate are untouched — this is slice 1 of a bigger rollout, see issue #33/#34). GATE_CMD
-# now defaults to harness/sandbox/run-fast-gate.sh: it snapshots the staged index via
-# `git write-tree` + `git archive` into a throwaway dir (no live bind mount, no .git in the
-# container), then runs `sbt compile test` inside a pinned, non-root, no-credentials image on
-# an isolated Docker network (fes-sandbox-net) that can reach nothing but an egress-
-# allowlisting proxy sidecar (fes-sandbox-proxy — versioned allowlist at
-# harness/sandbox/proxy/allowlist). A self-populating named volume caches coursier downloads
-# across runs; it is mounted only inside gate containers, never by any host sbt process. The
-# gate seam contract is untouched: GATE_CMD is still a single overridable command string, and
-# the wrapper reuses the existing rc-124-is-infra-fault convention for every infra problem
-# (missing image, dead proxy, unreachable Docker) so run_gate()'s dispatch logic needed zero
-# changes. See harness/README.md "Containerized FAST gate" for the full design.
+# v6 slice 1 containerized the FAST gate: GATE_CMD defaults to harness/sandbox/run-fast-gate.sh,
+# which snapshots the staged index via `git write-tree` + `git archive` into a throwaway dir (no
+# live bind mount, no .git in the container), then runs `sbt compile test` inside a pinned, non-
+# root, no-credentials image on an isolated Docker network (fes-sandbox-net) that can reach nothing
+# but an egress-allowlisting proxy sidecar (fes-sandbox-proxy — versioned allowlist at
+# harness/sandbox/proxy/allowlist). A self-populating named volume caches coursier downloads across
+# runs, mounted only inside sandbox containers, never by any host sbt process. The gate seam
+# contract is a single overridable command string reusing the rc-124-is-infra-fault convention for
+# every infra problem. See harness/README.md "Containerized FAST gate".
 #
-# v6 slice 2 (this revision) reworks the code path so agent output crosses an inspect-then-apply
-# boundary instead of being committed straight from the tree the agent edited (prefactor: the
-# worker still runs on the host, but its output now leaves as a PATCH — a future slice swaps the
-# host tree edit for a container that hands back a patch the same way). After every worker/fixer
-# dispatch, stage_patch() takes the cumulative diff against origin/main as a size-capped patch
-# file, resets the tree to a pristine base, guards the patch (protected-path guard now reads the
-# PATCH and spells out CI workflows/.github, harness code/harness, and the constitution CONTEXT.md;
-# plus a byte-size cap MAX_PATCH_BYTES), and applies it with `git apply --index`. A patch that will
-# not apply is an infra fault (rc 50, no budget), NOT a gate failure; a guard rejection routes to
-# needs-human exactly as the original tree guard did. The test-tamper numstat check now reads the
-# patch too. The worker/fixer STUB contract changes: a stub PRODUCES a patch at $PATCH_OUT instead
-# of editing the tree in place — the patch-extraction point is the seam boundary.
+# v6 slice 2 reworked the code path so agent output crosses an inspect-then-apply boundary instead
+# of being committed straight from the tree the agent edited. After every worker/fixer dispatch,
+# stage_patch() takes the cumulative diff against origin/main as a size-capped patch file, resets
+# the tree to a pristine base, guards the patch (protected-path guard reads the PATCH and spells out
+# CI workflows/.github, harness code/harness, and the constitution CONTEXT.md; plus a byte-size cap
+# MAX_PATCH_BYTES), and applies it with `git apply --index`. A patch that will not apply is an infra
+# fault (rc 50, no budget), NOT a gate failure; a guard rejection routes to needs-human. The worker/
+# fixer STUB contract: a stub PRODUCES a patch at $PATCH_OUT — the patch-extraction point is the seam.
 #
-# Still NOT here (deferred): convention-lint gate step, auto-merge for class-2/3, cost cap
-# in dollars (MAX_ITERS is the ceiling), container isolation for worker/fixer/reviewer/IT gate
-# (planned as #36/#37).
+# v6 slice 3 (this revision) moves the agent itself into the sandbox and removes the last host
+# execution of agent-authored code. dispatch_worker()'s real path now calls
+# harness/sandbox/run-agent.sh instead of a host `claude -p`: the container clones origin/main
+# (git archive, read-only), overlays the prior cumulative patch, runs claude with a DEDICATED
+# spend-capped ANTHROPIC_API_KEY reaching the network only through the proxy, and leaves the
+# cumulative patch on an output volume. Containers are detached and awaited under ITER_TIMEOUT; on
+# expiry run-agent.sh kills the container (a client-side timeout alone would orphan it) and exits
+# 124 (infra fault, no repair budget). In the same slice the LOCAL IT gate, the Docker preflight,
+# and the colima socket env plumbing are deleted: GitHub Actions (already a required check on
+# protected main, and it runs `sbt It/test`) becomes the sole Testcontainers judge, and an IT-red
+# PR follows the existing CI-red path (comment, needs-human, halt — no local self-repair).
+#
+# Still NOT here (deferred): convention-lint gate step, auto-merge for class-2/3, cost cap in
+# dollars (MAX_ITERS is the ceiling), and containerizing the reviewer (planned as #37; it runs on
+# the host but authors no code — all mutating tools are denied).
 #
 # The loop never lets the model choose what to work on: bash resolves all state with `gh`
 # queries and dispatches narrow, fresh `claude -p` tasks. Every dispatch is fresh context.
 #
 # Usage:   harness/loop.sh
 # Env:     MAX_ITERS      hard cap on US count               (default 1)
-#          ITER_TIMEOUT   per-dispatch claude -p timeout, s  (default 1800)
+#          ITER_TIMEOUT   per-dispatch agent timeout, s      (default 1800)
 #          GATE_TIMEOUT   per-fast-gate sbt budget, s        (default 900)
-#          IT_GATE_TIMEOUT per-IT-gate sbt budget, s         (default 1200 — container startup)
 #          DRY_RUN        1 = stop before invoking claude -p and before any push/PR
 #          REPAIR_BUDGET  shared fix budget per US           (default 2)
 #          MAX_PATCH_BYTES size cap on an extracted patch, B  (default 1000000 — v6 slice 2)
 #          -- test seams (default to the real thing; overridden by the state-machine test) --
 #          GATE_CMD       the fast (src/test) gate command   (default: harness/sandbox/run-fast-gate.sh,
 #                                                              a containerized `sbt compile test` — v6 slice 1)
-#          IT_GATE_CMD    the IT (src/it) gate command       (default sbt It/test)
 #          IMPL_CMD       stub for the worker dispatch       (default: real claude -p)
 #          FIX_CMD        stub for the fix dispatch          (default: real claude -p)
 #          REVIEW_CMD     stub for the reviewer dispatch     (default: real claude -p)
@@ -104,9 +104,8 @@ REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 
 MAX_ITERS="${MAX_ITERS:-1}"
-ITER_TIMEOUT="${ITER_TIMEOUT:-1800}"   # per-dispatch claude -p budget, seconds
+ITER_TIMEOUT="${ITER_TIMEOUT:-1800}"   # per-dispatch agent budget, seconds (container killed on expiry)
 GATE_TIMEOUT="${GATE_TIMEOUT:-900}"    # per-fast-gate sbt compile+test budget, seconds
-IT_GATE_TIMEOUT="${IT_GATE_TIMEOUT:-1200}"  # per-IT-gate budget, seconds (Docker container startup)
 DRY_RUN="${DRY_RUN:-0}"
 REPAIR_BUDGET="${REPAIR_BUDGET:-2}"    # shared across gate-RED and REQUEST_CHANGES per US
 MAX_PATCH_BYTES="${MAX_PATCH_BYTES:-1000000}"  # size cap (bytes) on an extracted agent patch (v6 slice 2)
@@ -122,18 +121,15 @@ mkdir -p "$LOG_DIR"
 
 # Test seams: default empty -> real `claude -p`; the state-machine test overrides them with
 # deterministic stubs so it can force RED / REQUEST_CHANGES / budget exhaustion for free.
-# Capture whether the FAST/IT gate seams were overridden BEFORE applying their defaults: the
-# sandbox/docker preflights below only apply to the real gate commands, never to test stubs.
+# Capture whether the FAST gate seam was overridden BEFORE applying its default: the sandbox
+# preflight below (image build + proxy) only applies to the real containerized gate and agent,
+# never to test stubs. The state-machine test overrides GATE_CMD together with IMPL/FIX, so a
+# skipped preflight always coincides with a stubbed worker/fixer — no container is ever needed.
 GATE_OVERRIDDEN=0
 if [[ -n "${GATE_CMD:-}" ]]; then GATE_OVERRIDDEN=1; fi
-IT_GATE_OVERRIDDEN=0
-if [[ -n "${IT_GATE_CMD:-}" ]]; then IT_GATE_OVERRIDDEN=1; fi
-# v6 slice 1: the FAST gate now runs in a container (harness/sandbox/) instead of on the host
-# — see harness/sandbox/run-fast-gate.sh and the changelog paragraph above. Exit code contract
-# is unchanged (0 green, 124 infra fault, anything else red), so run_gate()/iterate() needed
-# no changes at all.
+# v6 slice 1: the FAST gate runs in a container (harness/sandbox/run-fast-gate.sh) instead of on
+# the host. Exit code contract is unchanged (0 green, 124 infra fault, anything else red).
 GATE_CMD="${GATE_CMD:-$SCRIPT_DIR/sandbox/run-fast-gate.sh}"
-IT_GATE_CMD="${IT_GATE_CMD:-sbt -batch -no-colors It/test}"
 IMPL_CMD="${IMPL_CMD:-}"
 FIX_CMD="${FIX_CMD:-}"
 REVIEW_CMD="${REVIEW_CMD:-}"
@@ -189,30 +185,27 @@ if [[ -x "$JAVA_HOME_PINNED/bin/java" ]]; then
 else
   log "WARNING: pinned JDK not at $JAVA_HOME_PINNED — gate runs under default java (may abort)"
 fi
-# Testcontainers under colima needs the docker socket pointed explicitly (see memory note).
-export DOCKER_HOST="${DOCKER_HOST:-unix://$HOME/.colima/default/docker.sock}"
-export TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE="${TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE:-/var/run/docker.sock}"
-export TESTCONTAINERS_RYUK_DISABLED="${TESTCONTAINERS_RYUK_DISABLED:-true}"
+# v6 slice 3: the local IT gate is gone (GitHub Actions is the sole Testcontainers judge), so the
+# colima socket / Testcontainers env plumbing that only served the host IT gate is deleted. The
+# sandbox containers reach the daemon through the docker CLI's active context (colima's socket on
+# this setup), and run-fast-gate.sh / run-agent.sh each do their own gate-time `docker info` infra
+# check, so no loop-level Docker preflight is needed.
 
 command -v gh    >/dev/null || die "gh not found"
 command -v sbt   >/dev/null || die "sbt not found"
 command -v claude >/dev/null || die "claude not found"
-# Docker reachability probe — needed if EITHER the IT gate or the FAST-gate sandbox will run
-# containerized (both need a reachable colima daemon; a mid-run failure looks like a false
-# gate-RED and burns repair budget, so refuse to start instead). Skipped only when BOTH
-# seams are overridden (state-machine tests touch no Docker).
-if [[ "$IT_GATE_OVERRIDDEN" == "0" || "$GATE_OVERRIDDEN" == "0" ]]; then
-  docker info >/dev/null 2>&1 || die "docker unreachable (colima running?) — gates would fail for infra reasons"
-fi
-# FAST-gate sandbox preflight (v6 slice 1): build the image, start the proxy sidecar, and make
-# sure it always stops on loop exit — normal exit or any die(). A dead/missing sidecar or a
-# stale image would otherwise surface as a false gate-RED, burning repair budget on what is
-# really an infra problem; run-fast-gate.sh itself also re-checks all three at gate time and
-# exits 124 (infra fault, no budget spent) if anything has gone stale mid-run. Skipped when
-# GATE_CMD is overridden — the state-machine test never touches Docker for the FAST-gate seam.
+# Sandbox preflight (v6): build the image, start the proxy sidecar, and always stop it on loop
+# exit — normal exit or any die(). It covers BOTH the containerized FAST gate AND the now-
+# containerized worker/fixer (same image, same proxy). A dead/missing sidecar or a stale image
+# would surface as a false gate-RED / infra fault; run-fast-gate.sh and run-agent.sh re-check at
+# dispatch time and exit 124 (infra fault, no budget spent) if anything has gone stale mid-run.
+# Skipped when GATE_CMD is overridden — the state-machine test overrides it together with the
+# IMPL/FIX seams, so a skipped preflight always coincides with stubbed, container-free dispatches.
 if [[ "$GATE_OVERRIDDEN" == "0" ]]; then
-  "$SCRIPT_DIR/sandbox/build-image.sh" || die "FAST-gate sandbox image build failed"
-  "$SCRIPT_DIR/sandbox/start-proxy.sh" || die "FAST-gate sandbox proxy failed to start"
+  [[ -n "${ANTHROPIC_API_KEY:-}" ]] \
+    || die "ANTHROPIC_API_KEY not set — the sandboxed worker/fixer has no other way to authenticate"
+  "$SCRIPT_DIR/sandbox/build-image.sh" || die "sandbox image build failed"
+  "$SCRIPT_DIR/sandbox/start-proxy.sh" || die "sandbox proxy failed to start"
   trap '"$SCRIPT_DIR/sandbox/stop-proxy.sh" >/dev/null 2>&1 || true' EXIT
 fi
 for f in "$ITERATE_PROMPT" "$FIX_PROMPT" "$REVIEW_PROMPT"; do
@@ -242,9 +235,9 @@ render_template() {
 # Returns the ACTUAL command exit code: 0 = green, 124 = timeout (an infra fault — callers
 # must treat it as terminal, not RED, and must NOT spend repair budget on it), any other
 # non-zero = red. -Werror is already in build.sbt scalacOptions.
-# Parametrised over (label, command, timeout, logfile) so both tiers share the timeout-
-# wrapping logic: the FAST tier (GATE_CMD, src/test — Docker-free after the v2 split) and
-# the IT tier (IT_GATE_CMD, src/it — real PG via Testcontainers). Both are test seams.
+# Parametrised over (label, command, timeout, logfile). v6 slice 3 removed the local IT tier
+# (CI is now the sole Testcontainers judge), so this drives only the FAST tier (GATE_CMD,
+# containerized `sbt compile test`) and the CI-wait. GATE_CMD is a test seam.
 run_gate() {
   local label="$1" cmd="$2" tmo="$3" logfile="$4"
   log "$label gate: $cmd (timeout ${tmo}s) -> $logfile"
@@ -259,46 +252,45 @@ run_gate() {
 # Writes a stream-json JSONL log (one event per turn) so harness/tail-claude.sh can follow it
 # live; bash reads only the exit code. Honours the IMPL_CMD / FIX_CMD seams (a stub command
 # that ignores the prompt and simulates the agent).
-# Real path: returns 124 when claude -p hits the timeout (infra fault — the caller must not
-# let a half-finished worker fall through to the gates), 0 otherwise. Stub overrides keep
-# the always-return-0 behavior: they simulate the agent, their rc is meaningless.
-# v6 slice 2: the dispatch's OUTPUT is a patch file at $patch_out — the seam boundary. The
-# real worker/fixer still edits the host tree, but bash immediately snapshots the cumulative
-# diff against origin/main into $patch_out (stage_patch() then resets the tree and re-applies
-# it under inspection). A stub honours the same contract by writing $PATCH_OUT itself instead
-# of editing the tree, so the state-machine test drives the patch seam without a real agent.
+# Real path (v6 slice 3): the agent runs INSIDE the sandbox container. run-agent.sh clones
+# origin/main read-only, overlays the prior cumulative patch, runs claude with a dedicated
+# spend-capped ANTHROPIC_API_KEY reaching the network only through the proxy, and writes the
+# cumulative-vs-origin/main patch to $patch_out. It returns 124 on timeout (it kills the
+# container — gtimeout alone would orphan it) or any infra fault, 0 otherwise; the caller must
+# not let a half-finished worker fall through to the gates. Stub overrides simulate the agent by
+# writing $PATCH_OUT themselves; a stub that exits 124 simulates the container-dispatch timeout.
+#
+# $CURRENT_PATCH is the prior cumulative work seeding the container's tree: empty on the initial
+# IMPL, and the last applied patch on a FIX (stage_patch resets the tree only AFTER this returns,
+# so CURRENT_PATCH still points at the prior pass here).
 dispatch_worker() {
   local role="$1" prompt="$2" logf="$3" patch_out="$4" override="" rc=0
   case "$role" in
     IMPL) override="$IMPL_CMD";;
     FIX)  override="$FIX_CMD";;
   esac
-  log "dispatching $role claude -p -> $logf (patch -> $patch_out)"
+  log "dispatching $role agent -> $logf (patch -> $patch_out)"
   if [[ -n "$override" ]]; then
     ( export PATCH_OUT="$patch_out"; eval "$override" ) >"$logf" 2>&1 || rc=$?
     log "$role stub exited rc=$rc"
+    (( rc == 124 )) && return 124        # a stub can simulate the container-dispatch timeout
     return 0
   fi
-  local args=(-p "$prompt" --dangerously-skip-permissions --output-format stream-json --verbose)
+  # The container reads the prompt from a file (it can be large; a mount is cleaner than an arg).
+  local prompt_file; prompt_file="$(mktemp)"
+  printf '%s' "$prompt" > "$prompt_file"
+  local runner=("$SCRIPT_DIR/sandbox/run-agent.sh" "$prompt_file" "$patch_out" "${CURRENT_PATCH:-}")
   if [[ -n "$TIMEOUT_BIN" ]]; then
-    "$TIMEOUT_BIN" "$ITER_TIMEOUT" claude "${args[@]}" >"$logf" 2>&1 || rc=$?
+    "$TIMEOUT_BIN" "$ITER_TIMEOUT" "${runner[@]}" >"$logf" 2>&1 || rc=$?
   else
-    claude "${args[@]}" >"$logf" 2>&1 || rc=$?
+    "${runner[@]}" >"$logf" 2>&1 || rc=$?
   fi
+  rm -f "$prompt_file"
   if [[ "$rc" == "124" ]]; then
-    log "WARNING: $role claude -p hit the ${ITER_TIMEOUT}s timeout"
+    log "WARNING: $role sandbox dispatch failed rc=124 (${ITER_TIMEOUT}s timeout or infra fault: missing image/proxy/Docker/API key/prior-patch)"
     return 124
   fi
-  log "$role claude -p exited rc=$rc"
-  # Extract the agent's work as a patch (cumulative diff against the base branch). This is the
-  # ONLY thing that leaves the dispatch — stage_patch() inspects and applies it; the tree the
-  # agent edited is never committed directly.
-  git add -A
-  # --no-renames is what keeps the protected-path guard rename-proof: with rename detection ON,
-  # a file renamed INTO a protected dir emits a brace token (harness/foo => harness/evil or
-  # {old => harness/evil}) that harness/* would NOT match, slipping past the guard. --no-renames
-  # records a rename as a delete plus an add, so the concrete destination path appears literally.
-  git diff --cached --no-renames origin/main > "$patch_out"
+  log "$role sandbox dispatch exited rc=$rc (patch written by the container)"
   return 0
 }
 
@@ -725,7 +717,11 @@ iterate() {
     pass=$((pass + 1))
     git add -A                                        # stage so new files show in diff/gate/tamper
 
-    # --- FAST tier: src/test only (no Docker after the v2 split) -----------------------
+    # --- FAST tier: src/test only, containerized (v6 slice 1) --------------------------
+    # v6 slice 3: this is the ONLY local gate. Integration tests (src/it, real Postgres via
+    # Testcontainers) are judged by GitHub Actions on the PR — the required `build` check runs
+    # `sbt It/test`, so an IT failure surfaces as CI-red on the auto-merge path (needs-human,
+    # no local self-repair), never as a local gate here.
     CUR_PASS="$pass"
     local gate_log="$LOG_DIR/issue-${issue}-pass${pass}.gate.log"
     local gate_rc=0
@@ -741,7 +737,7 @@ iterate() {
       log "FAST gate RED (pass $pass, see $gate_log)"
       if (( budget == 0 )); then outcome="FAIL"; break; fi
       budget=$((budget - 1)); CUR_BUDGET="$budget"
-      log "self-repair: budget now $budget — dispatching FIX for gate-RED (IT gate short-circuited)"
+      log "self-repair: budget now $budget — dispatching FIX for gate-RED"
       local fail_file="$LOG_DIR/issue-${issue}-pass${pass}.failure.md"
       {
         printf '## Fast-gate failure — `%s` (compile under -Werror, then in-memory tests)\n\n' "$GATE_CMD"
@@ -753,45 +749,12 @@ iterate() {
       handle_fix_result; local hf=$?
       (( hf == 50 )) && return 50
       (( hf == 2 ))  && break
-      continue                                        # short-circuits the IT gate (no Docker paid)
-    fi
-    log "FAST gate GREEN (pass $pass) — running IT gate (real PG)"
-    phase FAST_GATE ok "$gate_log"
-
-    # --- IT tier: src/it only (Testcontainers real PG). Only reached on fast-GREEN. ----
-    local it_gate_log="$LOG_DIR/issue-${issue}-pass${pass}.it-gate.log"
-    local it_gate_rc=0
-    phase IT_GATE start "$it_gate_log"
-    run_gate "IT" "$IT_GATE_CMD" "$IT_GATE_TIMEOUT" "$it_gate_log" || it_gate_rc=$?
-    if (( it_gate_rc == 124 )); then
-      log "WARNING: IT gate hit the ${IT_GATE_TIMEOUT}s timeout — infra fault, not a code failure"
-      return 50
-    fi
-    if (( it_gate_rc != 0 )); then
-      gate_status="IT-RED"; failure_kind="IT-gate-RED"
-      phase IT_GATE red "$it_gate_log"
-      log "IT gate RED (pass $pass, see $it_gate_log)"
-      if (( budget == 0 )); then outcome="FAIL"; break; fi
-      budget=$((budget - 1)); CUR_BUDGET="$budget"
-      log "self-repair: budget now $budget — dispatching FIX for IT-gate-RED"
-      local fail_file="$LOG_DIR/issue-${issue}-pass${pass}.failure.md"
-      {
-        printf '## IT-gate failure — `%s` (Testcontainers real-Postgres integration tests)\n\n' "$IT_GATE_CMD"
-        printf 'The in-memory fast tier passed; the real-PG integration tier (src/it) failed.\n\n'
-        printf 'Tail of the IT-gate log:\n\n```\n'
-        tail -n 200 "$it_gate_log"
-        printf '\n```\n'
-      } >"$fail_file"
-      dispatch_fix "$pass" "$fail_file"
-      handle_fix_result; local hf=$?
-      (( hf == 50 )) && return 50
-      (( hf == 2 ))  && break
       continue
     fi
 
     gate_status="GREEN"
-    log "FAST + IT gates GREEN (pass $pass) — running tamper check + cold reviewer"
-    phase IT_GATE ok "$it_gate_log"
+    log "FAST gate GREEN (pass $pass) — running tamper check + cold reviewer"
+    phase FAST_GATE ok "$gate_log"
 
     # Tamper check feeds the reviewer (bash surfaces, does not block).
     local tamper_file="$LOG_DIR/issue-${issue}-tamper.md"
@@ -884,7 +847,7 @@ iterate() {
   elif [[ "$outcome" == "SUCCESS" ]]; then
     label="needs-review"
     commit_tag="reviewer APPROVE, gate ${gate_status}"
-    pr_note="**Reviewer: APPROVE** · gate ${gate_status} (in-memory + real-PG IT tiers both green). Not class-1, so not auto-merged: a human reviews and merges."
+    pr_note="**Reviewer: APPROVE** · gate ${gate_status} (containerized in-memory FAST tier green; the real-PG IT tier is judged by CI on this PR). Not class-1, so not auto-merged: a human reviews and merges."
   elif [[ "$failure_kind" == "protected-path" || "$failure_kind" == "oversized-patch" ]]; then
     label="needs-human"
     commit_tag="patch guard rejection (${failure_kind}), gate ${gate_status}"

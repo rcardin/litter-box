@@ -23,7 +23,6 @@ def chip_name($p):
   if   $p=="PICK"      then "pick"
   elif $p=="IMPL"      then "impl"
   elif $p=="FAST_GATE" then "fast"
-  elif $p=="IT_GATE"   then "IT"
   elif $p=="REVIEW"    then "rev"
   elif $p=="PR"        then "pr"
   elif $p=="CI_WAIT"   then "ci"
@@ -53,7 +52,7 @@ else
   # over", so the phase map is scoped to events at or after the LAST PICK, the start of the
   # in-flight iteration. That scoping fixes two things at once: a DONE from a finished
   # earlier iteration can no longer be mistaken for the run being over, and chips from that
-  # finished iteration (its FAST_GATE/IT_GATE ticks etc) can no longer paint the in-flight
+  # finished iteration (its FAST_GATE ticks etc) can no longer paint the in-flight
   # iteration row. If a run somehow has no PICK, fall back to using the whole run.
   | ([ range(0; ($ev|length)) | select($ev[.].phase == "PICK") ] | last) as $pickIdx
   | (if $pickIdx != null then $ev[$pickIdx:] else $ev end) as $cev
@@ -73,7 +72,7 @@ else
 
     ( "US-\($last.issue) · iter \($last.iter) · pass \($last.pass) · budget \($last.budget)" ),
 
-    ( ([ "PICK", "IMPL", "FAST_GATE", "IT_GATE" ] | map(chip(.)) | join("  "))
+    ( ([ "PICK", "IMPL", "FAST_GATE" ] | map(chip(.)) | join("  "))
       + (if $fixes > 0 then "  ↺ fix \($fixes)" else "" end) ),
 
     ( [ "REVIEW", "PR", "CI_WAIT", "MERGE" ] | map(chip(.)) | join("  ") ),

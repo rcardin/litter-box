@@ -22,19 +22,19 @@ ev() { # ev TS PHASE STATE PASS BUDGET [LOGFILE] [DETAIL] [ISSUE] [RUN] [ITER]
     "$1" "${9:-100}" "${10:-1}" "${8:-5}" "$2" "$3" "$4" "$5" "${6:-}" "${7:-}"
 }
 
-echo "== Fixture A: IT gate running, loop alive -> running banner with elapsed =="
+# v6 slice 3 removed the local IT gate, so the banner's fixed chip row is PICK/IMPL/FAST_GATE
+# only — no IT_GATE chip. Integration tests are judged by CI (surfaced on the PR / CI_WAIT chip).
+echo "== Fixture A: fast gate running, loop alive -> running banner with elapsed =="
 F="$SB/a.jsonl"
 { ev 100 PICK      ok    0 2
   ev 101 IMPL      start 0 2 harness/logs/issue-5-iter1.claude.log
   ev 500 IMPL      ok    0 2 harness/logs/issue-5-iter1.claude.log
-  ev 501 FAST_GATE start 1 2 harness/logs/issue-5-pass1.gate.log
-  ev 600 FAST_GATE ok    1 2 harness/logs/issue-5-pass1.gate.log
-  ev 748 IT_GATE   start 1 2 harness/logs/issue-5-pass1.it-gate.log
+  ev 748 FAST_GATE start 1 2 harness/logs/issue-5-pass1.gate.log
 } > "$F"
 out="$(render_banner "$F" 1 1000)"
 check "A line count is 4"  "4" "$(echo "$out" | wc -l | tr -d ' ')"
 check "A header"  "US-5 · iter 1 · pass 1 · budget 2"    "$(line "$out" 1)"
-check "A chips 1" "✓ pick  ✓ impl  ✓ fast  ▶ IT 4m12s"   "$(line "$out" 2)"
+check "A chips 1" "✓ pick  ✓ impl  ▶ fast 4m12s"         "$(line "$out" 2)"
 check "A chips 2" "· rev  · pr  · ci  · merge"           "$(line "$out" 3)"
 check "A status"  "RUNNING (pid 4711)"                   "$(line "$out" 4)"
 
@@ -55,18 +55,17 @@ F="$SB/b.jsonl"
 } > "$F"
 out="$(render_banner "$F" 1 1000)"
 check "B header"  "US-5 · iter 1 · pass 3 · budget 0"  "$(line "$out" 1)"
-check "B chips 1" "✓ pick  ✓ impl  ✗ fast  · IT  ↺ fix 2" "$(line "$out" 2)"
+check "B chips 1" "✓ pick  ✓ impl  ✗ fast  ↺ fix 2"    "$(line "$out" 2)"
 check "B status"  "RUNNING (pid 4711)"                 "$(line "$out" 4)"
 
 echo "== Fixture C: pid dead, no terminal event -> stale, names the phase =="
 F="$SB/c.jsonl"
 { ev 100 PICK      ok    0 2
   ev 101 IMPL      ok    0 2 harness/logs/issue-5-iter1.claude.log
-  ev 500 FAST_GATE ok    1 2 harness/logs/issue-5-pass1.gate.log
-  ev 748 IT_GATE   start 1 2 harness/logs/issue-5-pass1.it-gate.log
+  ev 748 FAST_GATE start 1 2 harness/logs/issue-5-pass1.gate.log
 } > "$F"
 out="$(render_banner "$F" 0 1000)"
-check "C status is stale, names phase" "STALE (loop died in IT)" "$(line "$out" 4)"
+check "C status is stale, names phase" "STALE (loop died in fast)" "$(line "$out" 4)"
 check "C line count is 4" "4" "$(echo "$out" | wc -l | tr -d ' ')"
 
 echo "== Fixture D: terminal event rc=50 -> infra-fault banner, wins over liveness =="
@@ -74,12 +73,11 @@ F="$SB/d.jsonl"
 { ev 100 PICK      ok    0 2
   ev 101 IMPL      ok    0 2 harness/logs/issue-5-iter1.claude.log
   ev 500 FAST_GATE ok    1 2 harness/logs/issue-5-pass1.gate.log
-  ev 700 IT_GATE   ok    1 2 harness/logs/issue-5-pass1.it-gate.log
   ev 900 DONE      end   1 2 "" "rc=50"
 } > "$F"
 out="$(render_banner "$F" 0 1000)"
 check "D status"  "DONE rc=50"                          "$(line "$out" 4)"
-check "D chips 1" "✓ pick  ✓ impl  ✓ fast  ✓ IT"        "$(line "$out" 2)"
+check "D chips 1" "✓ pick  ✓ impl  ✓ fast"              "$(line "$out" 2)"
 
 echo "== Fixture E: two runs in one file -> only the newest renders =="
 F="$SB/e.jsonl"
@@ -95,11 +93,11 @@ echo "== Fixture F: torn line mid-file -> skipped, banner still renders =="
 F="$SB/f.jsonl"
 { ev 100 PICK ok 0 2
   printf '{"ts":123,"pha\n'
-  ev 748 IT_GATE start 1 2 harness/logs/issue-5-pass1.it-gate.log
+  ev 748 FAST_GATE start 1 2 harness/logs/issue-5-pass1.gate.log
 } > "$F"
 out="$(render_banner "$F" 1 1000)"
 check "F line count is still 4" "4" "$(echo "$out" | wc -l | tr -d ' ')"
-check "F renders the valid tail" "✓ pick  · impl  · fast  ▶ IT 4m12s" "$(line "$out" 2)"
+check "F renders the valid tail" "✓ pick  · impl  ▶ fast 4m12s" "$(line "$out" 2)"
 
 echo "== Fixture G: empty file -> placeholder, still 4 lines =="
 F="$SB/g.jsonl"; : > "$F"
@@ -119,14 +117,13 @@ rc=$?
 set -e
 check "H exits 0"                 "0" "$rc"
 check "H line count is 4"         "4" "$(echo "$out" | wc -l | tr -d ' ')"
-check "H renders the valid tail"  "✓ pick  ▶ impl 14m59s  · fast  · IT" "$(line "$out" 2)"
+check "H renders the valid tail"  "✓ pick  ▶ impl 14m59s  · fast" "$(line "$out" 2)"
 
 echo "== Fixture I: detail with embedded newline is sanitized to one line =="
 F="$SB/i.jsonl"
 { ev 100 PICK      ok  0 2
   ev 101 IMPL      ok  0 2 harness/logs/issue-5-iter1.claude.log
   ev 500 FAST_GATE ok  1 2 harness/logs/issue-5-pass1.gate.log
-  ev 700 IT_GATE   ok  1 2 harness/logs/issue-5-pass1.it-gate.log
   ev 900 DONE      end 1 2 "" "rc=1\nfatal: something broke"
 } > "$F"
 out="$(render_banner "$F" 0 1000)"
@@ -151,14 +148,13 @@ F="$SB/j.jsonl"
 check "J fixture has more than 500 lines" "1" "$(( $(wc -l < "$F") > 500 ))"
 out="$(render_banner "$F" 1 1000)"
 check "J header"  "US-5 · iter 1 · pass 1 · budget 2"                    "$(line "$out" 1)"
-check "J chips 1" "✓ pick  ✓ impl  ✗ fast  · IT  ↺ fix 250"             "$(line "$out" 2)"
+check "J chips 1" "✓ pick  ✓ impl  ✗ fast  ↺ fix 250"                    "$(line "$out" 2)"
 
 echo "== Fixture K: same run, later iteration in flight -> the earlier iteration's DONE must not leak =="
 F="$SB/k.jsonl"
 { ev 100 PICK      ok    0 2 ""                                   ""              5 200 1
   ev 101 IMPL      ok    0 2 harness/logs/issue-5-iter1.claude.log ""             5 200 1
   ev 200 FAST_GATE ok    1 2 harness/logs/issue-5-pass1.gate.log   ""             5 200 1
-  ev 300 IT_GATE   ok    1 2 harness/logs/issue-5-pass1.it-gate.log ""            5 200 1
   ev 400 REVIEW    ok    1 2 ""                                   "verdict=APPROVE" 5 200 1
   ev 450 PR        ok    0 2 ""                                   "pr=123"        5 200 1
   ev 500 DONE      end   0 2 ""                                   "rc=0"          5 200 1
@@ -168,7 +164,7 @@ F="$SB/k.jsonl"
 out="$(render_banner "$F" 1 1000)"
 check "K header shows the in-flight issue, not the finished one" "US-6 · iter 2 · pass 0 · budget 2" "$(line "$out" 1)"
 check "K chips scope to the in-flight issue only (no leaked gate ticks)" \
-  "✓ pick  ▶ impl 6m39s  · fast  · IT" "$(line "$out" 2)"
+  "✓ pick  ▶ impl 6m39s  · fast" "$(line "$out" 2)"
 check "K status is RUNNING, not the earlier iteration's DONE" "RUNNING (pid 4711)" "$(line "$out" 4)"
 
 echo "== Fixture L: terminal DONE as the very last event, loop still alive -> DONE beats liveness =="
@@ -176,7 +172,6 @@ F="$SB/l.jsonl"
 { ev 100 PICK      ok    0 2 ""                                   ""              5 300
   ev 101 IMPL      ok    0 2 harness/logs/issue-5-iter1.claude.log ""             5 300
   ev 200 FAST_GATE ok    1 2 harness/logs/issue-5-pass1.gate.log   ""             5 300
-  ev 300 IT_GATE   ok    1 2 harness/logs/issue-5-pass1.it-gate.log ""            5 300
   ev 400 REVIEW    ok    1 2 ""                                   "verdict=APPROVE" 5 300
   ev 450 PR        ok    0 2 ""                                   "pr=123"        5 300
   ev 500 DONE      end   0 2 ""                                   "rc=0"          5 300

@@ -34,10 +34,11 @@ issue other than this one.
 ## Definition of done for this iteration
 
 - The acceptance criteria in the issue are implemented.
-- `sbt -Werror compile` is clean and `sbt test` (the fast in-memory tier) is green locally.
-- If you added any `src/it` test, `sbt It/test` (the real-Postgres tier) is green locally too.
+- `sbt -Werror compile` is clean and `sbt test` (the fast in-memory tier) is green.
+- If you added any `src/it` test, keep it correct: it is judged by CI (a real-Postgres runner),
+  not by a local gate, so it must be self-contained and pass against a fresh Postgres.
 - Every acceptance criterion maps to at least one test.
 
-When you believe you are done, stop. The harness runs the fast (in-memory) gate, then the IT
-(real-Postgres) gate, then an independent reviewer, opens a PR, and hands it to a human. You do
-not report success — the gates and the reviewer do.
+When you believe you are done, stop. The harness runs the fast (in-memory) gate and an independent
+reviewer, opens a PR, and lets CI run the real-Postgres integration tests. You do not report
+success — the gate, the reviewer, and CI do.
