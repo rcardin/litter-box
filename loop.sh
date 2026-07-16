@@ -60,7 +60,8 @@
 # execution of agent-authored code. dispatch_worker()'s real path now calls
 # harness/sandbox/run-agent.sh instead of a host `claude -p`: the container clones origin/main
 # (git archive, read-only), overlays the prior cumulative patch, runs claude with a DEDICATED
-# spend-capped ANTHROPIC_API_KEY reaching the network only through the proxy, and leaves the
+# credential (CLAUDE_CODE_OAUTH_TOKEN preferred, spend-capped ANTHROPIC_API_KEY as fallback)
+# reaching the network only through the proxy, and leaves the
 # cumulative patch on an output volume. Containers are detached and awaited under ITER_TIMEOUT; on
 # expiry run-agent.sh kills the container (a client-side timeout alone would orphan it) and exits
 # 124 (infra fault, no repair budget). In the same slice the LOCAL IT gate, the Docker preflight,
@@ -202,8 +203,8 @@ command -v claude >/dev/null || die "claude not found"
 # Skipped when GATE_CMD is overridden — the state-machine test overrides it together with the
 # IMPL/FIX seams, so a skipped preflight always coincides with stubbed, container-free dispatches.
 if [[ "$GATE_OVERRIDDEN" == "0" ]]; then
-  [[ -n "${ANTHROPIC_API_KEY:-}" ]] \
-    || die "ANTHROPIC_API_KEY not set — the sandboxed worker/fixer has no other way to authenticate"
+  [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" || -n "${ANTHROPIC_API_KEY:-}" ]] \
+    || die "neither CLAUDE_CODE_OAUTH_TOKEN nor ANTHROPIC_API_KEY set — the sandboxed worker/fixer has no other way to authenticate"
   "$SCRIPT_DIR/sandbox/build-image.sh" || die "sandbox image build failed"
   "$SCRIPT_DIR/sandbox/start-proxy.sh" || die "sandbox proxy failed to start"
   trap '"$SCRIPT_DIR/sandbox/stop-proxy.sh" >/dev/null 2>&1 || true' EXIT
@@ -254,7 +255,8 @@ run_gate() {
 # that ignores the prompt and simulates the agent).
 # Real path (v6 slice 3): the agent runs INSIDE the sandbox container. run-agent.sh clones
 # origin/main read-only, overlays the prior cumulative patch, runs claude with a dedicated
-# spend-capped ANTHROPIC_API_KEY reaching the network only through the proxy, and writes the
+# credential (CLAUDE_CODE_OAUTH_TOKEN preferred, spend-capped ANTHROPIC_API_KEY as fallback)
+# reaching the network only through the proxy, and writes the
 # cumulative-vs-origin/main patch to $patch_out. It returns 124 on timeout (it kills the
 # container — gtimeout alone would orphan it) or any infra fault, 0 otherwise; the caller must
 # not let a half-finished worker fall through to the gates. Stub overrides simulate the agent by

@@ -4,7 +4,8 @@
 # mounts — no repository, no output volume, no host config, no `.git`. Everything it judges (the
 # issue, the conventions, the tamper report, the full diff) is already spliced into the prompt by
 # loop.sh's render_template, so the container needs nothing but the prompt (an env var) and the
-# dedicated ANTHROPIC_API_KEY (an env var). Its STDOUT is the verdict, streamed back verbatim to
+# dedicated credential (CLAUDE_CODE_OAUTH_TOKEN preferred, ANTHROPIC_API_KEY as fallback — see
+# sandbox_credential_env in lib.sh). Its STDOUT is the verdict, streamed back verbatim to
 # this script's stdout, which dispatch_review captures to the review file and greps exactly as
 # before. Independence is now enforced by CONSTRUCTION twice over: there is no tree in the
 # container to touch, and the mutating tools are still denied as defense-in-depth.
@@ -22,7 +23,7 @@
 #   0    the container ran; stdout holds the reviewer's output (possibly empty = crashed reviewer,
 #        which loop.sh already treats as an infra fault — see dispatch_review's empty-review guard)
 #   124  timeout (container killed by the trap) or any infra fault (missing image, dead proxy,
-#        unreachable Docker, no API key) — dispatch_review maps 124 to an rc-50 terminal that
+#        unreachable Docker, no credential) — dispatch_review maps 124 to an rc-50 terminal that
 #        spends NO repair budget.
 set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -44,7 +45,7 @@ infra_fault() { echo "[run-reviewer] INFRA FAULT: $*" >&2; exit 124; }
 PROMPT="${REVIEW_PROMPT:-${1:-}}"
 [[ -n "$PROMPT" ]] || infra_fault "no reviewer prompt (set REVIEW_PROMPT env or pass it as argv \$1)"
 
-[[ -n "${ANTHROPIC_API_KEY:-}" ]] || infra_fault "ANTHROPIC_API_KEY not set (the sandboxed reviewer has no other way to authenticate)"
+sandbox_credential_env || infra_fault "neither CLAUDE_CODE_OAUTH_TOKEN nor ANTHROPIC_API_KEY set (the sandboxed reviewer has no other way to authenticate)"
 sandbox_preflight   # docker reachable + image present + proxy running (shared, see lib.sh)
 
 # Only a waitfile is needed on the host — the reviewer container mounts nothing, so there is no
@@ -72,7 +73,7 @@ trap cleanup EXIT
 trap on_signal TERM INT
 
 # --- the reviewer container -------------------------------------------------------------------
-# ZERO mounts (no -v at all): the prompt and the dedicated API key are the only non-proxy env. Same
+# ZERO mounts (no -v at all): the prompt and the dedicated credential are the only non-proxy env. Same
 # non-root gate user + cap-drop + no-new-privileges as every other role, and it joins
 # fes-sandbox-net only, so it reaches the network solely through the proxy sidecar
 # (api.anthropic.com is on the allowlist). Detached (gtimeout can't reach into the VM — see
@@ -87,7 +88,7 @@ docker run -d --name "$cname" \
   --cap-drop=ALL \
   --security-opt=no-new-privileges \
   -e HOME=/home/gate \
-  -e ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
+  "${CREDENTIAL_ENV[@]}" \
   -e HTTP_PROXY="$proxy_url" -e HTTPS_PROXY="$proxy_url" \
   -e http_proxy="$proxy_url" -e https_proxy="$proxy_url" \
   -e NO_PROXY="" -e no_proxy="" \

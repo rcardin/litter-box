@@ -38,7 +38,8 @@ if [[ -s "$INPUT/prior.patch" ]]; then
     || { echo "[agent-entrypoint] prior.patch did not apply" >&2; exit 3; }
 fi
 
-# The agent. The dedicated ANTHROPIC_API_KEY and the proxy env come from the container env
+# The agent. The dedicated credential (CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY) and the
+# proxy env come from the container env
 # (run-agent.sh) — no host keychain, no host claude config, no gh token. stdout is the stream-
 # json log the harness tails, so it must NOT be redirected. A claude failure is not fatal here:
 # it leaves an empty patch, which the host reads as "no diff" (EMPTY), exactly like a host claude

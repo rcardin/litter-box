@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # The worker/fixer dispatch, containerized (v6 slice 3, issue #36). Replaces the host `claude -p`
 # invocation: loop.sh's dispatch_worker() calls this instead. The agent runs inside the sandbox
-# image with a dedicated, spend-capped ANTHROPIC_API_KEY, reaches the network ONLY through the
+# image with a dedicated credential (CLAUDE_CODE_OAUTH_TOKEN preferred, ANTHROPIC_API_KEY as
+# fallback — see sandbox_credential_env in lib.sh), reaches the network ONLY through the
 # proxy sidecar, works on a throwaway origin/main clone (never the host tree), and leaves its
 # result as a patch on the output volume — the seam the prefactor slice (#35) built.
 #
@@ -14,7 +15,7 @@
 # Exit codes mirror run-fast-gate.sh so dispatch_worker needs no new dispatch logic:
 #   0    the container ran; PATCH_OUT holds the agent's patch (possibly empty = no diff)
 #   124  timeout (container killed) or any infra fault (missing image, dead proxy, unreachable
-#        Docker, no API key, prior patch failed to apply) — dispatch_worker maps 124 to an
+#        Docker, no credential, prior patch failed to apply) — dispatch_worker maps 124 to an
 #        infra-fault exit that spends NO repair budget.
 set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -28,7 +29,7 @@ PRIOR_PATCH="${3:-}"
 # run-fast-gate.sh, and gtimeout wraps this script so a real timeout arrives as a signal below.
 infra_fault() { echo "[run-agent] INFRA FAULT: $*" >&2; exit 124; }
 
-[[ -n "${ANTHROPIC_API_KEY:-}" ]] || infra_fault "ANTHROPIC_API_KEY not set (the sandboxed agent has no other way to authenticate)"
+sandbox_credential_env || infra_fault "neither CLAUDE_CODE_OAUTH_TOKEN nor ANTHROPIC_API_KEY set (the sandboxed agent has no other way to authenticate)"
 sandbox_preflight   # docker reachable + image present + proxy running (shared, see lib.sh)
 
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || infra_fault "not inside a git working tree"
@@ -76,7 +77,7 @@ fi
 # --- the agent container ----------------------------------------------------------------------
 # Detached (gtimeout can't reach into the VM to stop it — see on_signal) and NOT --rm (AutoRemove
 # races docker wait for the exit code). No gh token, no host claude config, no host env beyond the
-# dedicated API key and the proxy plumbing. --user gate + cap-drop + no-new-privileges match the
+# dedicated credential and the proxy plumbing. --user gate + cap-drop + no-new-privileges match the
 # gate container. The proxy is set both as HTTP(S)_PROXY (claude's fetch) and as JVM system
 # properties (in case the agent runs sbt to self-check).
 proxy_url="http://$PROXY_NAME:$PROXY_PORT"
@@ -86,7 +87,7 @@ docker run -d --name "$cname" \
   --cap-drop=ALL \
   --security-opt=no-new-privileges \
   -e HOME=/home/gate \
-  -e ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
+  "${CREDENTIAL_ENV[@]}" \
   -e HTTP_PROXY="$proxy_url" -e HTTPS_PROXY="$proxy_url" \
   -e http_proxy="$proxy_url" -e https_proxy="$proxy_url" \
   -e NO_PROXY="" -e no_proxy="" \

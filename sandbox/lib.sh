@@ -18,10 +18,30 @@ log() { printf '[sandbox] %s\n' "$*" >&2; }
 # the pre-extraction inline code. Every caller therefore MUST define infra_fault BEFORE invoking
 # these helpers (all three already do).
 
+# The claude credential, shared by the two model-touching runners (run-agent.sh, run-reviewer.sh;
+# run-fast-gate.sh runs no model and needs none). Two credentials are accepted, OAuth preferred:
+#   CLAUDE_CODE_OAUTH_TOKEN  a subscription OAuth token (`claude setup-token`) — bills the
+#                            subscription, no extra spend
+#   ANTHROPIC_API_KEY        a dedicated, spend-capped console API key
+# Exactly ONE is passed into the container: passing both would let a stale/invalid
+# ANTHROPIC_API_KEY (e.g. an OAuth token exported under the wrong name — the exact 401 that
+# motivated this) shadow a valid OAuth token inside claude. Sets CREDENTIAL_ENV to the docker -e
+# args for the chosen credential; returns 1 if neither is set (callers infra-fault with their
+# own role tag).
+sandbox_credential_env() {
+  if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
+    CREDENTIAL_ENV=(-e CLAUDE_CODE_OAUTH_TOKEN="$CLAUDE_CODE_OAUTH_TOKEN")
+  elif [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+    CREDENTIAL_ENV=(-e ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY")
+  else
+    return 1
+  fi
+}
+
 # The proxy-stack preflight, identical in all three runners: Docker reachable, sandbox image
 # present, proxy sidecar running. On any failure the caller's infra_fault emits its tagged message
-# and exits 124. (The per-runner ANTHROPIC_API_KEY check is intentionally NOT here — it is absent
-# in run-fast-gate.sh — so it stays inline in the runners that need it, before this call.)
+# and exits 124. (The per-runner credential check is intentionally NOT here — it is absent in
+# run-fast-gate.sh — so it stays inline in the runners that need it, before this call.)
 sandbox_preflight() {
   docker info >/dev/null 2>&1 || infra_fault "docker unreachable"
   docker image inspect "$IMAGE" >/dev/null 2>&1 \
