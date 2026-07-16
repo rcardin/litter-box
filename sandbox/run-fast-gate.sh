@@ -12,11 +12,7 @@ source "$SCRIPT_DIR/lib.sh"
 # repair budget. Reusing it means zero changes to the state-machine dispatch logic.
 infra_fault() { echo "[run-fast-gate] INFRA FAULT: $*" >&2; exit 124; }
 
-docker info >/dev/null 2>&1 || infra_fault "docker unreachable"
-docker image inspect "$IMAGE" >/dev/null 2>&1 \
-  || infra_fault "image $IMAGE missing (run harness/sandbox/build-image.sh)"
-[[ "$(docker inspect -f '{{.State.Running}}' "$PROXY_NAME" 2>/dev/null || true)" == "true" ]] \
-  || infra_fault "proxy $PROXY_NAME not running (run harness/sandbox/start-proxy.sh)"
+sandbox_preflight   # docker reachable + image present + proxy running (shared, see lib.sh)
 
 # --- read-only clone: git write-tree + git archive, no live bind mount, no .git ------------
 # loop.sh runs `git add -A` immediately before invoking GATE_CMD in every pass, so the index
@@ -103,8 +99,7 @@ wait "$wait_pid" || true
 # Let the log streamer flush the tail of the output (container has already exited here).
 wait "$logs_pid" 2>/dev/null || true
 
-rc="$(cat "$waitfile" 2>/dev/null || true)"
 # Empty/garbage docker-wait output = daemon hiccup: infra fault, never a silent 0.
-[[ "$rc" =~ ^[0-9]+$ ]] || infra_fault "docker wait returned no usable exit code (got '${rc:-}')"
+rc="$(read_wait_rc "$waitfile")"   # validated bare integer, else infra-fault (shared, see lib.sh)
 
 exit "$rc"

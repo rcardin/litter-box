@@ -111,9 +111,9 @@ origin/main, so this only ever bites out-of-band PRs.
 | `iterate-prompt.md` | The narrow worker prompt (unchanged from v0). `{{ISSUE}}` is spliced with the issue body. |
 | `fix-prompt.md` | The fix-iteration prompt. Splices `{{ISSUE}}` + `{{FAILURE}}` (gate-log tail **or** reviewer reasons + tamper). Same hard rules as the worker (no test weakening, `-Werror`, no `gh`/branch ops). |
 | `review-prompt.md` | The cold reviewer prompt. Splices `{{ISSUE}}`, `{{CONVENTIONS}}` (`CONTEXT.md`), `{{TAMPER}}`, `{{DIFF}}`. Adversarial. Last line MUST be `VERDICT: APPROVE` or `VERDICT: REQUEST_CHANGES`. |
-| `sandbox/` | The containerized sandbox — image `Dockerfile`, proxy sidecar (`proxy/`), `build-image.sh`, `start-proxy.sh` / `stop-proxy.sh`, the `GATE_CMD` default `run-fast-gate.sh` (v6 slice 1), and the worker/fixer dispatch `run-agent.sh` + `agent-entrypoint.sh` (v6 slice 3). See **Containerized FAST gate** and **Containerized worker/fixer** below. |
+| `sandbox/` | The containerized sandbox — image `Dockerfile`, proxy sidecar (`proxy/`), `build-image.sh`, `start-proxy.sh` / `stop-proxy.sh`, the `GATE_CMD` default `run-fast-gate.sh` (v6 slice 1), the worker/fixer dispatch `run-agent.sh` + `agent-entrypoint.sh` (v6 slice 3), and the zero-mount reviewer dispatch `run-reviewer.sh` (v6 slice 4). See **Containerized FAST gate**, **Containerized worker/fixer** and **Containerized reviewer** below. |
 | `test/statemachine-test.sh` | Drives the whole state machine in a throwaway sandbox (fake `gh`, stubbed gate + dispatches) — no real GitHub, no Opus tokens, no Docker (`GATE_CMD` and the `IMPL/FIX/REVIEW` seams are always stubbed). Scenarios A–T plus a DRY_RUN check (APPROVE, REQUEST_CHANGES, fast-RED, **container-dispatch timeout for worker + fixer**, budget exhaustion, idle-no-latch, protected-path, empty-review, gate-timeout, class-1 auto-merge + CI red/timeout/late-registering-check/unverified-merge/merge-failure, class-2 stop-at-PR, plus patch-guard CI-workflow rejection / apply-conflict / oversized-patch), 142 assertions total. Stubs produce patch files at `$PATCH_OUT`; a stub that exits `124` simulates a container-dispatch timeout. |
-| `sandbox/test/` | Manual/local Docker-dependent checks for the sandbox itself (image smoke test, proxy allowlist test, FAST-gate and worker/fixer infra-fault checks, coursier-cache speed check) — not part of `sbt test` or `statemachine-test.sh`. Run `sandbox/test/run-all.sh`. |
+| `sandbox/test/` | Manual/local Docker-dependent checks for the sandbox itself (image smoke test, per-role egress policy test, FAST-gate + worker/fixer + reviewer infra-fault checks, coursier-cache speed check) — not part of `sbt test` or `statemachine-test.sh`. Run `sandbox/test/run-all.sh`. |
 | `logs/` | Per-pass `claude -p` logs, gate logs, rendered prompts, tamper + review + diff artefacts. Git-ignored. |
 
 ## Control flow (what `loop.sh` does)
@@ -148,7 +148,8 @@ origin/main, so this only ever bites out-of-band PRs.
        the sandbox; fast-gate-log tail spliced; a FIX timeout is also infra fault, exit `50`),
        re-loop.
      - **GREEN** → run the **tamper check** (`src/test` + `src/it`), then dispatch the cold
-       **REVIEWER** (on the host — it authors no code; all mutating tools are denied). A `124`
+       **REVIEWER** **inside the sandbox** (v6 slice 4: zero mounts — it authors no code, has no
+       tree to touch, and all mutating tools are denied as defense-in-depth). A `124`
        timeout, or an empty/whitespace-only review, is an infra fault (crashed/timed-out
        reviewer) → exit `50`, no budget spent. Grep the `VERDICT:` sentinel on a non-empty review
        (missing → `REQUEST_CHANGES`, fail-safe — model misbehavior, real signal, not an infra
@@ -192,11 +193,12 @@ review failures:
   die-on-failure), plus a `trap ... EXIT` that always runs `sandbox/stop-proxy.sh` when the loop
   exits (normal exit or any `die`). There is **no loop-level `docker info` preflight** any more
   (v6 slice 3 deleted it together with the local IT gate). At dispatch *time*,
-  `sandbox/run-fast-gate.sh` (the FAST gate) and `sandbox/run-agent.sh` (the worker/fixer) each
+  `sandbox/run-fast-gate.sh` (the FAST gate), `sandbox/run-agent.sh` (the worker/fixer) and
+  `sandbox/run-reviewer.sh` (the reviewer) each
   re-check Docker reachability, image presence and proxy liveness and exit `124` — the loop's
   rc-124-is-infra-fault convention — on any failure, so a sidecar that dies mid-run is never
-  mistaken for a code failure. See **Containerized FAST gate** and **Containerized worker/fixer**
-  below.
+  mistaken for a code failure. See **Containerized FAST gate**, **Containerized worker/fixer** and
+  **Containerized reviewer** below.
 - **Patch seam (v6 slice 2).** Every agent dispatch (IMPL and each FIX) crosses an
   inspect-then-apply boundary rather than being committed straight from the tree the agent
   edited. As of v6 slice 3 the agent runs **in the sandbox**: `run-agent.sh` returns the
@@ -245,12 +247,13 @@ patch-guard / apply-conflict / oversized scenarios (R/S/T) in `test/statemachine
 
 The FAST gate (`GATE_CMD`) no longer runs `sbt compile test` on the host. `build.sbt` is
 agent-authored, so a hostile or merely buggy worker/fixer iteration could make a *host* gate
-lie. v6 reframes the threat model (issue #33/#34): the sandbox protects the host, GH Actions CI
-protects `main`, and a local gate is a productivity signal only — so the FAST gate now runs
+lie. v6 reframes the threat model (issue #33/#34): **the sandbox protects the host, GH Actions CI
+protects `main`, and a local gate is a productivity signal only** — so the FAST gate now runs
 inside a locked-down container. Slice 1 containerized **only** the FAST gate; v6 slice 3 then
 moved the **worker and fixer** into the same image (see **Containerized worker/fixer** below) and
-deleted the local IT gate. Only the reviewer still runs on the host — it authors no code (all
-mutating tools denied).
+deleted the local IT gate; v6 slice 4 moved the **cold reviewer** in too (see **Containerized
+reviewer** below). As of slice 4 **no model-touched execution remains on the host** — a full loop
+iteration runs with worker, fixer, gate and reviewer all sandboxed.
 
 - **The image** (`sandbox/Dockerfile`, tag `fes-harness-sandbox:v6`) — `eclipse-temurin:25-jdk`
   (matches the host's `.sdkmanrc` JDK 25 pin) plus sbt 1.12.9 (matches
@@ -266,8 +269,16 @@ mutating tools denied).
   reach at all. The hostname allowlist lives in `sandbox/proxy/allowlist` (one hostname per
   line — `api.anthropic.com`, `repo1.maven.org`, `repo.maven.apache.org`,
   `repo.scala-sbt.org`, `oss.sonatype.org`), enforced by tinyproxy's `Filter` +
-  `FilterDefaultDeny yes` on both plain HTTP and HTTPS `CONNECT` (no MITM — the hostname in the
-  `CONNECT` line is enough to filter on). **To extend it**: edit `sandbox/proxy/allowlist`,
+  `FilterDefaultDeny yes` on both plain HTTP and HTTPS `CONNECT`. **Accepted limitation
+  (hostname-only egress filtering).** Under HTTPS the proxy sees only the `CONNECT` line, so it
+  filters on the **hostname**, never the URL path or the TLS-encrypted payload (no MITM — the
+  sandbox mounts no CA, so it cannot terminate TLS). A host on the allowlist is therefore reachable
+  at *any* path. This is accepted by the trust framing above: the fence's job is to stop a
+  compromised container from exfiltrating to an arbitrary host, not to police what it sends to the
+  handful of package/API hosts it legitimately needs — the sandbox protects the host, and CI (not
+  this proxy) protects `main`. The per-role egress test (`sandbox/test/egress-policy-test.sh`)
+  verifies every container role reaches an allowlisted host and is refused for a non-allowlisted
+  one. **To extend it**: edit `sandbox/proxy/allowlist`,
   bump the `# version:` comment at the top of `sandbox/proxy/tinyproxy.conf`, then
   `sandbox/build-image.sh && sandbox/stop-proxy.sh && sandbox/start-proxy.sh` (or just restart
   `loop.sh`, which does both). The sidecar starts as part of `loop.sh`'s startup preflight and
@@ -326,6 +337,40 @@ executed outside a sandbox. `dispatch_worker()`'s real path calls `sandbox/run-a
 The state-machine test drives this seam with stubs (a stub writing `$PATCH_OUT`, or exiting
 `124` to simulate the dispatch timeout); `sandbox/test/agent-infra-fault-test.sh` covers the
 real `run-agent.sh` infra-fault exit codes without a live daemon.
+
+## Containerized reviewer (v6 slice 4)
+
+The cold reviewer no longer runs `claude -p` on the host — the **last** model-touched execution to
+leave it. `dispatch_review()`'s real path calls `sandbox/run-reviewer.sh`, which:
+
+- **Mounts nothing at all.** No repository, no output volume, no host config, no `.git`. There is
+  no tree to touch inside the container — everything the reviewer judges (the issue, `CONTEXT.md`,
+  the tamper report, the full diff) is already spliced into its prompt by `render_template`. The
+  prompt travels as the `REVIEW_PROMPT` env var (so a large multi-line diff never becomes an argv
+  entry), and the dedicated, spend-capped `ANTHROPIC_API_KEY` is the only credential. Same
+  `fes-sandbox-net`-only networking, non-root `gate` user, `--cap-drop=ALL` and
+  `--security-opt=no-new-privileges` as every other role.
+- **Keeps the tool-deny flags as defense-in-depth.** `--disallowed-tools Edit Write MultiEdit
+  NotebookEdit Bash` stays on the invocation (now inside `run-reviewer.sh`). Independence is
+  enforced by construction twice over: zero mounts *and* no mutating tools. `Read` stays allowed
+  for extra context, exactly as the pre-slice-4 host call.
+- **Streams stdout as the verdict.** `claude -p`'s default output is text — the final assistant
+  message, whose last line is the `VERDICT:` sentinel. `run-reviewer.sh` streams the container's
+  stdout to its own stdout and the container's stderr to its own stderr (kept split), so
+  `dispatch_review` captures stdout to the review file and greps the sentinel **exactly as before**
+  — the existing verdict-parsing, empty-review-is-infra-fault, and missing-sentinel-fail-safe
+  behavior is unchanged (state-machine scenarios A, B, H and K pass untouched).
+- **Is detached and awaited under `ITER_TIMEOUT`.** Same trap pattern as `run-agent.sh`: on expiry
+  the signal trap **kills the container** and exits `124`. Every infra fault (timeout, missing
+  image, dead proxy, unreachable Docker, missing API key) exits `124`, which `dispatch_review` maps
+  to the rc-`50` infra-fault terminal that spends no repair budget and opens no PR. A nonzero
+  `claude` exit is **not** an infra fault — it leaves empty stdout, which the existing empty-review
+  guard already treats as a crashed reviewer.
+
+The state-machine test drives this seam through the same `REVIEW_CMD` stub as before (no container,
+no tokens); `sandbox/test/reviewer-infra-fault-test.sh` covers the real `run-reviewer.sh`
+infra-fault exit codes without a live daemon, and `sandbox/test/egress-policy-test.sh` verifies the
+reviewer's (and every other role's) egress fence.
 
 ## Environment the loop needs
 

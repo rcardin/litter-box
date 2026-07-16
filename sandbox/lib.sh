@@ -10,3 +10,33 @@ COURSIER_VOLUME="fes-sandbox-coursier-cache"
 SANDBOX_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 log() { printf '[sandbox] %s\n' "$*" >&2; }
+
+# --- shared preflight + wait-rc guard (extracted from the three runners) -----------------------
+# CONTRACT: both helpers below call `infra_fault "<msg>"` on failure. infra_fault is deliberately
+# NOT defined here — each runner defines it with its own role tag ([run-agent] / [run-fast-gate] /
+# [run-reviewer]) and the exit-124 convention, so the emitted diagnostics stay byte-identical to
+# the pre-extraction inline code. Every caller therefore MUST define infra_fault BEFORE invoking
+# these helpers (all three already do).
+
+# The proxy-stack preflight, identical in all three runners: Docker reachable, sandbox image
+# present, proxy sidecar running. On any failure the caller's infra_fault emits its tagged message
+# and exits 124. (The per-runner ANTHROPIC_API_KEY check is intentionally NOT here — it is absent
+# in run-fast-gate.sh — so it stays inline in the runners that need it, before this call.)
+sandbox_preflight() {
+  docker info >/dev/null 2>&1 || infra_fault "docker unreachable"
+  docker image inspect "$IMAGE" >/dev/null 2>&1 \
+    || infra_fault "image $IMAGE missing (run harness/sandbox/build-image.sh)"
+  [[ "$(docker inspect -f '{{.State.Running}}' "$PROXY_NAME" 2>/dev/null || true)" == "true" ]] \
+    || infra_fault "proxy $PROXY_NAME not running (run harness/sandbox/start-proxy.sh)"
+}
+
+# Read the docker-wait exit code from $1 and validate it is a bare integer, else infra-fault.
+# Empty/garbage docker-wait output = daemon hiccup: infra fault, never a silent 0. Prints the
+# validated rc on stdout so callers can `rc="$(read_wait_rc "$waitfile")"`; callers that only need
+# the guard (not the value) invoke it as `read_wait_rc "$waitfile" >/dev/null`.
+read_wait_rc() {
+  local waitfile="$1" rc
+  rc="$(cat "$waitfile" 2>/dev/null || true)"
+  [[ "$rc" =~ ^[0-9]+$ ]] || infra_fault "docker wait returned no usable exit code (got '${rc:-}')"
+  printf '%s\n' "$rc"
+}

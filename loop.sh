@@ -295,34 +295,39 @@ dispatch_worker() {
 }
 
 # --- cold reviewer dispatch ------------------------------------------------------------
-# Unlike the worker, the reviewer's STDOUT is the product: `claude -p` default output is
-# "text" (verified) — the final assistant message, whose last line is the VERDICT sentinel.
-# We capture stdout to the review file and stderr separately. Honours the REVIEW_CMD seam.
+# Containerized (v6 slice 4): the reviewer runs `claude -p` inside the sandbox image with ZERO
+# mounts via sandbox/run-reviewer.sh — the last model-touched execution to leave the host. Unlike
+# the worker, the reviewer's STDOUT is the product: `claude -p` default output is "text" (verified)
+# — the final assistant message, whose last line is the VERDICT sentinel. run-reviewer.sh streams
+# the container's stdout/stderr split, and we capture stdout to the review file and stderr
+# separately. Honours the REVIEW_CMD seam (the state-machine tests never touch a container).
 #
-# Independence is enforced by CONSTRUCTION, not just by the prompt: the reviewer needs no
-# tools (the diff, AC, CONTEXT.md and tamper report are all spliced into its prompt), so all
-# mutating tools are denied. It cannot touch the working tree it is judging. Read stays
-# allowed for extra context. This is the "cold independent reviewer" the gate stack needs.
-REVIEWER_DENY=(--disallowed-tools Edit Write MultiEdit NotebookEdit Bash)
+# Independence is enforced by CONSTRUCTION twice over: the container mounts no repository at all
+# (nothing to touch — the diff, AC, CONTEXT.md and tamper report are all spliced into the prompt),
+# and the mutating tools are still denied as defense-in-depth (run-reviewer.sh holds REVIEWER_DENY).
+# Read stays allowed for extra context. This is the "cold independent reviewer" the gate stack needs.
 dispatch_review() {
   local prompt="$1" review_file="$2" rc=0
-  log "dispatching REVIEWER claude -p (cold, no mutating tools) -> $review_file"
+  log "dispatching REVIEWER in the sandbox (cold, zero mounts, no mutating tools) -> $review_file"
   if [[ -n "$REVIEW_CMD" ]]; then
     ( eval "$REVIEW_CMD" ) >"$review_file" 2>"$review_file.stderr" || rc=$?
     log "REVIEWER stub exited rc=$rc"
     return 0
   fi
+  # Deliver the (large, multi-line) prompt via ENV, never argv — same reason dispatch_worker writes
+  # it to a file: keeps the full diff out of argv (ARG_MAX / process-listing leak). The env prefix
+  # scopes REVIEW_PROMPT to this one command and passes cleanly through gtimeout into run-reviewer.sh.
+  local runner=("$SCRIPT_DIR/sandbox/run-reviewer.sh")
   if [[ -n "$TIMEOUT_BIN" ]]; then
-    "$TIMEOUT_BIN" "$ITER_TIMEOUT" \
-      claude -p "$prompt" --dangerously-skip-permissions "${REVIEWER_DENY[@]}" >"$review_file" 2>"$review_file.stderr" || rc=$?
+    REVIEW_PROMPT="$prompt" "$TIMEOUT_BIN" "$ITER_TIMEOUT" "${runner[@]}" >"$review_file" 2>"$review_file.stderr" || rc=$?
   else
-    claude -p "$prompt" --dangerously-skip-permissions "${REVIEWER_DENY[@]}" >"$review_file" 2>"$review_file.stderr" || rc=$?
+    REVIEW_PROMPT="$prompt" "${runner[@]}" >"$review_file" 2>"$review_file.stderr" || rc=$?
   fi
   if [[ "$rc" == "124" ]]; then
-    log "WARNING: REVIEWER claude -p hit the ${ITER_TIMEOUT}s timeout"
+    log "WARNING: REVIEWER sandbox dispatch failed rc=124 (${ITER_TIMEOUT}s timeout or infra fault: missing image/proxy/Docker/API key)"
     return 124
   fi
-  log "REVIEWER claude -p exited rc=$rc"
+  log "REVIEWER sandbox dispatch exited rc=$rc"
   return 0
 }
 

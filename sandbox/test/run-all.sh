@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Thin manual/local runner for the sandbox's Docker-dependent checks: build + image smoke test
-# (AC1) + proxy allowlist test (AC3) + a coursier-cache speed check (AC6, second gate run
-# measurably faster than the first). NOT wired into `sbt test` -- needs Docker + network
+# (AC1) + per-role egress policy test (issue #37: every role reaches allowlisted hosts, is refused
+# elsewhere) + worker/fixer + reviewer infra-fault checks + a coursier-cache speed check (second
+# gate run measurably faster than the first). NOT wired into `sbt test` -- needs Docker + network
 # egress, same category as the pre-existing IT gate.
 set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -21,9 +22,10 @@ trap cleanup EXIT
 
 fail=0
 "$SCRIPT_DIR/test/image-smoke-test.sh" || fail=1
-"$SCRIPT_DIR/test/proxy-allowlist-test.sh" || fail=1
+"$SCRIPT_DIR/test/egress-policy-test.sh" || fail=1
 "$SCRIPT_DIR/test/infra-fault-test.sh" || fail=1
 "$SCRIPT_DIR/test/agent-infra-fault-test.sh" || fail=1
+"$SCRIPT_DIR/test/reviewer-infra-fault-test.sh" || fail=1
 "$SCRIPT_DIR/test/agent-entrypoint-test.sh" || fail=1
 
 echo "== AC6: coursier cache volume speed check (first run vs second run) ==" >&2

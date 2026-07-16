@@ -29,11 +29,7 @@ PRIOR_PATCH="${3:-}"
 infra_fault() { echo "[run-agent] INFRA FAULT: $*" >&2; exit 124; }
 
 [[ -n "${ANTHROPIC_API_KEY:-}" ]] || infra_fault "ANTHROPIC_API_KEY not set (the sandboxed agent has no other way to authenticate)"
-docker info >/dev/null 2>&1 || infra_fault "docker unreachable"
-docker image inspect "$IMAGE" >/dev/null 2>&1 \
-  || infra_fault "image $IMAGE missing (run harness/sandbox/build-image.sh)"
-[[ "$(docker inspect -f '{{.State.Running}}' "$PROXY_NAME" 2>/dev/null || true)" == "true" ]] \
-  || infra_fault "proxy $PROXY_NAME not running (run harness/sandbox/start-proxy.sh)"
+sandbox_preflight   # docker reachable + image present + proxy running (shared, see lib.sh)
 
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || infra_fault "not inside a git working tree"
 
@@ -120,8 +116,7 @@ wait "$wait_pid" || true
 # Let the log streamer flush the tail of the output (container has already exited here).
 wait "$logs_pid" 2>/dev/null || true
 
-rc="$(cat "$waitfile" 2>/dev/null || true)"
-[[ "$rc" =~ ^[0-9]+$ ]] || infra_fault "docker wait returned no usable exit code (got '${rc:-}')"
+rc="$(read_wait_rc "$waitfile")"   # validated bare integer, else infra-fault (shared, see lib.sh)
 
 # The entrypoint's only nonzero exit is 3 = an infra fault (base-repo setup, prior patch would not
 # apply, or staging failed). Any other container exit (including a claude failure) leaves a
