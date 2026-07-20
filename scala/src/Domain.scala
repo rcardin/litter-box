@@ -74,6 +74,12 @@ enum FailureKind(val text: String):
 /** The typed infra-fault channel. Raised through `Raise[InfraFault]`; the driver folds it to rc 50.
   * By construction no code after a raise can run, so no fault path can decrement the repair budget
   * or dispatch a FIX — the v3 invariant as a type-level property.
+  *
+  * `reason` is the bash `log()` line for that fault, copied verbatim from loop.sh, and
+  * `Machine.infraFault` writes it to the `Log` capability at the point of the raise. The parity
+  * oracle greps some of these (`half-finished worker must not reach the gates`,
+  * `infra fault, not a code failure`), so the wording is asserted behaviour: one string per fault,
+  * carried and logged, never two that can drift apart.
   */
 final case class InfraFault(reason: String)
 

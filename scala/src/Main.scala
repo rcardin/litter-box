@@ -181,7 +181,8 @@ object Main:
       StatusLog,
       Notify,
       HarnessFs,
-      Clock
+      Clock,
+      Log
   ): Int =
     var i = 1
     while i <= maxIters do
@@ -323,6 +324,7 @@ object Main:
     given Notify     = LiveNotify(parsed.notifyCmd, parsed.ntfyTopic, LiveLog.log)
     given HarnessFs  = LiveHarnessFs(root)
     given Clock      = LiveClock
+    given Log        = LiveLog
 
     // 9. loop.sh:926's start line, copied byte-for-byte. DRY_RUN is rendered as the raw env
     // string bash would show (`$DRY_RUN` after its own `${DRY_RUN:-0}` default), not the parsed

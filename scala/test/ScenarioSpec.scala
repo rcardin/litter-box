@@ -9,26 +9,13 @@ import Script.*
   */
 class ScenarioSpec extends AnyFlatSpec with Matchers:
 
-  def runLoop(w: TestWorld, cfg: Config = Config()): LoopExit =
-    Machine.runOnce(1)(using
-      cfg,
-      w.github,
-      w.git,
-      w.agents,
-      w.gates,
-      w.status,
-      w.notifier,
-      w.fs,
-      w.clock
-    )
-
   // ---- STOP.md ----------------------------------------------------------------------------
 
   "The machine" should "exit ManualStop (rc 10) when STOP.md is present, touching nothing" in {
     val w = TestWorld()
     w.stopFile = true
 
-    val exit = runLoop(w)
+    val exit = w.runLoop()
 
     exit shouldBe LoopExit.ManualStop
     exit.rc shouldBe 10
@@ -44,7 +31,7 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     w.inProgress = None
     w.ready = None
 
-    val exit = runLoop(w)
+    val exit = w.runLoop()
 
     exit shouldBe LoopExit.Idle
     exit.rc shouldBe 11
@@ -59,7 +46,7 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     w.inProgress = None
     w.ready = None
 
-    val first = runLoop(w)
+    val first = w.runLoop()
 
     first shouldBe LoopExit.Idle
     first.rc shouldBe 11
@@ -68,7 +55,7 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     // Now a US goes ready: the very next tick must resume on its own.
     w.ready = Some(999)
 
-    val second = runLoop(w)
+    val second = w.runLoop()
 
     second shouldBe LoopExit.Success
     second.rc shouldBe 0
@@ -80,7 +67,7 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     w.inProgress = Some(777)
     w.ready = Some(999)
 
-    runLoop(w, Config(dryRun = true))
+    w.runLoop(Config(dryRun = true))
 
     w.called("gh issue view 777 --json title,body") shouldBe true
     w.called("gh issue view 999") shouldBe false
@@ -91,7 +78,7 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
   it should "stop at DryRun (rc 20) with the worker prompt rendered and zero mutations" in {
     val w = TestWorld()
 
-    val exit = runLoop(w, Config(dryRun = true))
+    val exit = w.runLoop(Config(dryRun = true))
 
     exit shouldBe LoopExit.DryRun
     exit.rc shouldBe 20
@@ -110,7 +97,7 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
   it should "reach a PR and needs-review on APPROVE (Scenario A)" in {
     val w = TestWorld()
 
-    val exit = runLoop(w)
+    val exit = w.runLoop()
 
     exit shouldBe LoopExit.Success
     exit.rc shouldBe 0
@@ -147,7 +134,7 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     val w = TestWorld()
     w.labels = List("ready", "class-2")
 
-    val exit = runLoop(w)
+    val exit = w.runLoop()
 
     exit shouldBe LoopExit.Success
     w.called("gh issue edit 999 --add-label needs-review --remove-label in-progress") shouldBe true
@@ -165,7 +152,7 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     w.issueBodies = Map(555 -> "Blocked-by: #999\n", 666 -> "Blocked-by: #999\nBlocked-by: #777\n")
     w.issueStates = Map(777 -> "OPEN")
 
-    val exit = runLoop(w)
+    val exit = w.runLoop()
 
     exit shouldBe LoopExit.Success
     w.called("gate CI-WAIT") shouldBe true // CI wait ran
@@ -208,7 +195,7 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     )
     w.fixScripts = List(WorkerScript.Produces("1\t0\tsrc/main/scala/SliceFixed.scala"))
 
-    val exit = runLoop(w)
+    val exit = w.runLoop()
 
     exit shouldBe LoopExit.Success
     w.callCount("dispatch FIX") shouldBe 1 // exactly one fix
@@ -237,7 +224,7 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
       WorkerScript.Produces("1\t0\tsrc/main/scala/Fix2.scala")
     )
 
-    val exit = runLoop(w)
+    val exit = w.runLoop()
 
     exit shouldBe LoopExit.NeedsHuman
     exit.rc shouldBe 40
@@ -265,7 +252,7 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
       WorkerScript.Produces("1\t0\tsrc/main/scala/Fix2.scala")
     )
 
-    val exit = runLoop(w)
+    val exit = w.runLoop()
 
     exit shouldBe LoopExit.NeedsHuman
     w.callCount("dispatch FIX") shouldBe 2
@@ -284,7 +271,7 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     w.implScript = WorkerScript.TimedOut
     w.fixScripts = List(WorkerScript.Produces(newFilePatch)) // must never be consumed
 
-    val exit = runLoop(w)
+    val exit = w.runLoop()
 
     exit shouldBe LoopExit.InfraFault
     exit.rc shouldBe 50
@@ -308,7 +295,7 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     w.gateResults = List(GateResult.Red)
     w.fixScripts = List(WorkerScript.TimedOut)
 
-    val exit = runLoop(w)
+    val exit = w.runLoop()
 
     exit shouldBe LoopExit.InfraFault
     w.callCount("dispatch FIX") shouldBe 1 // one FIX attempted, then halted
@@ -328,7 +315,7 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     w.reviewScripts = List(ReviewScript.TimedOut)
     w.fixScripts = List(WorkerScript.Produces(newFilePatch)) // must never be consumed
 
-    val exit = runLoop(w)
+    val exit = w.runLoop()
 
     exit shouldBe LoopExit.InfraFault
     w.callCount("dispatch FIX") shouldBe 0
@@ -347,7 +334,7 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     w.reviewScripts = List(ReviewScript.Says("  \n \t "))
     w.fixScripts = List(WorkerScript.Produces(newFilePatch)) // must never be consumed
 
-    val exit = runLoop(w)
+    val exit = w.runLoop()
 
     exit shouldBe LoopExit.InfraFault
     w.callCount("dispatch FIX") shouldBe 0 // spends nothing
@@ -367,7 +354,7 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     )
     w.fixScripts = List(WorkerScript.Produces("1\t0\tsrc/main/scala/Fix1.scala"))
 
-    val exit = runLoop(w)
+    val exit = w.runLoop()
 
     exit shouldBe LoopExit.Success
     w.callCount("dispatch FIX") shouldBe 1 // the fail-safe verdict SPENDS budget
@@ -383,7 +370,7 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
       ReviewScript.Says("draft says VERDICT: REQUEST_CHANGES but on reflection\nVERDICT: APPROVE")
     )
 
-    val exit = runLoop(w)
+    val exit = w.runLoop()
 
     exit shouldBe LoopExit.Success
     w.callCount("dispatch FIX") shouldBe 0
@@ -396,7 +383,7 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     w.gateResults = List(GateResult.Timeout)
     w.fixScripts = List(WorkerScript.Produces(newFilePatch)) // must never be consumed
 
-    val exit = runLoop(w)
+    val exit = w.runLoop()
 
     exit shouldBe LoopExit.InfraFault
     w.callCount("dispatch FIX") shouldBe 0
@@ -416,7 +403,7 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     w.ciWaitResult = GateResult.Red
     w.fixScripts = List(WorkerScript.Produces(newFilePatch)) // must never be consumed
 
-    val exit = runLoop(w)
+    val exit = w.runLoop()
 
     exit shouldBe LoopExit.NeedsHuman
     w.called("gh pr merge") shouldBe false      // NO merge attempted
@@ -433,7 +420,7 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     w.labels = List("ready", "class-1")
     w.ciWaitResult = GateResult.Timeout
 
-    val exit = runLoop(w)
+    val exit = w.runLoop()
 
     exit shouldBe LoopExit.InfraFault
     w.called("gh pr merge") shouldBe false
@@ -452,7 +439,7 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     w.rollupCounts = List(0, 0, 1)
     val cfg = Config(ciAppearInterval = 1, ciAppearTimeout = 30)
 
-    val exit = runLoop(w, cfg)
+    val exit = w.runLoop(cfg)
 
     exit shouldBe LoopExit.Success
     w.callCount("gh pr view 123 --json statusCheckRollup") shouldBe 3 // polled until registered
@@ -471,7 +458,7 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     w.rollupCounts = List(0)
     val cfg = Config(ciAppearInterval = 1, ciAppearTimeout = 3)
 
-    val exit = runLoop(w, cfg)
+    val exit = w.runLoop(cfg)
 
     exit shouldBe LoopExit.InfraFault
     w.called("gate CI-WAIT") shouldBe false // nothing to watch
@@ -491,7 +478,7 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     w.labels = List("ready", "class-1")
     w.prStateAnswer = "OPEN"
 
-    val exit = runLoop(w)
+    val exit = w.runLoop()
 
     exit shouldBe LoopExit.InfraFault
     w.called("gh pr merge 123") shouldBe true            // merge WAS attempted
@@ -506,9 +493,9 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
   it should "exit InfraFault when the merge command fails, before any verification (Scenario O)" in {
     val w = TestWorld()
     w.labels = List("ready", "class-1")
-    w.mergeSucceeds = false
+    w.mergeRc = 1
 
-    val exit = runLoop(w)
+    val exit = w.runLoop()
 
     exit shouldBe LoopExit.InfraFault
     w.called("gh pr view 123 --json state") shouldBe false // verify not reached
@@ -525,7 +512,7 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     w.implScript = WorkerScript.Produces("1\t0\tharness/evil.txt")
     w.fixScripts = List(WorkerScript.Produces(newFilePatch)) // must never be consumed
 
-    val exit = runLoop(w)
+    val exit = w.runLoop()
 
     exit shouldBe LoopExit.NeedsHuman
     w.callCount("dispatch FIX") shouldBe 0    // fixer = violating agent class
@@ -564,7 +551,7 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     val w = TestWorld()
     w.fixScripts = List(WorkerScript.Produces(newFilePatch)) // must never be consumed
 
-    val exit = runLoop(w, Config(maxPatchBytes = 10)) // any real patch exceeds the tiny cap
+    val exit = w.runLoop(Config(maxPatchBytes = 10)) // any real patch exceeds the tiny cap
 
     exit shouldBe LoopExit.NeedsHuman
     w.callCount("dispatch FIX") shouldBe 0
@@ -585,7 +572,7 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     w.applySucceeds = false                                  // valid patch, conflicts with the base
     w.fixScripts = List(WorkerScript.Produces(newFilePatch)) // must never be consumed
 
-    val exit = runLoop(w)
+    val exit = w.runLoop()
 
     exit shouldBe LoopExit.InfraFault
     w.callCount("dispatch FIX") shouldBe 0 // no budget spent
@@ -602,7 +589,7 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     val w = TestWorld()
     w.implScript = WorkerScript.Produces("this is not a unified diff at all")
 
-    val exit = runLoop(w)
+    val exit = w.runLoop()
 
     exit shouldBe LoopExit.InfraFault // ApplyFail, never a gate failure
     w.callCount("gate FAST") shouldBe 0
@@ -616,7 +603,7 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     val w = TestWorld()
     w.implScript = WorkerScript.Empty
 
-    val exit = runLoop(w)
+    val exit = w.runLoop()
 
     exit shouldBe LoopExit.NothingMade
     exit.rc shouldBe 30
@@ -634,7 +621,7 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     w.gateResults = List(GateResult.Red)
     w.fixScripts = List(WorkerScript.Empty) // the fixer reverted all prior work
 
-    val exit = runLoop(w)
+    val exit = w.runLoop()
 
     exit shouldBe LoopExit.NeedsHuman
     w.callCount("dispatch FIX") shouldBe 1
@@ -657,7 +644,7 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
       WorkerScript.Produces(newFilePatch) // must never be consumed
     )
 
-    val exit = runLoop(w)
+    val exit = w.runLoop()
 
     exit shouldBe LoopExit.NeedsHuman
     w.callCount("dispatch FIX") shouldBe 1 // the rejection breaks the loop
@@ -682,7 +669,7 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     val w = TestWorld()
     w.labels = List("ready", "class-1")
 
-    val exit = runLoop(w, Config(ciWaitCmd = Some("false")))
+    val exit = w.runLoop(Config(ciWaitCmd = Some("false")))
 
     exit shouldBe LoopExit.Success
     w.called("gate CI-WAIT cmd=false") shouldBe true

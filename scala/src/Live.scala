@@ -18,7 +18,7 @@ import scala.util.control.NonFatal
   * `[loop HH:MM:SS] <msg>`, written to stderr, verbatim parity, since the slice 3 parity oracle
   * greps log lines.
   */
-object LiveLog:
+object LiveLog extends Log:
   private val fmt = java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss")
 
   def log(msg: String): Unit =
@@ -879,9 +879,9 @@ final class LiveGitHub(
     * `gh pr merge` one included: in bash the redirection is on the expansion of `$merge_cmd`, not
     * on the override.
     */
-  def merge(pr: Int, ciLog: String): Boolean =
+  def merge(pr: Int, ciLog: String): Int =
     val logPath = root.resolve(ciLog)
-    val rc      = mergeSeam match
+    mergeSeam match
       case Some(cmd) =>
         LiveProc.wordSplit(cmd) match
           // bash: `$merge_cmd >>"$ci_log" 2>&1` with a whitespace-only MERGE_CMD expands to
@@ -906,4 +906,3 @@ final class LiveGitHub(
           logPath,
           extraPath
         )
-    rc == 0

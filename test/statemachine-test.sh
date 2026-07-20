@@ -7,6 +7,34 @@ set -euo pipefail
 # The harness/ dir under test defaults to the one this script lives in (harness/test/..).
 SRC_HARNESS="${SRC_HARNESS:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 
+# Which implementation of the loop this run scores (the Scala rewrite's parity oracle, slice 3):
+#   bash  (default) -> harness/loop.sh, the reference implementation
+#   scala           -> scala-cli run harness/scala, the port
+# Every scenario, stub and assertion below is shared: the two implementations are scored on the
+# same 142 checks, which is the whole point. Slice 4 flips the default and retires this switch
+# along with loop.sh; until then bash stays the default so nothing else that runs this suite
+# (CI, the sandbox tests) changes behaviour.
+HARNESS_IMPL="${HARNESS_IMPL:-bash}"
+case "$HARNESS_IMPL" in
+  bash|scala) ;;
+  *) echo "HARNESS_IMPL must be 'bash' or 'scala' (got '$HARNESS_IMPL')" >&2; exit 2 ;;
+esac
+
+# The command that runs ONE loop process against the sandbox at $WORK (cwd is always $WORK).
+#
+# bash runs the COPY inside the sandbox, because loop.sh derives the repo root it mutates from its
+# own $BASH_SOURCE. The Scala entry derives that root from the cwd instead (Main.resolveRepoRoot
+# walks up for harness/loop.sh, which the sandbox copy carries), so its sources can stay where they
+# are — and must, or scala-cli would compile them again from scratch in each of the 22 sandboxes.
+# Same sandbox under test either way; only the location of the code doing the driving differs.
+harness_entry() {
+  if [[ "$HARNESS_IMPL" == "scala" ]]; then
+    scala-cli run "$SRC_HARNESS/scala"
+  else
+    "$WORK/harness/loop.sh"
+  fi
+}
+
 pass=0; fail=0
 check() { # check DESC EXPECTED ACTUAL
   if [[ "$2" == "$3" ]]; then printf '  ok   %s\n' "$1"; pass=$((pass+1));
@@ -119,7 +147,7 @@ teardown() { cd /; rm -rf "$SB"; }
 run_loop() { # run_loop -> sets RC; env vars for seams passed by caller
   cd "$WORK"
   RC=0
-  MAX_ITERS=1 "$WORK/harness/loop.sh" >"$SB/loop.out" 2>&1 || RC=$?
+  MAX_ITERS=1 harness_entry >"$SB/loop.out" 2>&1 || RC=$?
 }
 
 echo "== Scenario DRY: DRY_RUN renders worker prompt, no mutation =="
@@ -128,7 +156,7 @@ RC=0; cd "$WORK"
 # GATE_CMD overridden so the sandbox preflight (image build + proxy + containerized worker/fixer)
 # is skipped: the suite must not depend on a live docker daemon or an API key on the machine
 # running it. Overriding GATE_CMD is what the loop keys the whole sandbox preflight off.
-DRY_RUN=1 MAX_ITERS=1 GATE_CMD=true "$WORK/harness/loop.sh" >"$SB/loop.out" 2>&1 || RC=$?
+DRY_RUN=1 MAX_ITERS=1 GATE_CMD=true harness_entry >"$SB/loop.out" 2>&1 || RC=$?
 check "exit code 0 (dry run)" 0 "$RC"
 checkc "worker prompt rendered" "AC1: implement the slice" "$WORK/harness/logs/issue-999.prompt.txt"
 check "no gh issue edit (no label mutation)" "0" "$(grep -c 'issue edit' "$GH_CALLS" || true; )"

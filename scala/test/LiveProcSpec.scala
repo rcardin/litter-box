@@ -875,7 +875,7 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
     val gh                     =
       LiveGitHub(root, ciAppearCmd = None, mergeCmd = None, extraPath = Some(binDir.toString))
 
-    gh.merge(42, ciLogRel) shouldBe true
+    gh.merge(42, ciLogRel) shouldBe 0
 
     readString(callsFile) should include("gh pr merge 42 --squash --delete-branch")
   }
@@ -890,7 +890,7 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
     val gh             =
       LiveGitHub(root, ciAppearCmd = None, mergeCmd = None, extraPath = Some(binDir.toString))
 
-    gh.merge(42, ciLogRel) shouldBe true
+    gh.merge(42, ciLogRel) shouldBe 0
 
     val contents = readString(ciLog)
     contents should startWith("CI watch output already here\n") // append, NOT truncate
@@ -914,7 +914,7 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
       extraPath = Some(binDir.toString)
     )
 
-    gh.merge(42, ciLogRel) shouldBe false
+    gh.merge(42, ciLogRel) shouldBe 7 // the seam's real exit code, not just "nonzero"
 
     val contents = readString(ciLog)
     contents should startWith("CI watch output already here\n")
@@ -932,7 +932,7 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
       extraPath = Some(binDir.toString)
     )
 
-    gh.merge(42, ciLogRel) shouldBe true
+    gh.merge(42, ciLogRel) shouldBe 0
 
     readString(callsFile) shouldBe ""
   }
@@ -953,7 +953,7 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
       extraPath = Some(binDir.toString)
     )
 
-    gh.merge(42, ciLogRel) shouldBe true
+    gh.merge(42, ciLogRel) shouldBe 0
 
     readString(callsFile) shouldBe ""
     readString(ciLog) shouldBe "CI watch output already here\n"
@@ -969,7 +969,7 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
       extraPath = Some(binDir.toString)
     )
 
-    gh.merge(42, ciLogRel) shouldBe true
+    gh.merge(42, ciLogRel) shouldBe 0
 
     Files.exists(root.resolve(ciLogRel)) shouldBe true
     readString(root.resolve(ciLogRel)) shouldBe ""

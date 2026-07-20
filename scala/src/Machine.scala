@@ -62,6 +62,15 @@ object Machine:
         .mkString("\n")
     }
 
+  /** Logs an infra fault the way bash does — the message on the operator's log stream at the point
+    * of the fault, not at the fold — and raises it. Single helper rather than a log+raise pair at
+    * each of the ten raise sites: `InfraFault.reason` IS the bash log line (see `InfraFault`), so
+    * there is exactly one string per fault and no way to log one wording and carry another.
+    */
+  private def infraFault(reason: String)(using logger: Log)(using Raise[InfraFault]): Nothing =
+    logger.log(reason)
+    Raise.raise(InfraFault(reason))
+
   /** One driver tick: folds the infra-fault channel to LoopExit.InfraFault (rc 50) and emits the
     * terminal DONE status event, exactly like the bash driver.
     */
@@ -74,7 +83,8 @@ object Machine:
       StatusLog,
       Notify,
       HarnessFs,
-      Clock
+      Clock,
+      Log
   ): LoopExit =
     val cur  = Cursor()
     val exit = Raise.fold(iterate(n, cur)) { (_: InfraFault) =>
@@ -99,19 +109,25 @@ object Machine:
       log: StatusLog,
       notify: Notify,
       fs: HarnessFs,
-      clock: Clock
+      clock: Clock,
+      logger: Log
   )(using Raise[InfraFault]): LoopExit =
     // STOP.md is a MANUAL kill-switch only: the loop never writes it itself.
-    if fs.stopRequested() then return LoopExit.ManualStop
+    if fs.stopRequested() then
+      logger.log("STOP.md present (manual kill-switch) — exiting")
+      return LoopExit.ManualStop
 
     // Pick US (deterministic, no LLM): resume an in-progress one, else oldest ready.
     // No issue = transient idle — nothing is written, nothing is labelled, so the very next
     // tick resumes on its own when a US goes ready (the idle state must never latch).
     val issue = gh.inProgressIssue().orElse(gh.oldestReadyIssue()) match
-      case None    => return LoopExit.Idle
+      case None =>
+        logger.log("no in-progress or ready issue — idle, exiting (next tick resumes when one goes ready)")
+        return LoopExit.Idle
       case Some(i) => i
     cur.iter = n; cur.issue = issue.toString; cur.pass = 0; cur.budget = cfg.repairBudget
     emit(cur, "PICK", "ok", detail = s"issue=$issue")
+    logger.log(s"iteration $n -> issue #$issue")
 
     // Render the worker prompt with the issue body injected (read-only).
     val bodyFile = s"$LogDir/issue-$issue.body.md"
@@ -126,7 +142,11 @@ object Machine:
     val isClass1 = gh.issueLabels(issue).contains("class-1")
 
     // Dry run stops here — before ANY git/label mutation, so it is truly read-only.
-    if cfg.dryRun then return LoopExit.DryRun
+    if cfg.dryRun then
+      logger.log(
+        s"DRY_RUN=1 — rendered worker prompt for #$issue -> $workerPromptFile; no mutation; stopping"
+      )
+      return LoopExit.DryRun
 
     // Require a clean tree on a fresh branch off main. Serial loop: one US at a time.
     // These are die() paths in bash (exit 1): fatal misconfiguration, not part of the
@@ -163,16 +183,10 @@ object Machine:
     stagePatch(Role.IMPL, workerPromptFile, implPatch, implLog, currentPatch) match
       case StageResult.Empty =>
         emit(cur, "IMPL", "ok", implLog, "no diff")
+        logger.log("no changes produced by the iteration — leaving issue in-progress, not opening a PR")
         return LoopExit.NothingMade
       case result =>
-        handleStageResult(
-          cur,
-          "IMPL",
-          implLog,
-          result,
-          timeoutMsg = "IMPL worker timed out — a half-finished worker must not reach the gates",
-          applyFailMsg = "IMPL patch did not apply — infra fault, no budget spent"
-        ) match
+        handleStageResult(cur, Role.IMPL, implLog, result) match
           case StageVerdict.Applied(p)     => currentPatch = Some(p)
           case StageVerdict.Rejected(kind) =>
             outcome = Some(Outcome.Fail); failureKind = Some(kind); gateStatus = "SKIPPED"
@@ -197,17 +211,10 @@ object Machine:
         case StageResult.Empty =>
           // The fixer reverted all prior work — route to needs-human, never re-gate an empty tree.
           emit(cur, "FIX", "red", fixLog, "empty fix")
+          logger.log("FIX produced no diff (the fixer reverted all prior work); routing to needs-human")
           outcome = Some(Outcome.Fail); failureKind = Some(FailureKind.EmptyFix)
         case result =>
-          handleStageResult(
-            cur,
-            "FIX",
-            fixLog,
-            result,
-            timeoutMsg =
-              "FIX worker timed out (infra fault); exiting without spending further budget",
-            applyFailMsg = "FIX patch did not apply (infra fault, no budget spent)"
-          ) match
+          handleStageResult(cur, Role.FIX, fixLog, result) match
             case StageVerdict.Applied(p)     => currentPatch = Some(p)
             case StageVerdict.Rejected(kind) =>
               outcome = Some(Outcome.Fail); failureKind = Some(kind)
@@ -215,10 +222,11 @@ object Machine:
     // Shared shape of both repair triggers (gate-RED, REQUEST_CHANGES): out of budget fails the
     // outcome, otherwise spend one unit, write the fail file with the stage-specific content, and
     // dispatch a FIX round. failureKind/gateStatus are set by the caller before this runs.
-    def spendOrExhaust(failContent: String): Unit =
+    def spendOrExhaust(trigger: FailureKind, failContent: String): Unit =
       if budget == 0 then outcome = Some(Outcome.Fail)
       else
         budget -= 1; cur.budget = budget
+        logger.log(s"self-repair: budget now $budget — dispatching FIX for ${trigger.text}")
         val failFile = s"$LogDir/issue-$issue-pass$pass.failure.md"
         fs.write(failFile, failContent)
         fixRound(pass, failFile)
@@ -233,22 +241,23 @@ object Machine:
       emit(cur, "FAST_GATE", "start", gateLog)
       gates.run("FAST", cfg.gateCmd, cfg.gateTimeout, gateLog) match
         case GateResult.Timeout =>
-          Raise.raise(
-            InfraFault(
-              s"FAST gate hit the ${cfg.gateTimeout}s timeout — infra fault, not a code failure"
-            )
+          infraFault(
+            s"WARNING: FAST gate hit the ${cfg.gateTimeout}s timeout — infra fault, not a code failure"
           )
         case GateResult.Red =>
           gateStatus = "RED"
           failureKind = Some(FailureKind.GateRed)
           emit(cur, "FAST_GATE", "red", gateLog)
+          logger.log(s"FAST gate RED (pass $pass, see $gateLog)")
           spendOrExhaust(
+            FailureKind.GateRed,
             s"## Fast-gate failure — `${cfg.gateCmd}` (compile under -Werror, then in-memory tests)\n\n" +
               s"Tail of the fast-gate log:\n\n```\n${fs.read(gateLog)}\n```\n"
           )
         case GateResult.Green =>
           gateStatus = "GREEN"
           emit(cur, "FAST_GATE", "ok", gateLog)
+          logger.log(s"FAST gate GREEN (pass $pass) — running tamper check + cold reviewer")
 
           // Tamper check feeds the reviewer (the harness surfaces, does not block).
           val tamperFile = s"$LogDir/issue-$issue-tamper.md"
@@ -270,21 +279,22 @@ object Machine:
           agents.review(fs.read(reviewPromptFile), reviewFile) match
             case DispatchOutcome.TimedOut =>
               emit(cur, "REVIEW", "red", reviewFile, "timeout")
-              Raise.raise(InfraFault("REVIEWER timed out — exiting without spending budget"))
+              infraFault("REVIEWER timed out — infra fault; exiting without spending budget")
             case DispatchOutcome.Done => ()
           reviewed = true
 
           // An empty (or whitespace-only) review is a crashed reviewer, not a verdict.
           if fs.read(reviewFile).isBlank then
             emit(cur, "REVIEW", "red", reviewFile, "empty review")
-            Raise.raise(
-              InfraFault(
-                "reviewer produced no output — infra fault (crashed or timed-out reviewer)"
-              )
-            )
+            infraFault("reviewer produced no output — infra fault (crashed or timed-out reviewer)")
 
           // Grep, not parse. Missing sentinel -> REQUEST_CHANGES (fail safe, never auto-approve).
-          val verdict = parseVerdict(fs.read(reviewFile)).getOrElse(Verdict.RequestChanges)
+          val verdict = parseVerdict(fs.read(reviewFile)) match
+            case Some(v) => v
+            case None    =>
+              logger.log("reviewer emitted no VERDICT sentinel — fail-safe REQUEST_CHANGES")
+              Verdict.RequestChanges
+          logger.log(s"reviewer verdict: ${verdictText(verdict)} (pass $pass)")
           emit(cur, "REVIEW", "ok", reviewFile, s"verdict=${verdictText(verdict)}")
           verdict match
             case Verdict.Approve =>
@@ -293,6 +303,7 @@ object Machine:
               // REQUEST_CHANGES — spend from the same shared budget as gate-RED.
               failureKind = Some(FailureKind.ReviewChanges)
               spendOrExhaust(
+                FailureKind.ReviewChanges,
                 s"## The independent reviewer requested changes\n\n${fs.read(reviewFile)}\n\n${fs.read(tamperFile)}"
               )
     end while
@@ -315,7 +326,9 @@ object Machine:
       )
       git.add("FIX-EMPTY.md")
     git.addAll()
-    if !git.anythingStaged() then return LoopExit.NothingMade
+    if !git.anythingStaged() then
+      logger.log("nothing staged at terminal — unexpected; leaving in-progress")
+      return LoopExit.NothingMade
 
     val outcomeText = if outcome.contains(Outcome.Success) then "SUCCESS" else "FAIL"
     val kindText    = failureKind.map(_.text).getOrElse("?")
@@ -397,18 +410,18 @@ object Machine:
       prBody.toString
     )
     val prNum = prNumberOf(prUrl) match
-      case None => Raise.raise(InfraFault("could not determine PR number from gh pr create output"))
+      case None =>
+        infraFault("could not determine PR number from gh pr create output — infra fault")
       case Some(p) => p
+    logger.log(s"PR #$prNum opened for #$issue (outcome $outcomeText)")
     emit(cur, "PR", "ok", detail = s"pr=$prNum outcome=$outcomeText")
 
     route match
       case Route.AutoMergeCandidate => autoMerge(issue, prNum, cur)
-      case Route.NeedsReview        =>
+      case Route.NeedsReview | Route.NeedsHuman =>
         gh.editLabels(issue, add = List(label), remove = List("in-progress"))
-        LoopExit.Success
-      case Route.NeedsHuman =>
-        gh.editLabels(issue, add = List(label), remove = List("in-progress"))
-        LoopExit.NeedsHuman
+        logger.log(s"issue #$issue -> $label")
+        if route == Route.NeedsReview then LoopExit.Success else LoopExit.NeedsHuman
 
   /** v4 auto-merge (class-1 + APPROVE only): wait-appear -> watch -> merge -> VERIFY the PR state
     * is MERGED (unverified = infra fault) -> drop in-progress -> flip blocked -> fetch -> notify.
@@ -422,7 +435,8 @@ object Machine:
       gates: GateRunner,
       log: StatusLog,
       notify: Notify,
-      clock: Clock
+      clock: Clock,
+      logger: Log
   )(using Raise[InfraFault]): LoopExit =
     val ciLog = s"$LogDir/issue-$issue.ci-wait.log"
     emit(cur, "CI_WAIT", "start", ciLog)
@@ -431,10 +445,8 @@ object Machine:
     // the rollup is non-empty, and only then let the CI watch judge. A check that never
     // registers is a scheduler/infra problem, never rc 40.
     if !waitForChecks(prNum) then
-      Raise.raise(
-        InfraFault(
-          s"no CI check registered on PR #$prNum within ${cfg.ciAppearTimeout}s — PR open, issue stays in-progress"
-        )
+      infraFault(
+        s"no CI check registered on PR #$prNum within ${cfg.ciAppearTimeout}s — infra fault; PR open, issue stays in-progress"
       )
     gates.run(
       "CI-WAIT",
@@ -443,45 +455,59 @@ object Machine:
       ciLog
     ) match
       case GateResult.Timeout =>
-        Raise.raise(
-          InfraFault(
-            s"CI wait hit the ${cfg.ciWaitTimeout}s bound — PR open, issue stays in-progress"
-          )
+        infraFault(
+          s"CI wait hit the ${cfg.ciWaitTimeout}s bound — infra fault; PR open, issue stays in-progress"
         )
       case GateResult.Red =>
         emit(cur, "CI_WAIT", "red", ciLog)
+        logger.log(
+          s"CI RED on PR #$prNum after local gates green — needs-human, no merge, no self-repair"
+        )
         gh.prComment(
           prNum,
           "CI red after local gates were green. The loop never self-repairs against the independent check (v3 hands-off rule) — a human must look."
         )
-        gh.editLabels(issue, add = List("needs-human"), remove = List("in-progress"))
+        // bash guards this flip (loop.sh:464): a failed flip is a warning, not a hard stop.
+        if !gh.editLabels(issue, add = List("needs-human"), remove = List("in-progress")) then
+          logger.log(s"WARNING: could not flip #$issue to needs-human (flip by hand)")
         notify.notify(s"harness: #$issue CI RED -> needs-human (PR #$prNum)")
         LoopExit.NeedsHuman
       case GateResult.Green =>
         emit(cur, "CI_WAIT", "ok", ciLog)
+        logger.log(s"CI green — merging PR #$prNum")
         emit(cur, "MERGE", "start")
         // Same `ciLog` the CI watch just wrote: bash appends the merge output to it (loop.sh:473).
-        if !gh.merge(prNum, ciLog) then
-          Raise.raise(InfraFault("merge command failed — infra fault"))
+        val mergeRc = gh.merge(prNum, ciLog)
+        // loop.sh:475 prints the rc: it is what tells "PR not mergeable" from "gh auth expired".
+        if mergeRc != 0 then infraFault(s"merge command failed rc=$mergeRc — infra fault")
         val state = gh.prState(prNum)
         if state != "MERGED" then
-          Raise.raise(InfraFault(s"merge NOT verified (PR state '$state') — infra fault"))
+          // bash's `${state:-unknown}` (loop.sh:481): an empty answer from `gh pr view` is the
+          // very case this fault exists to report, so it must not print as an empty pair of quotes.
+          val shown = if state.isEmpty then "unknown" else state
+          infraFault(s"merge NOT verified (PR state '$shown') — infra fault")
         emit(cur, "MERGE", "ok", detail = s"pr=$prNum")
         gh.editLabels(issue, add = Nil, remove = List("in-progress"))
         flipBlocked(issue)
-        git.fetchOriginMain() // a post-merge fetch failure is tolerated: next tick re-fetches
+        // a post-merge fetch failure is tolerated: next tick re-fetches
+        if !git.fetchOriginMain() then
+          logger.log("post-merge fetch failed (next iteration re-fetches anyway)")
         notify.notify(s"harness: #$issue auto-merged (PR #$prNum, CI green, reviewer APPROVE)")
         LoopExit.Success
 
   /** Poll the rollup length until > 0, bounded by ciAppearTimeout. True once >=1 check is
     * registered, false on timeout.
     */
-  private def waitForChecks(prNum: Int)(using cfg: Config, gh: GitHub, clock: Clock): Boolean =
+  private def waitForChecks(
+      prNum: Int
+  )(using cfg: Config, gh: GitHub, clock: Clock, logger: Log): Boolean =
     var waited = 0
     while waited < cfg.ciAppearTimeout do
       gh.checksRollupCount(prNum) match
-        case Some(n) if n > 0 => return true
-        case _                => ()
+        case Some(n) if n > 0 =>
+          logger.log(s"CI check registered on PR #$prNum after ${waited}s")
+          return true
+        case _ => ()
       clock.sleepSeconds(cfg.ciAppearInterval)
       waited += cfg.ciAppearInterval
     false
@@ -494,12 +520,15 @@ object Machine:
     * The just-merged issue counts as closed even if GitHub's async close lags the merge. Issues
     * without the sentinel are left alone (human-managed).
     */
-  private def flipBlocked(mergedIssue: Int)(using gh: GitHub): Unit =
+  private def flipBlocked(mergedIssue: Int)(using gh: GitHub, logger: Log): Unit =
     gh.openBlockedIssues().foreach { b =>
       val refs = parseBlockedBy(gh.issueBody(b))
       if refs.nonEmpty then
         val allClosed = refs.forall(r => r == mergedIssue || gh.issueState(r) == "CLOSED")
-        if allClosed then gh.editLabels(b, add = List("ready"), remove = List("blocked"))
+        if allClosed then
+          logger.log(s"dependency #$mergedIssue closed — flipping #$b blocked -> ready")
+          if !gh.editLabels(b, add = List("ready"), remove = List("blocked")) then
+            logger.log(s"WARNING: could not flip #$b blocked -> ready (flip by hand)")
     }
 
   private enum Outcome:
@@ -530,6 +559,49 @@ object Machine:
     case Applied(patch: String)
     case Rejected(kind: FailureKind)
 
+  /** Whether a stage narrates a patch-guard rejection on its own log line, or deliberately stays
+    * silent about it.
+    *
+    * `Silent` is a decision, not a missing value: loop.sh:710/714 log the guard rejection naming the
+    * patch that was rejected, while loop.sh's handle_fix_result (:608-609) logs NOTHING for the same
+    * two results on a FIX, because the fixer's rejection is already narrated by the guard line
+    * inside stage_patch. The asymmetry is kept, not tidied: the oracle greps this stream.
+    */
+  private enum RejectionNarration:
+    /** Emit one guard-rejection line naming `subject` as the patch that was rejected. */
+    case Announce(subject: String)
+
+    /** Emit nothing; the rejection is already narrated elsewhere. */
+    case Silent
+
+  /** Everything `handleStageResult` does differently for an IMPL than for a FIX, in one place. The
+    * five strings used to travel as five parameters of `handleStageResult`, always in lockstep; the
+    * only thing that genuinely varies per call is the log file, which stays a parameter.
+    */
+  private case class StagePolicy(
+      stage: String,
+      rejectionNarration: RejectionNarration,
+      timeoutMsg: String,
+      applyFailMsg: String
+  )
+
+  private def policyOf(role: Role): StagePolicy = role match
+    case Role.IMPL =>
+      StagePolicy(
+        stage = "IMPL",
+        rejectionNarration = RejectionNarration.Announce("the initial worker patch"),
+        timeoutMsg =
+          "IMPL worker timed out — infra fault; a half-finished worker must not reach the gates",
+        applyFailMsg = "IMPL patch did not apply — infra fault, no budget spent"
+      )
+    case Role.FIX =>
+      StagePolicy(
+        stage = "FIX",
+        rejectionNarration = RejectionNarration.Silent,
+        timeoutMsg = "FIX worker timed out (infra fault); exiting without spending further budget",
+        applyFailMsg = "FIX patch did not apply (infra fault, no budget spent)"
+      )
+
   /** Shared shape of a stagePatch(...) result match, common to both the IMPL and FIX call sites:
     * Timeout and ApplyFail both raise InfraFault (infra fault, no budget spent); Protected and
     * Oversize both fail the outcome with the matching FailureKind; Ok emits the ok status and
@@ -538,24 +610,31 @@ object Machine:
     */
   private def handleStageResult(
       cur: Cursor,
-      stage: String,
+      role: Role,
       logFile: String,
-      result: StageResult,
-      timeoutMsg: String,
-      applyFailMsg: String
-  )(using log: StatusLog)(using Raise[InfraFault]): StageVerdict =
+      result: StageResult
+  )(using log: StatusLog, logger: Log)(using Raise[InfraFault]): StageVerdict =
+    val policy = policyOf(role)
+    val stage  = policy.stage
+    def logRejection(kind: FailureKind): Unit =
+      policy.rejectionNarration match
+        case RejectionNarration.Announce(subject) =>
+          logger.log(s"patch guard rejected $subject (${kind.text}) — routing to needs-human")
+        case RejectionNarration.Silent => ()
     result match
       case StageResult.Timeout =>
         emit(cur, stage, "red", logFile, "timeout")
-        Raise.raise(InfraFault(timeoutMsg))
+        infraFault(policy.timeoutMsg)
       case StageResult.ApplyFail =>
         emit(cur, stage, "red", logFile, "patch apply conflict")
-        Raise.raise(InfraFault(applyFailMsg))
+        infraFault(policy.applyFailMsg)
       case StageResult.Protected =>
         emit(cur, stage, "red", logFile, "protected-path")
+        logRejection(FailureKind.ProtectedPath)
         StageVerdict.Rejected(FailureKind.ProtectedPath)
       case StageResult.Oversize =>
         emit(cur, stage, "red", logFile, "oversized patch")
+        logRejection(FailureKind.OversizedPatch)
         StageVerdict.Rejected(FailureKind.OversizedPatch)
       case StageResult.Ok(p) =>
         emit(cur, stage, "ok", logFile)
@@ -577,7 +656,8 @@ object Machine:
       cfg: Config,
       git: Git,
       agents: AgentDispatch,
-      fs: HarnessFs
+      fs: HarnessFs,
+      logger: Log
   ): StageResult =
     agents.worker(role, promptFile, patchOut, logFile, currentPatch) match
       case DispatchOutcome.TimedOut => return StageResult.Timeout
@@ -591,18 +671,28 @@ object Machine:
     val numstat = git.applyNumstat(patchOut)
     val bytes   = fs.sizeBytes(patchOut)
     if bytes > cfg.maxPatchBytes then
+      logger.log(
+        s"patch guard: ${bytes}B exceeds the ${cfg.maxPatchBytes}B cap — rejecting oversized patch (not applied)"
+      )
       writeRejectMarker(
         s"Oversized patch: $bytes bytes exceeds the ${cfg.maxPatchBytes}-byte cap.",
         numstat
       )
       return StageResult.Oversize
     if touchesProtected(numstat) then
+      logger.log(
+        "patch guard: patch touches a protected path (.github/, harness/, docs/, CONTEXT.md, PROMPT.md or STOP.md) — rejecting (not applied)"
+      )
       writeRejectMarker(
         "Patch touches a protected path (CI workflow, harness code, docs, or a control/constitution file).",
         numstat
       )
       return StageResult.Protected
-    if !git.applyIndex(patchOut) then return StageResult.ApplyFail
+    if !git.applyIndex(patchOut) then
+      logger.log(
+        s"git apply refused the patch (see ${patchOut}.apply.err) — infra fault, no budget spent"
+      )
+      return StageResult.ApplyFail
     StageResult.Ok(patchOut)
 
   /** On a guard rejection the tree is left pristine — a hostile or oversized patch is NEVER

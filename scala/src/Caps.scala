@@ -41,13 +41,16 @@ trait GitHub:
   /** `statusCheckRollup | length`; None when the query itself failed. */
   def checksRollupCount(pr: Int): Option[Int]
 
-  /** MERGE_CMD seam (`gh pr merge --squash --delete-branch`). False = merge command failed.
+  /** MERGE_CMD seam (`gh pr merge --squash --delete-branch`). Returns the merge child's exit code
+    * (bash's `$merge_rc`); 0 = merged. The rc itself is load-bearing, not just its zero-ness: it is
+    * the only diagnostic in the failure log line separating "PR not mergeable" from "gh auth
+    * expired", and loop.sh:475 prints it verbatim.
     *
     * The merge child's combined stdout+stderr is APPENDED to `ciLog` — bash's
     * `$merge_cmd >>"$ci_log" 2>&1` (loop.sh:473), where `$ci_log` is the CI-wait log the caller
     * already computed. Append, never truncate: the CI watch's own output is already in there.
     */
-  def merge(pr: Int, ciLog: String): Boolean
+  def merge(pr: Int, ciLog: String): Int
 
 /** `git` operations, all against the serial one-US-at-a-time working tree. */
 trait Git:
@@ -131,3 +134,17 @@ trait HarnessFs:
 /** Wall-clock waits (CI-appear poll). In-memory tests script it; slice 2 sleeps for real. */
 trait Clock:
   def sleepSeconds(s: Int): Unit
+
+/** The operator-facing log stream (bash's `log()` helper, loop.sh:141 — `[loop HH:MM:SS] msg` on
+  * stderr).
+  *
+  * A capability rather than a direct `LiveLog` call inside Machine for the same reason every other
+  * side effect is one: Machine stays a pure decision function over its `using` clause, and the
+  * scenario tests can assert on what was logged. That matters more here than it looks — the bash
+  * parity oracle (harness/test/statemachine-test.sh) greps this stream for load-bearing phrases
+  * (`half-finished worker must not reach the gates`, `protected-path`, `oversized-patch`, ...), so
+  * these strings are asserted behaviour, not decoration. The wording is copied from loop.sh
+  * verbatim; changing one is a parity break, not a style change.
+  */
+trait Log:
+  def log(msg: String): Unit
