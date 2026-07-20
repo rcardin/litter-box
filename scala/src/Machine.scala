@@ -7,9 +7,8 @@ object Machine:
 
   val LogDir = "harness/logs"
 
-  /** The four CUR_* globals of loop.sh: the status-event context. iterate() keeps them
-    * current; emit() only reads them, so a terminal DONE from the driver still carries the
-    * right issue.
+  /** The four CUR_* globals of loop.sh: the status-event context. iterate() keeps them current;
+    * emit() only reads them, so a terminal DONE from the driver still carries the right issue.
     */
   final class Cursor:
     var iter: Int     = 0
@@ -17,28 +16,42 @@ object Machine:
     var pass: Int     = 0
     var budget: Int   = 0
 
-  /** Detail sanitization: never model-controlled, but strip anything that could break out of
-    * the JSON string anyway (backslash, double quote, newlines).
+  /** Detail sanitization: never model-controlled, but strip anything that could break out of the
+    * JSON string anyway (backslash, double quote, newlines).
     */
   private[harness] def sanitizeDetail(detail: String): String =
     detail.replace("\\", "").replace("\"", "").replace("\n", " ")
 
   /** Extracts the PR number from a `gh pr create` PR URL (last path segment), e.g.
-    * `https://github.com/o/r/pull/42` -> `Some(42)`. `None` if the URL has no numeric last
-    * segment.
+    * `https://github.com/o/r/pull/42` -> `Some(42)`. `None` if the URL has no numeric last segment.
     */
   private[harness] def prNumberOf(prUrl: String): Option[Int] =
     prUrl.split('/').lastOption.flatMap(_.toIntOption)
 
-  private def emit(cur: Cursor, phase: String, state: String, logfile: String = "", detail: String = "")(using
+  private def emit(
+      cur: Cursor,
+      phase: String,
+      state: String,
+      logfile: String = "",
+      detail: String = ""
+  )(using
       log: StatusLog
   ): Unit =
     log.append(
-      StatusEvent(cur.iter, cur.issue, phase, state, cur.pass, cur.budget, logfile, sanitizeDetail(detail))
+      StatusEvent(
+        cur.iter,
+        cur.issue,
+        phase,
+        state,
+        cur.pass,
+        cur.budget,
+        logfile,
+        sanitizeDetail(detail)
+      )
     )
 
-  /** render_template: each line containing the literal `{{KEY}}` is replaced by the spliced
-    * content (whole-line replacement, embedded newlines preserved), one key per pass.
+  /** render_template: each line containing the literal `{{KEY}}` is replaced by the spliced content
+    * (whole-line replacement, embedded newlines preserved), one key per pass.
     */
   private[harness] def renderTemplate(template: String, splices: (String, String)*): String =
     splices.foldLeft(template) { case (acc, (key, content)) =>
@@ -49,8 +62,8 @@ object Machine:
         .mkString("\n")
     }
 
-  /** One driver tick: folds the infra-fault channel to LoopExit.InfraFault (rc 50) and emits
-    * the terminal DONE status event, exactly like the bash driver.
+  /** One driver tick: folds the infra-fault channel to LoopExit.InfraFault (rc 50) and emits the
+    * terminal DONE status event, exactly like the bash driver.
     */
   def runOnce(n: Int)(using
       Config,
@@ -63,17 +76,19 @@ object Machine:
       HarnessFs,
       Clock
   ): LoopExit =
-    val cur = Cursor()
+    val cur  = Cursor()
     val exit = Raise.fold(iterate(n, cur)) { (_: InfraFault) =>
       // rc-50 exits fire the notify seam: exit for inspection, issue stays in-progress.
-      summon[Notify].notify("harness: infra fault — loop exited rc=50 for inspection (issue stays in-progress)")
+      summon[Notify].notify(
+        "harness: infra fault — loop exited rc=50 for inspection (issue stays in-progress)"
+      )
       LoopExit.InfraFault
     }(identity)
     emit(cur, "DONE", "end", detail = s"rc=${exit.rc}")
     exit
 
-  /** One US, start to terminal. Infra faults short-circuit via Raise[InfraFault]: no code
-    * past a raise can spend repair budget or dispatch a FIX.
+  /** One US, start to terminal. Infra faults short-circuit via Raise[InfraFault]: no code past a
+    * raise can spend repair budget or dispatch a FIX.
     */
   def iterate(n: Int, cur: Cursor)(using
       cfg: Config,
@@ -102,7 +117,10 @@ object Machine:
     val bodyFile = s"$LogDir/issue-$issue.body.md"
     fs.write(bodyFile, gh.issueTitleAndBody(issue))
     val workerPromptFile = s"$LogDir/issue-$issue.prompt.txt"
-    fs.write(workerPromptFile, renderTemplate(fs.readTemplate(Template.Iterate), "ISSUE" -> fs.read(bodyFile)))
+    fs.write(
+      workerPromptFile,
+      renderTemplate(fs.readTemplate(Template.Iterate), "ISSUE" -> fs.read(bodyFile))
+    )
 
     // Auto-merge is earned by class-1 only. Detect the class once, at pick time.
     val isClass1 = gh.issueLabels(issue).contains("class-1")
@@ -113,7 +131,8 @@ object Machine:
     // Require a clean tree on a fresh branch off main. Serial loop: one US at a time.
     // These are die() paths in bash (exit 1): fatal misconfiguration, not part of the
     // rc 0..50 state machine, so they surface as exceptions.
-    if !git.statusClean() then throw IllegalStateException("working tree not clean — refusing to start")
+    if !git.statusClean() then
+      throw IllegalStateException("working tree not clean — refusing to start")
     // Stale-base guard: everything downstream is measured against origin/main; no fallback.
     if !git.fetchOriginMain() then
       throw IllegalStateException("cannot fetch origin/main — refusing to run against a stale base")
@@ -141,7 +160,7 @@ object Machine:
     val implLog   = s"$LogDir/issue-$issue-iter$n.claude.log"
     val implPatch = s"$LogDir/issue-$issue-iter$n.impl.patch"
     emit(cur, "IMPL", "start", implLog)
-    stagePatch(Role.IMPL, workerPromptFile, implPatch, currentPatch) match
+    stagePatch(Role.IMPL, workerPromptFile, implPatch, implLog, currentPatch) match
       case StageResult.Empty =>
         emit(cur, "IMPL", "ok", implLog, "no diff")
         return LoopExit.NothingMade
@@ -154,7 +173,7 @@ object Machine:
           timeoutMsg = "IMPL worker timed out — a half-finished worker must not reach the gates",
           applyFailMsg = "IMPL patch did not apply — infra fault, no budget spent"
         ) match
-          case StageVerdict.Applied(p) => currentPatch = Some(p)
+          case StageVerdict.Applied(p)     => currentPatch = Some(p)
           case StageVerdict.Rejected(kind) =>
             outcome = Some(Outcome.Fail); failureKind = Some(kind); gateStatus = "SKIPPED"
 
@@ -165,12 +184,16 @@ object Machine:
       val fixPromptFile = s"$LogDir/issue-$issue-pass$pass.fix.prompt.txt"
       fs.write(
         fixPromptFile,
-        renderTemplate(fs.readTemplate(Template.Fix), "ISSUE" -> fs.read(bodyFile), "FAILURE" -> fs.read(failFile))
+        renderTemplate(
+          fs.readTemplate(Template.Fix),
+          "ISSUE"   -> fs.read(bodyFile),
+          "FAILURE" -> fs.read(failFile)
+        )
       )
       val fixLog   = s"$LogDir/issue-$issue-pass$pass.fix.claude.log"
       val fixPatch = s"$LogDir/issue-$issue-pass$pass.fix.patch"
       emit(cur, "FIX", "start", fixLog)
-      stagePatch(Role.FIX, fixPromptFile, fixPatch, currentPatch) match
+      stagePatch(Role.FIX, fixPromptFile, fixPatch, fixLog, currentPatch) match
         case StageResult.Empty =>
           // The fixer reverted all prior work — route to needs-human, never re-gate an empty tree.
           emit(cur, "FIX", "red", fixLog, "empty fix")
@@ -181,11 +204,13 @@ object Machine:
             "FIX",
             fixLog,
             result,
-            timeoutMsg = "FIX worker timed out (infra fault); exiting without spending further budget",
+            timeoutMsg =
+              "FIX worker timed out (infra fault); exiting without spending further budget",
             applyFailMsg = "FIX patch did not apply (infra fault, no budget spent)"
           ) match
-            case StageVerdict.Applied(p)      => currentPatch = Some(p)
-            case StageVerdict.Rejected(kind) => outcome = Some(Outcome.Fail); failureKind = Some(kind)
+            case StageVerdict.Applied(p)     => currentPatch = Some(p)
+            case StageVerdict.Rejected(kind) =>
+              outcome = Some(Outcome.Fail); failureKind = Some(kind)
 
     // Shared shape of both repair triggers (gate-RED, REQUEST_CHANGES): out of budget fails the
     // outcome, otherwise spend one unit, write the fail file with the stage-specific content, and
@@ -208,7 +233,11 @@ object Machine:
       emit(cur, "FAST_GATE", "start", gateLog)
       gates.run("FAST", cfg.gateCmd, cfg.gateTimeout, gateLog) match
         case GateResult.Timeout =>
-          Raise.raise(InfraFault(s"FAST gate hit the ${cfg.gateTimeout}s timeout — infra fault, not a code failure"))
+          Raise.raise(
+            InfraFault(
+              s"FAST gate hit the ${cfg.gateTimeout}s timeout — infra fault, not a code failure"
+            )
+          )
         case GateResult.Red =>
           gateStatus = "RED"
           failureKind = Some(FailureKind.GateRed)
@@ -248,7 +277,11 @@ object Machine:
           // An empty (or whitespace-only) review is a crashed reviewer, not a verdict.
           if fs.read(reviewFile).isBlank then
             emit(cur, "REVIEW", "red", reviewFile, "empty review")
-            Raise.raise(InfraFault("reviewer produced no output — infra fault (crashed or timed-out reviewer)"))
+            Raise.raise(
+              InfraFault(
+                "reviewer produced no output — infra fault (crashed or timed-out reviewer)"
+              )
+            )
 
           // Grep, not parse. Missing sentinel -> REQUEST_CHANGES (fail safe, never auto-approve).
           val verdict = parseVerdict(fs.read(reviewFile)).getOrElse(Verdict.RequestChanges)
@@ -311,7 +344,9 @@ object Machine:
             s"**Reviewer: APPROVE** · gate $gateStatus (containerized in-memory FAST tier green; the real-PG IT tier is judged by CI on this PR). Not class-1, so not auto-merged: a human reviews and merges."
           )
         case Route.NeedsHuman =>
-          if failureKind.contains(FailureKind.ProtectedPath) || failureKind.contains(FailureKind.OversizedPatch)
+          if failureKind.contains(FailureKind.ProtectedPath) || failureKind.contains(
+              FailureKind.OversizedPatch
+            )
           then
             (
               "needs-human",
@@ -331,7 +366,8 @@ object Machine:
               s"**Needs human** — self-repair budget of ${cfg.repairBudget} exhausted on $kindText (last gate $gateStatus). Opened for the audit trail; do NOT merge without review."
             )
 
-    if route == Route.NeedsHuman then notify.notify(s"harness: #$issue needs-human ($kindText, gate $gateStatus)")
+    if route == Route.NeedsHuman then
+      notify.notify(s"harness: #$issue needs-human ($kindText, gate $gateStatus)")
 
     git.commit(
       s"""feat(US-$issue): autonomous iteration — $commitTag
@@ -350,29 +386,34 @@ object Machine:
       prBody ++= s"<details><summary>Independent reviewer output</summary>\n\n```\n${fs.read(reviewFile)}\n```\n\n</details>\n\n"
     if route == Route.AutoMergeCandidate then
       prBody ++= "v4 auto-merge: class-1 + reviewer APPROVE — the loop merges once the required CI check is green.\n\n"
-    else prBody ++= "Not auto-merged (v4 merges class-1 + APPROVE only): a human reviews and merges.\n\n"
+    else
+      prBody ++= "Not auto-merged (v4 merges class-1 + APPROVE only): a human reviews and merges.\n\n"
     prBody ++= s"Closes #$issue\n"
     fs.write(s"$LogDir/issue-$issue.pr-body.md", prBody.toString)
 
-    val prUrl = gh.createPr(branch, s"US-$issue: autonomous iteration ($outcomeText, gate $gateStatus)", prBody.toString)
+    val prUrl = gh.createPr(
+      branch,
+      s"US-$issue: autonomous iteration ($outcomeText, gate $gateStatus)",
+      prBody.toString
+    )
     val prNum = prNumberOf(prUrl) match
-      case None    => Raise.raise(InfraFault("could not determine PR number from gh pr create output"))
+      case None => Raise.raise(InfraFault("could not determine PR number from gh pr create output"))
       case Some(p) => p
     emit(cur, "PR", "ok", detail = s"pr=$prNum outcome=$outcomeText")
 
     route match
       case Route.AutoMergeCandidate => autoMerge(issue, prNum, cur)
-      case Route.NeedsReview =>
+      case Route.NeedsReview        =>
         gh.editLabels(issue, add = List(label), remove = List("in-progress"))
         LoopExit.Success
       case Route.NeedsHuman =>
         gh.editLabels(issue, add = List(label), remove = List("in-progress"))
         LoopExit.NeedsHuman
 
-  /** v4 auto-merge (class-1 + APPROVE only): wait-appear -> watch -> merge -> VERIFY the PR
-    * state is MERGED (unverified = infra fault) -> drop in-progress -> flip blocked ->
-    * fetch -> notify. CI red after green local gates = needs-human WITHOUT self-repair: the
-    * loop never repairs against the independent check.
+  /** v4 auto-merge (class-1 + APPROVE only): wait-appear -> watch -> merge -> VERIFY the PR state
+    * is MERGED (unverified = infra fault) -> drop in-progress -> flip blocked -> fetch -> notify.
+    * CI red after green local gates = needs-human WITHOUT self-repair: the loop never repairs
+    * against the independent check.
     */
   private def autoMerge(issue: Int, prNum: Int, cur: Cursor)(using
       cfg: Config,
@@ -391,11 +432,22 @@ object Machine:
     // registers is a scheduler/infra problem, never rc 40.
     if !waitForChecks(prNum) then
       Raise.raise(
-        InfraFault(s"no CI check registered on PR #$prNum within ${cfg.ciAppearTimeout}s — PR open, issue stays in-progress")
+        InfraFault(
+          s"no CI check registered on PR #$prNum within ${cfg.ciAppearTimeout}s — PR open, issue stays in-progress"
+        )
       )
-    gates.run("CI-WAIT", s"gh pr checks $prNum --watch --fail-fast", cfg.ciWaitTimeout, ciLog) match
+    gates.run(
+      "CI-WAIT",
+      cfg.ciWaitCmd.getOrElse(s"gh pr checks $prNum --watch --fail-fast"),
+      cfg.ciWaitTimeout,
+      ciLog
+    ) match
       case GateResult.Timeout =>
-        Raise.raise(InfraFault(s"CI wait hit the ${cfg.ciWaitTimeout}s bound — PR open, issue stays in-progress"))
+        Raise.raise(
+          InfraFault(
+            s"CI wait hit the ${cfg.ciWaitTimeout}s bound — PR open, issue stays in-progress"
+          )
+        )
       case GateResult.Red =>
         emit(cur, "CI_WAIT", "red", ciLog)
         gh.prComment(
@@ -408,9 +460,12 @@ object Machine:
       case GateResult.Green =>
         emit(cur, "CI_WAIT", "ok", ciLog)
         emit(cur, "MERGE", "start")
-        if !gh.merge(prNum) then Raise.raise(InfraFault("merge command failed — infra fault"))
+        // Same `ciLog` the CI watch just wrote: bash appends the merge output to it (loop.sh:473).
+        if !gh.merge(prNum, ciLog) then
+          Raise.raise(InfraFault("merge command failed — infra fault"))
         val state = gh.prState(prNum)
-        if state != "MERGED" then Raise.raise(InfraFault(s"merge NOT verified (PR state '$state') — infra fault"))
+        if state != "MERGED" then
+          Raise.raise(InfraFault(s"merge NOT verified (PR state '$state') — infra fault"))
         emit(cur, "MERGE", "ok", detail = s"pr=$prNum")
         gh.editLabels(issue, add = Nil, remove = List("in-progress"))
         flipBlocked(issue)
@@ -435,9 +490,9 @@ object Machine:
   private[harness] def parseBlockedBy(body: String): List[Int] =
     "Blocked-by: #(\\d+)".r.findAllMatchIn(body).map(_.group(1).toInt).toList
 
-  /** After a verified merge, flip every open `blocked` issue whose Blocked-by refs are ALL
-    * closed. The just-merged issue counts as closed even if GitHub's async close lags the
-    * merge. Issues without the sentinel are left alone (human-managed).
+  /** After a verified merge, flip every open `blocked` issue whose Blocked-by refs are ALL closed.
+    * The just-merged issue counts as closed even if GitHub's async close lags the merge. Issues
+    * without the sentinel are left alone (human-managed).
     */
   private def flipBlocked(mergedIssue: Int)(using gh: GitHub): Unit =
     gh.openBlockedIssues().foreach { b =>
@@ -450,8 +505,8 @@ object Machine:
   private enum Outcome:
     case Success, Fail
 
-  /** The terminal route for a US, decided once in `iterate` and threaded to every downstream
-    * site (label, notify, PR note, auto-merge dispatch, exit code).
+  /** The terminal route for a US, decided once in `iterate` and threaded to every downstream site
+    * (label, notify, PR note, auto-merge dispatch, exit code).
     */
   private enum Route:
     case AutoMergeCandidate, NeedsReview, NeedsHuman
@@ -475,12 +530,11 @@ object Machine:
     case Applied(patch: String)
     case Rejected(kind: FailureKind)
 
-  /** Shared shape of a stagePatch(...) result match, common to both the IMPL and FIX call
-    * sites: Timeout and ApplyFail both raise InfraFault (infra fault, no budget spent);
-    * Protected and Oversize both fail the outcome with the matching FailureKind; Ok emits the ok
-    * status and yields the applied patch. The Empty case is genuinely stage-specific (IMPL
-    * exits NothingMade, FIX routes to needs-human) and is handled by each call site before it
-    * delegates the rest here.
+  /** Shared shape of a stagePatch(...) result match, common to both the IMPL and FIX call sites:
+    * Timeout and ApplyFail both raise InfraFault (infra fault, no budget spent); Protected and
+    * Oversize both fail the outcome with the matching FailureKind; Ok emits the ok status and
+    * yields the applied patch. The Empty case is genuinely stage-specific (IMPL exits NothingMade,
+    * FIX routes to needs-human) and is handled by each call site before it delegates the rest here.
     */
   private def handleStageResult(
       cur: Cursor,
@@ -510,16 +564,22 @@ object Machine:
         // Unreachable: both call sites match Empty themselves before delegating here.
         throw IllegalStateException("handleStageResult called with StageResult.Empty")
 
-  /** The patch seam: dispatch the agent, reset to the pristine base, inspect the patch, THEN
-    * apply it. The tree the agent edited is data to inspect, never trusted.
+  /** The patch seam: dispatch the agent, reset to the pristine base, inspect the patch, THEN apply
+    * it. The tree the agent edited is data to inspect, never trusted.
     */
-  private def stagePatch(role: Role, promptFile: String, patchOut: String, currentPatch: Option[String])(using
+  private def stagePatch(
+      role: Role,
+      promptFile: String,
+      patchOut: String,
+      logFile: String,
+      currentPatch: Option[String]
+  )(using
       cfg: Config,
       git: Git,
       agents: AgentDispatch,
       fs: HarnessFs
   ): StageResult =
-    agents.worker(role, promptFile, patchOut, currentPatch) match
+    agents.worker(role, promptFile, patchOut, logFile, currentPatch) match
       case DispatchOutcome.TimedOut => return StageResult.Timeout
       case DispatchOutcome.Done     => ()
     // Reset to the pristine base BEFORE looking at the patch.
@@ -531,7 +591,10 @@ object Machine:
     val numstat = git.applyNumstat(patchOut)
     val bytes   = fs.sizeBytes(patchOut)
     if bytes > cfg.maxPatchBytes then
-      writeRejectMarker(s"Oversized patch: $bytes bytes exceeds the ${cfg.maxPatchBytes}-byte cap.", numstat)
+      writeRejectMarker(
+        s"Oversized patch: $bytes bytes exceeds the ${cfg.maxPatchBytes}-byte cap.",
+        numstat
+      )
       return StageResult.Oversize
     if touchesProtected(numstat) then
       writeRejectMarker(
@@ -543,10 +606,13 @@ object Machine:
     StageResult.Ok(patchOut)
 
   /** On a guard rejection the tree is left pristine — a hostile or oversized patch is NEVER
-    * applied. Stage a small tracked marker instead, so the terminal still has a diff to open
-    * the audit PR with. The marker, not the rejected change, lands on the throwaway branch.
+    * applied. Stage a small tracked marker instead, so the terminal still has a diff to open the
+    * audit PR with. The marker, not the rejected change, lands on the throwaway branch.
     */
-  private def writeRejectMarker(reason: String, numstat: String)(using git: Git, fs: HarnessFs): Unit =
+  private def writeRejectMarker(reason: String, numstat: String)(using
+      git: Git,
+      fs: HarnessFs
+  ): Unit =
     fs.write(
       "PATCH-REJECTED.md",
       s"""# Patch rejected by the harness guard
@@ -566,8 +632,8 @@ object Machine:
   private[harness] def numstatPaths(numstat: String): List[String] =
     numstat.linesIterator.toList.flatMap(line => NumstatRow.parse(line).map(_.path))
 
-  /** The three classes the sandbox must never let an agent rewrite (CI workflows, harness
-    * code, the constitution) plus docs/ and the control files.
+  /** The three classes the sandbox must never let an agent rewrite (CI workflows, harness code, the
+    * constitution) plus docs/ and the control files.
     */
   private[harness] def touchesProtected(numstat: String): Boolean =
     numstatPaths(numstat).exists { p =>
@@ -580,10 +646,12 @@ object Machine:
     val parsed = numstat.linesIterator.toList.flatMap(line => NumstatRow.parse(line).map(line -> _))
     def isTestPath(row: NumstatRow): Boolean =
       row.path.startsWith("src/test/") || row.path.startsWith("src/it/")
-    val rows = parsed.collect { case (line, row) if isTestPath(row) => line }
+    val rows    = parsed.collect { case (line, row) if isTestPath(row) => line }
     val touched = rows.size
-    val netDel = parsed.count { case (_, row) =>
-      isTestPath(row) && row.added != "-" && row.deleted != "-" && row.deleted.toInt > row.added.toInt
+    val netDel  = parsed.count { case (_, row) =>
+      isTestPath(
+        row
+      ) && row.added != "-" && row.deleted != "-" && row.deleted.toInt > row.added.toInt
     }
     val raw =
       if rows.nonEmpty then s"```\n${rows.mkString("\n")}\n```"
