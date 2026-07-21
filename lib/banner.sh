@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Pure banner renderer for harness/logs/status.jsonl.
+# Pure banner renderer for logs/status.jsonl.
 #
 #   render_banner <status_file> <alive:0|1> [now_epoch]  ->  exactly 4 lines on stdout
 #
@@ -97,7 +97,7 @@ render_banner() {
     return 0
   fi
 
-  # tail bounds the read: harness/logs/status.jsonl is append-only and never truncated, so
+  # tail bounds the read: logs/status.jsonl is append-only and never truncated, so
   # an unbounded read grows without limit across months of runs. A `run` is stamped once per
   # loop PROCESS, so it spans a whole loop process across all its iterations and issues, not
   # a single iteration; 5000 lines is roughly 500 gate passes (about 900 KB) and still cheap

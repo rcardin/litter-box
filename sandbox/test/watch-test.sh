@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Fixture tests for render_banner (harness/lib/banner.sh).
+# Fixture tests for render_banner (lib/banner.sh).
 # Pure function: (status.jsonl, alive, now) -> 4 lines. No terminal, no loop, no gh.
 set -euo pipefail
 
-SRC_HARNESS="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-# shellcheck source=../lib/banner.sh
-. "$SRC_HARNESS/lib/banner.sh"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# shellcheck source=../../lib/banner.sh
+. "$REPO_ROOT/lib/banner.sh"
 
 pass=0; fail=0
 check() { # check DESC EXPECTED ACTUAL

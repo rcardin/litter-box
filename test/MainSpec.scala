@@ -1,4 +1,4 @@
-package harness
+package in.rcard.litterbox
 
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
@@ -20,7 +20,7 @@ class MainSpec extends AnyFlatSpec with Matchers:
     parsed.cfg.dryRun shouldBe false
     parsed.cfg.repairBudget shouldBe 2
     parsed.cfg.maxPatchBytes shouldBe 1_000_000L
-    parsed.cfg.gateCmd shouldBe "harness/sandbox/run-fast-gate.sh"
+    parsed.cfg.gateCmd shouldBe "sandbox/run-fast-gate.sh"
     parsed.cfg.ciWaitCmd shouldBe None
     parsed.cfg.gateTimeout shouldBe 900
     parsed.cfg.iterTimeout shouldBe 1800
@@ -73,10 +73,10 @@ class MainSpec extends AnyFlatSpec with Matchers:
   }
 
   it should "flip gateOverridden even when GATE_CMD is set to its own default value" in {
-    val parsed = Main.parseEnv(Map("GATE_CMD" -> "harness/sandbox/run-fast-gate.sh"))
+    val parsed = Main.parseEnv(Map("GATE_CMD" -> "sandbox/run-fast-gate.sh"))
 
     parsed.gateOverridden shouldBe true
-    parsed.cfg.gateCmd shouldBe "harness/sandbox/run-fast-gate.sh"
+    parsed.cfg.gateCmd shouldBe "sandbox/run-fast-gate.sh"
   }
 
   it should "parse DRY_RUN=1 as true, and treat 0 / absent / any other string as false" in {
@@ -174,7 +174,7 @@ class MainSpec extends AnyFlatSpec with Matchers:
   private def markerAt(root: java.nio.file.Path): java.nio.file.Path => Boolean =
     p => p == root.resolve(Main.RootMarker)
 
-  "resolveRepoRoot" should "return the cwd when the cwd itself is the harness repo root" in {
+  "resolveRepoRoot" should "return the cwd when the cwd itself is the litter-box repo root" in {
     val root = java.nio.file.Paths.get("/work/repo")
 
     Main.resolveRepoRoot(root, markerAt(root)) shouldBe Right(root)
@@ -183,13 +183,13 @@ class MainSpec extends AnyFlatSpec with Matchers:
   it should "walk up to the repo root when invoked from a subdirectory, as bash does" in {
     val root = java.nio.file.Paths.get("/work/repo")
 
-    Main.resolveRepoRoot(root.resolve("harness/scala/src"), markerAt(root)) shouldBe Right(root)
+    Main.resolveRepoRoot(root.resolve("src/deeply/nested"), markerAt(root)) shouldBe Right(root)
   }
 
   it should "normalise the start path before walking (relative / dot segments)" in {
     val root = java.nio.file.Paths.get("/work/repo")
 
-    Main.resolveRepoRoot(root.resolve("harness/./scala/.."), markerAt(root)) shouldBe Right(root)
+    Main.resolveRepoRoot(root.resolve("src/./sub/.."), markerAt(root)) shouldBe Right(root)
   }
 
   it should "fail loudly instead of silently taking a cwd that is not inside the repo" in {

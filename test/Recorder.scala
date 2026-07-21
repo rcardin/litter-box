@@ -1,4 +1,4 @@
-package harness
+package in.rcard.litterbox
 
 import scala.collection.mutable
 

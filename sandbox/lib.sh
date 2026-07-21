@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
-# Shared constants for the v6-slice-1 FAST-gate sandbox (issue #34). Sourced, never executed
-# directly — no side effects, just variable assignments and the shared log() helper.
-IMAGE="fes-harness-sandbox:v6"
-PROXY_IMAGE="fes-harness-sandbox-proxy:v6"
-NETWORK="fes-sandbox-net"
-PROXY_NAME="fes-sandbox-proxy"
+# Shared constants for the FAST-gate sandbox. Sourced, never executed directly — no side effects,
+# just variable assignments and the shared log() helper.
+#
+# These Docker identifiers are global to the machine, and start-proxy.sh does `docker rm -f` on
+# PROXY_NAME at startup: two litter-box instances sharing them would kill each other's proxy
+# mid-iteration. Still hardcoded for now; the `instance_name` config that makes them per-instance
+# lands in #3.
+IMAGE="litter-box-sandbox:v6"
+PROXY_IMAGE="litter-box-sandbox-proxy:v6"
+NETWORK="litter-box-net"
+PROXY_NAME="litter-box-proxy"
 PROXY_PORT="8888"
-COURSIER_VOLUME="fes-sandbox-coursier-cache"
+COURSIER_VOLUME="litter-box-coursier-cache"
 SANDBOX_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 log() { printf '[sandbox] %s\n' "$*" >&2; }

@@ -1,0 +1,5 @@
+iteration 1 -> issue #999
+patch guard: patch touches a protected path (.github/, sandbox/, lib/, prompts/, docs/, project.scala, watch.sh, tail-claude.sh, CONTEXT.md, PROMPT.md or STOP.md) — rejecting (not applied)
+patch guard rejected the initial worker patch (protected-path) — routing to needs-human
+PR #123 opened for #999 (outcome FAIL)
+issue #999 -> needs-human

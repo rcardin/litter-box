@@ -1,8 +1,9 @@
-# fes-harness-sandbox — pinned toolchain for the containerized FAST gate (issue #34).
-# JDK 25 matches the host pin (.sdkmanrc: java=25.0.2-open); sbt matches project/build.properties.
+# litter-box-sandbox — pinned toolchain for the containerized FAST gate.
+# JDK 21 LTS matches the loop's own `//> using jvm temurin:21`. The old JDK 25 pin existed only
+# because the old effect library needed StructuredTaskScope; that dependency is gone, so 21 it is.
 # This image carries NO credentials of any kind (no ANTHROPIC_API_KEY, no gh token) — see
-# harness/sandbox/run-fast-gate.sh for what's actually passed into a running container.
-FROM eclipse-temurin:25-jdk
+# sandbox/run-fast-gate.sh for what's actually passed into a running container.
+FROM eclipse-temurin:21-jdk
 
 ARG SBT_VERSION=1.12.9
 ARG CLAUDE_INSTALL_URL=https://claude.ai/install.sh

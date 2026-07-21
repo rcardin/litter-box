@@ -37,13 +37,13 @@ git rev-parse --is-inside-work-tree >/dev/null 2>&1 || infra_fault "not inside a
 # The tmpdirs must live under $HOME: under colima only $HOME is mounted into the VM, so a plain
 # mktemp -d (macOS /var/folders/...) would silently bind-mount an EMPTY dir. Same constraint the
 # FAST gate documents in run-fast-gate.sh.
-FES_SANDBOX_TMP_ROOT="${FES_SANDBOX_TMP_ROOT:-$HOME/.cache/fes-harness-sandbox}"
-mkdir -p "$FES_SANDBOX_TMP_ROOT"
-workdir="$(mktemp -d "$FES_SANDBOX_TMP_ROOT/agent-work-XXXXXX")"   # the origin/main clone (rw)
-inpdir="$(mktemp -d "$FES_SANDBOX_TMP_ROOT/agent-inp-XXXXXX")"     # prompt + prior patch + entrypoint (ro)
-outdir="$(mktemp -d "$FES_SANDBOX_TMP_ROOT/agent-out-XXXXXX")"     # the returned patch (rw)
-cname="fes-agent-$$-$(date +%s)"
-waitfile="$(mktemp "$FES_SANDBOX_TMP_ROOT/agent-wait-XXXXXX")"
+LITTER_BOX_SANDBOX_TMP_ROOT="${LITTER_BOX_SANDBOX_TMP_ROOT:-$HOME/.cache/litter-box-sandbox}"
+mkdir -p "$LITTER_BOX_SANDBOX_TMP_ROOT"
+workdir="$(mktemp -d "$LITTER_BOX_SANDBOX_TMP_ROOT/agent-work-XXXXXX")"   # the origin/main clone (rw)
+inpdir="$(mktemp -d "$LITTER_BOX_SANDBOX_TMP_ROOT/agent-inp-XXXXXX")"     # prompt + prior patch + entrypoint (ro)
+outdir="$(mktemp -d "$LITTER_BOX_SANDBOX_TMP_ROOT/agent-out-XXXXXX")"     # the returned patch (rw)
+cname="litter-box-agent-$$-$(date +%s)"
+waitfile="$(mktemp "$LITTER_BOX_SANDBOX_TMP_ROOT/agent-wait-XXXXXX")"
 
 # EXIT covers every normal path; TERM/INT cover gtimeout and Ctrl-C. gtimeout kills the docker
 # CLIENT process group, never the container in the VM, so an untrapped timeout would orphan a

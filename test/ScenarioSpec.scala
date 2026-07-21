@@ -1,4 +1,4 @@
-package harness
+package in.rcard.litterbox
 
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
@@ -83,7 +83,7 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     exit shouldBe LoopExit.DryRun
     exit.rc shouldBe 20
     // the worker prompt was rendered with the issue body spliced in
-    w.files("harness/logs/issue-999.prompt.txt") should include("AC1: implement the slice")
+    w.files("logs/issue-999.prompt.txt") should include("AC1: implement the slice")
     // truly read-only: no label mutation, no branch, no fetch, no PR
     w.called("gh issue edit") shouldBe false
     w.called("gh pr create") shouldBe false
@@ -106,7 +106,7 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     w.callCount("dispatch FIX") shouldBe 0 // no repair
     w.callCount("dispatch REVIEW") shouldBe 1
     // the review prompt got conventions, tamper report and the diff spliced in
-    val reviewPrompt = w.files("harness/logs/issue-999-pass1.review.prompt.txt")
+    val reviewPrompt = w.files("logs/issue-999-pass1.review.prompt.txt")
     reviewPrompt should include("Conventions: onion layout")
     reviewPrompt should include("Test-tamper report")
     reviewPrompt should include("src/main/scala/Slice.scala")
@@ -159,10 +159,10 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     w.called("gh pr merge 123 --squash --delete-branch") shouldBe true
     // loop.sh:473 appends the merge output to the SAME ci_log the CI watch just wrote
     w.called(
-      "gate CI-WAIT cmd=gh pr checks 123 --watch --fail-fast log=harness/logs/issue-999.ci-wait.log"
+      "gate CI-WAIT cmd=gh pr checks 123 --watch --fail-fast log=logs/issue-999.ci-wait.log"
     ) shouldBe true
     w.called(
-      "gh pr merge 123 --squash --delete-branch >>harness/logs/issue-999.ci-wait.log"
+      "gh pr merge 123 --squash --delete-branch >>logs/issue-999.ci-wait.log"
     ) shouldBe true
     w.called("gh pr view 123 --json state") shouldBe true // merge verified
     w.called("--add-label needs-review") shouldBe false   // auto-merge owns the fate
@@ -203,14 +203,14 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     w.callCount("dispatch REVIEW") shouldBe 2
     w.called("gh issue edit 999 --add-label needs-review --remove-label in-progress") shouldBe true
     // the fix prompt carried the reviewer's complaint and was rendered per pass
-    w.files("harness/logs/issue-999-pass1.fix.prompt.txt") should include(
+    w.files("logs/issue-999-pass1.fix.prompt.txt") should include(
       "The independent reviewer requested changes"
     )
     // one budget unit spent: the FIX phase event carries budget 1 (of 2)
     w.events.filter(_.phase == "FIX").map(_.budget).distinct shouldBe List(1)
     // the FIX dispatch was seeded with the prior cumulative patch
     w.calls.find(_.startsWith("dispatch FIX")).get should include(
-      "currentPatch=harness/logs/issue-999-iter1.impl.patch"
+      "currentPatch=logs/issue-999-iter1.impl.patch"
     )
   }
 
@@ -509,7 +509,7 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
 
   it should "reject a protected-path IMPL patch: marker staged, repair loop skipped, needs-human (Scenarios G/R)" in {
     val w = TestWorld()
-    w.implScript = WorkerScript.Produces("1\t0\tharness/evil.txt")
+    w.implScript = WorkerScript.Produces("1\t0\tsandbox/evil.sh")
     w.fixScripts = List(WorkerScript.Produces(newFilePatch)) // must never be consumed
 
     val exit = w.runLoop()
@@ -520,7 +520,7 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     w.callCount("gate FAST") shouldBe 0       // guard rejection short-circuits the gates
     w.appliedPatches shouldBe empty           // the rejected patch was NEVER applied
     w.files("PATCH-REJECTED.md") should include("protected path")
-    w.files("PATCH-REJECTED.md") should include("harness/evil.txt") // numstat in the marker
+    w.files("PATCH-REJECTED.md") should include("sandbox/evil.sh") // numstat in the marker
     w.called("git add PATCH-REJECTED.md") shouldBe true
     w.called("gh issue edit 999 --add-label needs-human --remove-label in-progress") shouldBe true
     w.called("gh pr create") shouldBe true // PR still opened (audit trail)
@@ -533,9 +533,14 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     def numstat(p: String) = s"1\t0\t$p"
     val protectedPaths     =
       List(
-        "harness/evil.txt",
         ".github/workflows/evil.yml",
+        "sandbox/evil.sh",
+        "lib/evil.jar",
+        "prompts/evil.md",
         "docs/x.md",
+        "project.scala",
+        "watch.sh",
+        "tail-claude.sh",
         "CONTEXT.md",
         "PROMPT.md",
         "STOP.md"
@@ -640,7 +645,7 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     val w = TestWorld()
     w.gateResults = List(GateResult.Red)
     w.fixScripts = List(
-      WorkerScript.Produces("1\t0\tharness/evil.txt"),
+      WorkerScript.Produces("1\t0\tsandbox/evil.sh"),
       WorkerScript.Produces(newFilePatch) // must never be consumed
     )
 
@@ -649,7 +654,7 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     exit shouldBe LoopExit.NeedsHuman
     w.callCount("dispatch FIX") shouldBe 1 // the rejection breaks the loop
     // only the initial IMPL patch was ever applied; the rejected FIX patch never was
-    w.appliedPatches shouldBe List("harness/logs/issue-999-iter1.impl.patch")
+    w.appliedPatches shouldBe List("logs/issue-999-iter1.impl.patch")
     w.files("PATCH-REJECTED.md") should include("protected path")
     w.called("gh issue edit 999 --add-label needs-human --remove-label in-progress") shouldBe true
     w.commitMessages.head should include("patch guard rejection (protected-path), gate RED")

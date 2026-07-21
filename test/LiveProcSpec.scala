@@ -1,4 +1,4 @@
-package harness
+package in.rcard.litterbox
 
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
@@ -54,7 +54,7 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
       "FAST",
       "true",
       timeoutSec = 5,
-      logFile = "harness/logs/g.log"
+      logFile = "logs/g.log"
     ) shouldBe GateResult.Green
   }
 
@@ -66,7 +66,7 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
       "FAST",
       "false",
       timeoutSec = 5,
-      logFile = "harness/logs/g.log"
+      logFile = "logs/g.log"
     ) shouldBe GateResult.Red
   }
 
@@ -80,7 +80,7 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
       "FAST",
       "test -f /nonexistent",
       timeoutSec = 5,
-      logFile = "harness/logs/g.log"
+      logFile = "logs/g.log"
     ) shouldBe GateResult.Red
   }
 
@@ -102,7 +102,7 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
       "FAST",
       "true",
       timeoutSec = 42,
-      logFile = "harness/logs/g.log"
+      logFile = "logs/g.log"
     ) shouldBe GateResult.Green
 
     readString(callsFile).strip() shouldBe "42 true"
@@ -120,13 +120,13 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
       "FAST",
       "   ",
       timeoutSec = 5,
-      logFile = "harness/logs/g.log"
+      logFile = "logs/g.log"
     ) shouldBe GateResult.Green
   }
 
   it should "still create and truncate the log file for a whitespace-only cmd (bash's redirection)" in {
     val root    = tempRoot()
-    val logPath = root.resolve("harness/logs/g.log")
+    val logPath = root.resolve("logs/g.log")
     Files.createDirectories(logPath.getParent)
     Files.write(logPath, "stale output from a previous run\n".getBytes(StandardCharsets.UTF_8))
     val gate = LiveGateRunner(root, timeoutBin = None)
@@ -135,7 +135,7 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
       "FAST",
       "\t \n ",
       timeoutSec = 5,
-      logFile = "harness/logs/g.log"
+      logFile = "logs/g.log"
     ) shouldBe GateResult.Green
 
     Files.exists(logPath) shouldBe true
@@ -158,7 +158,7 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
     )
     val gate = LiveGateRunner(root, timeoutBin = Some(fakeTimeout.toString))
 
-    gate.run("FAST", "   ", timeoutSec = 42, logFile = "harness/logs/g.log")
+    gate.run("FAST", "   ", timeoutSec = 42, logFile = "logs/g.log")
 
     readString(callsFile).strip() shouldBe "42"
   }
@@ -176,10 +176,10 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
       "FAST",
       script.toString,
       timeoutSec = 5,
-      logFile = "harness/logs/g.log"
+      logFile = "logs/g.log"
     ) shouldBe GateResult.Green
 
-    val logged = readString(root.resolve("harness/logs/g.log"))
+    val logged = readString(root.resolve("logs/g.log"))
     logged should include("out-line")
     logged should include("err-line")
   }
@@ -191,7 +191,7 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
   // JVM cwd.
   it should "resolve a relative cmd path against root, not the JVM cwd" in {
     val root = tempRoot()
-    // Same SHAPE as the real default (`harness/sandbox/run-fast-gate.sh`) but a directory name
+    // Same SHAPE as the real default (`sandbox/run-fast-gate.sh`) but a directory name
     // that cannot exist at the JVM cwd: otherwise an unfixed runner would find the repo's own
     // real gate script relative to its cwd and launch the containerized gate for real.
     Files.createDirectories(root.resolve("harness/sandbox-fixture"))
@@ -208,9 +208,9 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
       "FAST",
       "harness/sandbox-fixture/run-fast-gate.sh",
       timeoutSec = 5,
-      logFile = "harness/logs/g.log"
+      logFile = "logs/g.log"
     ) shouldBe GateResult.Green
-    readString(root.resolve("harness/logs/g.log")) should include("gate-ran")
+    readString(root.resolve("logs/g.log")) should include("gate-ran")
   }
 
   // Bash resolves a word with NO slash off PATH, never against the cwd — so a same-named file
@@ -224,7 +224,7 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
       "FAST",
       "true",
       timeoutSec = 5,
-      logFile = "harness/logs/g.log"
+      logFile = "logs/g.log"
     ) shouldBe GateResult.Green
   }
 
@@ -239,10 +239,10 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
       "FAST",
       s"${script.toString} harness/sandbox/x.sh",
       timeoutSec = 5,
-      logFile = "harness/logs/g.log"
+      logFile = "logs/g.log"
     ) shouldBe GateResult.Green
 
-    readString(root.resolve("harness/logs/g.log")).strip() shouldBe "harness/sandbox/x.sh"
+    readString(root.resolve("logs/g.log")).strip() shouldBe "harness/sandbox/x.sh"
   }
 
   it should "map rc 124 to Timeout" in {
@@ -254,7 +254,7 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
       "FAST",
       script.toString,
       timeoutSec = 5,
-      logFile = "harness/logs/g.log"
+      logFile = "logs/g.log"
     ) shouldBe GateResult.Timeout
   }
 
@@ -267,11 +267,11 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
     val gate = LiveGateRunner(root, timeoutBin = None)
 
     val lines = captureLogLines {
-      gate.run("FAST", "true", timeoutSec = 900, logFile = "harness/logs/issue-999-pass1.gate.log")
+      gate.run("FAST", "true", timeoutSec = 900, logFile = "logs/issue-999-pass1.gate.log")
     }
 
     lines should contain(
-      s"FAST gate: true (timeout 900s) -> ${root.resolve("harness/logs/issue-999-pass1.gate.log")}"
+      s"FAST gate: true (timeout 900s) -> ${root.resolve("logs/issue-999-pass1.gate.log")}"
     )
   }
 
@@ -293,13 +293,13 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
     val outcome = dispatch.worker(
       Role.IMPL,
       promptFile = "unused.txt",
-      patchOut = "harness/logs/i.patch",
-      logFile = "harness/logs/i.claude.log",
+      patchOut = "logs/i.patch",
+      logFile = "logs/i.claude.log",
       currentPatch = None
     )
 
     outcome shouldBe DispatchOutcome.Done
-    readString(root.resolve("harness/logs/i.patch")) shouldBe "hello patch\n"
+    readString(root.resolve("logs/i.patch")) shouldBe "hello patch\n"
   }
 
   it should "return TimedOut when the override stub exits 124" in {
@@ -317,8 +317,8 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
     dispatch.worker(
       Role.IMPL,
       "unused.txt",
-      "harness/logs/i.patch",
-      "harness/logs/i.claude.log",
+      "logs/i.patch",
+      "logs/i.claude.log",
       None
     ) shouldBe DispatchOutcome.TimedOut
   }
@@ -338,8 +338,8 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
     dispatch.worker(
       Role.IMPL,
       "unused.txt",
-      "harness/logs/i.patch",
-      "harness/logs/i.claude.log",
+      "logs/i.patch",
+      "logs/i.claude.log",
       None
     ) shouldBe DispatchOutcome.Done
   }
@@ -358,11 +358,11 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
     dispatch.worker(
       Role.FIX,
       "unused.txt",
-      "harness/logs/f.patch",
-      "harness/logs/f.claude.log",
+      "logs/f.patch",
+      "logs/f.claude.log",
       None
     ) shouldBe DispatchOutcome.Done
-    readString(root.resolve("harness/logs/f.patch")) shouldBe "fix patch\n"
+    readString(root.resolve("logs/f.patch")) shouldBe "fix patch\n"
   }
 
   it should "write the worker child's combined output to the given logFile (bash parity: $logf)" in {
@@ -379,12 +379,12 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
     dispatch.worker(
       Role.IMPL,
       "unused.txt",
-      "harness/logs/i.patch",
-      "harness/logs/issue-999-iter1.claude.log",
+      "logs/i.patch",
+      "logs/issue-999-iter1.claude.log",
       None
     ) shouldBe DispatchOutcome.Done
 
-    val logged = readString(root.resolve("harness/logs/issue-999-iter1.claude.log"))
+    val logged = readString(root.resolve("logs/issue-999-iter1.claude.log"))
     logged should include("worker-stdout")
     logged should include("worker-stderr")
   }
@@ -406,15 +406,15 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
     val lines = captureLogLines {
       dispatch.worker(
         Role.IMPL,
-        "harness/logs/issue-999.prompt.txt",
-        "harness/logs/issue-999-iter1.impl.patch",
-        "harness/logs/issue-999-iter1.claude.log",
+        "logs/issue-999.prompt.txt",
+        "logs/issue-999-iter1.impl.patch",
+        "logs/issue-999-iter1.claude.log",
         None
       )
     }
 
-    val logAbs   = root.resolve("harness/logs/issue-999-iter1.claude.log")
-    val patchAbs = root.resolve("harness/logs/issue-999-iter1.impl.patch")
+    val logAbs   = root.resolve("logs/issue-999-iter1.claude.log")
+    val patchAbs = root.resolve("logs/issue-999-iter1.impl.patch")
     lines should contain(s"dispatching IMPL agent -> $logAbs (patch -> $patchAbs)")
   }
 
@@ -429,11 +429,11 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
       reviewCmd = Some("echo VERDICT: APPROVE; echo diagnostic 1>&2")
     )
 
-    val outcome = dispatch.review("the prompt (unused by the stub)", "harness/logs/r.md")
+    val outcome = dispatch.review("the prompt (unused by the stub)", "logs/r.md")
 
     outcome shouldBe DispatchOutcome.Done
-    readString(root.resolve("harness/logs/r.md")) should include("VERDICT: APPROVE")
-    readString(root.resolve("harness/logs/r.md.stderr")) should include("diagnostic")
+    readString(root.resolve("logs/r.md")) should include("VERDICT: APPROVE")
+    readString(root.resolve("logs/r.md.stderr")) should include("diagnostic")
   }
 
   it should "log the reviewer dispatch line with an ABSOLUTE review path, byte for byte with bash" in {
@@ -450,10 +450,10 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
         reviewCmd = Some("true")
       )
 
-    val lines = captureLogLines { dispatch.review("prompt", "harness/logs/issue-999-review.md") }
+    val lines = captureLogLines { dispatch.review("prompt", "logs/issue-999-review.md") }
 
     lines should contain(
-      s"dispatching REVIEWER in the sandbox (cold, zero mounts, no mutating tools) -> ${root.resolve("harness/logs/issue-999-review.md")}"
+      s"dispatching REVIEWER in the sandbox (cold, zero mounts, no mutating tools) -> ${root.resolve("logs/issue-999-review.md")}"
     )
   }
 
@@ -469,7 +469,7 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
         reviewCmd = Some("exit 124")
       )
 
-    dispatch.review("prompt", "harness/logs/r.md") shouldBe DispatchOutcome.Done
+    dispatch.review("prompt", "logs/r.md") shouldBe DispatchOutcome.Done
   }
 
   // =============================================================================================
@@ -591,8 +591,9 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
     * Bash captures this with `$(git apply --numstat "$patch" 2>/dev/null)` (loop.sh:554), and
     * command substitution keeps whatever reached stdout no matter how the command exited. If the
     * port dropped stdout on a nonzero rc, rows git DID emit would vanish and
-    * `Machine.touchesProtected` — the guard whose job is to block writes to `harness/`, `.github/`,
-    * `docs/`, CONTEXT.md, PROMPT.md, STOP.md — would see an empty file list and wave the patch
+    * `Machine.touchesProtected` — the guard whose job is to block writes to `.github/`, `sandbox/`,
+    * `lib/`, `prompts/`, `docs/`, project.scala, watch.sh, tail-claude.sh, CONTEXT.md, PROMPT.md,
+    * STOP.md — would see an empty file list and wave the patch
     * through: failing open WIDER than bash, in the one guard where that matters most.
     *
     * Real git 2.50.1 parses a patch in full before emitting any numstat row, so no natural patch we
@@ -606,7 +607,7 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
       binDir,
       "git",
       """#!/usr/bin/env bash
-        |printf '1\t0\tharness/loop.sh\n12\t3\tsrc/main/scala/Ok.scala\n'
+        |printf '1\t0\tsandbox/loop.sh\n12\t3\tsrc/main/scala/Ok.scala\n'
         |echo "error: corrupt patch at line 42" >&2
         |exit 128
         |""".stripMargin
@@ -615,7 +616,7 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
 
     val numstat = git.applyNumstat("whatever.patch")
 
-    numstat shouldBe "1\t0\tharness/loop.sh\n12\t3\tsrc/main/scala/Ok.scala"
+    numstat shouldBe "1\t0\tsandbox/loop.sh\n12\t3\tsrc/main/scala/Ok.scala"
     // The whole point: the guard downstream still rejects the patch.
     Machine.touchesProtected(numstat) shouldBe true
   }
@@ -858,7 +859,7 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
     gh.checksRollupCount(42) shouldBe Some(7)
   }
 
-  private val ciLogRel = "harness/logs/issue-42.ci-wait.log"
+  private val ciLogRel = "logs/issue-42.ci-wait.log"
 
   /** Seeds the CI-wait log with what the CI watch would already have written, so an append can be
     * told apart from a truncating write.
@@ -1044,7 +1045,7 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
           "FAST",
           s"${probe.toString} ${fakeJdk.toString}",
           timeoutSec = 10,
-          logFile = "harness/logs/g.log"
+          logFile = "logs/g.log"
         )
     }
 

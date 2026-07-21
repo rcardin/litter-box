@@ -1,0 +1,5 @@
+iteration 1 -> issue #999
+patch guard: 30B exceeds the 10B cap — rejecting oversized patch (not applied)
+patch guard rejected the initial worker patch (oversized-patch) — routing to needs-human
+PR #123 opened for #999 (outcome FAIL)
+issue #999 -> needs-human

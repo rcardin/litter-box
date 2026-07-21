@@ -5,7 +5,7 @@
 # proxy-allowlist-test.sh: same refusal signature, now asserted once per role in the exact network
 # posture that role runs in.
 #
-# The two egress mechanisms in play (all roles join fes-sandbox-net only, so the proxy is the sole
+# The two egress mechanisms in play (all roles join litter-box-net only, so the proxy is the sole
 # reachable host either way):
 #   - env    : HTTP(S)_PROXY set in the container env — how run-agent.sh (worker/fixer) and
 #              run-reviewer.sh (reviewer) point `claude`'s fetch at the proxy. `curl` reads the

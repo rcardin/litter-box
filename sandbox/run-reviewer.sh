@@ -51,10 +51,10 @@ sandbox_preflight   # docker reachable + image present + proxy running (shared, 
 # Only a waitfile is needed on the host — the reviewer container mounts nothing, so there is no
 # workdir/input/output tmpdir to stage. Rooted under $HOME for the same colima reason the other
 # runners document (macOS's real TMPDIR is invisible to the Docker daemon under colima).
-FES_SANDBOX_TMP_ROOT="${FES_SANDBOX_TMP_ROOT:-$HOME/.cache/fes-harness-sandbox}"
-mkdir -p "$FES_SANDBOX_TMP_ROOT"
-cname="fes-reviewer-$$-$(date +%s)"
-waitfile="$(mktemp "$FES_SANDBOX_TMP_ROOT/reviewer-wait-XXXXXX")"
+LITTER_BOX_SANDBOX_TMP_ROOT="${LITTER_BOX_SANDBOX_TMP_ROOT:-$HOME/.cache/litter-box-sandbox}"
+mkdir -p "$LITTER_BOX_SANDBOX_TMP_ROOT"
+cname="litter-box-reviewer-$$-$(date +%s)"
+waitfile="$(mktemp "$LITTER_BOX_SANDBOX_TMP_ROOT/reviewer-wait-XXXXXX")"
 
 # EXIT covers every normal path; TERM/INT cover gtimeout and Ctrl-C. gtimeout kills the docker
 # CLIENT process group, never the container in the VM, so an untrapped timeout would orphan a full
@@ -75,7 +75,7 @@ trap on_signal TERM INT
 # --- the reviewer container -------------------------------------------------------------------
 # ZERO mounts (no -v at all): the prompt and the dedicated credential are the only non-proxy env. Same
 # non-root gate user + cap-drop + no-new-privileges as every other role, and it joins
-# fes-sandbox-net only, so it reaches the network solely through the proxy sidecar
+# litter-box-net only, so it reaches the network solely through the proxy sidecar
 # (api.anthropic.com is on the allowlist). Detached (gtimeout can't reach into the VM — see
 # on_signal) and NOT --rm (AutoRemove races docker wait for the exit code). The default `claude -p`
 # output format is TEXT — the final assistant message, whose last line is the VERDICT sentinel — so
