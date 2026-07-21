@@ -62,7 +62,7 @@ start_tail() { # start_tail FILE
   local f="$1"
   stop_tail
   case "$f" in
-    *.claude.log) ( tail -n 40 -f "$f" 2>/dev/null | jq -r --unbuffered -f "$FILTER" >"$FIFO" ) & ;;
+    *.claude.log) ( tail -n 40 -f "$f" 2>/dev/null | jq -R -r --unbuffered -f "$FILTER" >"$FIFO" ) & ;;
     *)            ( tail -n 40 -f "$f" 2>/dev/null >"$FIFO" ) & ;;
   esac
   TAIL_PID=$!

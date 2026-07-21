@@ -22,4 +22,4 @@ FILTER="$SCRIPT_DIR/lib/claude-fmt.jq"
 [[ -f "$FILTER" ]] || { echo "missing filter: $FILTER" >&2; exit 1; }
 
 # -n +1 so we render the whole log so far, then follow.
-tail -n +1 -f "$LOG" | jq -r --unbuffered -f "$FILTER" || true
+tail -n +1 -f "$LOG" | jq -R -r --unbuffered -f "$FILTER" || true
