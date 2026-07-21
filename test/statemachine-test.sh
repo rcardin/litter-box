@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Drives harness/loop.sh through its v1 state machine in a throwaway sandbox.
+# Parity oracle: drives whichever loop implementation HARNESS_IMPL selects through the v1 state
+# machine in a throwaway sandbox — scala (default, via harness/loop.sh) or bash (harness/loop-bash.sh).
 # Stubs gh (fake bin on PATH), the gate (GATE_CMD), and the three claude dispatches
 # (IMPL_CMD/FIX_CMD/REVIEW_CMD). No real GitHub, no Opus tokens.
 set -euo pipefail
@@ -8,13 +9,14 @@ set -euo pipefail
 SRC_HARNESS="${SRC_HARNESS:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 
 # Which implementation of the loop this run scores (the Scala rewrite's parity oracle, slice 3):
-#   bash  (default) -> harness/loop.sh, the reference implementation
-#   scala           -> scala-cli run harness/scala, the port
+#   scala (default) -> scala-cli run harness/scala, which harness/loop.sh now execs
+#   bash            -> harness/loop-bash.sh, the retiring reference implementation
 # Every scenario, stub and assertion below is shared: the two implementations are scored on the
-# same 142 checks, which is the whole point. Slice 4 flips the default and retires this switch
-# along with loop.sh; until then bash stays the default so nothing else that runs this suite
-# (CI, the sandbox tests) changes behaviour.
-HARNESS_IMPL="${HARNESS_IMPL:-bash}"
+# same 142 checks, which is the whole point. Slice 4 made the Scala port the default because it is
+# now what `harness/loop.sh` runs. `bash` stays selectable, and `loop-bash.sh` stays on disk, only
+# until the first real US merges under the Scala loop; then both this switch and the whole suite
+# retire (ScenarioSpec is the canonical test — see issue #47).
+HARNESS_IMPL="${HARNESS_IMPL:-scala}"
 case "$HARNESS_IMPL" in
   bash|scala) ;;
   *) echo "HARNESS_IMPL must be 'bash' or 'scala' (got '$HARNESS_IMPL')" >&2; exit 2 ;;
@@ -22,16 +24,18 @@ esac
 
 # The command that runs ONE loop process against the sandbox at $WORK (cwd is always $WORK).
 #
-# bash runs the COPY inside the sandbox, because loop.sh derives the repo root it mutates from its
-# own $BASH_SOURCE. The Scala entry derives that root from the cwd instead (Main.resolveRepoRoot
+# bash runs the COPY inside the sandbox, because loop-bash.sh derives the repo root it mutates from
+# its own $BASH_SOURCE. The Scala entry derives that root from the cwd instead (Main.resolveRepoRoot
 # walks up for harness/loop.sh, which the sandbox copy carries), so its sources can stay where they
 # are — and must, or scala-cli would compile them again from scratch in each of the 22 sandboxes.
+# That is also why scala mode invokes scala-cli directly rather than the `$WORK/harness/loop.sh`
+# shim, which would cd into the sandbox and recompile: same program, same env, same exit code.
 # Same sandbox under test either way; only the location of the code doing the driving differs.
 harness_entry() {
   if [[ "$HARNESS_IMPL" == "scala" ]]; then
     scala-cli run "$SRC_HARNESS/scala"
   else
-    "$WORK/harness/loop.sh"
+    "$WORK/harness/loop-bash.sh"
   fi
 }
 

@@ -7,10 +7,19 @@ building on v1 (`docs/superpowers/specs/2026-07-01-harness-v1-reviewer-design.md
 > `v2: + Testcontainers gate split`
 
 This revision also hardens v2 on top of the same design: an infra-fault terminal (rc `50`), a
-Docker preflight, protected-path enforcement in bash, and a fatal stale-base guard — see
+Docker preflight, protected-path enforcement in the loop, and a fatal stale-base guard — see
 **Infra faults vs code failures** below. None of this changes the v2 state machine; it closes
 gaps where infra problems or prompt violations were previously indistinguishable from code
 failures.
+
+> **The state machine is Scala, not bash** (rewrite slices #44-#47, design:
+> `docs/superpowers/specs/2026-07-19-harness-scala-rewrite-design.md`). `harness/loop.sh` is now a
+> thin shim that `exec`s `scala-cli run harness/scala`; the machine itself lives in
+> `harness/scala/src` as a typed state machine over yaes capabilities. **Nothing outward changed**:
+> same invocation, same env vars, same test seams, same exit codes, same `status.jsonl`, so
+> `watch.sh` and every command in this README work unmodified. Where prose below says "bash does
+> X", read it as "the loop does X" — the behaviour is what was ported, assertion by assertion. See
+> **The Scala loop** near the end.
 
 **v1** gave the reviewer stack (all unchanged in v2):
 
@@ -107,7 +116,9 @@ origin/main, so this only ever bites out-of-band PRs.
 |---|---|
 | `build.sbt` | Defines the `It` custom config (`config("it") extend Test` + `inConfig(It)(Defaults.testSettings)`, forked + serial + `-oDF`). `sbt test` = `src/test`; `sbt It/test` = `src/it`. |
 | `src/it/scala/.../PostgresJdbcEventStoreSpec.scala` | The one Testcontainers IT (real PG + Flyway). Judged by **CI** (`sbt It/test` in `ci.yml`), never by a local gate — the loop has no local IT gate as of v6 slice 3. |
-| `loop.sh` | Bash state machine. Sandbox preflight at startup (v6: build image, start proxy sidecar; requires `ANTHROPIC_API_KEY`), picks one issue via `gh`, dispatches fresh `claude -p` tasks **inside the sandbox** (worker/fixer, v6 slice 3), enforces the protected-path patch guard, runs the FAST gate + repair loop + reviewer, opens a PR, stops. Timeouts and other infra faults exit `50` without spending repair budget. The model never chooses the task. |
+| `loop.sh` | The entry point: a ~50-line shim that `cd`s to the repo root and `exec`s `scala-cli run harness/scala`. Holds no logic — it also serves as the repo-root marker `Main.resolveRepoRoot` walks up for, which is how the loop keeps working from any subdirectory. |
+| `scala/` | The state machine. Sandbox preflight at startup (build image, start proxy sidecar; requires a Claude credential), picks one issue via `gh`, dispatches fresh `claude -p` tasks **inside the sandbox** (worker/fixer, v6 slice 3), enforces the protected-path patch guard, runs the FAST gate + repair loop + reviewer, opens a PR, stops. Timeouts and other infra faults exit `50` without spending repair budget. The model never chooses the task. Layout: `src/Domain.scala` (ADTs), `src/Machine.scala` (transitions), `src/Caps.scala` (capability traits), `src/Live.scala` (subprocess/fs/gh/git handlers), `src/Main.scala` (env parsing, preflight, driver), `test/` (138 scalatest assertions over in-memory handlers). Standalone scala-cli project, deliberately NOT part of the sbt build — the threat model distrusts agent-authored `build.sbt`. |
+| `loop-bash.sh` | The retiring 944-line bash state machine, kept on disk only as the parity oracle's `HARNESS_IMPL=bash` reference until the first real US merges under the Scala loop. Invoked by nothing else. |
 | `iterate-prompt.md` | The narrow worker prompt (unchanged from v0). `{{ISSUE}}` is spliced with the issue body. |
 | `fix-prompt.md` | The fix-iteration prompt. Splices `{{ISSUE}}` + `{{FAILURE}}` (gate-log tail **or** reviewer reasons + tamper). Same hard rules as the worker (no test weakening, `-Werror`, no `gh`/branch ops). |
 | `review-prompt.md` | The cold reviewer prompt. Splices `{{ISSUE}}`, `{{CONVENTIONS}}` (`CONTEXT.md`), `{{TAMPER}}`, `{{DIFF}}`. Adversarial. Last line MUST be `VERDICT: APPROVE` or `VERDICT: REQUEST_CHANGES`. |
@@ -374,15 +385,26 @@ reviewer's (and every other role's) egress fence.
 
 ## Environment the loop needs
 
-`loop.sh` pins/exports these itself (override via env if your paths differ):
+The loop pins these itself (override via env if your paths differ):
 
+- **`scala-cli`** — the loop IS a Scala program; `loop.sh` exits `1` immediately if it is not on
+  `PATH` (`brew install Coursier/formulas/coursier && cs setup`, or `brew install scala-cli`).
+  Compilation is cached, so per-tick startup is ~1 s against a 30-minute iteration.
+  Note that exit `1` is therefore ambiguous: besides the harness's own "nothing staged / fatal
+  preflight" terminal, it is also what `scala-cli` returns when it fails to compile the harness
+  or to provision the JVM. In that case the loop never started at all, and `scala-cli`'s own
+  output on the way out says which of the two happened.
 - **JDK 25** (`.sdkmanrc` pins `java=25.0.2-open`). yaes 0.20.0 binds JDK 25's
   `StructuredTaskScope` API; under a newer default JDK (e.g. 26) **every** test aborts with
-  `NoSuchMethodError` — a false RED that masks the real signal. `JAVA_HOME_PINNED` overrides.
-  (The sandbox image pins the same JDK 25 in its own image, independent of the host.)
-- **`ANTHROPIC_API_KEY`** — the dedicated, spend-capped key handed to the containerized
-  worker/fixer. Required at startup (the loop `die`s without it); nothing else from the host
-  environment enters the agent container.
+  `NoSuchMethodError` — a false RED that masks the real signal. Two separate pins: the loop
+  process itself runs on the JDK `harness/scala/project.scala` requests (`//> using jvm
+  temurin:25`, provisioned by scala-cli), while `JAVA_HOME_PINNED` is stamped onto every CHILD
+  process the loop forks — a `GATE_CMD` override pointing at a host `sbt` is exactly what that
+  protects. (The sandbox image pins the same JDK 25 independently of the host.)
+- **A Claude credential** — `CLAUDE_CODE_OAUTH_TOKEN` (preferred) or `ANTHROPIC_API_KEY`, the
+  dedicated, spend-capped credential handed to the containerized worker/fixer. At least one is
+  required at startup (the loop `die`s without either); nothing else from the host environment
+  enters the agent container.
 - **Docker via colima** — the loop no longer exports `DOCKER_HOST` or any `TESTCONTAINERS_*`
   var (v6 slice 3 deleted that plumbing along with the local IT gate). The sandbox containers
   reach the daemon through the docker CLI's active context (colima's socket on this setup), so
@@ -392,6 +414,41 @@ reviewer's (and every other role's) egress fence.
   macOS's real `TMPDIR`, `/var/folders/...`) is invisible to the Docker daemon there and would
   silently bind-mount an empty directory into the container.
 
+## The Scala loop
+
+Six versions in, the bash machine was 944 lines and every new invariant (an infra fault spends no
+budget, a guard rejection skips the repair loop, an empty fix routes to needs-human) landed as
+scattered `exit` calls and README prose. The rewrite (design:
+`docs/superpowers/specs/2026-07-19-harness-scala-rewrite-design.md`) ports it to a typed state
+machine — not a transliteration, and not event-sourced.
+
+- **`Domain.scala`** — the outcomes as closed ADTs: `LoopExit` (each case carries its `rc`),
+  `StageResult`, `GateResult`, `Verdict`, `FailureKind`, `Config`. An unhandled terminal is a
+  compile error rather than a missing `case` in a bash `case` block.
+- **`Caps.scala` / `Live.scala`** — every effect the loop has sits behind a capability trait
+  (`GitHub`, `Git`, `AgentDispatch`, `GateRunner`, `StatusLog`, `Notify`, `HarnessFs`, `Clock`,
+  `Log`), passed as a yaes-style context parameter. `Live.scala` holds the only code that shells
+  out. The sandbox seam is verbatim: `run-fast-gate.sh`, `run-agent.sh`, `run-reviewer.sh` under
+  today's exact argv/env/rc contract, `rc 124` = infra fault everywhere.
+- **`Machine.scala`** — the transitions, decisions first and effects behind the capabilities.
+  Infra faults short-circuit through `Raise[InfraFault]`, so "an infra fault never spends repair
+  budget" is a property of the type, not a convention every new `exit 50` has to remember.
+- **`Main.scala`** — env parsing, the `command -v` and prompt-template preflight, the sandbox
+  image/proxy startup with a shutdown hook standing in for bash's `trap ... EXIT`, the `MAX_ITERS`
+  driver and the `LoopExit` → process-exit-code map.
+
+Dogfooding is the point: the harness is the repo's second real yaes program, on deliberately ugly
+ground (subprocesses, timeouts, exit codes) where API gaps show up.
+
+**What stayed bash**: `watch.sh`, `tail-claude.sh`, and everything under `sandbox/` — the
+containers, the proxy, the wrappers. The loop runs on the host and never inside the sandbox.
+
+**Testing.** `scala-cli test harness/scala` is canonical: 138 assertions driving the machine over
+in-memory handlers plus a recorder, so a scenario asserts on the outcome (exit code, labels
+flipped, PR opened, budget left) AND the interaction sequence (no FIX after an infra fault, no
+merge without verification, marker staged on a guard rejection). `statemachine-test.sh` remains as
+the migration's parity oracle and retires once the first real US merges under this loop.
+
 ## Run it
 
 The loop burns Opus tokens and opens a real PR. Run it yourself when ready:
@@ -399,23 +456,25 @@ The loop burns Opus tokens and opens a real PR. Run it yourself when ready:
 ```bash
 harness/loop.sh                 # one US (default MAX_ITERS=1)
 DRY_RUN=1 harness/loop.sh       # inspect plumbing: render the worker prompt, no mutation
-harness/test/statemachine-test.sh   # exercise the state machine offline (no gh, no tokens)
-HARNESS_IMPL=scala harness/test/statemachine-test.sh   # score the Scala port on the same 142 checks
+scala-cli test harness/scala        # the canonical suite: 138 in-memory scenario/unit assertions
+harness/test/statemachine-test.sh   # parity oracle, offline (no gh, no tokens): 142 assertions
+HARNESS_IMPL=bash harness/test/statemachine-test.sh   # same 142 against the retiring bash machine
 ```
 
 `HARNESS_IMPL` is the Scala rewrite's **parity oracle** switch (design:
-`docs/superpowers/specs/2026-07-19-harness-scala-rewrite-design.md`). `bash` (the default) drives
-`loop.sh`; `scala` drives `scala-cli run harness/scala` through the identical scenarios, stubs and
-assertions. Both must read 142/142 — that equality, not a diff of the two sources, is what says the
-port is faithful. Note that the suite scores the harness on its **stderr** as well as its
-behaviour (ten `checkc ... loop.out` assertions), so the `log()` wording on those paths is
-asserted behaviour in both implementations. Eight of those needles come out of the loop's own log
-stream and are pinned in-memory by `harness/scala/test/LogParitySpec.scala`; the other two are the
-driver's exit-path line, pinned by `harness/scala/src/Main.scala` and `MainSpec.scala`.
+`docs/superpowers/specs/2026-07-19-harness-scala-rewrite-design.md`). `scala` (the default since
+slice 4) drives `scala-cli run harness/scala`, which is what `loop.sh` now execs; `bash` drives
+`loop-bash.sh` through the identical scenarios, stubs and assertions. Both must read 142/142 —
+that equality, not a diff of the two sources, is what says the port is faithful. Note that the
+suite scores the harness on its **stderr** as well as its behaviour (ten `checkc ... loop.out`
+assertions), so the `log()` wording on those paths is asserted behaviour in both implementations.
+Eight of those needles come out of the loop's own log stream and are pinned in-memory by
+`harness/scala/test/LogParitySpec.scala`; the other two are the driver's exit-path line, pinned
+by `harness/scala/src/Main.scala` and `MainSpec.scala`.
 
 Env: `MAX_ITERS` (default 1), `ITER_TIMEOUT` s (default 1800), `GATE_TIMEOUT` s (default 900),
-`REPAIR_BUDGET` (default 2), `DRY_RUN=1`. `ANTHROPIC_API_KEY` is required (handed to the
-containerized worker/fixer).
+`REPAIR_BUDGET` (default 2), `DRY_RUN=1`. `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY` is
+required (handed to the containerized worker/fixer).
 
 **Test seams** (default to the real thing; used by `statemachine-test.sh` to force outcomes):
 `GATE_CMD` (FAST tier), `IMPL_CMD`, `FIX_CMD`, `REVIEW_CMD`. A stub ignores the prompt and
