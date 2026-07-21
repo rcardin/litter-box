@@ -26,6 +26,17 @@ object Machine:
     */
   val LogDir = "logs"
 
+  /** Where the three prompt templates live, relative to the repo root. Bash read them from
+    * `$SCRIPT_DIR` (loop.sh:116-118); here the root IS the project, so they sit in the project's own
+    * `prompts/`. The filenames hang off `Template.fileName`.
+    */
+  val PromptDir = "prompts"
+
+  /** Where the container launcher scripts live, relative to the repo root — bash's
+    * `$SCRIPT_DIR/sandbox` (loop.sh:198-211).
+    */
+  val SandboxDir = "sandbox"
+
   /** The four CUR_* globals of loop.sh: the status-event context. iterate() keeps them current;
     * emit() only reads them, so a terminal DONE from the driver still carries the right issue.
     */
@@ -704,10 +715,10 @@ object Machine:
       return StageResult.Oversize
     if touchesProtected(numstat) then
       logger.log(
-        "patch guard: patch touches a protected path (.github/, harness/, docs/, CONTEXT.md, PROMPT.md or STOP.md) — rejecting (not applied)"
+        "patch guard: patch touches a protected path (.github/, sandbox/, lib/, prompts/, docs/, project.scala, watch.sh, tail-claude.sh, CONTEXT.md, PROMPT.md or STOP.md) — rejecting (not applied)"
       )
       writeRejectMarker(
-        "Patch touches a protected path (CI workflow, harness code, docs, or a control/constitution file).",
+        "Patch touches a protected path (CI workflow, loop code, docs, or a control/constitution file).",
         numstat
       )
       return StageResult.Protected
@@ -745,12 +756,21 @@ object Machine:
   private[litterbox] def numstatPaths(numstat: String): List[String] =
     numstat.linesIterator.toList.flatMap(line => NumstatRow.parse(line).map(_.path))
 
-  /** The three classes the sandbox must never let an agent rewrite (CI workflows, harness code, the
+  /** The three classes the sandbox must never let an agent rewrite (CI workflows, loop code, the
     * constitution) plus docs/ and the control files.
+    *
+    * Since the repo root IS the loop, "loop code" is enumerated as the loop-owned paths that cannot
+    * collide with a worked-on project's layout. `src/` is DELIBERATELY absent: it holds the loop's
+    * own sources but is also the conventional source root of the project the loop works on (see
+    * `tamperReport`, which reads `src/test/` and `src/it/` out of the worked-on repo), so listing it
+    * would reject every legitimate worker patch. Closing that hole needs the `instance_name`/config
+    * work tracked in issue #3.
     */
   private[litterbox] def touchesProtected(numstat: String): Boolean =
     numstatPaths(numstat).exists { p =>
-      p.startsWith(".github/") || p.startsWith("harness/") || p.startsWith("docs/") ||
+      p.startsWith(".github/") || p.startsWith("sandbox/") || p.startsWith("lib/") ||
+      p.startsWith("prompts/") || p.startsWith("docs/") ||
+      p == "project.scala" || p == "watch.sh" || p == "tail-claude.sh" ||
       p == "CONTEXT.md" || p == "PROMPT.md" || p == "STOP.md"
     }
 

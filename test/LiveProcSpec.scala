@@ -591,8 +591,9 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
     * Bash captures this with `$(git apply --numstat "$patch" 2>/dev/null)` (loop.sh:554), and
     * command substitution keeps whatever reached stdout no matter how the command exited. If the
     * port dropped stdout on a nonzero rc, rows git DID emit would vanish and
-    * `Machine.touchesProtected` — the guard whose job is to block writes to `harness/`, `.github/`,
-    * `docs/`, CONTEXT.md, PROMPT.md, STOP.md — would see an empty file list and wave the patch
+    * `Machine.touchesProtected` — the guard whose job is to block writes to `.github/`, `sandbox/`,
+    * `lib/`, `prompts/`, `docs/`, project.scala, watch.sh, tail-claude.sh, CONTEXT.md, PROMPT.md,
+    * STOP.md — would see an empty file list and wave the patch
     * through: failing open WIDER than bash, in the one guard where that matters most.
     *
     * Real git 2.50.1 parses a patch in full before emitting any numstat row, so no natural patch we
@@ -606,7 +607,7 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
       binDir,
       "git",
       """#!/usr/bin/env bash
-        |printf '1\t0\tharness/loop.sh\n12\t3\tsrc/main/scala/Ok.scala\n'
+        |printf '1\t0\tsandbox/loop.sh\n12\t3\tsrc/main/scala/Ok.scala\n'
         |echo "error: corrupt patch at line 42" >&2
         |exit 128
         |""".stripMargin
@@ -615,7 +616,7 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
 
     val numstat = git.applyNumstat("whatever.patch")
 
-    numstat shouldBe "1\t0\tharness/loop.sh\n12\t3\tsrc/main/scala/Ok.scala"
+    numstat shouldBe "1\t0\tsandbox/loop.sh\n12\t3\tsrc/main/scala/Ok.scala"
     // The whole point: the guard downstream still rejects the patch.
     Machine.touchesProtected(numstat) shouldBe true
   }

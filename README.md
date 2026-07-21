@@ -35,9 +35,9 @@ oldest `ready` one — deterministic, no LLM involved.
 This is the product. Everything else is plumbing.
 
 - **The worker never picks its own work.** The issue comes from a label query, not from the model.
-- **Protected-path patch guard.** A patch touching `.github/`, `harness/`, `docs/`, `CONTEXT.md`,
-  `PROMPT.md` or `STOP.md` is rejected unapplied. The loop cannot be talked into editing its own
-  guards or its own CI.
+- **Protected-path patch guard.** A patch touching `.github/`, `sandbox/`, `lib/`, `prompts/`,
+  `docs/`, `project.scala`, `watch.sh`, `tail-claude.sh`, `CONTEXT.md`, `PROMPT.md` or `STOP.md` is
+  rejected unapplied. The loop cannot be talked into editing its own guards or its own CI.
 - **Test-tamper check.** The diff is measured against `origin/main` with `git apply --numstat` and
   the result is handed to the reviewer, which catches the classic failure mode: deleting a failing
   test to go green.

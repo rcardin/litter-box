@@ -6,15 +6,15 @@ import Script.*
 
 /** The load-bearing log-line contract, frozen as golden files.
   *
-  * Until slice 1 this spec pinned eight individual needles that `test/statemachine-test.sh` grepped
-  * out of the harness's stderr (`checkc NEEDLE "$SB/loop.out"`). That bash oracle is deleted — it
-  * scored a bash implementation that no longer exists — so the needles it protected are re-pinned
-  * here instead, against the `.log` files under `test/golden`.
+  * Each test drives one scenario through the loop and asserts the harness's entire operator log
+  * stream against a `.log` file under `test/golden`. See `Golden` for the regeneration workflow.
   *
-  * Golden files rather than needles because the audience is a parser, not a human: `watch.sh` reads
-  * this stream, and the eight needles were only ever a sample of it. Pinning the whole stream per
-  * scenario catches a dropped line, a reordered pair, and a reworded phrase — all of which the
-  * needle form let through. See `Golden` for the regeneration workflow.
+  * This replaces an older bash oracle, since deleted, that scored a bash implementation which no
+  * longer exists. That oracle grepped eight individual needles out of the harness's stderr; the
+  * goldens re-pin those same scenarios whole. Golden files rather than needles because the audience
+  * is a parser, not a human: `watch.sh` reads this stream, and the eight needles were only ever a
+  * sample of it. Pinning the whole stream per scenario catches a dropped line, a reordered pair, and
+  * a reworded phrase — all of which the needle form let through.
   *
   * Assertions that are NOT about the log stream (`w.files`, `w.called`, `w.callCount`) stay as
   * explicit expectations: a golden file freezes what was said, never what was done.
@@ -30,9 +30,9 @@ class LogParitySpec extends AnyFlatSpec with Matchers:
         actual shouldBe Golden.expected(name, actual)
       }
 
-  // ---- the scenarios the bash oracle used to grep, now pinned whole -------------------------
+  // ---- the fault and budget-exhaustion scenarios, pinned whole ------------------------------
 
-  "The log stream" should "match the golden for an IMPL timeout (statemachine-test.sh:241)" in {
+  "The log stream" should "match the golden for an IMPL worker timeout" in {
     val w = TestWorld()
     w.implScript = WorkerScript.TimedOut
 
@@ -41,7 +41,7 @@ class LogParitySpec extends AnyFlatSpec with Matchers:
     w.logShouldMatchGolden("impl-timeout")
   }
 
-  it should "match the golden for a FIX timeout (statemachine-test.sh:266)" in {
+  it should "match the golden for a FIX worker timeout during a repair round" in {
     val w = TestWorld()
     w.gateResults = List(GateResult.Red)
     w.fixScripts = List(WorkerScript.TimedOut)
@@ -51,7 +51,7 @@ class LogParitySpec extends AnyFlatSpec with Matchers:
     w.logShouldMatchGolden("fix-timeout")
   }
 
-  it should "match the golden for a gate timeout (statemachine-test.sh:372)" in {
+  it should "match the golden for a gate timeout" in {
     val w = TestWorld()
     w.gateResults = List(GateResult.Timeout)
 
@@ -60,16 +60,16 @@ class LogParitySpec extends AnyFlatSpec with Matchers:
     w.logShouldMatchGolden("gate-timeout")
   }
 
-  it should "match the golden for a protected-path rejection (statemachine-test.sh:329, :558)" in {
+  it should "match the golden for a patch rejected for touching a protected path" in {
     val w = TestWorld()
-    w.implScript = WorkerScript.Produces("1\t0\tharness/evil.txt")
+    w.implScript = WorkerScript.Produces("1\t0\tsandbox/evil.sh")
 
     w.runLoop() shouldBe LoopExit.NeedsHuman
 
     w.logShouldMatchGolden("protected-path")
   }
 
-  it should "match the golden for an oversized patch (statemachine-test.sh:600)" in {
+  it should "match the golden for a patch rejected for exceeding the size cap" in {
     val w = TestWorld()
 
     w.runLoop(Config(maxPatchBytes = 10)) shouldBe LoopExit.NeedsHuman
@@ -77,7 +77,7 @@ class LogParitySpec extends AnyFlatSpec with Matchers:
     w.logShouldMatchGolden("oversized-patch")
   }
 
-  it should "match the golden for the idle tick (statemachine-test.sh:292)" in {
+  it should "match the golden for the idle tick, with no ready and no in-progress issue" in {
     val w = TestWorld()
     w.inProgress = None
     w.ready = None
@@ -88,7 +88,7 @@ class LogParitySpec extends AnyFlatSpec with Matchers:
     w.files shouldBe empty // still no sentinel: logging is not writing
   }
 
-  it should "match the golden for three reds exhausting the budget (statemachine-test.sh:212)" in {
+  it should "match the golden for three gate REDs exhausting the repair budget" in {
     val w = TestWorld()
     w.gateResults = List(GateResult.Red, GateResult.Red, GateResult.Red)
 
@@ -152,7 +152,7 @@ class LogParitySpec extends AnyFlatSpec with Matchers:
     w.logShouldMatchGolden("auto-merge-chain")
   }
 
-  it should "carry the merge child's rc into the merge-failure line (loop.sh:475)" in {
+  it should "match the golden for a failed merge, carrying the child's rc into the failure line" in {
     val w = TestWorld()
     w.labels = List("ready", "class-1")
     w.mergeRc = 3 // not 1: a wrong-but-nonzero rc would still pass a zero/one-only assertion
@@ -174,7 +174,7 @@ class LogParitySpec extends AnyFlatSpec with Matchers:
     w.callCount("dispatch FIX") shouldBe 0
   }
 
-  it should "warn when the CI-RED needs-human flip fails, as bash does (loop.sh:464)" in {
+  it should "match the golden for a CI-RED whose needs-human label flip fails, which only warns" in {
     val w = TestWorld()
     w.labels = List("ready", "class-1")
     w.ciWaitResult = GateResult.Red
@@ -209,7 +209,7 @@ class LogParitySpec extends AnyFlatSpec with Matchers:
 
     w.runLoop() shouldBe LoopExit.InfraFault
 
-    // loop.sh:569's stage_patch line precedes the caller's own; the golden pins that pairing.
+    // The stage_patch line precedes the caller's own; the golden pins that pairing.
     w.logShouldMatchGolden("git-apply-refused")
   }
 

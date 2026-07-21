@@ -87,9 +87,14 @@ final case class InfraFault(reason: String)
 enum Role:
   case IMPL, FIX
 
-/** Prompt templates the harness renders ({{KEY}} line-splice contract of render_template). */
-enum Template:
-  case Iterate, Fix, Review
+/** Prompt templates the harness renders ({{KEY}} line-splice contract of render_template). Each
+  * case carries its own filename under `Machine.PromptDir`, so the reader and the startup preflight
+  * check cannot drift apart.
+  */
+enum Template(val fileName: String):
+  case Iterate extends Template("iterate-prompt.md")
+  case Fix     extends Template("fix-prompt.md")
+  case Review  extends Template("review-prompt.md")
 
 /** One line of `git apply --numstat` output: "<added>\t<deleted>\t<path>". `added`/`deleted` stay
   * `String` (not `Int`) because binary files report "-" instead of a line count.

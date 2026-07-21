@@ -509,7 +509,7 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
 
   it should "reject a protected-path IMPL patch: marker staged, repair loop skipped, needs-human (Scenarios G/R)" in {
     val w = TestWorld()
-    w.implScript = WorkerScript.Produces("1\t0\tharness/evil.txt")
+    w.implScript = WorkerScript.Produces("1\t0\tsandbox/evil.sh")
     w.fixScripts = List(WorkerScript.Produces(newFilePatch)) // must never be consumed
 
     val exit = w.runLoop()
@@ -520,7 +520,7 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     w.callCount("gate FAST") shouldBe 0       // guard rejection short-circuits the gates
     w.appliedPatches shouldBe empty           // the rejected patch was NEVER applied
     w.files("PATCH-REJECTED.md") should include("protected path")
-    w.files("PATCH-REJECTED.md") should include("harness/evil.txt") // numstat in the marker
+    w.files("PATCH-REJECTED.md") should include("sandbox/evil.sh") // numstat in the marker
     w.called("git add PATCH-REJECTED.md") shouldBe true
     w.called("gh issue edit 999 --add-label needs-human --remove-label in-progress") shouldBe true
     w.called("gh pr create") shouldBe true // PR still opened (audit trail)
@@ -533,9 +533,14 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     def numstat(p: String) = s"1\t0\t$p"
     val protectedPaths     =
       List(
-        "harness/evil.txt",
         ".github/workflows/evil.yml",
+        "sandbox/evil.sh",
+        "lib/evil.jar",
+        "prompts/evil.md",
         "docs/x.md",
+        "project.scala",
+        "watch.sh",
+        "tail-claude.sh",
         "CONTEXT.md",
         "PROMPT.md",
         "STOP.md"
@@ -640,7 +645,7 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     val w = TestWorld()
     w.gateResults = List(GateResult.Red)
     w.fixScripts = List(
-      WorkerScript.Produces("1\t0\tharness/evil.txt"),
+      WorkerScript.Produces("1\t0\tsandbox/evil.sh"),
       WorkerScript.Produces(newFilePatch) // must never be consumed
     )
 

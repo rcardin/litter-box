@@ -156,7 +156,7 @@ object Main:
       case Some(root) => Right(root)
       case None       =>
         Left(
-          s"not inside the harness repo: no ancestor of $from contains $RootMarker — run the harness from the repo"
+          s"not inside the litter-box repo: no ancestor of $from contains $RootMarker — run litter-box from the repo"
         )
 
   /** The exact bash log line for one iteration's outcome (loop.sh:932-941), copied byte-for-byte
@@ -217,7 +217,7 @@ object Main:
     pb.start().waitFor()
 
   /** Runs the sandbox teardown script (stop-proxy.sh) on the way out, with cwd=root and no args.
-    * Both streams are discarded so shutdown noise never trails the harness's final output, matching
+    * Both streams are discarded so shutdown noise never trails litter-box's final output, matching
     * bash's EXIT-trap invocation verbatim (loop.sh:210:
     * `"$SCRIPT_DIR/sandbox/stop-proxy.sh" >/dev/null 2>&1 || true`).
     */
@@ -230,7 +230,7 @@ object Main:
 
   // ---- Part B: entry point -------------------------------------------------------------------
 
-  @main def harnessLoop(): Unit =
+  @main def litterBoxLoop(): Unit =
     val env = sys.env
 
     // 1. root = the nearest ancestor of the cwd containing RootMarker, which is bash's REPO_ROOT
@@ -246,7 +246,8 @@ object Main:
 
     // 3. (was: the JAVA_HOME pin block, loop.sh:176-192.) Bash pinned JDK 25 onto every child it
     // forked because the old effect library needed JDK 25's StructuredTaskScope API. That dependency
-    // project is on JDK 21 LTS, so there is nothing left to pin and the block is deleted.
+    // is gone and the project targets JDK 21 LTS, so there is nothing left to pin and the block is
+    // deleted.
     // `LiveProc.pinJdk` survives unset — its default is None, i.e. "stamp nothing" — so children
     // inherit the ambient JDK, which is the behaviour bash had whenever the pinned JDK was absent.
 
@@ -272,25 +273,24 @@ object Main:
         die(
           "neither CLAUDE_CODE_OAUTH_TOKEN nor ANTHROPIC_API_KEY set — the sandboxed worker/fixer has no other way to authenticate"
         )
-      if runPreflightScript(root, root.resolve("sandbox/build-image.sh")) != 0 then
+      if runPreflightScript(root, root.resolve(Machine.SandboxDir).resolve("build-image.sh")) != 0
+      then
         die("sandbox image build failed")
-      if runPreflightScript(root, root.resolve("sandbox/start-proxy.sh")) != 0 then
+      if runPreflightScript(root, root.resolve(Machine.SandboxDir).resolve("start-proxy.sh")) != 0
+      then
         die("sandbox proxy failed to start")
       // loop.sh:210's `trap ... EXIT` equivalent: fires on normal completion, any sys.exit
       // (including from a later die()), or an uncaught exception; addShutdownHook guarantees
       // this the same way bash's EXIT trap does.
       sys.addShutdownHook {
-        try runTeardownScript(root, root.resolve("sandbox/stop-proxy.sh"))
+        try runTeardownScript(root, root.resolve(Machine.SandboxDir).resolve("stop-proxy.sh"))
         catch case NonFatal(_) => 0
         ()
       }
 
     // 6c. Prompt template / conventions file existence (loop.sh:116-119, 212-215).
-    val iteratePrompt = root.resolve("prompts/iterate-prompt.md")
-    val fixPrompt     = root.resolve("prompts/fix-prompt.md")
-    val reviewPrompt  = root.resolve("prompts/review-prompt.md")
-    val conventions   = root.resolve("CONTEXT.md")
-    for f <- List(iteratePrompt, fixPrompt, reviewPrompt) do
+    val conventions = root.resolve("CONTEXT.md")
+    for f <- Template.values.map(t => root.resolve(Machine.PromptDir).resolve(t.fileName)) do
       if !Files.isRegularFile(f) then die(s"missing prompt template: $f")
     if !Files.isRegularFile(conventions) then die(s"missing conventions file: $conventions")
 

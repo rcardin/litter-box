@@ -174,7 +174,7 @@ class MainSpec extends AnyFlatSpec with Matchers:
   private def markerAt(root: java.nio.file.Path): java.nio.file.Path => Boolean =
     p => p == root.resolve(Main.RootMarker)
 
-  "resolveRepoRoot" should "return the cwd when the cwd itself is the harness repo root" in {
+  "resolveRepoRoot" should "return the cwd when the cwd itself is the litter-box repo root" in {
     val root = java.nio.file.Paths.get("/work/repo")
 
     Main.resolveRepoRoot(root, markerAt(root)) shouldBe Right(root)

@@ -52,11 +52,7 @@ final class LiveHarnessFs(root: Path) extends HarnessFs:
     * project, so they live in the project's own `prompts/` directory.
     */
   def readTemplate(t: Template): String =
-    val name = t match
-      case Template.Iterate => "iterate-prompt.md"
-      case Template.Fix     => "fix-prompt.md"
-      case Template.Review  => "review-prompt.md"
-    readString(root.resolve("prompts").resolve(name))
+    readString(root.resolve(Machine.PromptDir).resolve(t.fileName))
 
   /** loop.sh:119: `CONVENTIONS="$REPO_ROOT/CONTEXT.md"`. */
   def conventions(): String =
@@ -527,7 +523,7 @@ final class LiveAgentDispatch(
         if rc == 124 then DispatchOutcome.TimedOut else DispatchOutcome.Done
       case None =>
         // Real path: harness/sandbox/run-agent.sh PROMPT_FILE PATCH_OUT [CURRENT_PATCH].
-        val runner          = root.resolve("sandbox/run-agent.sh").toString
+        val runner          = root.resolve(Machine.SandboxDir).resolve("run-agent.sh").toString
         val promptAbs       = root.resolve(promptFile).toString
         val currentPatchArg = currentPatch.map(root.resolve(_).toString).getOrElse("")
         val args            = (timeoutBin match
@@ -559,7 +555,7 @@ final class LiveAgentDispatch(
         DispatchOutcome.Done // bash asymmetry: the stub path never reads back rc==124
       case None =>
         // Real path: REVIEW_PROMPT env carries the prompt text, never argv.
-        val runner = root.resolve("sandbox/run-reviewer.sh").toString
+        val runner = root.resolve(Machine.SandboxDir).resolve("run-reviewer.sh").toString
         val args   = (timeoutBin match
           case Some(tb) => Seq(tb, iterTimeout.toString)
           case None     => Seq.empty
