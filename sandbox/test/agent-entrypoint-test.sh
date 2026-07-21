@@ -80,6 +80,40 @@ BADPRIOR="$SB/bad.patch"
 rc3=0; run_entrypoint "$SB/w3" "$BADPRIOR" "$SB/i3" "$SB/o3" || rc3=$?
 check "prior patch that will not apply -> exit 3 (infra fault)" 3 "$rc3"
 
+# --- Case 4: claude never reached the model (401/429/5xx). The stream-json result line carries
+# a numeric api_error_status; that is an INFRA fault, not "the agent produced nothing" — the
+# harness must not read it as an empty iteration and burn a pass on it. -----------------------
+cat > "$BIN/claude" <<'CL'
+#!/usr/bin/env bash
+printf '%s\n' '{"type":"result","subtype":"success","is_error":true,"api_error_status":401,"result":"Invalid API key · Fix external API key","terminal_reason":"api_error"}'
+exit 1
+CL
+chmod +x "$BIN/claude"
+rc4=0; run_entrypoint "$SB/w4" "" "$SB/i4" "$SB/o4" || rc4=$?
+check "claude API error (401) -> exit 3 (infra fault)" 3 "$rc4"
+
+# --- Case 5: claude exits nonzero WITHOUT ever emitting a result line (crashed, killed, egress
+# blocked). Also infra, for the same reason: the agent never got to think. ---------------------
+cat > "$BIN/claude" <<'CL'
+#!/usr/bin/env bash
+echo "claude: connection refused" >&2
+exit 1
+CL
+chmod +x "$BIN/claude"
+rc5=0; run_entrypoint "$SB/w5" "" "$SB/i5" "$SB/o5" || rc5=$?
+check "claude dies with no result line -> exit 3 (infra fault)" 3 "$rc5"
+
+# --- Case 6: a real run that reached the model and produced NOTHING stays exit 0 — an empty
+# iteration is a legitimate agent outcome and must not be confused with the two faults above. --
+cat > "$BIN/claude" <<'CL'
+#!/usr/bin/env bash
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"api_error_status":null,"result":"nothing to do"}'
+CL
+chmod +x "$BIN/claude"
+rc6=0; run_entrypoint "$SB/w6" "" "$SB/i6" "$SB/o6" || rc6=$?
+check "model reached, no edits -> exit 0 (empty iteration, not a fault)" 0 "$rc6"
+check "empty iteration writes an empty patch" "0" "$(wc -c < "$SB/o6/agent.patch" | tr -d ' ')"
+
 echo
 echo "==== $pass passed, $fail failed ===="
 [[ "$fail" -eq 0 ]]

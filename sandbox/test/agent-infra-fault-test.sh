@@ -48,4 +48,21 @@ else
   echo "  FAIL OAuth-only credential not accepted: rc=$rc msg=$msg"; fail=1
 fi
 
+# 4. An OAuth token exported under the API-key name (the sk-ant-oat prefix) must be forwarded as
+# CLAUDE_CODE_OAUTH_TOKEN, never as ANTHROPIC_API_KEY — the latter is a guaranteed 401.
+( unset CLAUDE_CODE_OAUTH_TOKEN
+  ANTHROPIC_API_KEY="sk-ant-oat01-deadbeef"
+  sandbox_credential_env
+  [[ "${CREDENTIAL_ENV[*]}" == "-e CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-deadbeef" ]] ) 2>/dev/null \
+  && echo "  ok   sk-ant-oat... in ANTHROPIC_API_KEY forwarded as CLAUDE_CODE_OAUTH_TOKEN" \
+  || { echo "  FAIL OAuth token under the API-key name not remapped"; fail=1; }
+
+# ...while a real console API key keeps going out as ANTHROPIC_API_KEY.
+( unset CLAUDE_CODE_OAUTH_TOKEN
+  ANTHROPIC_API_KEY="sk-ant-api03-cafe"
+  sandbox_credential_env
+  [[ "${CREDENTIAL_ENV[*]}" == "-e ANTHROPIC_API_KEY=sk-ant-api03-cafe" ]] ) 2>/dev/null \
+  && echo "  ok   a real API key still goes out as ANTHROPIC_API_KEY" \
+  || { echo "  FAIL API key remapped by mistake"; fail=1; }
+
 exit "$fail"

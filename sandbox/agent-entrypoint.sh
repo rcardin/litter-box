@@ -41,11 +41,37 @@ fi
 # The agent. The dedicated credential (CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY) and the
 # proxy env come from the container env
 # (run-agent.sh) — no host keychain, no host claude config, no gh token. stdout is the stream-
-# json log the harness tails, so it must NOT be redirected. A claude failure is not fatal here:
-# it leaves an empty patch, which the host reads as "no diff" (EMPTY), exactly like a host claude
-# that produced nothing.
+# json log the harness tails, so it must NOT be redirected — tee keeps it flowing while we also
+# keep a copy to classify the outcome below. The copy lives OUTSIDE $WORKSPACE: anything written
+# in the tree would land in the agent's patch.
+stream_log="$(mktemp)"
+claude_rc=0
 claude -p "$(cat "$INPUT/prompt.txt")" \
-  --dangerously-skip-permissions --output-format stream-json --verbose || true
+  --dangerously-skip-permissions --output-format stream-json --verbose \
+  | tee "$stream_log" || claude_rc=$?
+
+# Two claude outcomes are INFRA faults, not agent outcomes, and must be told apart from the
+# agent legitimately producing nothing (which is exit 0 with an empty patch):
+#
+#   1. the final stream-json result line carries a numeric api_error_status (401 invalid key,
+#      429, 5xx) — the request never reached the model
+#   2. claude exited nonzero without ever emitting a result line — it crashed, was killed, or
+#      egress was blocked before the first response
+#
+# Both used to be swallowed by a bare `|| true` and surfaced to the host as "no changes produced
+# by the iteration", which spent a pass and hid the real cause (an OAuth token exported as
+# ANTHROPIC_API_KEY 401s in exactly this way). Exit 3 -> run-agent.sh maps it to 124 -> the host
+# treats it as an infra fault and spends NO repair budget.
+result_line="$(grep '"type":"result"' "$stream_log" | tail -n 1 || true)"
+rm -f "$stream_log"
+if [[ "$result_line" =~ \"api_error_status\":[0-9] ]]; then
+  echo "[agent-entrypoint] claude never reached the model: $result_line" >&2
+  exit 3
+fi
+if (( claude_rc != 0 )) && [[ -z "$result_line" ]]; then
+  echo "[agent-entrypoint] claude exited rc=$claude_rc without producing a result — treating as an infra fault, not an empty iteration" >&2
+  exit 3
+fi
 
 # Extract the agent's work as the cumulative patch. --no-renames keeps the host protected-path
 # guard rename-proof: a rename records as delete+add, so the concrete destination path appears

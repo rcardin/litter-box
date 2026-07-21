@@ -119,10 +119,11 @@ wait "$logs_pid" 2>/dev/null || true
 
 rc="$(read_wait_rc "$waitfile")"   # validated bare integer, else infra-fault (shared, see lib.sh)
 
-# The entrypoint's only nonzero exit is 3 = an infra fault (base-repo setup, prior patch would not
-# apply, or staging failed). Any other container exit (including a claude failure) leaves a
-# possibly-empty patch, which the host reads as EMPTY — same as a host agent that produced nothing.
-(( rc == 3 )) && infra_fault "container setup failed inside the sandbox (base repo, prior patch, or staging)"
+# The entrypoint's only nonzero exit is 3 = an infra fault: base-repo setup, a prior patch that
+# would not apply, staging, OR claude never reaching the model (API error / died with no result —
+# see agent-entrypoint.sh). Any other container exit leaves a possibly-empty patch, which the host
+# reads as EMPTY — same as an agent that reached the model and chose to produce nothing.
+(( rc == 3 )) && infra_fault "the sandboxed agent faulted (base repo, prior patch, staging, or claude never reached the model — see the dispatch log)"
 
 # Hand the patch back to the host. A missing patch (claude produced nothing) becomes an empty
 # file so the host's stage_patch sees EMPTY rather than a stale artifact.

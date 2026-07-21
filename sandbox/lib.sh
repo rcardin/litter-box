@@ -31,6 +31,12 @@ log() { printf '[sandbox] %s\n' "$*" >&2; }
 sandbox_credential_env() {
   if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
     CREDENTIAL_ENV=(-e CLAUDE_CODE_OAUTH_TOKEN="$CLAUDE_CODE_OAUTH_TOKEN")
+  elif [[ "${ANTHROPIC_API_KEY:-}" == sk-ant-oat* ]]; then
+    # An OAuth token exported under the API-key name. Passing it as ANTHROPIC_API_KEY is a
+    # guaranteed 401 ("Invalid API key"), which is what motivated the check above; the prefix
+    # says unambiguously what the value IS, so pass it under the name it belongs to.
+    log "ANTHROPIC_API_KEY holds an OAuth token (sk-ant-oat...) — passing it as CLAUDE_CODE_OAUTH_TOKEN; export it under that name to silence this"
+    CREDENTIAL_ENV=(-e CLAUDE_CODE_OAUTH_TOKEN="$ANTHROPIC_API_KEY")
   elif [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
     CREDENTIAL_ENV=(-e ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY")
   else
