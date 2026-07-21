@@ -1,4 +1,4 @@
-package harness
+package in.rcard.litterbox
 
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
@@ -28,16 +28,16 @@ class LiveSpec extends AnyFlatSpec with Matchers:
       state = "GREEN",
       pass = 1,
       budget = 2,
-      logfile = "harness/logs/issue-999.fast.log",
+      logfile = "logs/issue-999.fast.log",
       detail = "ok"
     )
 
     log.append(event)
 
-    val lines = readLines(root.resolve("harness").resolve("logs").resolve("status.jsonl"))
+    val lines = readLines(root.resolve("logs").resolve("status.jsonl"))
     lines should have size 1
     val pattern =
-      """\{"ts":(\d+),"pid":(\d+),"run":"1234567890","iter":3,"issue":"999","phase":"FAST","state":"GREEN","pass":1,"budget":2,"logfile":"harness/logs/issue-999\.fast\.log","detail":"ok"\}""".r
+      """\{"ts":(\d+),"pid":(\d+),"run":"1234567890","iter":3,"issue":"999","phase":"FAST","state":"GREEN","pass":1,"budget":2,"logfile":"logs/issue-999\.fast\.log","detail":"ok"\}""".r
     pattern.matches(lines.head) shouldBe true
   }
 
@@ -49,7 +49,7 @@ class LiveSpec extends AnyFlatSpec with Matchers:
     log.append(event)
     log.append(event)
 
-    val lines = readLines(root.resolve("harness").resolve("logs").resolve("status.jsonl"))
+    val lines = readLines(root.resolve("logs").resolve("status.jsonl"))
     lines should have size 2
   }
 
@@ -60,7 +60,7 @@ class LiveSpec extends AnyFlatSpec with Matchers:
 
     log.append(event)
 
-    val line = readLines(root.resolve("harness").resolve("logs").resolve("status.jsonl")).head
+    val line = readLines(root.resolve("logs").resolve("status.jsonl")).head
     line should include(""""detail":"abcnd e"""")
     line should not include "\\"
   }
@@ -68,13 +68,13 @@ class LiveSpec extends AnyFlatSpec with Matchers:
   it should "relativize a logfile path with a leading root/ prefix" in {
     val root     = tempRoot()
     val log      = LiveStatusLog(root, "1")
-    val absolute = root.resolve("harness/logs/x.log").toString
+    val absolute = root.resolve("logs/x.log").toString
     val event    = StatusEvent(0, "1", "FAST", "START", 0, 0, absolute, "")
 
     log.append(event)
 
-    val line = readLines(root.resolve("harness").resolve("logs").resolve("status.jsonl")).head
-    line should include(""""logfile":"harness/logs/x.log"""")
+    val line = readLines(root.resolve("logs").resolve("status.jsonl")).head
+    line should include(""""logfile":"logs/x.log"""")
   }
 
   it should "pass a foreign absolute logfile path through unchanged" in {
@@ -84,15 +84,14 @@ class LiveSpec extends AnyFlatSpec with Matchers:
 
     log.append(event)
 
-    val line = readLines(root.resolve("harness").resolve("logs").resolve("status.jsonl")).head
+    val line = readLines(root.resolve("logs").resolve("status.jsonl")).head
     line should include(""""logfile":"/etc/foreign/path.log"""")
   }
 
   it should "not throw when the status.jsonl parent path is blocked by a file" in {
     val root = tempRoot()
-    Files.createDirectories(root.resolve("harness"))
-    // Block "harness/logs" (a directory the writer wants to create) with a plain file.
-    Files.write(root.resolve("harness").resolve("logs"), "blocked".getBytes)
+    // Block "logs" (the directory the writer wants to create) with a plain file.
+    Files.write(root.resolve("logs"), "blocked".getBytes)
     val log = LiveStatusLog(root, "1")
 
     noException should be thrownBy log.append(StatusEvent(0, "1", "FAST", "START", 0, 0, "", ""))
@@ -149,9 +148,9 @@ class LiveSpec extends AnyFlatSpec with Matchers:
     val root = tempRoot()
     val fs   = LiveHarnessFs(root)
 
-    fs.write("harness/logs/issue-999.prompt.txt", "hello")
+    fs.write("logs/issue-999.prompt.txt", "hello")
 
-    fs.read("harness/logs/issue-999.prompt.txt") shouldBe "hello"
+    fs.read("logs/issue-999.prompt.txt") shouldBe "hello"
   }
 
   it should "report the correct byte size" in {
@@ -166,7 +165,7 @@ class LiveSpec extends AnyFlatSpec with Matchers:
     val root = tempRoot()
     val fs   = LiveHarnessFs(root)
 
-    fs.sizeBytes("harness/logs/never-created.patch") shouldBe 0L
+    fs.sizeBytes("logs/never-created.patch") shouldBe 0L
   }
 
   it should "report stopRequested false, then true after STOP.md is created" in {
@@ -180,12 +179,12 @@ class LiveSpec extends AnyFlatSpec with Matchers:
     fs.stopRequested() shouldBe true
   }
 
-  it should "read the three template paths under harness/" in {
+  it should "read the three template paths under prompts/" in {
     val root = tempRoot()
-    Files.createDirectories(root.resolve("harness"))
-    Files.write(root.resolve("harness/iterate-prompt.md"), "ITERATE".getBytes)
-    Files.write(root.resolve("harness/fix-prompt.md"), "FIX".getBytes)
-    Files.write(root.resolve("harness/review-prompt.md"), "REVIEW".getBytes)
+    Files.createDirectories(root.resolve("prompts"))
+    Files.write(root.resolve("prompts/iterate-prompt.md"), "ITERATE".getBytes)
+    Files.write(root.resolve("prompts/fix-prompt.md"), "FIX".getBytes)
+    Files.write(root.resolve("prompts/review-prompt.md"), "REVIEW".getBytes)
     val fs = LiveHarnessFs(root)
 
     fs.readTemplate(Template.Iterate) shouldBe "ITERATE"

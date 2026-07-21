@@ -1,11 +1,30 @@
-package harness
+package in.rcard.litterbox
 
-import in.rcard.yaes.Raise
+import scala.util.boundary
+import scala.util.boundary.break
 
 /** The loop state machine for one US, ported from `harness/loop.sh` iterate(). */
 object Machine:
 
-  val LogDir = "harness/logs"
+  /** The infra-fault short-circuit channel, formerly a `Raise[InfraFault]` effect capability.
+    *
+    * `boundary.Label[LoopExit]` is the capability to abandon the current iteration and hand
+    * `LoopExit.InfraFault` straight to `runOnce`'s boundary. It carries the same guarantee the
+    * `Raise` capability did, and for the same reason: a function that can fault must SAY so in its
+    * signature, and no code after a fault can run — so no fault path can decrement the repair budget
+    * or dispatch a FIX. That is the v3 invariant, still enforced by the type system.
+    *
+    * The alias exists so the four signatures that need it read as one named concept rather than as
+    * an incidental `boundary.Label`.
+    */
+  private type Faulting = boundary.Label[LoopExit]
+
+  /** Where every per-iteration artifact (prompts, patches, gate logs, status.jsonl) is written,
+    * relative to the repo root. `logs/`, not `harness/logs/`: `watch.sh` and `tail-claude.sh` sit at
+    * the repo root and read `$SCRIPT_DIR/logs`, so this is the path that keeps them pointed at the
+    * run they are supposed to be watching.
+    */
+  val LogDir = "logs"
 
   /** The four CUR_* globals of loop.sh: the status-event context. iterate() keeps them current;
     * emit() only reads them, so a terminal DONE from the driver still carries the right issue.
@@ -19,13 +38,13 @@ object Machine:
   /** Detail sanitization: never model-controlled, but strip anything that could break out of the
     * JSON string anyway (backslash, double quote, newlines).
     */
-  private[harness] def sanitizeDetail(detail: String): String =
+  private[litterbox] def sanitizeDetail(detail: String): String =
     detail.replace("\\", "").replace("\"", "").replace("\n", " ")
 
   /** Extracts the PR number from a `gh pr create` PR URL (last path segment), e.g.
     * `https://github.com/o/r/pull/42` -> `Some(42)`. `None` if the URL has no numeric last segment.
     */
-  private[harness] def prNumberOf(prUrl: String): Option[Int] =
+  private[litterbox] def prNumberOf(prUrl: String): Option[Int] =
     prUrl.split('/').lastOption.flatMap(_.toIntOption)
 
   private def emit(
@@ -53,7 +72,7 @@ object Machine:
   /** render_template: each line containing the literal `{{KEY}}` is replaced by the spliced content
     * (whole-line replacement, embedded newlines preserved), one key per pass.
     */
-  private[harness] def renderTemplate(template: String, splices: (String, String)*): String =
+  private[litterbox] def renderTemplate(template: String, splices: (String, String)*): String =
     splices.foldLeft(template) { case (acc, (key, content)) =>
       acc.linesIterator
         .flatMap { line =>
@@ -63,16 +82,26 @@ object Machine:
     }
 
   /** Logs an infra fault the way bash does — the message on the operator's log stream at the point
-    * of the fault, not at the fold — and raises it. Single helper rather than a log+raise pair at
-    * each of the ten raise sites: `InfraFault.reason` IS the bash log line (see `InfraFault`), so
-    * there is exactly one string per fault and no way to log one wording and carry another.
+    * of the fault — fires the rc-50 notify seam, and abandons the iteration. Single helper rather
+    * than a log+break pair at each of the ten fault sites: `InfraFault.reason` IS the bash log line
+    * (see `InfraFault`), so there is exactly one string per fault and no way to log one wording and
+    * carry another.
+    *
+    * The notify used to fire in the old effect library's `Raise.fold` handler, one frame up. With a
+    * `boundary` that breaks straight to `LoopExit.InfraFault` there is no handler to hang it on, so
+    * it moves here — the observable order (fault line, then notify, then the terminal DONE event
+    * `runOnce` emits) is unchanged.
     */
-  private def infraFault(reason: String)(using logger: Log)(using Raise[InfraFault]): Nothing =
+  private def infraFault(reason: String)(using logger: Log, notify: Notify)(using Faulting): Nothing =
     logger.log(reason)
-    Raise.raise(InfraFault(reason))
+    notify.notify(
+      "harness: infra fault — loop exited rc=50 for inspection (issue stays in-progress)"
+    )
+    break(LoopExit.InfraFault)
 
-  /** One driver tick: folds the infra-fault channel to LoopExit.InfraFault (rc 50) and emits the
-    * terminal DONE status event, exactly like the bash driver.
+  /** One driver tick: bounds the infra-fault channel, so a fault anywhere inside `iterate` lands as
+    * LoopExit.InfraFault (rc 50), and emits the terminal DONE status event, exactly like the bash
+    * driver.
     */
   def runOnce(n: Int)(using
       Config,
@@ -87,18 +116,12 @@ object Machine:
       Log
   ): LoopExit =
     val cur  = Cursor()
-    val exit = Raise.fold(iterate(n, cur)) { (_: InfraFault) =>
-      // rc-50 exits fire the notify seam: exit for inspection, issue stays in-progress.
-      summon[Notify].notify(
-        "harness: infra fault — loop exited rc=50 for inspection (issue stays in-progress)"
-      )
-      LoopExit.InfraFault
-    }(identity)
+    val exit = boundary[LoopExit](iterate(n, cur))
     emit(cur, "DONE", "end", detail = s"rc=${exit.rc}")
     exit
 
-  /** One US, start to terminal. Infra faults short-circuit via Raise[InfraFault]: no code past a
-    * raise can spend repair budget or dispatch a FIX.
+  /** One US, start to terminal. Infra faults short-circuit via the `Faulting` boundary: no code past
+    * a fault can spend repair budget or dispatch a FIX.
     */
   def iterate(n: Int, cur: Cursor)(using
       cfg: Config,
@@ -111,7 +134,7 @@ object Machine:
       fs: HarnessFs,
       clock: Clock,
       logger: Log
-  )(using Raise[InfraFault]): LoopExit =
+  )(using Faulting): LoopExit =
     // STOP.md is a MANUAL kill-switch only: the loop never writes it itself.
     if fs.stopRequested() then
       logger.log("STOP.md present (manual kill-switch) — exiting")
@@ -437,7 +460,7 @@ object Machine:
       notify: Notify,
       clock: Clock,
       logger: Log
-  )(using Raise[InfraFault]): LoopExit =
+  )(using Faulting): LoopExit =
     val ciLog = s"$LogDir/issue-$issue.ci-wait.log"
     emit(cur, "CI_WAIT", "start", ciLog)
     // Discriminate on data, not on the exit code: a fresh PR routinely reports zero checks
@@ -513,7 +536,7 @@ object Machine:
     false
 
   /** `Blocked-by: #N` references in an issue body. */
-  private[harness] def parseBlockedBy(body: String): List[Int] =
+  private[litterbox] def parseBlockedBy(body: String): List[Int] =
     "Blocked-by: #(\\d+)".r.findAllMatchIn(body).map(_.group(1).toInt).toList
 
   /** After a verified merge, flip every open `blocked` issue whose Blocked-by refs are ALL closed.
@@ -545,7 +568,7 @@ object Machine:
     case Verdict.RequestChanges => "REQUEST_CHANGES"
 
   /** Last `VERDICT: (APPROVE|REQUEST_CHANGES)` occurrence wins (grep | tail -1). */
-  private[harness] def parseVerdict(review: String): Option[Verdict] =
+  private[litterbox] def parseVerdict(review: String): Option[Verdict] =
     "VERDICT: (APPROVE|REQUEST_CHANGES)".r
       .findAllMatchIn(review)
       .toList
@@ -613,7 +636,7 @@ object Machine:
       role: Role,
       logFile: String,
       result: StageResult
-  )(using log: StatusLog, logger: Log)(using Raise[InfraFault]): StageVerdict =
+  )(using log: StatusLog, logger: Log, notify: Notify)(using Faulting): StageVerdict =
     val policy = policyOf(role)
     val stage  = policy.stage
     def logRejection(kind: FailureKind): Unit =
@@ -719,20 +742,20 @@ object Machine:
     )
     git.add("PATCH-REJECTED.md")
 
-  private[harness] def numstatPaths(numstat: String): List[String] =
+  private[litterbox] def numstatPaths(numstat: String): List[String] =
     numstat.linesIterator.toList.flatMap(line => NumstatRow.parse(line).map(_.path))
 
   /** The three classes the sandbox must never let an agent rewrite (CI workflows, harness code, the
     * constitution) plus docs/ and the control files.
     */
-  private[harness] def touchesProtected(numstat: String): Boolean =
+  private[litterbox] def touchesProtected(numstat: String): Boolean =
     numstatPaths(numstat).exists { p =>
       p.startsWith(".github/") || p.startsWith("harness/") || p.startsWith("docs/") ||
       p == "CONTEXT.md" || p == "PROMPT.md" || p == "STOP.md"
     }
 
   /** Test-tamper report over the applied patch's numstat, filtered to src/test and src/it. */
-  private[harness] def tamperReport(numstat: String): String =
+  private[litterbox] def tamperReport(numstat: String): String =
     val parsed = numstat.linesIterator.toList.flatMap(line => NumstatRow.parse(line).map(line -> _))
     def isTestPath(row: NumstatRow): Boolean =
       row.path.startsWith("src/test/") || row.path.startsWith("src/it/")

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Idempotent start of the egress-allowlisting proxy sidecar (issue #34). Creates the internal
 # network if missing, removes any stale container from a previous crashed run, starts the
-# proxy joined to both fes-sandbox-net (where gate containers live) and the default bridge
+# proxy joined to both litter-box-net (where gate containers live) and the default bridge
 # (its real egress), and waits for tinyproxy to actually be listening before returning.
 set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -20,7 +20,7 @@ docker run -d --name "$PROXY_NAME" \
   --network "$NETWORK" \
   "$PROXY_IMAGE" >/dev/null
 
-# Also join the default bridge network for real egress (fes-sandbox-net alone has none).
+# Also join the default bridge network for real egress (litter-box-net alone has none).
 # A silently missing bridge attachment would leave the proxy "up" but egress-less, turning
 # infra faults into fake code REDs downstream — so verify the attachment and fail hard if
 # the connect failed for any reason other than "already connected".

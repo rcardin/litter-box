@@ -1,6 +1,6 @@
-package harness
+package in.rcard.litterbox
 
-/** Capability traits (yaes-style: passed as `using` context parameters).
+/** Capability traits (passed as `using` context parameters).
   *
   * Slice 1 provides only in-memory scripted handlers (test/Recorder.scala); the live
   * subprocess/fs/gh handlers are slice 2 (Live.scala). Machine.iterate is pure decision logic over
@@ -140,11 +140,12 @@ trait Clock:
   *
   * A capability rather than a direct `LiveLog` call inside Machine for the same reason every other
   * side effect is one: Machine stays a pure decision function over its `using` clause, and the
-  * scenario tests can assert on what was logged. That matters more here than it looks — the bash
-  * parity oracle (harness/test/statemachine-test.sh) greps this stream for load-bearing phrases
-  * (`half-finished worker must not reach the gates`, `protected-path`, `oversized-patch`, ...), so
-  * these strings are asserted behaviour, not decoration. The wording is copied from loop.sh
-  * verbatim; changing one is a parity break, not a style change.
+  * scenario tests can assert on what was logged. That matters more here than it looks — this stream
+  * is `watch.sh`'s input contract, and `LogParitySpec` freezes it whole against the golden files
+  * under `test/golden`. Its load-bearing phrases (`half-finished worker must not reach the gates`,
+  * `protected-path`, `oversized-patch`, ...) are asserted behaviour, not decoration: the wording is
+  * copied from the original loop.sh verbatim, and changing one is a contract break, not a style
+  * change. Deliberate rewordings go through `UPDATE_GOLDEN=1` and a read of the resulting diff.
   */
 trait Log:
   def log(msg: String): Unit

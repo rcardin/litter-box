@@ -7,7 +7,7 @@
 set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$SCRIPT_DIR/lib.sh"
-REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
+REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 
 # Single EXIT trap installed once, up front; GIT_INDEX_FILE is only set later (AC6), so
 # cleanup tolerates it being unset.

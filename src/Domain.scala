@@ -1,4 +1,4 @@
-package harness
+package in.rcard.litterbox
 
 /** Domain ADTs for the loop state machine — the typed spine of `harness/loop.sh`.
   *
@@ -125,7 +125,7 @@ final case class Config(
       * root. `LiveGateRunner.resolveArgv0` re-absolutises it against that runner's `root` using
       * bash's own lookup rule, so the launched command is identical.
       */
-    gateCmd: String = "harness/sandbox/run-fast-gate.sh",
+    gateCmd: String = "sandbox/run-fast-gate.sh",
     /** CI_WAIT_CMD seam (loop.sh:446): overrides the WHOLE CI-wait gate command, including the PR
       * number (bash: `cmd="${CI_WAIT_CMD:-gh pr checks $pr_num --watch --fail-fast}"`; the override
       * contains no pr interpolation, it replaces the default verbatim). `None` (the default) means

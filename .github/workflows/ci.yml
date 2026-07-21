@@ -1,0 +1,21 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The suite runs entirely over the in-memory handlers in test/Recorder.scala: no Docker, no
+      # `gh`, no Claude credentials. The Docker-dependent scripts under sandbox/test/ stay manual.
+      - uses: coursier/setup-action@v1
+        with:
+          jvm: temurin:21
+          apps: scala-cli
+
+      - run: scala-cli test .

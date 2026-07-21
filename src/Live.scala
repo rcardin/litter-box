@@ -1,11 +1,11 @@
-package harness
+package in.rcard.litterbox
 
 import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Path, StandardOpenOption}
 import scala.jdk.CollectionConverters.*
 import scala.util.control.NonFatal
 
-/** Production capability handlers: no yaes Effect machinery, just plain trait implementations over
+/** Production capability handlers: no effect-library machinery, just plain trait implementations over
   * `java.nio.file` and `scala.sys.process` / `java.lang.ProcessBuilder`, matching `harness/loop.sh`
   * byte-for-byte where the bash reference is explicit. Task 1 built the four handlers that need no
   * `gh`/`git` subprocess work: `HarnessFs`, `StatusLog`, `Notify`, `Clock`. This task (slice 2,
@@ -31,13 +31,13 @@ object LiveLog extends Log:
   * deeper (e.g. `$patch.apply.err`). Total: a path with no parent (a bare filename) is a no-op, not
   * a failure.
   */
-private[harness] object LiveFiles:
+private[litterbox] object LiveFiles:
   def ensureParentDir(p: Path): Unit =
     Option(p.getParent).foreach(Files.createDirectories(_))
     ()
 
 /** Filesystem the harness owns: prompts, logs, markers, STOP.md. All paths passed into `write`/
-  * `read`/`sizeBytes` arrive repo-relative from Machine (e.g. `harness/logs/issue-999.prompt.txt`)
+  * `read`/`sizeBytes` arrive repo-relative from Machine (e.g. `logs/issue-999.prompt.txt`)
   * and are resolved against `root`; `root` is a constructor parameter (never hardcoded to the
   * process cwd) so tests can point it at a temp dir.
   */
@@ -47,15 +47,16 @@ final class LiveHarnessFs(root: Path) extends HarnessFs:
   def stopRequested(): Boolean =
     Files.isRegularFile(root.resolve("STOP.md"))
 
-  /** loop.sh:116-118: ITERATE_PROMPT/FIX_PROMPT/REVIEW_PROMPT are `$SCRIPT_DIR/<name>.md`, i.e.
-    * `harness/<name>.md` relative to the repo root (`$SCRIPT_DIR` is the harness dir).
+  /** The three prompt templates, `prompts/<name>.md` relative to the repo root. Bash read them from
+    * `$SCRIPT_DIR/<name>.md` (loop.sh:116-118), i.e. the harness directory; here the root IS the
+    * project, so they live in the project's own `prompts/` directory.
     */
   def readTemplate(t: Template): String =
     val name = t match
       case Template.Iterate => "iterate-prompt.md"
       case Template.Fix     => "fix-prompt.md"
       case Template.Review  => "review-prompt.md"
-    readString(root.resolve("harness").resolve(name))
+    readString(root.resolve("prompts").resolve(name))
 
   /** loop.sh:119: `CONVENTIONS="$REPO_ROOT/CONTEXT.md"`. */
   def conventions(): String =
@@ -85,13 +86,13 @@ final class LiveHarnessFs(root: Path) extends HarnessFs:
     new String(Files.readAllBytes(p), java.nio.charset.StandardCharsets.UTF_8)
 
 /** status.jsonl appender (loop.sh:151-171, `phase()`). One JSON line per event, appended to
-  * `root/harness/logs/status.jsonl`. Fire and forget: the whole write path swallows exceptions,
+  * `root/logs/status.jsonl`. Fire and forget: the whole write path swallows exceptions,
   * matching bash's `>>"$STATUS_FILE" 2>/dev/null || true`, a wrong/missing event is a wrong banner,
   * never a wrong merge.
   */
 final class LiveStatusLog(root: Path, runId: String) extends StatusLog:
 
-  private val statusFile = root.resolve("harness").resolve("logs").resolve("status.jsonl")
+  private val statusFile = root.resolve(Machine.LogDir).resolve("status.jsonl")
 
   def append(event: StatusEvent): Unit =
     try
@@ -177,20 +178,20 @@ object LiveClock extends Clock:
   * TEST AFFORDANCE, deliberate (canonical description; `LiveGit.extraPath` and
   * `LiveGitHub.extraPath` are the two public doors onto it and defer here). `pathPrepend` names a
   * directory placed in FRONT of the child's PATH so a fake `gh` / `git` / gate binary out of a test
-  * fixture wins the lookup over the real one. It mirrors the bash suite's FAKEBIN mechanism
-  * (statemachine-test.sh:80-114), which is what makes it worth keeping past slice 2 even though
-  * nothing in `Main` sets it: the slice-3 parity oracle drives this Scala harness through the same
-  * FAKEBIN scenarios the bash harness is scored on, and this is the seam it plugs into.
+  * fixture wins the lookup over the real one. It mirrors the FAKEBIN mechanism the deleted bash
+  * suite used, and nothing in `Main` sets it: its consumer is `LiveProcSpec`, which uses it to drive
+  * the real `LiveGit` / `LiveGitHub` against fake `git` and `gh` binaries. That is the only way to
+  * test those handlers' exact argv without touching a real repo or a real GitHub.
   *
-  * Why a parameter rather than mutating the ambient PATH: the oracle must be able to run scenarios
-  * concurrently and leave the host's real PATH untouched, so the substitution has to be per child
-  * process, not per JVM.
+  * Why a parameter rather than mutating the ambient PATH: tests must be able to run concurrently and
+  * leave the host's real PATH untouched, so the substitution has to be per child process, not per
+  * JVM.
   *
   * PRODUCTION ALWAYS PASSES `None`. Every non-test call site leaves it defaulted, and with `None`
   * the child's PATH is exactly the inherited parent PATH: never scrubbed, never reordered. Any
   * production call site that starts passing `Some(...)` is a bug.
   */
-private[harness] object LiveProc:
+private[litterbox] object LiveProc:
 
   /** The JDK pin (loop.sh:176-182), as it applies to CHILDREN.
     *
@@ -472,7 +473,7 @@ object LiveGateRunner:
     * override keeps bash's word-splitting AND its lookup semantics verbatim (`gh pr checks ...`
     * still resolves `gh` off PATH).
     */
-  private[harness] def resolveArgv0(root: Path, words: Seq[String]): Seq[String] =
+  private[litterbox] def resolveArgv0(root: Path, words: Seq[String]): Seq[String] =
     words match
       case head +: tail if head.contains('/') && !Path.of(head).isAbsolute =>
         root.resolve(head).toString +: tail
@@ -526,7 +527,7 @@ final class LiveAgentDispatch(
         if rc == 124 then DispatchOutcome.TimedOut else DispatchOutcome.Done
       case None =>
         // Real path: harness/sandbox/run-agent.sh PROMPT_FILE PATCH_OUT [CURRENT_PATCH].
-        val runner          = root.resolve("harness/sandbox/run-agent.sh").toString
+        val runner          = root.resolve("sandbox/run-agent.sh").toString
         val promptAbs       = root.resolve(promptFile).toString
         val currentPatchArg = currentPatch.map(root.resolve(_).toString).getOrElse("")
         val args            = (timeoutBin match
@@ -558,7 +559,7 @@ final class LiveAgentDispatch(
         DispatchOutcome.Done // bash asymmetry: the stub path never reads back rc==124
       case None =>
         // Real path: REVIEW_PROMPT env carries the prompt text, never argv.
-        val runner = root.resolve("harness/sandbox/run-reviewer.sh").toString
+        val runner = root.resolve("sandbox/run-reviewer.sh").toString
         val args   = (timeoutBin match
           case Some(tb) => Seq(tb, iterTimeout.toString)
           case None     => Seq.empty
@@ -693,8 +694,8 @@ final class LiveGit(root: Path, extraPath: Option[String] = None) extends Git:
   *
   * `extraPath` is the deliberate TEST AFFORDANCE described in full on `LiveProc`: a fixture
   * directory prepended onto the child's PATH so a fake `gh` script wins the lookup, exactly as the
-  * bash suite's FAKEBIN mechanism does (statemachine-test.sh:80-114), and kept because the slice-3
-  * parity oracle replays those same scenarios against this harness. PRODUCTION ALWAYS PASSES `None`
+  * deleted bash suite's FAKEBIN mechanism did, and used by `LiveProcSpec` to pin this class's exact
+  * `gh` argv without touching a real GitHub. PRODUCTION ALWAYS PASSES `None`
   * (`Main` never sets it), and with `None` the child's PATH is exactly the inherited parent PATH.
   */
 final class LiveGitHub(

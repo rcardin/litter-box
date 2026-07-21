@@ -27,17 +27,17 @@ git rev-parse --is-inside-work-tree >/dev/null 2>&1 || infra_fault "not inside a
 # the VM by default; macOS's real TMPDIR (/var/folders/...) is NOT, so a plain `mktemp -d`
 # silently bind-mounts an EMPTY directory into the container (verified empirically: sbt then
 # reports "Neither build.sbt nor a 'project' directory"). Root the tmpdir under $HOME instead.
-FES_SANDBOX_TMP_ROOT="${FES_SANDBOX_TMP_ROOT:-$HOME/.cache/fes-harness-sandbox}"
-mkdir -p "$FES_SANDBOX_TMP_ROOT"
-tmpdir="$(mktemp -d "$FES_SANDBOX_TMP_ROOT/gate-XXXXXX")"
+LITTER_BOX_SANDBOX_TMP_ROOT="${LITTER_BOX_SANDBOX_TMP_ROOT:-$HOME/.cache/litter-box-sandbox}"
+mkdir -p "$LITTER_BOX_SANDBOX_TMP_ROOT"
+tmpdir="$(mktemp -d "$LITTER_BOX_SANDBOX_TMP_ROOT/gate-XXXXXX")"
 
 # Unique per-invocation container name: loop.sh wraps GATE_CMD in gtimeout, and gtimeout kills
 # the docker CLIENT process group, never the container itself (PRD #33 design note). So the
 # container must be run DETACHED under a name we can kill/remove from signal traps — a
 # foreground `docker run --rm` would keep running inside the VM after a timeout, leaking a
 # full sbt container per timed-out gate pass.
-cname="fes-gate-$$-$(date +%s)"
-waitfile="$(mktemp "$FES_SANDBOX_TMP_ROOT/wait-XXXXXX")"
+cname="litter-box-gate-$$-$(date +%s)"
+waitfile="$(mktemp "$LITTER_BOX_SANDBOX_TMP_ROOT/wait-XXXXXX")"
 
 # EXIT covers every normal path (and runs after a trap-initiated `exit`); it must be
 # idempotent and ignore-errors. TERM/INT covers gtimeout and Ctrl-C: an untrapped fatal

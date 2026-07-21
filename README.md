@@ -1,553 +1,139 @@
-# Autonomous loop harness — v2
+# litter-box
 
-Implements step **v2** of `docs/autonomous-loop-harness.md`
-(design: `docs/superpowers/specs/2026-07-01-harness-v2-testcontainers-split-design.md`),
-building on v1 (`docs/superpowers/specs/2026-07-01-harness-v1-reviewer-design.md`):
+A distrustful autonomous coding loop for JVM projects.
 
-> `v2: + Testcontainers gate split`
+It picks one labelled GitHub issue, dispatches a fresh `claude -p` worker inside a
+network-restricted Docker sandbox, gates the result, has a **cold independent reviewer** judge the
+diff, opens a PR, and lets CI decide. The model never picks its own task and never reports its own
+success.
 
-This revision also hardens v2 on top of the same design: an infra-fault terminal (rc `50`), a
-Docker preflight, protected-path enforcement in the loop, and a fatal stale-base guard — see
-**Infra faults vs code failures** below. None of this changes the v2 state machine; it closes
-gaps where infra problems or prompt violations were previously indistinguishable from code
-failures.
+Extracted from the `harness/` directory of
+[functional-event-sourcing-with-yaes](https://github.com/rcardin/functional-event-sourcing-with-yaes)
+and being generalized into an installable tool. See [#1](https://github.com/rcardin/litter-box/issues/1)
+for the design record.
 
-> **The state machine is Scala, not bash** (rewrite slices #44-#47, design:
-> `docs/superpowers/specs/2026-07-19-harness-scala-rewrite-design.md`). `harness/loop.sh` is now a
-> thin shim that `exec`s `scala-cli run harness/scala`; the machine itself lives in
-> `harness/scala/src` as a typed state machine over yaes capabilities. **Nothing outward changed**:
-> same invocation, same env vars, same test seams, same exit codes, same `status.jsonl`, so
-> `watch.sh` and every command in this README work unmodified. Where prose below says "bash does
-> X", read it as "the loop does X" — the behaviour is what was ported, assertion by assertion. See
-> **The Scala loop** near the end.
+## Not installable yet
 
-**v1** gave the reviewer stack (all unchanged in v2):
+There is no `litter-box` binary and no `litter-box init`. Slice 1 is a bootstrap: the loop runs from
+a checkout, still reads a few hardcoded paths, and still assumes the repo it works on is the repo it
+lives in. Config (`#3`), the consumer-repo scaffold, and a published binary (`#6`) come later.
+**If you are looking for something to install, come back after [#1](https://github.com/rcardin/litter-box/issues/1) closes.**
 
-- **Cold independent reviewer** — a separate, fresh `claude -p` that never shared context
-  with the worker. It sees only the diff, the issue acceptance criteria, `CONTEXT.md`, and
-  the tamper report, and emits a `VERDICT:` sentinel bash greps for.
-- **Test-tamper check** — bash diffs the test tree against `origin/main` and surfaces the
-  numstat (deleted / net-negative test files) to the reviewer. Bash does **not** block; the
-  reviewer is the judgment. This catches the classic Ralph failure: deleting a failing test
-  to go green. **v2 extends the diff to `src/it`** so gutting the IT to pass its tier is caught.
-- **Bounded self-repair** — a shared budget of **2** fix iterations per US, spent by *any* of
-  a fast-RED gate, an IT-RED gate, or a reviewer `REQUEST_CHANGES`. A pathological US spends at
-  most 2 fixes total before it terminates.
+## The pipeline
 
-**v2** splits the one gate into **two tiers by source directory** (not by tag):
+Fixed, not pluggable:
 
-- `src/test/scala` = in-memory unit/acceptance tests. **FAST gate** (`sbt compile test`) runs
-  only these — **no Docker**.
-- `src/it/scala` = Testcontainers integration tests (real Postgres + Flyway). **IT gate**
-  (`sbt It/test`) runs only these. The one IT today is `PostgresJdbcEventStoreSpec`.
-- The tier boundary is a custom sbt config in `build.sbt`: `lazy val It = config("it") extend
-  Test` + `inConfig(It)(Defaults.testSettings)` (sbt's built-in `IntegrationTest` was
-  deprecated in 1.9). `extend Test` gives `It` the full Test classpath, so no dependency
-  rewiring.
-- **IT fires after fast-GREEN and before the reviewer**, so the reviewer only ever judges a
-  unit+IT-green diff. **fast-RED short-circuits the IT gate** — Docker is never paid for an
-  iteration whose unit tests already fail. IT-RED draws from the same shared budget of 2.
-
-> **v6 slice 3 removed the LOCAL IT gate.** The `src/it` tier is now judged **only by GitHub
-> Actions** (the required `build` check runs `sbt It/test` on the PR). The loop runs the FAST
-> gate as its sole local gate; an IT failure surfaces as **CI-red** on the class-1 auto-merge
-> path (→ needs-human, no local self-repair), exactly the existing CI-red route. The paragraphs
-> above describe the historical v2 two-tier loop; see **Containerized worker/fixer (v6 slice 3)**
-> below for the current shape. The tamper diff still covers `src/it`.
-
-**v3 (GitHub Actions CI `build` check + branch protection on `main`) has shipped**, outside this
-script — `ci.yml` is merged and `main` is protected on the `build` check. **Still not
-implemented:** a convention-lint gate step, rebase-on-main-and-rerun. **For class-2/3, the
-loop still stops at PR — a human merges** (class-1 is auto-merged as of v4, below). Budget
-exhaustion (fast-RED, IT-RED, or `REQUEST_CHANGES`) opens a PR too (audit trail) but flips
-`needs-human` — as does a protected-path violation (see **Infra faults vs code failures**
-below), which skips the gate and the reviewer entirely.
-
-## v4: auto-merge (class-1 only)
-
-A class-1 issue that ends in reviewer APPROVE is merged unattended:
-
-1. The loop opens the PR as before, then waits for the required `build` check to
-   **register** — a push races the workflow scheduler, so a fresh PR reports zero
-   checks for a few seconds, and `gh pr checks` exits nonzero there exactly as it
-   does for a failed check. The loop polls `statusCheckRollup` until it is non-empty
-   (bounded by `CI_APPEAR_TIMEOUT`, default 300 s) before letting `gh pr checks
-   --watch` judge the result (bounded by `CI_WAIT_TIMEOUT`, default 900 s).
-   Hitting either bound is an infra fault (rc 50): the loop exits for inspection,
-   the PR stays open, the issue keeps `in-progress`. A check that never registers is
-   a scheduler problem, never a code failure — it must not reach `needs-human`.
-2. CI red after green local gates → the issue flips to `needs-human` and the loop
-   moves on. There is no self-repair against the independent check (the v3
-   hands-off rule): local gates were green, so red CI means environment drift or
-   a real independence catch — a human looks either way.
-3. CI green → `gh pr merge --squash --delete-branch`, then the loop verifies the
-   PR state is actually MERGED (an unverified merge is rc 50). The PR body's
-   `Closes #N` closes the issue.
-
-Class-2/3 SUCCESS keeps the stop-at-PR terminal: `needs-review`, human merges.
-Auto-merge for the harder classes is earned by class-1 track record, not assumed.
-
-### blocked → ready
-
-After a verified merge the loop scans open `blocked` issues for the sentinel line
-
-    Blocked-by: #N
-
-and flips `blocked` → `ready` when every referenced issue is closed (the
-just-merged one counts immediately). Issues without the sentinel are never
-touched. File dependent slices with the sentinel or flip them by hand.
-
-### Notifications
-
-Set `NTFY_TOPIC` (an https://ntfy.sh topic) to get a push on: every
-`needs-human` terminal, every infra-fault exit (rc 50), and every auto-merge.
-Unset = log-only. `NOTIFY_CMD` overrides the channel entirely (test seam,
-eval'd with `$msg` in scope). Notify failures never change loop behavior.
-
-### Branch protection
-
-`strict: true` is set on the required `build` check: a PR must be up to date
-with main before merging. The loop is serial and always branches off fresh
-origin/main, so this only ever bites out-of-band PRs.
-
-## Pieces
-
-| File | Role |
-|---|---|
-| `build.sbt` | Defines the `It` custom config (`config("it") extend Test` + `inConfig(It)(Defaults.testSettings)`, forked + serial + `-oDF`). `sbt test` = `src/test`; `sbt It/test` = `src/it`. |
-| `src/it/scala/.../PostgresJdbcEventStoreSpec.scala` | The one Testcontainers IT (real PG + Flyway). Judged by **CI** (`sbt It/test` in `ci.yml`), never by a local gate — the loop has no local IT gate as of v6 slice 3. |
-| `loop.sh` | The entry point: a ~50-line shim that `cd`s to the repo root and `exec`s `scala-cli run harness/scala`. Holds no logic — it also serves as the repo-root marker `Main.resolveRepoRoot` walks up for, which is how the loop keeps working from any subdirectory. |
-| `scala/` | The state machine. Sandbox preflight at startup (build image, start proxy sidecar; requires a Claude credential), picks one issue via `gh`, dispatches fresh `claude -p` tasks **inside the sandbox** (worker/fixer, v6 slice 3), enforces the protected-path patch guard, runs the FAST gate + repair loop + reviewer, opens a PR, stops. Timeouts and other infra faults exit `50` without spending repair budget. The model never chooses the task. Layout: `src/Domain.scala` (ADTs), `src/Machine.scala` (transitions), `src/Caps.scala` (capability traits), `src/Live.scala` (subprocess/fs/gh/git handlers), `src/Main.scala` (env parsing, preflight, driver), `test/` (138 scalatest assertions over in-memory handlers). Standalone scala-cli project, deliberately NOT part of the sbt build — the threat model distrusts agent-authored `build.sbt`. |
-| `loop-bash.sh` | The retiring 944-line bash state machine, kept on disk only as the parity oracle's `HARNESS_IMPL=bash` reference until the first real US merges under the Scala loop. Invoked by nothing else. |
-| `iterate-prompt.md` | The narrow worker prompt (unchanged from v0). `{{ISSUE}}` is spliced with the issue body. |
-| `fix-prompt.md` | The fix-iteration prompt. Splices `{{ISSUE}}` + `{{FAILURE}}` (gate-log tail **or** reviewer reasons + tamper). Same hard rules as the worker (no test weakening, `-Werror`, no `gh`/branch ops). |
-| `review-prompt.md` | The cold reviewer prompt. Splices `{{ISSUE}}`, `{{CONVENTIONS}}` (`CONTEXT.md`), `{{TAMPER}}`, `{{DIFF}}`. Adversarial. Last line MUST be `VERDICT: APPROVE` or `VERDICT: REQUEST_CHANGES`. |
-| `sandbox/` | The containerized sandbox — image `Dockerfile`, proxy sidecar (`proxy/`), `build-image.sh`, `start-proxy.sh` / `stop-proxy.sh`, the `GATE_CMD` default `run-fast-gate.sh` (v6 slice 1), the worker/fixer dispatch `run-agent.sh` + `agent-entrypoint.sh` (v6 slice 3), and the zero-mount reviewer dispatch `run-reviewer.sh` (v6 slice 4). See **Containerized FAST gate**, **Containerized worker/fixer** and **Containerized reviewer** below. |
-| `test/statemachine-test.sh` | Drives the whole state machine in a throwaway sandbox (fake `gh`, stubbed gate + dispatches) — no real GitHub, no Opus tokens, no Docker (`GATE_CMD` and the `IMPL/FIX/REVIEW` seams are always stubbed). Scenarios A–T plus a DRY_RUN check (APPROVE, REQUEST_CHANGES, fast-RED, **container-dispatch timeout for worker + fixer**, budget exhaustion, idle-no-latch, protected-path, empty-review, gate-timeout, class-1 auto-merge + CI red/timeout/late-registering-check/unverified-merge/merge-failure, class-2 stop-at-PR, plus patch-guard CI-workflow rejection / apply-conflict / oversized-patch), 142 assertions total. Stubs produce patch files at `$PATCH_OUT`; a stub that exits `124` simulates a container-dispatch timeout. |
-| `sandbox/test/` | Manual/local Docker-dependent checks for the sandbox itself (image smoke test, per-role egress policy test, FAST-gate + worker/fixer + reviewer infra-fault checks, coursier-cache speed check) — not part of `sbt test` or `statemachine-test.sh`. Run `sandbox/test/run-all.sh`. |
-| `logs/` | Per-pass `claude -p` logs, gate logs, rendered prompts, tamper + review + diff artefacts. Git-ignored. |
-
-## Control flow (what `loop.sh` does)
-
-0. Startup: unless `GATE_CMD` is overridden (test seam), the loop builds the sandbox image,
-   starts the proxy sidecar, and requires `ANTHROPIC_API_KEY` (the dedicated key handed to the
-   containerized worker/fixer) — any failure `die`s before touching an issue. There is no longer
-   a loop-level Docker preflight: `run-fast-gate.sh` and `run-agent.sh` each re-check Docker /
-   image / proxy at dispatch time and exit `124` (infra fault) if anything is stale.
-1. Guard: `STOP.md` present (a **manual** kill-switch — create it by hand to halt the loop) or
-   `MAX_ITERS` hit → exit.
-2. Pick US (deterministic): resume an `in-progress` issue, else oldest `ready`. None → log idle,
-   exit `11`. This is transient (a US parked in human review), not terminal: the loop writes **no**
-   sentinel, so the next tick resumes on its own once an issue goes `ready`.
-3. Require a clean tree. `git fetch origin main` and branching `us-<n>` off `origin/main` are
-   both **fatal** on failure (`die`) — every diff, tamper report, gate run and PR downstream is
-   measured against `origin/main`, so a stale local base is never silently tolerated. Flip issue
-   `ready`→`in-progress`.
-4. Dispatch the fresh **IMPL** worker **inside the sandbox container** (v6 slice 3) **across the
-   patch seam** (v6 slice 2, below): `run-agent.sh` clones `origin/main` read-only, runs `claude
-   -p` with a dedicated `ANTHROPIC_API_KEY` reaching the network only through the proxy, and
-   returns the cumulative patch, which the harness resets, inspects and `git apply`s. A `124`
-   timeout → the container is **killed** and it exits infra fault `50` (a half-finished worker
-   must never reach the gates). A patch that will not apply → infra fault, exit `50`, no budget
-   spent. Nothing produced (empty patch) → leave in-progress, no PR (exit `30`). A **patch-guard
-   rejection** (protected path or oversized) terminates as `FAIL(needs-human)` without entering
-   the repair loop.
-5. **Repair loop** (shared budget of 2), each pass:
-   - Run the **FAST gate** (`sbt compile -Werror` + `sbt test`, `src/test` only, containerized).
-     A `124` timeout → infra fault, exit `50`, no budget spent.
-     - **RED** → budget 0? terminate `FAIL(needs-human)`. Else spend one, dispatch **FIX** (in
-       the sandbox; fast-gate-log tail spliced; a FIX timeout is also infra fault, exit `50`),
-       re-loop.
-     - **GREEN** → run the **tamper check** (`src/test` + `src/it`), then dispatch the cold
-       **REVIEWER** **inside the sandbox** (v6 slice 4: zero mounts — it authors no code, has no
-       tree to touch, and all mutating tools are denied as defense-in-depth). A `124`
-       timeout, or an empty/whitespace-only review, is an infra fault (crashed/timed-out
-       reviewer) → exit `50`, no budget spent. Grep the `VERDICT:` sentinel on a non-empty review
-       (missing → `REQUEST_CHANGES`, fail-safe — model misbehavior, real signal, not an infra
-       fault):
-       - `APPROVE` → terminate `SUCCESS`.
-       - `REQUEST_CHANGES` → budget 0? terminate `FAIL(needs-human)`. Else spend one, dispatch
-         **FIX** (review reasons + tamper spliced), re-loop.
-
-   The `src/it` integration tier has **no local gate**: it is judged by CI on the PR. On a
-   class-1 SUCCESS the auto-merge step waits for the required `build` check, and an **IT failure
-   there is CI-red → `needs-human`, no local self-repair** (the existing CI-red route).
-6. **Terminal:** commit, push, `gh pr create`. `SUCCESS` on a **class-1** issue hands off to
-   **v4 auto-merge** (below) instead of flipping a label — the merge or a CI-red `needs-human`
-   decides its fate. `SUCCESS` on **class-2/3** records the APPROVE + review and flips
-   `needs-review`; a human merges. `FAIL` (budget exhaustion, or a patch-guard rejection —
-protected-path or oversized) records the
-   last failure and flips `needs-human` regardless of class. An exit-`50` infra fault instead
-   commits nothing and opens no PR — the issue simply stays `in-progress` for the next tick or
-   for manual inspection.
-
-Every `claude -p` (IMPL, FIX, REVIEW) is a **fresh context**: the failure reason or the diff
-it needs is spliced into its prompt, never remembered.
-
-## Infra faults vs code failures
-
-Not every non-zero outcome is a code failure. `loop.sh` distinguishes **infra faults**, which
-must never cost repair budget or bury the real signal under `needs-human`, from actual code or
-review failures:
-
-- **rc `50` — infra-fault terminal.** A gate timeout (rc `124`), a **worker/fixer container
-  dispatch timeout** (rc `124` — the container is killed, no orphan) or reviewer timeout, a
-  missing sandbox image / dead proxy / unreachable Docker / missing API key at dispatch time, a
-  **patch that fails to `git apply`** (v6 slice 2), or an empty/whitespace-only reviewer output
-  all exit the *whole loop* with `50`. The issue **keeps its `in-progress` label** (resumable
-  next tick), **no repair-budget unit is spent**, **no FIX is dispatched**, and **no PR is
-  opened**. A non-empty review that is simply missing the `VERDICT:` sentinel is treated
-  differently — that is model misbehavior, real signal — and still fail-safes to
-  `REQUEST_CHANGES`, spending budget as usual.
-- **Sandbox preflight (v6).** At startup, when `GATE_CMD` is not overridden, the loop requires
-  `ANTHROPIC_API_KEY`, then runs `sandbox/build-image.sh` and `sandbox/start-proxy.sh` (both
-  die-on-failure), plus a `trap ... EXIT` that always runs `sandbox/stop-proxy.sh` when the loop
-  exits (normal exit or any `die`). There is **no loop-level `docker info` preflight** any more
-  (v6 slice 3 deleted it together with the local IT gate). At dispatch *time*,
-  `sandbox/run-fast-gate.sh` (the FAST gate), `sandbox/run-agent.sh` (the worker/fixer) and
-  `sandbox/run-reviewer.sh` (the reviewer) each
-  re-check Docker reachability, image presence and proxy liveness and exit `124` — the loop's
-  rc-124-is-infra-fault convention — on any failure, so a sidecar that dies mid-run is never
-  mistaken for a code failure. See **Containerized FAST gate**, **Containerized worker/fixer** and
-  **Containerized reviewer** below.
-- **Patch seam (v6 slice 2).** Every agent dispatch (IMPL and each FIX) crosses an
-  inspect-then-apply boundary rather than being committed straight from the tree the agent
-  edited. As of v6 slice 3 the agent runs **in the sandbox**: `run-agent.sh` returns the
-  cumulative diff vs `origin/main` as a patch file, which `stage_patch()` inspects (protected
-  path, size cap) then `git apply --index`es onto a pristine base. The worker/fixer **stub
-  contract** matches: a stub writes `$PATCH_OUT` instead of running a container. A patch that
-  will not apply is an **infra fault** (exit `50`, no budget spent), never a gate failure.
-- **Protected-path / oversized patch guard.** Enforced in bash, reading the file list straight
-  out of the **patch** (`git apply --numstat`), because the worker/fixer runs with
-  `--dangerously-skip-permissions`. A patch touching `harness/` (harness code), `.github/` (CI
-  workflows), `docs/`, `CONTEXT.md` (the constitution), `PROMPT.md` or `STOP.md`, **or** a patch
-  over `MAX_PATCH_BYTES` (default 1 MB), terminates the US as `FAIL(needs-human)` immediately:
-  gate `SKIPPED`, no FIX dispatched, the rejected patch **never applied**, PR still opened with a
-  rejection marker (do-not-merge, audit trail only). `harness/logs/` is gitignored so the
-  harness's own log writes never enter a patch.
-- **Fatal stale-base guard.** `git fetch origin main` failing, or being unable to branch off
-  `origin/main`, is fatal (`die`) rather than a silent fallback to a stale local base.
-
-## Patch seam (v6 slice 2)
-
-Agent output no longer reaches the branch straight from the tree the agent edited. This is a
-**prefactor**: the worker still runs on the host, but its changes already cross an
-inspect-then-apply boundary, so a later slice can swap the host tree edit for a container that
-hands back a patch the same way.
-
-Every IMPL and FIX dispatch funnels through `stage_patch()`:
-
-1. **Produce a patch.** The dispatch's output is a patch file at `$PATCH_OUT` — the seam
-   boundary. A real worker/fixer edits the host tree and bash snapshots the cumulative diff vs
-   `origin/main`; a test **stub** writes `$PATCH_OUT` itself (the slice-2 stub contract) so the
-   state machine is driven with no real agent.
-2. **Reset to a pristine base.** `git reset --hard origin/main` + `git clean -fd` — the tree the
-   agent edited is never trusted or committed directly. (`harness/logs/` is gitignored, so the
-   extracted patch file survives the clean.)
-3. **Inspect, then apply.** Size cap (`MAX_PATCH_BYTES`, default 1 MB) and the protected-path
-   guard both read the **patch** (`git apply --numstat`), not the tree. A rejection routes to
-   `needs-human` (rejected patch never applied; a marker is committed for the audit PR). A clean
-   patch is applied with `git apply --index` on the branch; a patch that will not apply is an
-   **infra fault** (rc `50`, no repair budget spent), not a gate failure.
-
-The **test-tamper numstat check** is reworked to read the same applied patch, so its verdicts
-are unchanged but now derive from the one artifact the guard and `git apply` also see. See the
-patch-guard / apply-conflict / oversized scenarios (R/S/T) in `test/statemachine-test.sh`.
-
-## Containerized FAST gate (v6 slice 1)
-
-The FAST gate (`GATE_CMD`) no longer runs `sbt compile test` on the host. `build.sbt` is
-agent-authored, so a hostile or merely buggy worker/fixer iteration could make a *host* gate
-lie. v6 reframes the threat model (issue #33/#34): **the sandbox protects the host, GH Actions CI
-protects `main`, and a local gate is a productivity signal only** — so the FAST gate now runs
-inside a locked-down container. Slice 1 containerized **only** the FAST gate; v6 slice 3 then
-moved the **worker and fixer** into the same image (see **Containerized worker/fixer** below) and
-deleted the local IT gate; v6 slice 4 moved the **cold reviewer** in too (see **Containerized
-reviewer** below). As of slice 4 **no model-touched execution remains on the host** — a full loop
-iteration runs with worker, fixer, gate and reviewer all sandboxed.
-
-- **The image** (`sandbox/Dockerfile`, tag `fes-harness-sandbox:v6`) — `eclipse-temurin:25-jdk`
-  (matches the host's `.sdkmanrc` JDK 25 pin) plus sbt 1.12.9 (matches
-  `project/build.properties`, installed from the official release tarball), `git`, and the
-  Claude Code CLI (installed via its native installer, currently reporting the same
-  `2.1.207` the host runs — the CLI does not need to authenticate in this slice, only to
-  report `claude --version`). Runs as a non-root `gate` user with `--cap-drop=ALL
-  --security-opt=no-new-privileges` at `docker run` time.
-- **The egress proxy sidecar** (`sandbox/proxy/`, container `fes-sandbox-proxy`) — a tiny
-  `alpine` + `tinyproxy` image on a Docker `--internal` network (`fes-sandbox-net`, no route to
-  the outside world) that the proxy *also* joins the default `bridge` network for its own real
-  egress. Gate containers join `fes-sandbox-net` only, so the proxy is the only host they can
-  reach at all. The hostname allowlist lives in `sandbox/proxy/allowlist` (one hostname per
-  line — `api.anthropic.com`, `repo1.maven.org`, `repo.maven.apache.org`,
-  `repo.scala-sbt.org`, `oss.sonatype.org`), enforced by tinyproxy's `Filter` +
-  `FilterDefaultDeny yes` on both plain HTTP and HTTPS `CONNECT`. **Accepted limitation
-  (hostname-only egress filtering).** Under HTTPS the proxy sees only the `CONNECT` line, so it
-  filters on the **hostname**, never the URL path or the TLS-encrypted payload (no MITM — the
-  sandbox mounts no CA, so it cannot terminate TLS). A host on the allowlist is therefore reachable
-  at *any* path. This is accepted by the trust framing above: the fence's job is to stop a
-  compromised container from exfiltrating to an arbitrary host, not to police what it sends to the
-  handful of package/API hosts it legitimately needs — the sandbox protects the host, and CI (not
-  this proxy) protects `main`. The per-role egress test (`sandbox/test/egress-policy-test.sh`)
-  verifies every container role reaches an allowlisted host and is refused for a non-allowlisted
-  one. **To extend it**: edit `sandbox/proxy/allowlist`,
-  bump the `# version:` comment at the top of `sandbox/proxy/tinyproxy.conf`, then
-  `sandbox/build-image.sh && sandbox/stop-proxy.sh && sandbox/start-proxy.sh` (or just restart
-  `loop.sh`, which does both). The sidecar starts as part of `loop.sh`'s startup preflight and
-  stops via a `trap ... EXIT`, so it never outlives the loop.
-- **The coursier cache volume** (`fes-sandbox-coursier-cache`, a Docker named volume) — mounted
-  only at `/home/gate/.cache/coursier` inside gate containers. It self-populates on first use
-  and measurably speeds up subsequent gate runs (observed on this repo: ~27s cold, ~19s warm).
-  Nothing on the host — no `sbt` config, no env var — references this volume, so by
-  construction it can never be mounted by a host `sbt` process.
-- **The read-only clone** — rather than a live bind mount of the real working tree,
-  `run-fast-gate.sh` runs `git write-tree` (loop.sh already does `git add -A` immediately
-  before every gate call, so the index reflects the worker's current output) then `git
-  archive` into a throwaway `mktemp` directory with **no `.git` at all**. Only that disposable
-  copy is bind-mounted read-write into the container (needed for `target/`); the real
-  repository, its history, and its hooks never enter the container.
-- **No credentials, ever.** The gate container gets exactly two env vars
-  (`JAVA_TOOL_OPTIONS` pointing coursier/sbt's JVM at the proxy via
-  `-Dhttp(s).proxyHost/-Port` — a JVM does not read `HTTP_PROXY`/`HTTPS_PROXY` on its own).
-  No `ANTHROPIC_API_KEY`, no `GH_TOKEN`, no `gh` config mount — the `gh` binary is not even
-  installed in the image, so there is nothing for a compromised gate container to reach for.
-- **Infra faults, not code failures.** `run-fast-gate.sh` reuses the loop's existing
-  rc-124-is-infra-fault convention for the three ways this slice can break: Docker
-  unreachable, the image missing, or the proxy sidecar dead — see **Infra faults vs code
-  failures** above.
-- **The seam is untouched.** `GATE_CMD` is still a single overridable command string
-  (`GATE_OVERRIDDEN`); `run_gate()` and every rc-handling branch in `iterate()` needed zero
-  changes.
-
-## Containerized worker/fixer (v6 slice 3)
-
-The worker and fixer no longer run `claude -p` on the host — the last place agent-authored code
-executed outside a sandbox. `dispatch_worker()`'s real path calls `sandbox/run-agent.sh`, which:
-
-- **Clones `origin/main` read-only** via `git archive` into a throwaway `$HOME/.cache/...`
-  directory (no host `.git` ever enters the container — stronger than a `:ro` bind mount). The
-  in-container `agent-entrypoint.sh` commits that tree as the base (`HEAD == origin/main`), then
-  overlays the **prior cumulative patch** (`$CURRENT_PATCH`, empty on the initial IMPL) so a FIX
-  builds on prior work. The agent's diff is therefore cumulative-vs-`origin/main`, exactly what
-  `stage_patch()` applies onto a pristine base.
-- **Passes a dedicated, spend-capped `ANTHROPIC_API_KEY`** as a container env var — the only
-  credential in the container. No `GH_TOKEN`, no host `gh`/claude config, no host keychain. The
-  container joins `fes-sandbox-net` only, so it reaches the network **only through the proxy**
-  (`api.anthropic.com` is on the allowlist); `HTTP(S)_PROXY` + JVM proxy props are set so both
-  `claude`'s fetch and any `sbt` the agent runs go through it. Same non-root `gate` user,
-  `--cap-drop=ALL`, `--security-opt=no-new-privileges`, and coursier cache volume as the gate.
-- **Leaves its result as a patch** on an output volume (`/output/agent.patch`), copied back to
-  the harness's `$patch_out`. Only that patch crosses the boundary; the host tree is never
-  written by the agent.
-- **Is detached and awaited under `ITER_TIMEOUT`.** `gtimeout` kills only the docker *client*, so
-  on expiry `run-agent.sh`'s signal trap **kills the container** and exits `124` (infra fault) —
-  a client-side timeout alone would orphan a full claude container in the VM. Every infra fault
-  (timeout, missing image, dead proxy, unreachable Docker, missing API key, a prior patch that
-  will not apply) exits `124`, which `dispatch_worker()` maps to an rc-`50` terminal that spends
-  no repair budget.
-
-The state-machine test drives this seam with stubs (a stub writing `$PATCH_OUT`, or exiting
-`124` to simulate the dispatch timeout); `sandbox/test/agent-infra-fault-test.sh` covers the
-real `run-agent.sh` infra-fault exit codes without a live daemon.
-
-## Containerized reviewer (v6 slice 4)
-
-The cold reviewer no longer runs `claude -p` on the host — the **last** model-touched execution to
-leave it. `dispatch_review()`'s real path calls `sandbox/run-reviewer.sh`, which:
-
-- **Mounts nothing at all.** No repository, no output volume, no host config, no `.git`. There is
-  no tree to touch inside the container — everything the reviewer judges (the issue, `CONTEXT.md`,
-  the tamper report, the full diff) is already spliced into its prompt by `render_template`. The
-  prompt travels as the `REVIEW_PROMPT` env var (so a large multi-line diff never becomes an argv
-  entry), and the dedicated, spend-capped `ANTHROPIC_API_KEY` is the only credential. Same
-  `fes-sandbox-net`-only networking, non-root `gate` user, `--cap-drop=ALL` and
-  `--security-opt=no-new-privileges` as every other role.
-- **Keeps the tool-deny flags as defense-in-depth.** `--disallowed-tools Edit Write MultiEdit
-  NotebookEdit Bash` stays on the invocation (now inside `run-reviewer.sh`). Independence is
-  enforced by construction twice over: zero mounts *and* no mutating tools. `Read` stays allowed
-  for extra context, exactly as the pre-slice-4 host call.
-- **Streams stdout as the verdict.** `claude -p`'s default output is text — the final assistant
-  message, whose last line is the `VERDICT:` sentinel. `run-reviewer.sh` streams the container's
-  stdout to its own stdout and the container's stderr to its own stderr (kept split), so
-  `dispatch_review` captures stdout to the review file and greps the sentinel **exactly as before**
-  — the existing verdict-parsing, empty-review-is-infra-fault, and missing-sentinel-fail-safe
-  behavior is unchanged (state-machine scenarios A, B, H and K pass untouched).
-- **Is detached and awaited under `ITER_TIMEOUT`.** Same trap pattern as `run-agent.sh`: on expiry
-  the signal trap **kills the container** and exits `124`. Every infra fault (timeout, missing
-  image, dead proxy, unreachable Docker, missing API key) exits `124`, which `dispatch_review` maps
-  to the rc-`50` infra-fault terminal that spends no repair budget and opens no PR. A nonzero
-  `claude` exit is **not** an infra fault — it leaves empty stdout, which the existing empty-review
-  guard already treats as a crashed reviewer.
-
-The state-machine test drives this seam through the same `REVIEW_CMD` stub as before (no container,
-no tokens); `sandbox/test/reviewer-infra-fault-test.sh` covers the real `run-reviewer.sh`
-infra-fault exit codes without a live daemon, and `sandbox/test/egress-policy-test.sh` verifies the
-reviewer's (and every other role's) egress fence.
-
-## Environment the loop needs
-
-The loop pins these itself (override via env if your paths differ):
-
-- **`scala-cli`** — the loop IS a Scala program; `loop.sh` exits `1` immediately if it is not on
-  `PATH` (`brew install Coursier/formulas/coursier && cs setup`, or `brew install scala-cli`).
-  Compilation is cached, so per-tick startup is ~1 s against a 30-minute iteration.
-  Note that exit `1` is therefore ambiguous: besides the harness's own "nothing staged / fatal
-  preflight" terminal, it is also what `scala-cli` returns when it fails to compile the harness
-  or to provision the JVM. In that case the loop never started at all, and `scala-cli`'s own
-  output on the way out says which of the two happened.
-- **JDK 25** (`.sdkmanrc` pins `java=25.0.2-open`). yaes 0.20.0 binds JDK 25's
-  `StructuredTaskScope` API; under a newer default JDK (e.g. 26) **every** test aborts with
-  `NoSuchMethodError` — a false RED that masks the real signal. Two separate pins: the loop
-  process itself runs on the JDK `harness/scala/project.scala` requests (`//> using jvm
-  temurin:25`, provisioned by scala-cli), while `JAVA_HOME_PINNED` is stamped onto every CHILD
-  process the loop forks — a `GATE_CMD` override pointing at a host `sbt` is exactly what that
-  protects. (The sandbox image pins the same JDK 25 independently of the host.)
-- **A Claude credential** — `CLAUDE_CODE_OAUTH_TOKEN` (preferred) or `ANTHROPIC_API_KEY`, the
-  dedicated, spend-capped credential handed to the containerized worker/fixer. At least one is
-  required at startup (the loop `die`s without either); nothing else from the host environment
-  enters the agent container.
-- **Docker via colima** — the loop no longer exports `DOCKER_HOST` or any `TESTCONTAINERS_*`
-  var (v6 slice 3 deleted that plumbing along with the local IT gate). The sandbox containers
-  reach the daemon through the docker CLI's active context (colima's socket on this setup), so
-  **colima must be running** (`colima start`). Note: under colima only `$HOME` is mounted into
-  the VM, so `run-fast-gate.sh` / `run-agent.sh` root their throwaway clones under
-  `$HOME/.cache/fes-harness-sandbox` rather than the system `TMPDIR` — a plain `/tmp` (or
-  macOS's real `TMPDIR`, `/var/folders/...`) is invisible to the Docker daemon there and would
-  silently bind-mount an empty directory into the container.
-
-## The Scala loop
-
-Six versions in, the bash machine was 944 lines and every new invariant (an infra fault spends no
-budget, a guard rejection skips the repair loop, an empty fix routes to needs-human) landed as
-scattered `exit` calls and README prose. The rewrite (design:
-`docs/superpowers/specs/2026-07-19-harness-scala-rewrite-design.md`) ports it to a typed state
-machine — not a transliteration, and not event-sourced.
-
-- **`Domain.scala`** — the outcomes as closed ADTs: `LoopExit` (each case carries its `rc`),
-  `StageResult`, `GateResult`, `Verdict`, `FailureKind`, `Config`. An unhandled terminal is a
-  compile error rather than a missing `case` in a bash `case` block.
-- **`Caps.scala` / `Live.scala`** — every effect the loop has sits behind a capability trait
-  (`GitHub`, `Git`, `AgentDispatch`, `GateRunner`, `StatusLog`, `Notify`, `HarnessFs`, `Clock`,
-  `Log`), passed as a yaes-style context parameter. `Live.scala` holds the only code that shells
-  out. The sandbox seam is verbatim: `run-fast-gate.sh`, `run-agent.sh`, `run-reviewer.sh` under
-  today's exact argv/env/rc contract, `rc 124` = infra fault everywhere.
-- **`Machine.scala`** — the transitions, decisions first and effects behind the capabilities.
-  Infra faults short-circuit through `Raise[InfraFault]`, so "an infra fault never spends repair
-  budget" is a property of the type, not a convention every new `exit 50` has to remember.
-- **`Main.scala`** — env parsing, the `command -v` and prompt-template preflight, the sandbox
-  image/proxy startup with a shutdown hook standing in for bash's `trap ... EXIT`, the `MAX_ITERS`
-  driver and the `LoopExit` → process-exit-code map.
-
-Dogfooding is the point: the harness is the repo's second real yaes program, on deliberately ugly
-ground (subprocesses, timeouts, exit codes) where API gaps show up.
-
-**What stayed bash**: `watch.sh`, `tail-claude.sh`, and everything under `sandbox/` — the
-containers, the proxy, the wrappers. The loop runs on the host and never inside the sandbox.
-
-**Testing.** `scala-cli test harness/scala` is canonical: 138 assertions driving the machine over
-in-memory handlers plus a recorder, so a scenario asserts on the outcome (exit code, labels
-flipped, PR opened, budget left) AND the interaction sequence (no FIX after an infra fault, no
-merge without verification, marker staged on a guard rejection). `statemachine-test.sh` remains as
-the migration's parity oracle and retires once the first real US merges under this loop.
-
-## Run it
-
-The loop burns Opus tokens and opens a real PR. Run it yourself when ready:
-
-```bash
-harness/loop.sh                 # one US (default MAX_ITERS=1)
-DRY_RUN=1 harness/loop.sh       # inspect plumbing: render the worker prompt, no mutation
-scala-cli test harness/scala        # the canonical suite: 138 in-memory scenario/unit assertions
-harness/test/statemachine-test.sh   # parity oracle, offline (no gh, no tokens): 142 assertions
-HARNESS_IMPL=bash harness/test/statemachine-test.sh   # same 142 against the retiring bash machine
+```
+PICK → IMPLEMENT → GATE → REPAIR → REVIEW → PR → CI → MERGE
 ```
 
-`HARNESS_IMPL` is the Scala rewrite's **parity oracle** switch (design:
-`docs/superpowers/specs/2026-07-19-harness-scala-rewrite-design.md`). `scala` (the default since
-slice 4) drives `scala-cli run harness/scala`, which is what `loop.sh` now execs; `bash` drives
-`loop-bash.sh` through the identical scenarios, stubs and assertions. Both must read 142/142 —
-that equality, not a diff of the two sources, is what says the port is faithful. Note that the
-suite scores the harness on its **stderr** as well as its behaviour (ten `checkc ... loop.out`
-assertions), so the `log()` wording on those paths is asserted behaviour in both implementations.
-Eight of those needles come out of the loop's own log stream and are pinned in-memory by
-`harness/scala/test/LogParitySpec.scala`; the other two are the driver's exit-path line, pinned
-by `harness/scala/src/Main.scala` and `MainSpec.scala`.
+One issue per iteration. `PICK` resumes an `in-progress` issue if there is one, else takes the
+oldest `ready` one — deterministic, no LLM involved.
 
-Env: `MAX_ITERS` (default 1), `ITER_TIMEOUT` s (default 1800), `GATE_TIMEOUT` s (default 900),
-`REPAIR_BUDGET` (default 2), `DRY_RUN=1`. `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY` is
-required (handed to the containerized worker/fixer).
+## The safety spine
 
-**Test seams** (default to the real thing; used by `statemachine-test.sh` to force outcomes):
-`GATE_CMD` (FAST tier), `IMPL_CMD`, `FIX_CMD`, `REVIEW_CMD`. A stub ignores the prompt and
-simulates the gate / agent — e.g. `GATE_CMD=false` forces fast-RED, `IMPL_CMD='exit 124'`
-simulates a container-dispatch timeout, `REVIEW_CMD='echo "VERDICT: REQUEST_CHANGES"'`. Note:
-the gate seam runs word-split (not shell `eval`), so a **stateful** gate stub must be a script on
-`PATH`, not an inline compound. Overriding `GATE_CMD` also skips the sandbox preflight, so the
-suite needs neither Docker nor an API key.
+This is the product. Everything else is plumbing.
 
-## Watching a live run
+- **The worker never picks its own work.** The issue comes from a label query, not from the model.
+- **Protected-path patch guard.** A patch touching `.github/`, `harness/`, `docs/`, `CONTEXT.md`,
+  `PROMPT.md` or `STOP.md` is rejected unapplied. The loop cannot be talked into editing its own
+  guards or its own CI.
+- **Test-tamper check.** The diff is measured against `origin/main` with `git apply --numstat` and
+  the result is handed to the reviewer, which catches the classic failure mode: deleting a failing
+  test to go green.
+- **Cold independent reviewer.** A separate `claude -p` with none of the worker's context. It sees
+  the diff, the acceptance criteria, the conventions and the tamper report, and must emit a
+  `VERDICT:` sentinel. **No sentinel is treated as REQUEST_CHANGES**, never as approval.
+- **Bounded self-repair.** A shared budget (default 2) per issue, spent by a RED gate *or* a
+  `REQUEST_CHANGES`. A pathological issue terminates instead of looping.
+- **Infra faults are not code failures.** A Docker outage, a timed-out worker or a failed merge
+  exits `50` with the budget untouched and the issue left `in-progress`, so the next tick resumes it.
+  A crashed sandbox can never burn repair budget or trigger a FIX.
+- **`STOP.md` is a manual kill switch.** The loop reads it and never writes it.
+- **The sandbox carries no credentials.** Non-root user, egress only through an allowlisting proxy.
 
-The IMPL and FIX dispatches run `--output-format stream-json --verbose`, emitting one JSONL
-event per turn *as they work* into `logs/*.claude.log`. Follow the newest live:
+## Exit codes
 
-```bash
-harness/tail-claude.sh              # renders 🗣 prose / 🔧 tool calls / ↳ results per event
-```
+Each iteration ends in one of seven states. The driver maps them to a process exit code:
 
-The reviewer dispatch is plain text (its stdout **is** the verdict-bearing review, captured to
-`logs/issue-<n>-review.md`). Bash reads only each dispatch's exit code and the one `VERDICT:`
-grep — never the mid-flight stream — so the raw outcome stays the signal.
+| State | rc | Process | Meaning |
+|---|---|---|---|
+| Success | 0 | *continues* | Merged, or PR opened → `needs-review` |
+| ManualStop | 10 | 0 | `STOP.md` present |
+| Idle | 11 | 0 | No `ready` or `in-progress` issue |
+| DryRun | 20 | 0 | `DRY_RUN=1` stop point, before any mutation |
+| NothingMade | 30 | 1 | Empty patch — nothing staged |
+| NeedsHuman | 40 | *continues* | Budget spent, guard rejection, or CI red. PR left open for audit |
+| InfraFault | 50 | 50 | Infra problem. Issue stays `in-progress` |
 
-## Labels the state machine queries
+`Success` and `NeedsHuman` are the only two that let the driver advance to the next iteration;
+every other state exits the process immediately. The loop runs at most `MAX_ITERS` iterations.
 
-`ready` · `blocked` · `in-progress` · `planned` · `needs-review` · `needs-human` +
-`class-1|2|3`. `needs-review` = reviewer APPROVE on a **class-2/3** issue, human merges
-(class-1 APPROVE skips this label — see **v4: auto-merge** above). `needs-human` = budget
-exhausted (fast-RED, IT-RED, or `REQUEST_CHANGES`), a protected-path violation, or CI red
-after a class-1 auto-merge attempt; human takes over. An rc-`50` infra fault touches no label
-— the issue stays `in-progress` for the next tick or manual inspection. Created in the repo
-already.
-
-## Observability
-
-The loop writes one JSON event per phase transition to `harness/logs/status.jsonl`
-(gitignored). It is a pure append: the loop's behaviour, exit codes and merge decisions do not
-depend on it, and nothing reads it back.
-
-Watch a run from a second terminal:
+## Running it
 
 ```bash
-harness/watch.sh
+scala-cli test .     # the test suite: no Docker, no gh, no credentials
+scala-cli run .      # the loop itself
 ```
 
-A four-line banner pins the current phase, gate pass and remaining repair budget to the top of
-the terminal, and the pane below follows whichever log the current phase is writing: agent
-dispatches rendered as prose, tool calls and tool results; gates and the CI wait as raw output.
-The pane switches on its own when the loop moves from the worker to a gate to the reviewer.
+Everything is configured by environment variable — there are no CLI arguments.
 
-The watcher is passive. Attach it, kill it, reattach it, run without it: the loop cannot tell.
+| Variable | Default | Purpose |
+|---|---|---|
+| `MAX_ITERS` | `1` | Iterations before the driver stops |
+| `DRY_RUN` | `0` | `1` renders the worker prompt, then stops before any mutation |
+| `REPAIR_BUDGET` | `2` | Fix attempts per issue |
+| `MAX_PATCH_BYTES` | `1000000` | Oversized-patch guard |
+| `GATE_CMD` | `sandbox/run-fast-gate.sh` | The gate. Overriding it skips the whole Docker preflight |
+| `GATE_TIMEOUT` | `900` | Gate timeout (seconds) |
+| `ITER_TIMEOUT` | `1800` | Worker dispatch timeout |
+| `CI_WAIT_TIMEOUT` / `CI_APPEAR_TIMEOUT` / `CI_APPEAR_INTERVAL` | `900` / `300` / `10` | CI polling |
+| `NTFY_TOPIC` | — | ntfy.sh topic for notifications |
 
-Banner states:
+`IMPL_CMD`, `FIX_CMD`, `REVIEW_CMD`, `NOTIFY_CMD`, `CI_WAIT_CMD`, `CI_APPEAR_CMD` and `MERGE_CMD`
+are test seams: each replaces one subprocess so the loop can be driven without Docker or GitHub.
 
-| Banner                          | Meaning                                                     |
-| ------------------------------- | ----------------------------------------------------------- |
-| `▶ IT 4m12s`                    | that phase is running, and has been for four minutes         |
-| `✗ fast` with `↺ fix 2`         | the fast gate went red twice and the repair budget is spent  |
-| `STALE (loop died in IT)`       | the loop's pid is gone and it never wrote a terminal event   |
-| `DONE rc=0` / `rc=40` / `rc=50` | clean terminal: merged or needs-review / needs-human / infra fault |
+Preflight requires `gh`, `sbt` and `claude` on `PATH`, and either `CLAUDE_CODE_OAUTH_TOKEN` or
+`ANTHROPIC_API_KEY` for the sandboxed worker.
 
-Liveness is a `kill -0` on the pid carried by each event, not a heartbeat. The IT gate blocks
-for up to twenty minutes waiting on a Testcontainers Postgres, so a heartbeat would need a
-child process inside the gate, and that child would outlive a `SIGKILL`ed loop and lie. The
-terminal `DONE` event is written by the driver's exit-code dispatch rather than by a
-`trap EXIT`, precisely so that a killed loop leaves none and the pid check catches it.
+### Issue labels
 
-To follow a single agent dispatch without the banner, `harness/tail-claude.sh` still works and
-takes an explicit log file.
+`ready` → `in-progress` → `needs-review` or `needs-human`. `blocked` issues carry a
+`Blocked-by: #N` line and are flipped to `ready` when their dependency closes. `class-1` marks an
+issue as eligible for auto-merge once CI is green.
 
-### The reviewer pane
+## Layout
 
-`dispatch_review` runs `claude -p` *without* `--output-format stream-json`, because the
-reviewer's stdout **is** the product: its last line carries the `VERDICT:` sentinel the loop
-greps for. The review pane therefore stays empty until the reviewer finishes, then shows the
-finished markdown. Streaming it live would mean restructuring the dispatch the verdict depends
-on, which is a control-plane change for a cosmetic gain.
+```
+src/          the loop: Machine (state machine), Live (handlers), Caps, Domain, Main
+test/         the suite, plus golden/ — the frozen log-line contract
+prompts/      worker, fixer and reviewer prompt templates
+sandbox/      the Docker sandbox: gate, agent and reviewer runners, egress proxy
+sandbox/test/ Docker-dependent shell tests, run manually
+lib/          shell helpers for the watch UI
+watch.sh      live run monitor, reads the log stream and status.jsonl
+```
+
+`Machine` is a pure decision function over a `using` clause of capability traits (`Caps.scala`);
+`Live.scala` holds every real side effect. That is what lets the whole suite run in memory.
+
+### The log contract
+
+The operator log stream is parsed by `watch.sh`, so its wording is asserted behaviour, not
+decoration. `LogParitySpec` freezes it whole against the golden files in `test/golden`. To change a
+log line deliberately:
+
+```bash
+UPDATE_GOLDEN=1 scala-cli test .
+git diff test/golden          # read this. it IS the contract change.
+```
+
+## Build
+
+Scala 3.8.3 on JDK 21 LTS, built with scala-cli. Deliberately **not** sbt: the threat model
+distrusts agent-authored build files, so the loop never couples to the build of the project it is
+working on.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
