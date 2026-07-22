@@ -3,7 +3,7 @@ package in.rcard.litterbox
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 
-import java.nio.file.{Files, Path, StandardOpenOption}
+import java.nio.file.{Files, Path, Paths, StandardOpenOption}
 import scala.jdk.CollectionConverters.*
 
 /** Unit tests for the slice-2 part-A live handlers (LiveHarnessFs, LiveStatusLog, LiveNotify,
@@ -15,6 +15,18 @@ class LiveSpec extends AnyFlatSpec with Matchers:
 
   private def readLines(p: Path): List[String] =
     Files.readAllLines(p).asScala.toList
+
+  // The artifact directory is no longer the hardcoded "logs": it is the `log-dir` config key, whose
+  // reference default is ".litter-box/logs". Deriving the expected location from `Config()` rather
+  // than re-typing the literal is deliberate. If the reference default ever moves again, these
+  // tests follow it instead of pinning a stale path and failing for the wrong reason.
+  private val logDir = Config().logDir
+
+  /** Where `LiveStatusLog` is expected to land its status.jsonl for a given root, when the caller
+    * lets the `logDir` parameter fall back to its configured default.
+    */
+  private def defaultStatusFile(root: Path): Path =
+    root.resolve(logDir).resolve("status.jsonl")
 
   // ---- LiveStatusLog -----------------------------------------------------------------------
 
@@ -28,16 +40,20 @@ class LiveSpec extends AnyFlatSpec with Matchers:
       state = "GREEN",
       pass = 1,
       budget = 2,
-      logfile = "logs/issue-999.fast.log",
+      logfile = s"$logDir/issue-999.fast.log",
       detail = "ok"
     )
 
     log.append(event)
 
-    val lines = readLines(root.resolve("logs").resolve("status.jsonl"))
+    val lines = readLines(defaultStatusFile(root))
     lines should have size 1
-    val pattern =
-      """\{"ts":(\d+),"pid":(\d+),"run":"1234567890","iter":3,"issue":"999","phase":"FAST","state":"GREEN","pass":1,"budget":2,"logfile":"logs/issue-999\.fast\.log","detail":"ok"\}""".r
+    // The logfile field travels through the writer verbatim (it is already repo-relative), so the
+    // expected literal is quoted into the pattern rather than spelled out: the directory segment
+    // comes from the config default and may contain regex metacharacters such as the leading dot.
+    val quotedLogfile = java.util.regex.Pattern.quote(s"$logDir/issue-999.fast.log")
+    val pattern       =
+      ("""\{"ts":(\d+),"pid":(\d+),"run":"1234567890","iter":3,"issue":"999","phase":"FAST","state":"GREEN","pass":1,"budget":2,"logfile":"""" + quotedLogfile + """","detail":"ok"\}""").r
     pattern.matches(lines.head) shouldBe true
   }
 
@@ -49,7 +65,7 @@ class LiveSpec extends AnyFlatSpec with Matchers:
     log.append(event)
     log.append(event)
 
-    val lines = readLines(root.resolve("logs").resolve("status.jsonl"))
+    val lines = readLines(defaultStatusFile(root))
     lines should have size 2
   }
 
@@ -60,7 +76,7 @@ class LiveSpec extends AnyFlatSpec with Matchers:
 
     log.append(event)
 
-    val line = readLines(root.resolve("logs").resolve("status.jsonl")).head
+    val line = readLines(defaultStatusFile(root)).head
     line should include(""""detail":"abcnd e"""")
     line should not include "\\"
   }
@@ -68,13 +84,13 @@ class LiveSpec extends AnyFlatSpec with Matchers:
   it should "relativize a logfile path with a leading root/ prefix" in {
     val root     = tempRoot()
     val log      = LiveStatusLog(root, "1")
-    val absolute = root.resolve("logs/x.log").toString
+    val absolute = root.resolve(s"$logDir/x.log").toString
     val event    = StatusEvent(0, "1", "FAST", "START", 0, 0, absolute, "")
 
     log.append(event)
 
-    val line = readLines(root.resolve("logs").resolve("status.jsonl")).head
-    line should include(""""logfile":"logs/x.log"""")
+    val line = readLines(defaultStatusFile(root)).head
+    line should include(s""""logfile":"$logDir/x.log"""")
   }
 
   it should "pass a foreign absolute logfile path through unchanged" in {
@@ -84,17 +100,40 @@ class LiveSpec extends AnyFlatSpec with Matchers:
 
     log.append(event)
 
-    val line = readLines(root.resolve("logs").resolve("status.jsonl")).head
+    val line = readLines(defaultStatusFile(root)).head
     line should include(""""logfile":"/etc/foreign/path.log"""")
+  }
+
+  it should "write status.jsonl under an explicit non-default logDir" in {
+    val root   = tempRoot()
+    val custom = "custom/logs"
+    // The third parameter is the whole point of the change: a consumer repo can put the loop's
+    // artifacts wherever its own `log-dir` says, so an explicitly passed directory must win over
+    // the configured default. Asserting the default location stays EMPTY is the half that would
+    // silently pass if the writer ignored the parameter and kept using its fallback.
+    val log = LiveStatusLog(root, "1", custom)
+
+    log.append(StatusEvent(0, "1", "FAST", "START", 0, 0, "", ""))
+
+    val written = root.resolve(custom).resolve("status.jsonl")
+    Files.isRegularFile(written) shouldBe true
+    readLines(written) should have size 1
+    Files.exists(defaultStatusFile(root)) shouldBe false
   }
 
   it should "not throw when the status.jsonl parent path is blocked by a file" in {
     val root = tempRoot()
-    // Block "logs" (the directory the writer wants to create) with a plain file.
-    Files.write(root.resolve("logs"), "blocked".getBytes)
+    // Block the configured log directory by planting a plain FILE where its first segment must
+    // become a directory (".litter-box" for the reference default), so `createDirectories` for the
+    // full ".litter-box/logs" chain cannot succeed. Blocking the leaf alone would no longer work
+    // now that the default is nested: this keeps exercising the same failure mode as before, the
+    // write path swallowing the IO error instead of letting a dead status line kill the loop.
+    val blocked = Paths.get(Config().logDir).getName(0).toString
+    Files.write(root.resolve(blocked), "blocked".getBytes)
     val log = LiveStatusLog(root, "1")
 
     noException should be thrownBy log.append(StatusEvent(0, "1", "FAST", "START", 0, 0, "", ""))
+    Files.exists(defaultStatusFile(root)) shouldBe false
   }
 
   // ---- LiveNotify ---------------------------------------------------------------------------
@@ -148,9 +187,9 @@ class LiveSpec extends AnyFlatSpec with Matchers:
     val root = tempRoot()
     val fs   = LiveHarnessFs(root)
 
-    fs.write("logs/issue-999.prompt.txt", "hello")
+    fs.write(s"$logDir/issue-999.prompt.txt", "hello")
 
-    fs.read("logs/issue-999.prompt.txt") shouldBe "hello"
+    fs.read(s"$logDir/issue-999.prompt.txt") shouldBe "hello"
   }
 
   it should "report the correct byte size" in {
@@ -165,7 +204,7 @@ class LiveSpec extends AnyFlatSpec with Matchers:
     val root = tempRoot()
     val fs   = LiveHarnessFs(root)
 
-    fs.sizeBytes("logs/never-created.patch") shouldBe 0L
+    fs.sizeBytes(s"$logDir/never-created.patch") shouldBe 0L
   }
 
   it should "report stopRequested false, then true after STOP.md is created" in {

@@ -1,3 +1,3 @@
 iteration 1 -> issue #999
-git apply refused the patch (see logs/issue-999-iter1.impl.patch.apply.err) — infra fault, no budget spent
+git apply refused the patch (see .litter-box/logs/issue-999-iter1.impl.patch.apply.err) — infra fault, no budget spent
 IMPL patch did not apply — infra fault, no budget spent

@@ -9,6 +9,14 @@ import Script.*
   */
 class ScenarioSpec extends AnyFlatSpec with Matchers:
 
+  // The loop's artifact directory used to be the hardcoded "logs"; it is now the `log-dir` config
+  // key, defaulting to ".litter-box/logs". Every artifact expectation below is built from this one
+  // value on purpose: scattering the new literal across the file would just swap one hardcoded
+  // directory for another, whereas reading it back from `Config()` means these tests keep tracking
+  // whatever the reference default becomes. A wrong default then fails in Settings, where it
+  // belongs, instead of in twenty unrelated scenario assertions here.
+  private val logDir = Config().logDir
+
   // ---- STOP.md ----------------------------------------------------------------------------
 
   "The machine" should "exit ManualStop (rc 10) when STOP.md is present, touching nothing" in {
@@ -83,7 +91,7 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     exit shouldBe LoopExit.DryRun
     exit.rc shouldBe 20
     // the worker prompt was rendered with the issue body spliced in
-    w.files("logs/issue-999.prompt.txt") should include("AC1: implement the slice")
+    w.files(s"$logDir/issue-999.prompt.txt") should include("AC1: implement the slice")
     // truly read-only: no label mutation, no branch, no fetch, no PR
     w.called("gh issue edit") shouldBe false
     w.called("gh pr create") shouldBe false
@@ -106,7 +114,7 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     w.callCount("dispatch FIX") shouldBe 0 // no repair
     w.callCount("dispatch REVIEW") shouldBe 1
     // the review prompt got conventions, tamper report and the diff spliced in
-    val reviewPrompt = w.files("logs/issue-999-pass1.review.prompt.txt")
+    val reviewPrompt = w.files(s"$logDir/issue-999-pass1.review.prompt.txt")
     reviewPrompt should include("Conventions: onion layout")
     reviewPrompt should include("Test-tamper report")
     reviewPrompt should include("src/main/scala/Slice.scala")
@@ -159,10 +167,10 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     w.called("gh pr merge 123 --squash --delete-branch") shouldBe true
     // loop.sh:473 appends the merge output to the SAME ci_log the CI watch just wrote
     w.called(
-      "gate CI-WAIT cmd=gh pr checks 123 --watch --fail-fast log=logs/issue-999.ci-wait.log"
+      s"gate CI-WAIT cmd=gh pr checks 123 --watch --fail-fast log=$logDir/issue-999.ci-wait.log"
     ) shouldBe true
     w.called(
-      "gh pr merge 123 --squash --delete-branch >>logs/issue-999.ci-wait.log"
+      s"gh pr merge 123 --squash --delete-branch >>$logDir/issue-999.ci-wait.log"
     ) shouldBe true
     w.called("gh pr view 123 --json state") shouldBe true // merge verified
     w.called("--add-label needs-review") shouldBe false   // auto-merge owns the fate
@@ -203,14 +211,14 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     w.callCount("dispatch REVIEW") shouldBe 2
     w.called("gh issue edit 999 --add-label needs-review --remove-label in-progress") shouldBe true
     // the fix prompt carried the reviewer's complaint and was rendered per pass
-    w.files("logs/issue-999-pass1.fix.prompt.txt") should include(
+    w.files(s"$logDir/issue-999-pass1.fix.prompt.txt") should include(
       "The independent reviewer requested changes"
     )
     // one budget unit spent: the FIX phase event carries budget 1 (of 2)
     w.events.filter(_.phase == "FIX").map(_.budget).distinct shouldBe List(1)
     // the FIX dispatch was seeded with the prior cumulative patch
     w.calls.find(_.startsWith("dispatch FIX")).get should include(
-      "currentPatch=logs/issue-999-iter1.impl.patch"
+      s"currentPatch=$logDir/issue-999-iter1.impl.patch"
     )
   }
 
@@ -509,7 +517,11 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
 
   it should "reject a protected-path IMPL patch: marker staged, repair loop skipped, needs-human (Scenarios G/R)" in {
     val w = TestWorld()
-    w.implScript = WorkerScript.Produces("1\t0\tsandbox/evil.sh")
+    // The violating path has to be one the DEFAULT `protect` list actually covers, since this
+    // scenario runs on `Config()`: the guard list is config now, and the built-in default protects
+    // ".litter-box/**", ".github/**" and "CONTEXT.md". A CI workflow is the canonical case anyway,
+    // an agent editing the very checks that judge it.
+    w.implScript = WorkerScript.Produces("1\t0\t.github/workflows/evil.yml")
     w.fixScripts = List(WorkerScript.Produces(newFilePatch)) // must never be consumed
 
     val exit = w.runLoop()
@@ -520,7 +532,7 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     w.callCount("gate FAST") shouldBe 0       // guard rejection short-circuits the gates
     w.appliedPatches shouldBe empty           // the rejected patch was NEVER applied
     w.files("PATCH-REJECTED.md") should include("protected path")
-    w.files("PATCH-REJECTED.md") should include("sandbox/evil.sh") // numstat in the marker
+    w.files("PATCH-REJECTED.md") should include(".github/workflows/evil.yml") // numstat in marker
     w.called("git add PATCH-REJECTED.md") shouldBe true
     w.called("gh issue edit 999 --add-label needs-human --remove-label in-progress") shouldBe true
     w.called("gh pr create") shouldBe true // PR still opened (audit trail)
@@ -531,7 +543,25 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
 
   it should "guard every protected path class and let ordinary source paths through" in {
     def numstat(p: String) = s"1\t0\t$p"
-    val protectedPaths     =
+    // This repo's OWN `.litter-box/config.conf` protect list, as globs. Before slice 2 the same
+    // eleven paths were a literal `startsWith`/`==` chain inside Machine; the point of keeping the
+    // case list identical here is that moving them into config must not have quietly changed which
+    // patches the guard rejects for the repo the loop actually runs on.
+    val protect = List(
+      ".litter-box/**",
+      ".github/**",
+      "sandbox/**",
+      "lib/**",
+      "prompts/**",
+      "docs/**",
+      "project.scala",
+      "watch.sh",
+      "tail-claude.sh",
+      "CONTEXT.md",
+      "PROMPT.md",
+      "STOP.md"
+    )
+    val protectedPaths =
       List(
         ".github/workflows/evil.yml",
         "sandbox/evil.sh",
@@ -543,11 +573,14 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
         "tail-claude.sh",
         "CONTEXT.md",
         "PROMPT.md",
-        "STOP.md"
+        "STOP.md",
+        ".litter-box/config.conf" // the guard list now protects the file that defines it
       )
-    protectedPaths.foreach(p => withClue(p) { Machine.touchesProtected(numstat(p)) shouldBe true })
+    protectedPaths.foreach(p =>
+      withClue(p) { Machine.touchesProtected(protect, numstat(p)) shouldBe true }
+    )
     List("src/main/scala/A.scala", "src/test/scala/ATest.scala", "build.sbt", "README.md")
-      .foreach(p => withClue(p) { Machine.touchesProtected(numstat(p)) shouldBe false })
+      .foreach(p => withClue(p) { Machine.touchesProtected(protect, numstat(p)) shouldBe false })
   }
 
   // ---- Scenario T: oversized patch -> marker, gate SKIPPED, needs-human + audit PR ---------
@@ -645,7 +678,9 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     val w = TestWorld()
     w.gateResults = List(GateResult.Red)
     w.fixScripts = List(
-      WorkerScript.Produces("1\t0\tsandbox/evil.sh"),
+      // Same reason as the IMPL case above: on `Config()` the guard only rejects what the default
+      // `protect` list names, so the fixer's violating patch has to touch one of those paths.
+      WorkerScript.Produces("1\t0\t.github/workflows/evil.yml"),
       WorkerScript.Produces(newFilePatch) // must never be consumed
     )
 
@@ -654,7 +689,7 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     exit shouldBe LoopExit.NeedsHuman
     w.callCount("dispatch FIX") shouldBe 1 // the rejection breaks the loop
     // only the initial IMPL patch was ever applied; the rejected FIX patch never was
-    w.appliedPatches shouldBe List("logs/issue-999-iter1.impl.patch")
+    w.appliedPatches shouldBe List(s"$logDir/issue-999-iter1.impl.patch")
     w.files("PATCH-REJECTED.md") should include("protected path")
     w.called("gh issue edit 999 --add-label needs-human --remove-label in-progress") shouldBe true
     w.commitMessages.head should include("patch guard rejection (protected-path), gate RED")

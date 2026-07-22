@@ -117,9 +117,9 @@ trait StatusLog:
 trait Notify:
   def notify(msg: String): Unit
 
-/** Filesystem the harness owns: prompts, logs, markers, STOP.md. */
+/** Filesystem the harness owns: prompts, logs, markers, the configured stop file. */
 trait HarnessFs:
-  /** STOP.md present — manual kill-switch. */
+  /** The `stop-file` is present — manual kill-switch. */
   def stopRequested(): Boolean
   def readTemplate(template: Template): String
 

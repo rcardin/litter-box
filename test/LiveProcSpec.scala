@@ -618,7 +618,11 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
 
     numstat shouldBe "1\t0\tsandbox/loop.sh\n12\t3\tsrc/main/scala/Ok.scala"
     // The whole point: the guard downstream still rejects the patch.
-    Machine.touchesProtected(numstat) shouldBe true
+    // The globs are spelled out rather than read off a Config because what is under test is the
+    // stdout that reached the guard, not which paths a given repo chose to protect: `sandbox/**`
+    // covers the first row of the fake numstat above, and `src/main/scala/Ok.scala` is deliberately
+    // left unprotected so a `true` here can only come from a row that actually survived rc 128.
+    Machine.touchesProtected(List("sandbox/**", ".github/**", "CONTEXT.md"), numstat) shouldBe true
   }
 
   "LiveGit.applyIndex" should "apply a valid patch (true) and stage it, and refuse a garbage patch (false)" in {

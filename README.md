@@ -14,10 +14,41 @@ for the design record.
 
 ## Not installable yet
 
-There is no `litter-box` binary and no `litter-box init`. Slice 1 is a bootstrap: the loop runs from
-a checkout, still reads a few hardcoded paths, and still assumes the repo it works on is the repo it
-lives in. Config (`#3`), the consumer-repo scaffold, and a published binary (`#6`) come later.
+There is no `litter-box` binary and no `litter-box init` yet. What slice 2 added is the tie-cutting:
+the loop finds its repo with `git rev-parse --show-toplevel` instead of assuming it lives inside one,
+and every repo-specific value now comes from `.litter-box/config.conf` instead of a literal in the
+source. The scaffold command (`#4`) and a published binary (`#6`) still come later.
 **If you are looking for something to install, come back after [#1](https://github.com/rcardin/litter-box/issues/1) closes.**
+
+## Configuration
+
+One HOCON file at the repo root, `.litter-box/config.conf`. It is mandatory: with no config the loop
+exits `50` (infra fault) and names `litter-box init`, rather than guessing and acting on the wrong
+labels. Anything omitted falls back to the reference schema in `src/Settings.scala`; every knob
+loop.sh took from an env var (`GATE_CMD`, `REPAIR_BUDGET`, `ITER_TIMEOUT`, ...) still overrides its
+config key for a single run, so the layering is **env var > config file > reference default**.
+
+```hocon
+instance-name = "litter-box"          # namespaces the Docker image/network/proxy/cache names
+conventions   = "CONTEXT.md"          # spliced into the review prompt as {{CONVENTIONS}}
+stop-file     = "STOP.md"
+log-dir       = ".litter-box/logs"
+
+gate {
+  fast    = "sbt -Werror compile test"
+  timeout = 900
+}
+ci { required-check = "build" }
+issues.labels { ready = "ready", active = "in-progress", blocked = "blocked" }
+protect  = [".litter-box/**", ".github/**", "CONTEXT.md"]
+budgets  { repair = 2, max-patch-bytes = 1000000 }
+timeouts { iter = 1800, ci-wait = 900, ci-appear = 300, ci-appear-interval = 10 }
+```
+
+`instance-name` earns its place even though litter-box never runs two instances at once:
+`sandbox/start-proxy.sh` does `docker rm -f "$PROXY_NAME"` at startup, before any issue label is
+read, so with machine-global names a mistaken second launch kills the running instance's proxy
+mid-iteration and no label discipline can prevent it.
 
 ## The pipeline
 
@@ -35,9 +66,10 @@ oldest `ready` one — deterministic, no LLM involved.
 This is the product. Everything else is plumbing.
 
 - **The worker never picks its own work.** The issue comes from a label query, not from the model.
-- **Protected-path patch guard.** A patch touching `.github/`, `sandbox/`, `lib/`, `prompts/`,
-  `docs/`, `project.scala`, `watch.sh`, `tail-claude.sh`, `CONTEXT.md`, `PROMPT.md` or `STOP.md` is
-  rejected unapplied. The loop cannot be talked into editing its own guards or its own CI.
+- **Protected-path patch guard.** A patch touching any glob in the config's `protect` list is
+  rejected unapplied. That list always covers `.litter-box/**`, i.e. the config file that defines
+  the list, so the loop cannot be talked into widening its own guard, editing its own CI, or
+  rewriting the conventions it is judged against.
 - **Test-tamper check.** The diff is measured against `origin/main` with `git apply --numstat` and
   the result is handed to the reviewer, which catches the classic failure mode: deleting a failing
   test to go green.

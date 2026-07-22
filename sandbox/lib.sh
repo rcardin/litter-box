@@ -3,15 +3,21 @@
 # just variable assignments and the shared log() helper.
 #
 # These Docker identifiers are global to the machine, and start-proxy.sh does `docker rm -f` on
-# PROXY_NAME at startup: two litter-box instances sharing them would kill each other's proxy
-# mid-iteration. Still hardcoded for now; the `instance_name` config that makes them per-instance
-# lands in #3.
-IMAGE="litter-box-sandbox:v6"
-PROXY_IMAGE="litter-box-sandbox-proxy:v6"
-NETWORK="litter-box-net"
-PROXY_NAME="litter-box-proxy"
+# PROXY_NAME at startup, BEFORE any issue label is consulted: two litter-box instances sharing
+# them would kill each other's proxy mid-iteration, and no amount of label discipline could stop
+# it. So they are namespaced by the `instance-name` config key, which the loop exports as
+# LITTER_BOX_INSTANCE onto every child it forks (Settings.InstanceEnvVar / LiveProc.exportEnv).
+#
+# This is the ONLY place the names are derived. The fallback keeps the scripts runnable by hand
+# (build-image.sh, start-proxy.sh, sandbox/test/*) without the loop having exported anything, and
+# equals the reference config's own `instance-name`.
+INSTANCE_NAME="${LITTER_BOX_INSTANCE:-litter-box}"
+IMAGE="${INSTANCE_NAME}-sandbox:v6"
+PROXY_IMAGE="${INSTANCE_NAME}-sandbox-proxy:v6"
+NETWORK="${INSTANCE_NAME}-net"
+PROXY_NAME="${INSTANCE_NAME}-proxy"
 PROXY_PORT="8888"
-COURSIER_VOLUME="litter-box-coursier-cache"
+COURSIER_VOLUME="${INSTANCE_NAME}-coursier-cache"
 SANDBOX_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 log() { printf '[sandbox] %s\n' "$*" >&2; }

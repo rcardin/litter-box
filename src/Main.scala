@@ -1,5 +1,7 @@
 package in.rcard.litterbox
 
+import com.typesafe.config.Config as TsConfig
+
 import java.nio.file.{Files, Path, Paths}
 import scala.util.control.NonFatal
 
@@ -30,28 +32,37 @@ object Main:
       gateOverridden: Boolean
   )
 
-  def parseEnv(env: Map[String, String]): ParsedEnv =
+  /** Config file first, env vars on top. `fromFile` is `.litter-box/config.conf` already merged onto
+    * `Settings.Reference` (so it is total over the schema); each env var below then overrides the
+    * one key it has always meant. Nothing here reads a default of its own any more — a key's default
+    * is whatever the reference says, which is why the `int`/`long`/`str` helpers take the
+    * config-derived value as their fallback instead of a literal.
+    */
+  def parseEnv(fromFile: TsConfig, env: Map[String, String]): ParsedEnv =
+    val base = Settings.parse(fromFile)
+
     def str(key: String): Option[String]    = env.get(key).filter(_.nonEmpty)
     def int(key: String, default: Int): Int = env.get(key).flatMap(_.toIntOption).getOrElse(default)
     def long(key: String, default: Long): Long =
       env.get(key).flatMap(_.toLongOption).getOrElse(default)
 
     // loop.sh:129-133: GATE_OVERRIDDEN is captured BEFORE GATE_CMD's own default is applied, so
-    // setting GATE_CMD to its own default value still counts as "overridden".
+    // setting GATE_CMD to its own default value still counts as "overridden". It is deliberately
+    // about the ENV var alone: a `gate.fast` in the config file is the repo's normal gate, not an
+    // operator saying "skip the sandbox preflight for this run".
     val gateOverridden = env.get("GATE_CMD").exists(_.nonEmpty)
-    val gateCmd        = str("GATE_CMD").getOrElse(Config().gateCmd)
 
-    val cfg = Config(
+    val cfg = base.copy(
       dryRun = env.getOrElse("DRY_RUN", "0") == "1", // loop.sh:654: `[[ "$DRY_RUN" == "1" ]]`
-      repairBudget = int("REPAIR_BUDGET", 2),
-      maxPatchBytes = long("MAX_PATCH_BYTES", 1_000_000L),
-      gateCmd = gateCmd,
+      repairBudget = int("REPAIR_BUDGET", base.repairBudget),
+      maxPatchBytes = long("MAX_PATCH_BYTES", base.maxPatchBytes),
+      gateCmd = str("GATE_CMD").getOrElse(base.gateCmd),
       ciWaitCmd = str("CI_WAIT_CMD"),
-      gateTimeout = int("GATE_TIMEOUT", 900),
-      iterTimeout = int("ITER_TIMEOUT", 1800),
-      ciWaitTimeout = int("CI_WAIT_TIMEOUT", 900),
-      ciAppearTimeout = int("CI_APPEAR_TIMEOUT", 300),
-      ciAppearInterval = int("CI_APPEAR_INTERVAL", 10)
+      gateTimeout = int("GATE_TIMEOUT", base.gateTimeout),
+      iterTimeout = int("ITER_TIMEOUT", base.iterTimeout),
+      ciWaitTimeout = int("CI_WAIT_TIMEOUT", base.ciWaitTimeout),
+      ciAppearTimeout = int("CI_APPEAR_TIMEOUT", base.ciAppearTimeout),
+      ciAppearInterval = int("CI_APPEAR_INTERVAL", base.ciAppearInterval)
     )
 
     ParsedEnv(
@@ -111,63 +122,42 @@ object Main:
     case LoopExit.NothingMade                                  => DriverAction.Exit(1)
     case LoopExit.InfraFault                                   => DriverAction.Exit(50)
 
-  /** Marker path that identifies the repo root: the scala-cli project file, which sits at the root
-    * by definition.
+  /** The repo the loop works on: the git work tree containing the process's CWD.
     *
-    * Was `harness/loop.sh` while the harness lived as a subdirectory of the repo it worked on — the
-    * root was then "the directory containing the harness". Here the root IS the project, so the
-    * marker is the project's own build file. Temporary either way: per the PRD the root becomes
-    * `git rev-parse --show-toplevel` once litter-box installs into a consumer repo, and this whole
-    * ancestor walk goes with it.
+    * Slice 1 walked ancestors looking for `project.scala`, i.e. "find the litter-box checkout",
+    * because the loop and the repo it worked on were the same directory. They are not any more, so
+    * the question changed: the root is the CONSUMER repo, and `git rev-parse --show-toplevel` is
+    * what answers it. It also keeps the property the ancestor walk existed to preserve — running
+    * from a subdirectory resolves the same root as running from the top — for free, since that is
+    * what `--show-toplevel` means.
+    *
+    * Not being inside a work tree is an rc-50 infra fault, not a silent fallback to the CWD: every
+    * path the loop touches hangs off this answer, so a wrong root is a run that writes logs, reads
+    * conventions and applies patches somewhere nobody asked for.
+    *
+    * TEST AFFORDANCE, deliberate, and the same shape as `findOnPath`'s `exists`: `revParse` is the
+    * `git` call, injected so the parsing and the failure mapping can be exercised against invented
+    * results instead of only ever against this one real checkout. THE ONLY PRODUCTION CALLER IS
+    * `main`, which passes the real subprocess.
     */
-  private[litterbox] val RootMarker = "project.scala"
-
-  /** Resolves the repo root the way loop.sh:102-105 does — "wherever you invoked me from, the root
-    * is a fixed place", not "the root is wherever you happened to be standing".
-    *
-    * Bash got that for free: `SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"` /
-    * `REPO_ROOT="$SCRIPT_DIR/.."` / `cd "$REPO_ROOT"` derive the root from the script's OWN
-    * location, so the loop worked identically from any subdirectory. A scala-cli program has no
-    * equivalent: there is no reliable `BASH_SOURCE` for it (sources are compiled into a cache dir
-    * far from the repo, so neither the class location nor the code source URL points at the
-    * project), so the location-derived form is simply unavailable.
-    *
-    * What IS available is the same INVARIANT: the root is the unique ancestor directory containing
-    * `RootMarker`. Walking up from the start directory to find it reproduces the "works from any
-    * subdirectory" guarantee for every invocation inside the repo, which is exactly the set of
-    * invocations bash supported. `git rev-parse --show-toplevel` is the eventual replacement (see
-    * `RootMarker`), but it belongs with the consumer-repo install in a later slice — today it would
-    * answer a question (VCS boundary) that is not yet the one being asked.
-    *
-    * When no ancestor carries the marker, the caller must treat it as fatal: the previous behaviour
-    * — taking the cwd unchecked — made every subsequent path silently resolve wrong.
-    *
-    * TEST AFFORDANCE, deliberate: `exists` is the marker-file probe, injected on the same reasoning
-    * as `findOnPath`'s above, so the ancestor walk can be exercised against a synthetic tree
-    * instead of only ever finding this one real repo. THE ONLY PRODUCTION CALLER IS `main`, which
-    * passes the real `Files.isRegularFile`.
-    */
-  private[litterbox] def resolveRepoRoot(start: Path, exists: Path => Boolean): Either[String, Path] =
-    val from = start.toAbsolutePath.normalize
-    Iterator
-      .iterate(from)(_.getParent)
-      .takeWhile(_ != null)
-      .find(d => exists(d.resolve(RootMarker))) match
-      case Some(root) => Right(root)
-      case None       =>
-        Left(
-          s"not inside the litter-box repo: no ancestor of $from contains $RootMarker — run litter-box from the repo"
-        )
+  private[litterbox] def resolveRepoRoot(revParse: () => LiveProc.Result): Either[String, Path] =
+    val r = revParse()
+    val out = r.stdoutTrimmedTrailingNewlines.strip()
+    if r.rc != 0 || out.isEmpty then
+      Left(
+        "not inside a git work tree (git rev-parse --show-toplevel failed) — run litter-box from inside the repo it should work on"
+      )
+    else Right(Path.of(out).toAbsolutePath.normalize)
 
   /** The exact bash log line for one iteration's outcome (loop.sh:932-941), copied byte-for-byte
     * including loop.sh's em-dash separator character. rc 50's notify already fires inside
     * `Machine.runOnce` (Machine.scala:69); this function only logs, it never notifies a second time.
     */
-  private[litterbox] def driverLog(i: Int, exit: LoopExit): String = exit match
+  private[litterbox] def driverLog(i: Int, exit: LoopExit, stopFile: String): String = exit match
     case LoopExit.Success    => s"iteration $i done (SUCCESS — auto-merged, or PR -> needs-review)"
     case LoopExit.NeedsHuman =>
       s"iteration $i done (FAIL terminal -> needs-human, PR open for audit)"
-    case LoopExit.ManualStop  => "manual STOP.md — exiting"
+    case LoopExit.ManualStop  => s"manual $stopFile — exiting"
     case LoopExit.Idle        => "no actionable issue — idle, exiting"
     case LoopExit.DryRun      => "dry run reached its stop point — exiting"
     case LoopExit.NothingMade => s"iteration $i produced nothing — exiting for inspection"
@@ -193,7 +183,7 @@ object Main:
     var i = 1
     while i <= maxIters do
       val exit = Machine.runOnce(i)
-      LiveLog.log(driverLog(i, exit))
+      LiveLog.log(driverLog(i, exit, summon[Config].stopFile))
       driverAction(exit) match
         case DriverAction.Continue   => i += 1
         case DriverAction.Exit(code) => return code
@@ -205,6 +195,16 @@ object Main:
   private def die(msg: String): Nothing =
     LiveLog.log(s"FATAL: $msg")
     sys.exit(1)
+
+  /** The two startup failures that are INFRA faults rather than misconfiguration-of-the-loop: a CWD
+    * outside any git work tree, and a repo with no `.litter-box/config.conf`. Both exit 50, the same
+    * code a Docker outage gets, because both mean "nothing was touched, fix the environment and run
+    * again" — an operator watching exit codes must not have to tell them apart from a broken
+    * install (rc 1).
+    */
+  private def die50(msg: String): Nothing =
+    LiveLog.log(s"FATAL: $msg")
+    sys.exit(LoopExit.InfraFault.rc)
 
   /** Runs one of the sandbox preflight scripts (build-image.sh, start-proxy.sh) with cwd=root and
     * no args. Their stdio is inherited so the operator sees the build/startup progress live,
@@ -233,16 +233,25 @@ object Main:
   @main def litterBoxLoop(): Unit =
     val env = sys.env
 
-    // 1. root = the nearest ancestor of the cwd containing RootMarker, which is bash's REPO_ROOT
-    // (loop.sh:102-105) by construction. See resolveRepoRoot for why the ancestor walk stands in
-    // for bash's script-location derivation, and why a cwd that is not inside the repo is fatal
-    // here rather than silently wrong.
-    val root = resolveRepoRoot(Paths.get("").toAbsolutePath, Files.isRegularFile(_)) match
+    // 1. root = the git work tree the process was launched inside. Everything downstream is
+    // relative to it, so an unanswerable question here is rc 50 and no further work.
+    val cwd  = Paths.get("").toAbsolutePath
+    val root = resolveRepoRoot(() =>
+      LiveProc.run(cwd, Seq("git", "rev-parse", "--show-toplevel"))
+    ) match
       case Right(r)  => r
-      case Left(msg) => die(msg)
+      case Left(msg) => die50(msg)
 
-    // 2. Parse every env var (Part C), capturing gateOverridden before GATE_CMD's own default.
-    val parsed = parseEnv(env)
+    // 2. Config file, then env vars on top of it (Part C). A repo with no config has not been
+    // `litter-box init`ed; that is an infra fault, not a loop failure.
+    val fromFile = Settings.loadFile(root) match
+      case Right(c)  => c
+      case Left(msg) => die50(msg)
+    val parsed = parseEnv(fromFile, env)
+
+    // 2b. instance-name reaches the sandbox scripts as an env var on every child (see
+    // LiveProc.export). Set BEFORE the preflight below, which is itself the first child.
+    LiveProc.exportEnv(Settings.childEnv(parsed.cfg))
 
     // 3. (was: the JAVA_HOME pin block, loop.sh:176-192.) Bash pinned JDK 25 onto every child it
     // forked because the old effect library needed JDK 25's StructuredTaskScope API. That dependency
@@ -251,8 +260,8 @@ object Main:
     // `LiveProc.pinJdk` survives unset — its default is None, i.e. "stamp nothing" — so children
     // inherit the ambient JDK, which is the behaviour bash had whenever the pinned JDK was absent.
 
-    // 4. mkdir -p logs (loop.sh:120-121: LOG_DIR="$SCRIPT_DIR/logs"; mkdir -p "$LOG_DIR").
-    Files.createDirectories(root.resolve(Machine.LogDir))
+    // 4. mkdir -p <log-dir> (loop.sh:120-121: LOG_DIR="$SCRIPT_DIR/logs"; mkdir -p "$LOG_DIR").
+    Files.createDirectories(root.resolve(parsed.cfg.logDir))
 
     // 5. RUN_ID = epoch seconds at startup, as a String (loop.sh:152: `RUN_ID="$(date +%s)"`).
     val runId = (System.currentTimeMillis() / 1000).toString
@@ -289,7 +298,7 @@ object Main:
       }
 
     // 6c. Prompt template / conventions file existence (loop.sh:116-119, 212-215).
-    val conventions = root.resolve("CONTEXT.md")
+    val conventions = root.resolve(parsed.cfg.conventions)
     for f <- Template.values.map(t => root.resolve(Machine.PromptDir).resolve(t.fileName)) do
       if !Files.isRegularFile(f) then die(s"missing prompt template: $f")
     if !Files.isRegularFile(conventions) then die(s"missing conventions file: $conventions")
@@ -299,7 +308,8 @@ object Main:
 
     // 8. Wire the Live handlers as a single `using` bundle for Machine.runOnce.
     given Config        = parsed.cfg
-    given GitHub        = LiveGitHub(root, parsed.ciAppearCmd, parsed.mergeCmd)
+    given GitHub        =
+      LiveGitHub(root, parsed.ciAppearCmd, parsed.mergeCmd, labels = parsed.cfg.labels)
     given Git           = LiveGit(root)
     given AgentDispatch =
       LiveAgentDispatch(
@@ -311,9 +321,9 @@ object Main:
         parsed.reviewCmd
       )
     given GateRunner = LiveGateRunner(root, timeoutBin)
-    given StatusLog  = LiveStatusLog(root, runId)
+    given StatusLog  = LiveStatusLog(root, runId, parsed.cfg.logDir)
     given Notify     = LiveNotify(parsed.notifyCmd, parsed.ntfyTopic, LiveLog.log)
-    given HarnessFs  = LiveHarnessFs(root)
+    given HarnessFs  = LiveHarnessFs(root, parsed.cfg.stopFile, parsed.cfg.conventions)
     given Clock      = LiveClock
     given Log        = LiveLog
 

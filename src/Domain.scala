@@ -13,7 +13,7 @@ enum LoopExit(val rc: Int):
   /** Merged (class-1 auto-merge) or PR opened -> needs-review. */
   case Success extends LoopExit(0)
 
-  /** STOP.md present — manual kill-switch only; the loop never writes it. */
+  /** The stop file is present — manual kill-switch only; the loop never writes it. */
   case ManualStop extends LoopExit(10)
 
   /** No ready/in-progress issue. Transient: NO sentinel is written (PR #17 latch bug). */
@@ -120,17 +120,58 @@ final case class StatusEvent(
     detail: String
 )
 
-/** Env-derived knobs — same outward surface as loop.sh (defaults identical). */
+/** The three issue labels the loop drives its own state machine with (`issues.labels`). Named rather
+  * than a bare `Map[String, String]` so a caller cannot ask for a key that does not exist, and so
+  * "which label does crash-resume query" has one answer (`active`) instead of a string lookup.
+  *
+  * `class-1`, `needs-review` and `needs-human` are deliberately NOT here: those are the loop's own
+  * vocabulary for outcomes it produces, not the consumer repo's queue labels it consumes.
+  */
+final case class Labels(
+    ready: String = "ready",
+    active: String = "in-progress",
+    blocked: String = "blocked"
+)
+
+/** The per-iteration knobs, read from `.litter-box/config.conf` and overlaid with the loop.sh env
+  * vars (see `Settings` for the layering and `Settings.Reference` for the schema).
+  *
+  * Every default below must equal the matching key in `Settings.Reference`; `SettingsSpec` asserts
+  * that rather than trusting this comment. The two exceptions carry no config key at all and are
+  * env-only, because both are per-RUN operator switches rather than per-repo facts: `dryRun`
+  * (`DRY_RUN`) and `ciWaitCmd` (`CI_WAIT_CMD`).
+  */
 final case class Config(
     dryRun: Boolean = false,
     repairBudget: Int = 2,
     maxPatchBytes: Long = 1_000_000L,
-    /** GATE_CMD (loop.sh:133). Held repo-RELATIVE, unlike bash's absolute
+    /** `instance-name` — namespaces the Docker image/network/proxy/cache-volume names, carried into
+      * the sandbox scripts as `Settings.InstanceEnvVar`.
+      */
+    instanceName: String = "litter-box",
+    /** `conventions` — the file spliced into the review prompt as `{{CONVENTIONS}}`. */
+    conventions: String = "CONTEXT.md",
+    /** `stop-file` — the manual kill switch. The loop reads it and never writes it. */
+    stopFile: String = "STOP.md",
+    /** `log-dir` — where every per-iteration artifact (prompts, patches, gate logs, status.jsonl)
+      * is written, relative to the repo root.
+      */
+    logDir: String = ".litter-box/logs",
+    /** `ci.required-check` — the check name the CI wait is about. Carried for the CI-wait command
+      * `litter-box init` writes and for operator diagnostics; the default CI wait
+      * (`gh pr checks --watch --fail-fast`) waits on ALL checks, so nothing in `Machine` reads it
+      * yet.
+      */
+    requiredCheck: String = "build",
+    labels: Labels = Labels(),
+    /** `protect` — globs (JDK `glob:` syntax) the patch guard rejects any patch touching. */
+    protect: List[String] = List(".litter-box/**", ".github/**", "CONTEXT.md"),
+    /** `gate.fast`, overridable by GATE_CMD (loop.sh:133). Held repo-RELATIVE, unlike bash's absolute
       * `$SCRIPT_DIR/sandbox/run-fast-gate.sh`, because this record is pure config and knows no repo
       * root. `LiveGateRunner.resolveArgv0` re-absolutises it against that runner's `root` using
       * bash's own lookup rule, so the launched command is identical.
       */
-    gateCmd: String = "sandbox/run-fast-gate.sh",
+    gateCmd: String = "sbt -Werror compile test",
     /** CI_WAIT_CMD seam (loop.sh:446): overrides the WHOLE CI-wait gate command, including the PR
       * number (bash: `cmd="${CI_WAIT_CMD:-gh pr checks $pr_num --watch --fail-fast}"`; the override
       * contains no pr interpolation, it replaces the default verbatim). `None` (the default) means

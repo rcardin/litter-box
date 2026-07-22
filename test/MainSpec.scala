@@ -7,6 +7,12 @@ import org.scalatest.matchers.should.Matchers
   * process-exit-code map (Part B). Preflight (PATH scanning against the real host,
   * build-image.sh/start-proxy.sh subprocesses) is deliberately NOT exercised here; those are
   * live-process concerns, out of scope for this spec per the task brief.
+  *
+  * Every `parseEnv` case below passes `Settings.referenceOnly` as the file layer, i.e. "a repo whose
+  * `.litter-box/config.conf` sets nothing". That keeps these tests about the one thing they are for,
+  * the ENV layer on top, and leaves the file layer's own behaviour to `SettingsSpec`. It also means
+  * the "default" a no-env case asserts is by construction the reference's value, which is the
+  * definition of the default now that no default is written twice.
   */
 class MainSpec extends AnyFlatSpec with Matchers:
 
@@ -15,12 +21,12 @@ class MainSpec extends AnyFlatSpec with Matchers:
   // ===============================================================================================
 
   "parseEnv" should "produce every bash default (loop.sh:100-139) from an empty env map" in {
-    val parsed = Main.parseEnv(Map.empty)
+    val parsed = Main.parseEnv(Settings.referenceOnly, Map.empty)
 
     parsed.cfg.dryRun shouldBe false
     parsed.cfg.repairBudget shouldBe 2
     parsed.cfg.maxPatchBytes shouldBe 1_000_000L
-    parsed.cfg.gateCmd shouldBe "sandbox/run-fast-gate.sh"
+    parsed.cfg.gateCmd shouldBe "sbt -Werror compile test"
     parsed.cfg.ciWaitCmd shouldBe None
     parsed.cfg.gateTimeout shouldBe 900
     parsed.cfg.iterTimeout shouldBe 1800
@@ -51,7 +57,7 @@ class MainSpec extends AnyFlatSpec with Matchers:
       "NTFY_TOPIC"    -> "some-topic"
     )
 
-    val parsed = Main.parseEnv(env)
+    val parsed = Main.parseEnv(Settings.referenceOnly, env)
 
     parsed.cfg.gateCmd shouldBe "stub-gate"
     parsed.cfg.ciWaitCmd shouldBe Some("stub-ci-wait")
@@ -66,28 +72,29 @@ class MainSpec extends AnyFlatSpec with Matchers:
   }
 
   it should "treat an empty-string seam as unset (None), matching bash's [[ -n ]] test" in {
-    val parsed = Main.parseEnv(Map("IMPL_CMD" -> "", "CI_WAIT_CMD" -> ""))
+    val parsed = Main.parseEnv(Settings.referenceOnly, Map("IMPL_CMD" -> "", "CI_WAIT_CMD" -> ""))
 
     parsed.implCmd shouldBe None
     parsed.cfg.ciWaitCmd shouldBe None
   }
 
   it should "flip gateOverridden even when GATE_CMD is set to its own default value" in {
-    val parsed = Main.parseEnv(Map("GATE_CMD" -> "sandbox/run-fast-gate.sh"))
+    val parsed =
+      Main.parseEnv(Settings.referenceOnly, Map("GATE_CMD" -> "sbt -Werror compile test"))
 
     parsed.gateOverridden shouldBe true
-    parsed.cfg.gateCmd shouldBe "sandbox/run-fast-gate.sh"
+    parsed.cfg.gateCmd shouldBe "sbt -Werror compile test"
   }
 
   it should "parse DRY_RUN=1 as true, and treat 0 / absent / any other string as false" in {
-    Main.parseEnv(Map("DRY_RUN" -> "1")).cfg.dryRun shouldBe true
-    Main.parseEnv(Map("DRY_RUN" -> "0")).cfg.dryRun shouldBe false
-    Main.parseEnv(Map.empty).cfg.dryRun shouldBe false
-    Main.parseEnv(Map("DRY_RUN" -> "true")).cfg.dryRun shouldBe false
+    Main.parseEnv(Settings.referenceOnly, Map("DRY_RUN" -> "1")).cfg.dryRun shouldBe true
+    Main.parseEnv(Settings.referenceOnly, Map("DRY_RUN" -> "0")).cfg.dryRun shouldBe false
+    Main.parseEnv(Settings.referenceOnly, Map.empty).cfg.dryRun shouldBe false
+    Main.parseEnv(Settings.referenceOnly, Map("DRY_RUN" -> "true")).cfg.dryRun shouldBe false
   }
 
   it should "parse numeric overrides" in {
-    val parsed = Main.parseEnv(
+    val parsed = Main.parseEnv(Settings.referenceOnly, 
       Map(
         "MAX_ITERS"          -> "5",
         "ITER_TIMEOUT"       -> "60",
@@ -136,23 +143,36 @@ class MainSpec extends AnyFlatSpec with Matchers:
   "driverLog" should "copy loop.sh's exact log lines, including the em-dash separator" in {
     Main.driverLog(
       3,
-      LoopExit.Success
+      LoopExit.Success,
+      "STOP.md"
     ) shouldBe "iteration 3 done (SUCCESS — auto-merged, or PR -> needs-review)"
     Main.driverLog(
       3,
-      LoopExit.NeedsHuman
+      LoopExit.NeedsHuman,
+      "STOP.md"
     ) shouldBe "iteration 3 done (FAIL terminal -> needs-human, PR open for audit)"
-    Main.driverLog(3, LoopExit.ManualStop) shouldBe "manual STOP.md — exiting"
-    Main.driverLog(3, LoopExit.Idle) shouldBe "no actionable issue — idle, exiting"
-    Main.driverLog(3, LoopExit.DryRun) shouldBe "dry run reached its stop point — exiting"
+    Main.driverLog(3, LoopExit.ManualStop, "STOP.md") shouldBe "manual STOP.md — exiting"
+    Main.driverLog(3, LoopExit.Idle, "STOP.md") shouldBe "no actionable issue — idle, exiting"
+    Main.driverLog(3, LoopExit.DryRun, "STOP.md") shouldBe "dry run reached its stop point — exiting"
     Main.driverLog(
       3,
-      LoopExit.NothingMade
+      LoopExit.NothingMade,
+      "STOP.md"
     ) shouldBe "iteration 3 produced nothing — exiting for inspection"
     Main.driverLog(
       3,
-      LoopExit.InfraFault
+      LoopExit.InfraFault,
+      "STOP.md"
     ) shouldBe "infra fault — exiting for inspection (issue stays in-progress)"
+  }
+
+  /** The stop file is `stop-file` in the config now, not a constant, so the ManualStop line has to
+    * NAME the file the operator was actually told to create. A non-default value proves the
+    * parameter reaches the string: with `STOP.md` everywhere, a `driverLog` that ignored its third
+    * argument entirely would still pass every assertion above.
+    */
+  it should "name the configured stop file, not a hardcoded STOP.md" in {
+    Main.driverLog(1, LoopExit.ManualStop, "HALT.md") shouldBe "manual HALT.md — exiting"
   }
 
   // ===============================================================================================
@@ -167,48 +187,56 @@ class MainSpec extends AnyFlatSpec with Matchers:
   }
 
   // ===============================================================================================
-  // resolveRepoRoot (loop.sh:102-105's SCRIPT_DIR/REPO_ROOT derivation)
+  // resolveRepoRoot: the CONSUMER repo's work tree, per `git rev-parse --show-toplevel`
   // ===============================================================================================
 
-  /** Fake filesystem: the marker exists at exactly one absolute path. */
-  private def markerAt(root: java.nio.file.Path): java.nio.file.Path => Boolean =
-    p => p == root.resolve(Main.RootMarker)
+  /** The unit cases here stub `git` rather than run it, because what they pin is the parsing and the
+    * failure mapping, and neither is reachable from a real invocation: a healthy checkout only ever
+    * produces the happy path, and the two failures below would need a directory outside any work
+    * tree and a git that answers rc 0 with nothing, neither of which a test can manufacture without
+    * being at least as fragile as the stub. The integration case at the end covers the other half,
+    * that the real subprocess is wired up the way this stub pretends it is.
+    */
+  "resolveRepoRoot" should "take git's toplevel from stdout, trailing newline and all" in {
+    val result =
+      Main.resolveRepoRoot(() => LiveProc.Result(0, "/work/consumer-repo\n", ""))
 
-  "resolveRepoRoot" should "return the cwd when the cwd itself is the litter-box repo root" in {
-    val root = java.nio.file.Paths.get("/work/repo")
-
-    Main.resolveRepoRoot(root, markerAt(root)) shouldBe Right(root)
+    result shouldBe Right(java.nio.file.Path.of("/work/consumer-repo"))
   }
 
-  it should "walk up to the repo root when invoked from a subdirectory, as bash does" in {
-    val root = java.nio.file.Paths.get("/work/repo")
+  it should "normalise the path git reports, so the root is absolute and dot-free" in {
+    val result =
+      Main.resolveRepoRoot(() => LiveProc.Result(0, "/work/./consumer-repo/sub/..\n", ""))
 
-    Main.resolveRepoRoot(root.resolve("src/deeply/nested"), markerAt(root)) shouldBe Right(root)
+    result shouldBe Right(java.nio.file.Path.of("/work/consumer-repo"))
   }
 
-  it should "normalise the start path before walking (relative / dot segments)" in {
-    val root = java.nio.file.Paths.get("/work/repo")
-
-    Main.resolveRepoRoot(root.resolve("src/./sub/.."), markerAt(root)) shouldBe Right(root)
-  }
-
-  it should "fail loudly instead of silently taking a cwd that is not inside the repo" in {
-    val root = java.nio.file.Paths.get("/work/repo")
-
-    val result = Main.resolveRepoRoot(java.nio.file.Paths.get("/somewhere/else"), markerAt(root))
+  it should "fail loudly when the cwd is outside any work tree (git's rc 128)" in {
+    val result = Main.resolveRepoRoot(() =>
+      LiveProc.Result(128, "", "fatal: not a git repository (or any of the parent directories)\n")
+    )
 
     result.isLeft shouldBe true
-    result.left.getOrElse("") should include(Main.RootMarker)
-    result.left.getOrElse("") should include("/somewhere/else")
+    result.left.getOrElse("") should include("git rev-parse")
   }
 
-  it should "find the real repo root from this test run's own cwd" in {
-    val real = Main.resolveRepoRoot(
-      java.nio.file.Paths.get("").toAbsolutePath,
-      java.nio.file.Files.isRegularFile(_)
+  /** rc 0 with nothing on stdout is not a root anyone can use, and treating it as one would resolve
+    * to the JVM's cwd via `Path.of("")` — the silent wrong-directory run this function exists to
+    * prevent. So an empty answer is a failure even though git said it succeeded.
+    */
+  it should "reject a blank stdout even on rc 0" in {
+    Main.resolveRepoRoot(() => LiveProc.Result(0, "  \n", "")).isLeft shouldBe true
+  }
+
+  it should "resolve this checkout's own root by really shelling out to git" in {
+    val real = Main.resolveRepoRoot(() =>
+      LiveProc.run(
+        java.nio.file.Paths.get("").toAbsolutePath,
+        Seq("git", "rev-parse", "--show-toplevel")
+      )
     )
 
-    real.map(r => java.nio.file.Files.isRegularFile(r.resolve(Main.RootMarker))) shouldBe Right(
-      true
-    )
+    real.map(r =>
+      java.nio.file.Files.isRegularFile(r.resolve(Settings.ConfigPath))
+    ) shouldBe Right(true)
   }

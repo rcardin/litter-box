@@ -36,16 +36,23 @@ private[litterbox] object LiveFiles:
     Option(p.getParent).foreach(Files.createDirectories(_))
     ()
 
-/** Filesystem the harness owns: prompts, logs, markers, STOP.md. All paths passed into `write`/
-  * `read`/`sizeBytes` arrive repo-relative from Machine (e.g. `logs/issue-999.prompt.txt`)
-  * and are resolved against `root`; `root` is a constructor parameter (never hardcoded to the
-  * process cwd) so tests can point it at a temp dir.
+/** Filesystem the harness owns: prompts, logs, markers, the stop file. All paths passed into
+  * `write`/`read`/`sizeBytes` arrive repo-relative from Machine (already carrying the configured
+  * `log-dir`) and are resolved against `root`; `root` is a constructor parameter (never hardcoded to
+  * the process cwd) so tests can point it at a temp dir.
   */
-final class LiveHarnessFs(root: Path) extends HarnessFs:
+final class LiveHarnessFs(
+    root: Path,
+    stopFile: String = Config().stopFile,
+    conventionsFile: String = Config().conventions
+) extends HarnessFs:
 
-  /** loop.sh:623 checks `$REPO_ROOT/STOP.md`, i.e. repo-root-relative, not under harness/. */
+  /** loop.sh:623 checks `$REPO_ROOT/STOP.md`, i.e. repo-root-relative, not under harness/. The name
+    * is `stop-file` in the config now, so a consumer repo that already means something else by
+    * `STOP.md` can pick another.
+    */
   def stopRequested(): Boolean =
-    Files.isRegularFile(root.resolve("STOP.md"))
+    Files.isRegularFile(root.resolve(stopFile))
 
   /** The three prompt templates, `prompts/<name>.md` relative to the repo root. Bash read them from
     * `$SCRIPT_DIR/<name>.md` (loop.sh:116-118), i.e. the harness directory; here the root IS the
@@ -54,9 +61,9 @@ final class LiveHarnessFs(root: Path) extends HarnessFs:
   def readTemplate(t: Template): String =
     readString(root.resolve(Machine.PromptDir).resolve(t.fileName))
 
-  /** loop.sh:119: `CONVENTIONS="$REPO_ROOT/CONTEXT.md"`. */
+  /** loop.sh:119: `CONVENTIONS="$REPO_ROOT/CONTEXT.md"`, now the `conventions` config key. */
   def conventions(): String =
-    readString(root.resolve("CONTEXT.md"))
+    readString(root.resolve(conventionsFile))
 
   def write(path: String, content: String): Unit =
     val p = root.resolve(path)
@@ -82,13 +89,14 @@ final class LiveHarnessFs(root: Path) extends HarnessFs:
     new String(Files.readAllBytes(p), java.nio.charset.StandardCharsets.UTF_8)
 
 /** status.jsonl appender (loop.sh:151-171, `phase()`). One JSON line per event, appended to
-  * `root/logs/status.jsonl`. Fire and forget: the whole write path swallows exceptions,
+  * `root/<log-dir>/status.jsonl`. Fire and forget: the whole write path swallows exceptions,
   * matching bash's `>>"$STATUS_FILE" 2>/dev/null || true`, a wrong/missing event is a wrong banner,
   * never a wrong merge.
   */
-final class LiveStatusLog(root: Path, runId: String) extends StatusLog:
+final class LiveStatusLog(root: Path, runId: String, logDir: String = Config().logDir)
+    extends StatusLog:
 
-  private val statusFile = root.resolve(Machine.LogDir).resolve("status.jsonl")
+  private val statusFile = root.resolve(logDir).resolve("status.jsonl")
 
   def append(event: StatusEvent): Unit =
     try
@@ -205,6 +213,18 @@ private[litterbox] object LiveProc:
 
   def pinJdk(javaHome: Option[String]): Unit = jdkPin = javaHome
 
+  /** Config-derived variables stamped onto EVERY child, on the same reasoning as `jdkPin`: bash got
+    * this by `export`ing into its own environment, a JVM cannot, so `builder` — the one choke point
+    * every `ProcessBuilder` in the harness goes through — does it per child instead.
+    *
+    * Today this carries `LITTER_BOX_INSTANCE` (`Settings.childEnv`), which `sandbox/lib.sh` turns
+    * into the Docker image/network/proxy/volume names. Set once by `Main` at startup; empty
+    * everywhere else, so a test that never sets it sees an unmodified child environment.
+    */
+  @volatile private var exported: Map[String, String] = Map.empty
+
+  def exportEnv(vars: Map[String, String]): Unit = exported = vars
+
   /** Bash word-splitting of an UNQUOTED `$cmd` expansion, the single helper every word-split seam
     * (`GATE_CMD` / `CI_WAIT_CMD` via `LiveGateRunner`, `MERGE_CMD` via `LiveGitHub.merge`) goes
     * through.
@@ -246,6 +266,7 @@ private[litterbox] object LiveProc:
     */
   def builder(args: Seq[String]): ProcessBuilder =
     val pb = new ProcessBuilder(args.asJava)
+    exported.foreach { case (k, v) => pb.environment().put(k, v) }
     jdkPin.foreach { javaHome =>
       val procEnv = pb.environment() // inherits the parent process environment; never cleared
       procEnv.put("JAVA_HOME", javaHome)
@@ -698,7 +719,13 @@ final class LiveGitHub(
     root: Path,
     ciAppearCmd: Option[String],
     mergeCmd: Option[String],
-    extraPath: Option[String] = None
+    extraPath: Option[String] = None,
+    /** The three queue labels off `issues.labels`. Only the three QUERY methods below need them —
+      * they bake a label into the `gh` argv; the label EDITS are `Machine`'s, which threads the same
+      * values off its `Config`. Trailing with a default so the many `extraPath`-only test
+      * constructions stay positional; production (`Main`) always passes the configured value.
+      */
+    labels: Labels = Labels()
 ) extends GitHub:
 
   // "" means unset, folded once on the way in (LiveProc.seam).
@@ -708,7 +735,8 @@ final class LiveGitHub(
   private def gh(args: String*): LiveProc.Result =
     LiveProc.run(root, "gh" +: args, pathPrepend = extraPath)
 
-  /** loop.sh:627: `gh issue list --state open --label in-progress --json number --jq .[0].number`.
+  /** loop.sh:627: `gh issue list --state open --label <active> --json number --jq .[0].number`.
+    * Crash-resume asks for the CONFIGURED active label, never the literal `in-progress`.
     */
   def inProgressIssue(): Option[Int] =
     gh(
@@ -717,7 +745,7 @@ final class LiveGitHub(
       "--state",
       "open",
       "--label",
-      "in-progress",
+      labels.active,
       "--json",
       "number",
       "--jq",
@@ -732,7 +760,7 @@ final class LiveGitHub(
       "--state",
       "open",
       "--label",
-      "ready",
+      labels.ready,
       "--json",
       "number,createdAt",
       "--jq",
@@ -792,7 +820,7 @@ final class LiveGitHub(
       remove.flatMap(l => Seq("--remove-label", l))
     gh(args*).rc == 0
 
-  /** loop.sh:392: `gh issue list --state open --label blocked --json number --jq .[].number`. */
+  /** loop.sh:392: `gh issue list --state open --label <blocked> --json number --jq .[].number`. */
   def openBlockedIssues(): List[Int] =
     gh(
       "issue",
@@ -800,7 +828,7 @@ final class LiveGitHub(
       "--state",
       "open",
       "--label",
-      "blocked",
+      labels.blocked,
       "--json",
       "number",
       "--jq",

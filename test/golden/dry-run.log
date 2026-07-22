@@ -1,2 +1,2 @@
 iteration 1 -> issue #999
-DRY_RUN=1 — rendered worker prompt for #999 -> logs/issue-999.prompt.txt; no mutation; stopping
+DRY_RUN=1 — rendered worker prompt for #999 -> .litter-box/logs/issue-999.prompt.txt; no mutation; stopping

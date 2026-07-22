@@ -7,7 +7,7 @@
 # never invokes gh. Attach, kill and reattach at any point in a run; the loop cannot tell.
 #
 # Usage:  harness/watch.sh [status.jsonl]
-#         (no arg → harness/logs/status.jsonl)
+#         (no arg → <repo root>/.litter-box/logs/status.jsonl, the `log-dir` config default)
 #
 # The PARENT is the only writer to the terminal. The child `tail -f` writes into a FIFO and
 # the parent prints what it reads, so a banner redraw can never interleave with a log line
@@ -16,13 +16,19 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+# Same question the loop itself answers with `git rev-parse --show-toplevel` (Main.resolveRepoRoot):
+# the repo being worked on, not wherever this script happens to live.
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || echo "$SCRIPT_DIR")"
 cd "$REPO_ROOT"     # `logfile` fields are repo-relative
+
+# The loop's `log-dir` config key. LITTER_BOX_LOG_DIR overrides it for a repo that changed it;
+# the fallback is the reference default (src/Settings.scala).
+LOG_DIR="${LITTER_BOX_LOG_DIR:-.litter-box/logs}"
 
 # shellcheck source=lib/banner.sh
 . "$SCRIPT_DIR/lib/banner.sh"
 
-STATUS="${1:-$SCRIPT_DIR/logs/status.jsonl}"
+STATUS="${1:-$REPO_ROOT/$LOG_DIR/status.jsonl}"
 FILTER="$SCRIPT_DIR/lib/claude-fmt.jq"
 command -v jq >/dev/null || { echo "jq not found" >&2; exit 1; }
 [[ -f "$FILTER" ]] || { echo "missing filter: $FILTER" >&2; exit 1; }

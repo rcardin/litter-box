@@ -19,12 +19,9 @@ object Machine:
     */
   private type Faulting = boundary.Label[LoopExit]
 
-  /** Where every per-iteration artifact (prompts, patches, gate logs, status.jsonl) is written,
-    * relative to the repo root. `logs/`, not `harness/logs/`: `watch.sh` and `tail-claude.sh` sit at
-    * the repo root and read `$SCRIPT_DIR/logs`, so this is the path that keeps them pointed at the
-    * run they are supposed to be watching.
-    */
-  val LogDir = "logs"
+  // (was: `val LogDir = "logs"`.) The artifact directory is `Config.logDir` now — a consumer repo
+  // says where its loop writes, and `watch.sh` / `tail-claude.sh` read the same key. Every site
+  // below takes it off the `Config` in scope.
 
   /** Where the three prompt templates live, relative to the repo root. Bash read them from
     * `$SCRIPT_DIR` (loop.sh:116-118); here the root IS the project, so they sit in the project's own
@@ -146,9 +143,9 @@ object Machine:
       clock: Clock,
       logger: Log
   )(using Faulting): LoopExit =
-    // STOP.md is a MANUAL kill-switch only: the loop never writes it itself.
+    // The stop file is a MANUAL kill-switch only: the loop never writes it itself.
     if fs.stopRequested() then
-      logger.log("STOP.md present (manual kill-switch) — exiting")
+      logger.log(s"${cfg.stopFile} present (manual kill-switch) — exiting")
       return LoopExit.ManualStop
 
     // Pick US (deterministic, no LLM): resume an in-progress one, else oldest ready.
@@ -164,9 +161,9 @@ object Machine:
     logger.log(s"iteration $n -> issue #$issue")
 
     // Render the worker prompt with the issue body injected (read-only).
-    val bodyFile = s"$LogDir/issue-$issue.body.md"
+    val bodyFile = s"${cfg.logDir}/issue-$issue.body.md"
     fs.write(bodyFile, gh.issueTitleAndBody(issue))
-    val workerPromptFile = s"$LogDir/issue-$issue.prompt.txt"
+    val workerPromptFile = s"${cfg.logDir}/issue-$issue.prompt.txt"
     fs.write(
       workerPromptFile,
       renderTemplate(fs.readTemplate(Template.Iterate), "ISSUE" -> fs.read(bodyFile))
@@ -193,8 +190,8 @@ object Machine:
     val branch = s"us-$issue"
     if !git.checkoutBranch(branch) then throw IllegalStateException("cannot branch off origin/main")
 
-    // Mark in-progress so a crashed run resumes the same US next tick.
-    gh.editLabels(issue, add = List("in-progress"), remove = List("ready"))
+    // Mark active so a crashed run resumes the same US next tick.
+    gh.editLabels(issue, add = List(cfg.labels.active), remove = List(cfg.labels.ready))
 
     // --- bounded self-repair state -------------------------------------------------------
     // Declared BEFORE the initial dispatch: a patch-guard rejection on the very first worker
@@ -205,14 +202,14 @@ object Machine:
     var gateStatus                       = ""
     var failureKind: Option[FailureKind] = None
     var currentPatch: Option[String]     = None
-    val reviewFile                       = s"$LogDir/issue-$issue-review.md"
+    val reviewFile                       = s"${cfg.logDir}/issue-$issue-review.md"
     fs.write(reviewFile, "") // empty until the first review
     var reviewed = false
 
     // Initial worker dispatch (fresh context), crossing the patch seam. The tree the worker
     // edited is never committed directly.
-    val implLog   = s"$LogDir/issue-$issue-iter$n.claude.log"
-    val implPatch = s"$LogDir/issue-$issue-iter$n.impl.patch"
+    val implLog   = s"${cfg.logDir}/issue-$issue-iter$n.claude.log"
+    val implPatch = s"${cfg.logDir}/issue-$issue-iter$n.impl.patch"
     emit(cur, "IMPL", "start", implLog)
     stagePatch(Role.IMPL, workerPromptFile, implPatch, implLog, currentPatch) match
       case StageResult.Empty =>
@@ -229,7 +226,7 @@ object Machine:
     // repair loop's control flow (bash dispatch_fix + handle_fix_result). Infra faults raise;
     // guard rejections and an empty fix become the terminal FAIL; Ok advances currentPatch.
     def fixRound(pass: Int, failFile: String): Unit =
-      val fixPromptFile = s"$LogDir/issue-$issue-pass$pass.fix.prompt.txt"
+      val fixPromptFile = s"${cfg.logDir}/issue-$issue-pass$pass.fix.prompt.txt"
       fs.write(
         fixPromptFile,
         renderTemplate(
@@ -238,8 +235,8 @@ object Machine:
           "FAILURE" -> fs.read(failFile)
         )
       )
-      val fixLog   = s"$LogDir/issue-$issue-pass$pass.fix.claude.log"
-      val fixPatch = s"$LogDir/issue-$issue-pass$pass.fix.patch"
+      val fixLog   = s"${cfg.logDir}/issue-$issue-pass$pass.fix.claude.log"
+      val fixPatch = s"${cfg.logDir}/issue-$issue-pass$pass.fix.patch"
       emit(cur, "FIX", "start", fixLog)
       stagePatch(Role.FIX, fixPromptFile, fixPatch, fixLog, currentPatch) match
         case StageResult.Empty =>
@@ -261,7 +258,7 @@ object Machine:
       else
         budget -= 1; cur.budget = budget
         logger.log(s"self-repair: budget now $budget — dispatching FIX for ${trigger.text}")
-        val failFile = s"$LogDir/issue-$issue-pass$pass.failure.md"
+        val failFile = s"${cfg.logDir}/issue-$issue-pass$pass.failure.md"
         fs.write(failFile, failContent)
         fixRound(pass, failFile)
 
@@ -271,7 +268,7 @@ object Machine:
       pass += 1
       git.addAll() // stage so new files show in diff/gate/tamper
       cur.pass = pass
-      val gateLog = s"$LogDir/issue-$issue-pass$pass.gate.log"
+      val gateLog = s"${cfg.logDir}/issue-$issue-pass$pass.gate.log"
       emit(cur, "FAST_GATE", "start", gateLog)
       gates.run("FAST", cfg.gateCmd, cfg.gateTimeout, gateLog) match
         case GateResult.Timeout =>
@@ -294,11 +291,11 @@ object Machine:
           logger.log(s"FAST gate GREEN (pass $pass) — running tamper check + cold reviewer")
 
           // Tamper check feeds the reviewer (the harness surfaces, does not block).
-          val tamperFile = s"$LogDir/issue-$issue-tamper.md"
+          val tamperFile = s"${cfg.logDir}/issue-$issue-tamper.md"
           fs.write(tamperFile, tamperReport(currentPatch.map(git.applyNumstat).getOrElse("")))
-          val diffFile = s"$LogDir/issue-$issue-diff.patch"
+          val diffFile = s"${cfg.logDir}/issue-$issue-diff.patch"
           fs.write(diffFile, git.diffCachedOriginMain())
-          val reviewPromptFile = s"$LogDir/issue-$issue-pass$pass.review.prompt.txt"
+          val reviewPromptFile = s"${cfg.logDir}/issue-$issue-pass$pass.review.prompt.txt"
           fs.write(
             reviewPromptFile,
             renderTemplate(
@@ -436,7 +433,7 @@ object Machine:
     else
       prBody ++= "Not auto-merged (v4 merges class-1 + APPROVE only): a human reviews and merges.\n\n"
     prBody ++= s"Closes #$issue\n"
-    fs.write(s"$LogDir/issue-$issue.pr-body.md", prBody.toString)
+    fs.write(s"${cfg.logDir}/issue-$issue.pr-body.md", prBody.toString)
 
     val prUrl = gh.createPr(
       branch,
@@ -453,7 +450,7 @@ object Machine:
     route match
       case Route.AutoMergeCandidate => autoMerge(issue, prNum, cur)
       case Route.NeedsReview | Route.NeedsHuman =>
-        gh.editLabels(issue, add = List(label), remove = List("in-progress"))
+        gh.editLabels(issue, add = List(label), remove = List(cfg.labels.active))
         logger.log(s"issue #$issue -> $label")
         if route == Route.NeedsReview then LoopExit.Success else LoopExit.NeedsHuman
 
@@ -472,7 +469,7 @@ object Machine:
       clock: Clock,
       logger: Log
   )(using Faulting): LoopExit =
-    val ciLog = s"$LogDir/issue-$issue.ci-wait.log"
+    val ciLog = s"${cfg.logDir}/issue-$issue.ci-wait.log"
     emit(cur, "CI_WAIT", "start", ciLog)
     // Discriminate on data, not on the exit code: a fresh PR routinely reports zero checks
     // for a few seconds (push races the workflow scheduler, PR #28 / issue #26). Block until
@@ -502,7 +499,7 @@ object Machine:
           "CI red after local gates were green. The loop never self-repairs against the independent check (v3 hands-off rule) — a human must look."
         )
         // bash guards this flip (loop.sh:464): a failed flip is a warning, not a hard stop.
-        if !gh.editLabels(issue, add = List("needs-human"), remove = List("in-progress")) then
+        if !gh.editLabels(issue, add = List("needs-human"), remove = List(cfg.labels.active)) then
           logger.log(s"WARNING: could not flip #$issue to needs-human (flip by hand)")
         notify.notify(s"harness: #$issue CI RED -> needs-human (PR #$prNum)")
         LoopExit.NeedsHuman
@@ -521,7 +518,7 @@ object Machine:
           val shown = if state.isEmpty then "unknown" else state
           infraFault(s"merge NOT verified (PR state '$shown') — infra fault")
         emit(cur, "MERGE", "ok", detail = s"pr=$prNum")
-        gh.editLabels(issue, add = Nil, remove = List("in-progress"))
+        gh.editLabels(issue, add = Nil, remove = List(cfg.labels.active))
         flipBlocked(issue)
         // a post-merge fetch failure is tolerated: next tick re-fetches
         if !git.fetchOriginMain() then
@@ -554,15 +551,16 @@ object Machine:
     * The just-merged issue counts as closed even if GitHub's async close lags the merge. Issues
     * without the sentinel are left alone (human-managed).
     */
-  private def flipBlocked(mergedIssue: Int)(using gh: GitHub, logger: Log): Unit =
+  private def flipBlocked(mergedIssue: Int)(using cfg: Config, gh: GitHub, logger: Log): Unit =
+    val (blocked, ready) = (cfg.labels.blocked, cfg.labels.ready)
     gh.openBlockedIssues().foreach { b =>
       val refs = parseBlockedBy(gh.issueBody(b))
       if refs.nonEmpty then
         val allClosed = refs.forall(r => r == mergedIssue || gh.issueState(r) == "CLOSED")
         if allClosed then
-          logger.log(s"dependency #$mergedIssue closed — flipping #$b blocked -> ready")
-          if !gh.editLabels(b, add = List("ready"), remove = List("blocked")) then
-            logger.log(s"WARNING: could not flip #$b blocked -> ready (flip by hand)")
+          logger.log(s"dependency #$mergedIssue closed — flipping #$b $blocked -> $ready")
+          if !gh.editLabels(b, add = List(ready), remove = List(blocked)) then
+            logger.log(s"WARNING: could not flip #$b $blocked -> $ready (flip by hand)")
     }
 
   private enum Outcome:
@@ -713,9 +711,9 @@ object Machine:
         numstat
       )
       return StageResult.Oversize
-    if touchesProtected(numstat) then
+    if touchesProtected(cfg.protect, numstat) then
       logger.log(
-        "patch guard: patch touches a protected path (.github/, sandbox/, lib/, prompts/, docs/, project.scala, watch.sh, tail-claude.sh, CONTEXT.md, PROMPT.md or STOP.md) — rejecting (not applied)"
+        s"patch guard: patch touches a protected path (${cfg.protect.mkString(", ")}) — rejecting (not applied)"
       )
       writeRejectMarker(
         "Patch touches a protected path (CI workflow, loop code, docs, or a control/constitution file).",
@@ -756,23 +754,17 @@ object Machine:
   private[litterbox] def numstatPaths(numstat: String): List[String] =
     numstat.linesIterator.toList.flatMap(line => NumstatRow.parse(line).map(_.path))
 
-  /** The three classes the sandbox must never let an agent rewrite (CI workflows, loop code, the
-    * constitution) plus docs/ and the control files.
+  /** Whether a patch touches anything the consumer repo declared off-limits in `protect` — CI
+    * workflows, the loop's own installed files, the constitution, whatever that repo names.
     *
-    * Since the repo root IS the loop, "loop code" is enumerated as the loop-owned paths that cannot
-    * collide with a worked-on project's layout. `src/` is DELIBERATELY absent: it holds the loop's
-    * own sources but is also the conventional source root of the project the loop works on (see
-    * `tamperReport`, which reads `src/test/` and `src/it/` out of the worked-on repo), so listing it
-    * would reject every legitimate worker patch. Closing that hole needs the `instance_name`/config
-    * work tracked in issue #3.
+    * The list used to be a literal here, enumerating THIS repo's layout, which only worked while the
+    * loop and the repo it worked on were the same checkout. Now it arrives as globs off the config,
+    * so a consumer repo protects its own paths and the loop protects everything under
+    * `.litter-box` — including the config file that defines this very list, which is what stops an
+    * agent from widening its own guard.
     */
-  private[litterbox] def touchesProtected(numstat: String): Boolean =
-    numstatPaths(numstat).exists { p =>
-      p.startsWith(".github/") || p.startsWith("sandbox/") || p.startsWith("lib/") ||
-      p.startsWith("prompts/") || p.startsWith("docs/") ||
-      p == "project.scala" || p == "watch.sh" || p == "tail-claude.sh" ||
-      p == "CONTEXT.md" || p == "PROMPT.md" || p == "STOP.md"
-    }
+  private[litterbox] def touchesProtected(protect: List[String], numstat: String): Boolean =
+    numstatPaths(numstat).exists(p => Settings.isProtected(protect, p))
 
   /** Test-tamper report over the applied patch's numstat, filtered to src/test and src/it. */
   private[litterbox] def tamperReport(numstat: String): String =

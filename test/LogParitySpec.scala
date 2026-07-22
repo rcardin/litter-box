@@ -62,7 +62,9 @@ class LogParitySpec extends AnyFlatSpec with Matchers:
 
   it should "match the golden for a patch rejected for touching a protected path" in {
     val w = TestWorld()
-    w.implScript = WorkerScript.Produces("1\t0\tsandbox/evil.sh")
+    // `.github/**` is in the reference `protect` list, so this drives a real guard rejection
+    // without the scenario having to carry a bespoke config.
+    w.implScript = WorkerScript.Produces("1\t0\t.github/workflows/evil.yml")
 
     w.runLoop() shouldBe LoopExit.NeedsHuman
 

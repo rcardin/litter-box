@@ -27,11 +27,16 @@ import java.nio.file.{Files, Path, Paths}
   */
 object Golden:
 
-  /** `test/golden`, resolved from the repo root rather than the JVM cwd, reusing the same ancestor
-    * walk `Main` uses so this works from any working directory a test runner might pick.
+  /** `test/golden`, resolved from the repo root rather than the JVM cwd, reusing the same
+    * `git rev-parse --show-toplevel` question `Main` asks so this works from any working directory a
+    * test runner might pick. Shelling out for real is the point here rather than a nuisance: this is
+    * a path into THIS checkout, so a stubbed answer would only be a second, weaker copy of the
+    * hardcoding it replaces.
     */
   private lazy val dir: Path =
-    Main.resolveRepoRoot(Paths.get("").toAbsolutePath, Files.isRegularFile(_)) match
+    Main.resolveRepoRoot(() =>
+      LiveProc.run(Paths.get("").toAbsolutePath, Seq("git", "rev-parse", "--show-toplevel"))
+    ) match
       case Right(root) => root.resolve("test").resolve("golden")
       case Left(msg)   => throw IllegalStateException(s"cannot locate the golden directory: $msg")
 

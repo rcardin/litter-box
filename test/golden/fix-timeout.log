@@ -1,4 +1,4 @@
 iteration 1 -> issue #999
-FAST gate RED (pass 1, see logs/issue-999-pass1.gate.log)
+FAST gate RED (pass 1, see .litter-box/logs/issue-999-pass1.gate.log)
 self-repair: budget now 1 — dispatching FIX for gate-RED
 FIX worker timed out (infra fault); exiting without spending further budget
