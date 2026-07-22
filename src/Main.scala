@@ -7,8 +7,11 @@ import scala.util.control.NonFatal
 
 /** Entry point: `scala-cli run .`. Env parsing, preflight, and the MAX_ITERS driver
   * loop that reproduces the original loop.sh's outer shell (loop.sh:100-215 for startup/preflight,
-  * loop.sh:925-944 for the driver) over the Machine/Live wiring tasks 1-2 built. No CLI args are
-  * consumed; everything is env, exactly like bash.
+  * loop.sh:925-944 for the driver) over the Machine/Live wiring tasks 1-2 built.
+  *
+  * Args reach `Cli.parse` first. `init`, `eject` and `help` run and exit before any preflight,
+  * because a repo with no config is the whole reason to run `init`; everything else the loop needs
+  * still comes from the environment, exactly like bash.
   */
 object Main:
 
@@ -104,6 +107,56 @@ object Main:
 
   private def onRealPath(pathEnv: String, name: String): Option[String] =
     findOnPath(pathEnv, name, p => Files.isExecutable(Path.of(p)))
+
+  // ---- gate-tool preflight: is the CONFIGURED gate command runnable at all? ------------------
+
+  /** Whether the configured gate command can actually be launched, checked the same way
+    * `LiveGateRunner.run` itself resolves and launches it — word-split, then argv[0] resolved
+    * against `root` by `resolveArgv0` — rather than by a hard-coded guess at what build tool the
+    * gate happens to use.
+    *
+    * Replaces a former hard-coded `sbt` PATH probe (loop.sh:196), a verbatim port of a bash script
+    * that only ever ran one repo's own sbt build. That assumption does not survive `litter-box`
+    * becoming a tool other repos consume: THIS repo's own `gate.fast` is `sandbox/run-fast-gate.sh`,
+    * a script that `docker run`s a container — sbt executes INSIDE that container and the host never
+    * needs it, so the old check was preflighting a binary the run does not use. A scaffolded
+    * consumer's gate is whatever `gate.fast` says, sbt or not; hard-coding `sbt` there produced the
+    * wrong diagnostic (`sbt not found`) for every non-sbt consumer. Probing the CONFIGURED command's
+    * own argv0 is the one preflight that is correct for every consumer, because it is the exact
+    * thing `LiveGateRunner` is about to try to exec.
+    *
+    * An empty/whitespace-only `gateCmd` returns `None` (nothing missing), not an error:
+    * `LiveProc.wordSplit` gives it bash's own no-op reading, the same one `LiveGateRunner.run`'s
+    * empty-argv branch relies on (Live.scala:450-464) to stay green on an empty gate. A preflight
+    * that treated an empty gate as a missing tool would reject a configuration the gate runner
+    * itself accepts and runs green — a regression this function must not introduce.
+    *
+    * TEST AFFORDANCE, deliberate, same shape as `findOnPath`'s `exists`: injected so the resolution
+    * can be exercised against invented PATHs, repo roots and gate commands without depending on what
+    * the host machine happens to have installed. THE ONLY PRODUCTION CALLER IS `onRealGateTool`
+    * below, which passes the real `Files.isExecutable`.
+    *
+    * Returns the argv0 AS RESOLVED — a repo-relative script made absolute under `root`, a bare name
+    * left untouched — when it could not be found, so the operator sees the actual thing that was
+    * looked for rather than the raw config string.
+    */
+  private[litterbox] def missingGateTool(
+      root: Path,
+      gateCmd: String,
+      pathEnv: String,
+      exists: String => Boolean
+  ): Option[String] =
+    LiveProc.wordSplit(gateCmd) match
+      case Seq() => None // empty/whitespace-only gate: bash's no-op, nothing to find
+      case words =>
+        val argv0 = LiveGateRunner.resolveArgv0(root, words).head
+        val runnable =
+          if argv0.contains('/') then exists(argv0)
+          else findOnPath(pathEnv, argv0, exists).isDefined
+        Option.unless(runnable)(argv0)
+
+  private def onRealGateTool(root: Path, gateCmd: String, pathEnv: String): Option[String] =
+    missingGateTool(root, gateCmd, pathEnv, p => Files.isExecutable(Path.of(p)))
 
   // ---- Part B: driver rc -> process-exit-code map (loop.sh:925-944) ------------------------
 
@@ -230,7 +283,62 @@ object Main:
 
   // ---- Part B: entry point -------------------------------------------------------------------
 
-  @main def litterBoxLoop(): Unit =
+  /** `--dry-run` ORs with `DRY_RUN=1` rather than replacing it.
+    *
+    * One-way on purpose: the flag can turn a dry run ON, never off. `DRY_RUN=1` is what an operator
+    * exports when they want to be sure nothing mutates, and the sandbox test scripts set it the same
+    * way; a flag able to clear it would be a way to mutate a repo somebody believed was safe.
+    */
+  private[litterbox] def applyDryRunFlag(flagged: Boolean, env: Map[String, String]): Boolean =
+    flagged || env.getOrElse("DRY_RUN", "0") == "1"
+
+  /** `litter-box init`. Runs before every preflight the loop does: a repo with no config is the
+    * whole reason to run this, so requiring one would be circular, and there is no reason to insist
+    * on Docker or a credential to write six files.
+    */
+  private def runInit(force: Boolean): Int =
+    val cwd  = Paths.get("").toAbsolutePath
+    val root = resolveRepoRoot(() => LiveProc.run(cwd, Seq("git", "rev-parse", "--show-toplevel")))
+    root match
+      case Left(msg) => LiveLog.log(s"FATAL: $msg"); 1
+      case Right(r)  =>
+        val detected = Init.detect(r, args => LiveProc.run(r, args))
+        Init.run(r, detected, force) match
+          case Left(msg)      => LiveLog.log(s"FATAL: $msg"); 1
+          case Right(written) =>
+            written.foreach(p => LiveLog.log(s"wrote $p"))
+            Init.warnings(detected).foreach(w => LiveLog.log(s"WARNING: $w"))
+            LiveLog.log("next steps:")
+            Init.nextSteps(detected).foreach(s => LiveLog.log(s"  - $s"))
+            0
+
+  /** `litter-box eject <prompt>`. Same reasoning as `runInit` for skipping preflight. */
+  private def runEject(what: String, force: Boolean): Int =
+    val cwd  = Paths.get("").toAbsolutePath
+    resolveRepoRoot(() => LiveProc.run(cwd, Seq("git", "rev-parse", "--show-toplevel"))) match
+      case Left(msg) => LiveLog.log(s"FATAL: $msg"); 1
+      case Right(r)  =>
+        Prompts.eject(r, what, force) match
+          case Left(msg)   => LiveLog.log(s"FATAL: $msg"); 1
+          case Right(dest) =>
+            LiveLog.log(s"wrote ${r.relativize(dest)} — it now overrides the built-in")
+            0
+
+  @main def litterBoxLoop(args: String*): Unit =
+    Cli.parse(args.toList) match
+      case Left(msg) =>
+        LiveLog.log(s"FATAL: $msg")
+        Console.err.println(Cli.Usage)
+        sys.exit(1)
+      case Right(Command.Help) =>
+        Console.out.println(Cli.Usage)
+        sys.exit(0)
+      case Right(Command.Init(force))        => sys.exit(runInit(force))
+      case Right(Command.Eject(what, force)) => sys.exit(runEject(what, force))
+      case Right(Command.Loop(dryRun))       => runLoop(dryRun)
+
+  /** The loop, which is everything this file did before there were subcommands. */
+  private def runLoop(dryRunFlag: Boolean): Unit =
     val env = sys.env
 
     // 1. root = the git work tree the process was launched inside. Everything downstream is
@@ -247,7 +355,10 @@ object Main:
     val fromFile = Settings.loadFile(root) match
       case Right(c)  => c
       case Left(msg) => die50(msg)
-    val parsed = parseEnv(fromFile, env)
+    val parsed0 = parseEnv(fromFile, env)
+    val parsed  = parsed0.copy(cfg =
+      parsed0.cfg.copy(dryRun = applyDryRunFlag(dryRunFlag, env))
+    )
 
     // 2b. instance-name reaches the sandbox scripts as an env var on every child (see
     // LiveProc.export). Set BEFORE the preflight below, which is itself the first child.
@@ -268,9 +379,12 @@ object Main:
 
     val pathEnv = env.getOrElse("PATH", "")
 
-    // 6a. gh/sbt/claude must be findable on PATH (loop.sh:195-197).
+    // 6a. gh/claude must be findable on PATH (loop.sh:195-197); the gate command must be launchable
+    // whatever it is (see `missingGateTool` — this repo's own gate never runs sbt on the host).
     if onRealPath(pathEnv, "gh").isEmpty then die("gh not found")
-    if onRealPath(pathEnv, "sbt").isEmpty then die("sbt not found")
+    onRealGateTool(root, parsed.cfg.gateCmd, pathEnv).foreach(t =>
+      die(s"gate command not runnable: $t not found (gate.fast in .litter-box/config.conf)")
+    )
     if onRealPath(pathEnv, "claude").isEmpty then die("claude not found")
 
     // 6b. Sandbox preflight (loop.sh:198-211), skipped entirely when GATE_CMD is overridden.
@@ -297,10 +411,11 @@ object Main:
         ()
       }
 
-    // 6c. Prompt template / conventions file existence (loop.sh:116-119, 212-215).
+    // 6c. Conventions file existence (loop.sh:119, 212-215). The prompt-template check that used
+    // to sit here is gone: the skeletons ship in the artifact now (`Prompts.builtIn`), so there is
+    // no consumer-side file whose absence could be a startup failure. A consumer repo that has
+    // never ejected anything has no `prompts/` directory at all, and that is the normal case.
     val conventions = root.resolve(parsed.cfg.conventions)
-    for f <- Template.values.map(t => root.resolve(Machine.PromptDir).resolve(t.fileName)) do
-      if !Files.isRegularFile(f) then die(s"missing prompt template: $f")
     if !Files.isRegularFile(conventions) then die(s"missing conventions file: $conventions")
 
     // 7. timeoutBin = first of `timeout`, `gtimeout` found on PATH, else None (loop.sh:174).
@@ -326,11 +441,14 @@ object Main:
     given Clock      = LiveClock
     given Log        = LiveLog
 
-    // 9. loop.sh:926's start line, copied byte-for-byte. DRY_RUN is rendered as the raw env
-    // string bash would show (`$DRY_RUN` after its own `${DRY_RUN:-0}` default), not the parsed
-    // boolean.
+    // 9. loop.sh:926's start line. Unlike loop.sh, this build has a second way into dry-run
+    // (`--dry-run`), so the raw env var and the mode the run is actually in can now disagree — the
+    // banner has to report `parsed.cfg.dryRun`, the folded value `applyDryRunFlag` already produced,
+    // or an operator who passed `--dry-run` alone would be told DRY_RUN=0 while the run genuinely
+    // stops at the dry-run stop point. The banner is the operator's confirmation of which mode a run
+    // is in, so it must match the mode the run is actually taking, not one of the two inputs to it.
     LiveLog.log(
-      s"v2 loop start (MAX_ITERS=${parsed.maxIters}, ITER_TIMEOUT=${parsed.cfg.iterTimeout}s, REPAIR_BUDGET=${parsed.cfg.repairBudget}, DRY_RUN=${env.getOrElse("DRY_RUN", "0")})"
+      s"v2 loop start (MAX_ITERS=${parsed.maxIters}, ITER_TIMEOUT=${parsed.cfg.iterTimeout}s, REPAIR_BUDGET=${parsed.cfg.repairBudget}, DRY_RUN=${if parsed.cfg.dryRun then "1" else "0"})"
     )
 
     sys.exit(runDriver(parsed.maxIters))

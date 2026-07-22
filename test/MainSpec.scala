@@ -187,6 +187,49 @@ class MainSpec extends AnyFlatSpec with Matchers:
   }
 
   // ===============================================================================================
+  // missingGateTool: is the CONFIGURED gate command runnable, whatever build tool it names?
+  // ===============================================================================================
+
+  private val gateRoot = java.nio.file.Path.of("/work/consumer-repo")
+  private val gatePath = List("/usr/bin", "/bin").mkString(java.io.File.pathSeparator)
+
+  "missingGateTool" should "find None when a bare tool name is on PATH" in {
+    Main.missingGateTool(gateRoot, "true", gatePath, _ == "/usr/bin/true") shouldBe None
+  }
+
+  it should "return the bare tool name when it is on no PATH dir" in {
+    Main.missingGateTool(gateRoot, "sbt", gatePath, _ => false) shouldBe Some("sbt")
+  }
+
+  it should "find None when a repo-relative script path resolves to an executable file" in {
+    val script = "/work/consumer-repo/sandbox/run-fast-gate.sh"
+    Main.missingGateTool(
+      gateRoot,
+      "sandbox/run-fast-gate.sh",
+      gatePath,
+      _ == script
+    ) shouldBe None
+  }
+
+  it should "return the resolved absolute path when a repo-relative script is missing" in {
+    val script = "/work/consumer-repo/sandbox/run-fast-gate.sh"
+    Main.missingGateTool(gateRoot, "sandbox/run-fast-gate.sh", gatePath, _ => false) shouldBe
+      Some(script)
+  }
+
+  it should "find None for an empty gate command, bash's own no-op reading" in {
+    Main.missingGateTool(gateRoot, "", gatePath, _ => false) shouldBe None
+  }
+
+  it should "find None for a whitespace-only gate command" in {
+    Main.missingGateTool(gateRoot, "   ", gatePath, _ => false) shouldBe None
+  }
+
+  it should "accept GATE_CMD=true, the shape the dry-run verification and sandbox scripts use" in {
+    Main.missingGateTool(gateRoot, "true", gatePath, _ == "/bin/true") shouldBe None
+  }
+
+  // ===============================================================================================
   // resolveRepoRoot: the CONSUMER repo's work tree, per `git rev-parse --show-toplevel`
   // ===============================================================================================
 
@@ -266,3 +309,24 @@ class MainSpec extends AnyFlatSpec with Matchers:
       java.nio.file.Files.isRegularFile(r.resolve(Settings.ConfigPath))
     ) shouldBe Right(true)
   }
+
+  // ===============================================================================================
+  // applyDryRunFlag: the one-way OR between --dry-run and DRY_RUN=1
+  // ===============================================================================================
+
+  "the --dry-run flag" should "turn dry-run on" in:
+    Main.applyDryRunFlag(flagged = true, Map.empty) shouldBe true
+
+  it should "leave an operator's DRY_RUN=1 alone when the flag is absent" in:
+    // The flag is one-way on purpose. An invocation that could silently disarm a dry run is an
+    // invocation that mutates a repo somebody believed was safe.
+    Main.applyDryRunFlag(flagged = false, Map("DRY_RUN" -> "1")) shouldBe true
+
+  it should "turn dry-run on even when DRY_RUN explicitly says off" in:
+    // The only combination where the OR does real work: the flag beating an env var that
+    // explicitly says off, not just an absent one.
+    Main.applyDryRunFlag(flagged = true, Map("DRY_RUN" -> "0")) shouldBe true
+
+  it should "be off when neither says otherwise" in:
+    Main.applyDryRunFlag(flagged = false, Map("DRY_RUN" -> "0")) shouldBe false
+    Main.applyDryRunFlag(flagged = false, Map.empty) shouldBe false

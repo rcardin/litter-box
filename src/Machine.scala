@@ -32,12 +32,6 @@ object Machine:
   private def artifact(issue: Int, suffix: String)(using cfg: Config): String =
     s"${cfg.logDir}/issue-$issue$suffix"
 
-  /** Where the three prompt templates live, relative to the repo root. Bash read them from
-    * `$SCRIPT_DIR` (loop.sh:116-118); here the root IS the project, so they sit in the project's own
-    * `prompts/`. The filenames hang off `Template.fileName`.
-    */
-  val PromptDir = "prompts"
-
   /** Where the container launcher scripts live, relative to the repo root — bash's
     * `$SCRIPT_DIR/sandbox` (loop.sh:198-211).
     */
@@ -97,6 +91,16 @@ object Machine:
         }
         .mkString("\n")
     }
+
+  /** `{{PROTECTED}}`: the patch guard's list, as markdown bullets for the prompt.
+    *
+    * The SHAPE of the sentence around it is protocol and stays in the skeleton; the LIST is this
+    * repo's and so cannot be. Rendered from `Config.protect` — which `Settings.protectWithFloor`
+    * has already unioned with the reference floor — so the prompt names exactly the paths the guard
+    * will actually reject, never a stale hand-maintained copy of them.
+    */
+  private[litterbox] def protectedList(protect: List[String]): String =
+    protect.map(p => s"- `$p`").mkString("\n")
 
   /** Logs an infra fault the way bash does — the message on the operator's log stream at the point
     * of the fault — fires the rc-50 notify seam, and abandons the iteration. Single helper rather
@@ -175,7 +179,18 @@ object Machine:
     val workerPromptFile = artifact(issue, ".prompt.txt")
     fs.write(
       workerPromptFile,
-      renderTemplate(fs.readTemplate(Template.Iterate), "ISSUE" -> fs.read(bodyFile))
+      renderTemplate(
+        fs.readTemplate(Template.Iterate),
+        // Config-derived slots FIRST, untrusted content last: `renderTemplate` folds left, so a
+        // slot spliced early has its injected text scanned by every later pass. With ISSUE first,
+        // an issue body containing the literal {{GATE}} would have that line rewritten by the
+        // harness. Nothing here is secret from the agent, but a prompt reshaped by its own inputs
+        // is a prompt nobody reviewed.
+        "PROTECTED"   -> protectedList(cfg.protect),
+        "GATE"        -> cfg.gateCmd,
+        "CONVENTIONS" -> fs.conventions(),
+        "ISSUE"       -> fs.read(bodyFile)
+      )
     )
 
     // Auto-merge is earned by class-1 only. Detect the class once, at pick time.
@@ -240,8 +255,11 @@ object Machine:
         fixPromptFile,
         renderTemplate(
           fs.readTemplate(Template.Fix),
-          "ISSUE"   -> fs.read(bodyFile),
-          "FAILURE" -> fs.read(failFile)
+          "PROTECTED"   -> protectedList(cfg.protect),
+          "GATE"        -> cfg.gateCmd,
+          "CONVENTIONS" -> fs.conventions(),
+          "ISSUE"       -> fs.read(bodyFile),
+          "FAILURE"     -> fs.read(failFile)
         )
       )
       val fixLog   = artifact(issue, s"-pass$pass.fix.claude.log")
@@ -309,8 +327,10 @@ object Machine:
             reviewPromptFile,
             renderTemplate(
               fs.readTemplate(Template.Review),
-              "ISSUE"       -> fs.read(bodyFile),
+              "PROTECTED"   -> protectedList(cfg.protect),
+              "GATE"        -> cfg.gateCmd,
               "CONVENTIONS" -> fs.conventions(),
+              "ISSUE"       -> fs.read(bodyFile),
               "TAMPER"      -> fs.read(tamperFile),
               "DIFF"        -> fs.read(diffFile)
             )
