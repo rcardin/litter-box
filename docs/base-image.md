@@ -17,7 +17,10 @@ The part of the litter-box gate sandbox that is not about any one project. Built
 ## What it deliberately does not have
 
 - **No build tool.** Not sbt, not Gradle, not Maven, not npm. That is the consumer's layer.
-- **No `ENTRYPOINT`.** The consumer sets it to their build tool.
+- **No `ENTRYPOINT` of its own.** The consumer sets it to their build tool. `base.Dockerfile` never
+  writes one, but note that `eclipse-temurin` ships `ENTRYPOINT ["/__cacert_entrypoint.sh"]` and
+  `CMD ["jshell"]`, so an image built on this one that sets no `ENTRYPOINT` inherits those rather
+  than getting nothing. Set yours.
 - **No credentials.** No API key, no OAuth token, no `gh` token, no registry login. Credentials
   reach a running container as environment variables at `docker run` time and are never baked in.
   See `sandbox/lib.sh:sandbox_credential_env`.
