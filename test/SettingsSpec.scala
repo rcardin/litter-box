@@ -47,7 +47,6 @@ class SettingsSpec extends AnyFlatSpec with Matchers:
       |stop-file     = "HALT.md"
       |log-dir       = "custom/logs"
       |gate { fast = "mill __.compile", timeout = 111 }
-      |ci { required-check = "verify" }
       |issues.labels { ready = "lbox-ready", active = "lbox-active", blocked = "lbox-blocked" }
       |protect = ["secrets/**", "Makefile"]
       |budgets { repair = 7, max-patch-bytes = 4242 }
@@ -55,7 +54,7 @@ class SettingsSpec extends AnyFlatSpec with Matchers:
       |""".stripMargin
 
   private def nonDefaultConfig: Config =
-    Settings.parse(Settings.onReference(ConfigFactory.parseString(nonDefaultHocon)))
+    Settings.parse(ConfigFactory.parseString(nonDefaultHocon).withFallback(Settings.referenceOnly))
 
   // ===============================================================================================
   // 1. Reference text vs case-class defaults
@@ -89,7 +88,7 @@ class SettingsSpec extends AnyFlatSpec with Matchers:
         |""".stripMargin
     )
 
-    val cfg = Settings.parse(Settings.onReference(partial))
+    val cfg = Settings.parse(partial.withFallback(Settings.referenceOnly))
 
     cfg.logDir shouldBe "build/loop-logs"
     cfg.repairBudget shouldBe 5
@@ -112,9 +111,10 @@ class SettingsSpec extends AnyFlatSpec with Matchers:
     cfg.logDir shouldBe "custom/logs"
     cfg.gateCmd shouldBe "mill __.compile"
     cfg.gateTimeout shouldBe 111
-    cfg.requiredCheck shouldBe "verify"
     cfg.labels shouldBe Labels("lbox-ready", "lbox-active", "lbox-blocked")
-    cfg.protect shouldBe List("secrets/**", "Makefile")
+    // The file's own entries first, then the reference floor unioned in (see the `protect` section
+    // below for why the floor is not droppable).
+    cfg.protect shouldBe List("secrets/**", "Makefile", ".litter-box/**", ".github/**", "CONTEXT.md")
     cfg.repairBudget shouldBe 7
     cfg.maxPatchBytes shouldBe 4242L
     cfg.iterTimeout shouldBe 60
@@ -171,7 +171,7 @@ class SettingsSpec extends AnyFlatSpec with Matchers:
     * an env var take the env value, and a key with no env var keeps the file value.
     */
   "Main.parseEnv" should "let an env var win over the config file, key by key" in {
-    val fromFile = Settings.onReference(ConfigFactory.parseString(nonDefaultHocon))
+    val fromFile = ConfigFactory.parseString(nonDefaultHocon).withFallback(Settings.referenceOnly)
 
     val parsed = Main.parseEnv(
       fromFile,
@@ -206,7 +206,7 @@ class SettingsSpec extends AnyFlatSpec with Matchers:
     * indistinguishable from the file's own parse.
     */
   it should "leave every file value untouched when the env map is empty" in {
-    val fromFile = Settings.onReference(ConfigFactory.parseString(nonDefaultHocon))
+    val fromFile = ConfigFactory.parseString(nonDefaultHocon).withFallback(Settings.referenceOnly)
 
     val parsed = Main.parseEnv(fromFile, Map.empty)
 
@@ -257,16 +257,56 @@ class SettingsSpec extends AnyFlatSpec with Matchers:
     ) shouldBe false
   }
 
-  /** The CONFIGURED list is what the guard consults, so a repo that protects `secrets/` and nothing
-    * else must see exactly that, and must NOT still be protecting `.github/` out of habit. This is
-    * the patch-guard half of the issue #3 rule.
+  /** The CONFIGURED list is what the guard consults ON TOP of the reference floor: a repo that
+    * protects `secrets/` gets `secrets/` too, but does not stop protecting `.github/` by writing the
+    * key. This is the patch-guard half of the issue #3 rule.
     */
-  it should "consult the configured protect list rather than the reference one" in {
+  it should "consult the configured protect list on top of the reference one" in {
     val protect = nonDefaultConfig.protect
 
     Machine.touchesProtected(protect, numstat("secrets/deploy.key")) shouldBe true
     Machine.touchesProtected(protect, numstat("Makefile")) shouldBe true
-    Machine.touchesProtected(protect, numstat(".github/workflows/ci.yml")) shouldBe false
+    Machine.touchesProtected(protect, numstat(".github/workflows/ci.yml")) shouldBe true
+
+    // Still a real list and not "protect everything": a path nobody named stays writable.
+    Machine.touchesProtected(protect, numstat("src/Main.scala")) shouldBe false
+  }
+
+  /** THE FLOOR, and the reason it exists. HOCON list semantics are REPLACE, not merge, so before
+    * `Settings.protectWithFloor` a consumer repo that wrote ANY `protect` list silently dropped the
+    * `.litter-box` double-star entry with it. That is not one path among others: it is the one that stops
+    * the agent under harness from editing `.litter-box/config.conf`, i.e. from rewriting the guard
+    * that is judging its own patch. The list below is a plausible consumer list — it names the repo's
+    * own secrets and nothing of the loop's — and the assertion is that it cannot open that door.
+    */
+  it should "protect .litter-box even when the consumer list omits it entirely" in {
+    val cfg = Settings.parse(
+      ConfigFactory
+        .parseString("""protect = ["secrets/**"]""")
+        .withFallback(Settings.referenceOnly)
+    )
+
+    Machine.touchesProtected(cfg.protect, numstat(Settings.ConfigPath)) shouldBe true
+    Machine.touchesProtected(cfg.protect, numstat(".litter-box/logs/status.jsonl")) shouldBe true
+
+    // The consumer's own entry still takes effect, so the floor added to the list rather than
+    // replacing it in the other direction.
+    Machine.touchesProtected(cfg.protect, numstat("secrets/deploy.key")) shouldBe true
+  }
+
+  /** A consumer list that repeats a floor entry must not double it: `isProtected` runs every entry
+    * against every numstat path, so duplicates are pure cost, and a config that reads back the
+    * `.github` entry twice invites someone to "fix" it by dropping the floor.
+    */
+  it should "not duplicate an entry the consumer already names" in {
+    val cfg = Settings.parse(
+      ConfigFactory
+        .parseString("""protect = [".github/**", "secrets/**"]""")
+        .withFallback(Settings.referenceOnly)
+    )
+
+    cfg.protect.distinct shouldBe cfg.protect
+    cfg.protect should contain(".litter-box/**")
   }
 
   it should "reject a multi-row numstat as soon as ONE row is protected" in {
@@ -304,8 +344,8 @@ class SettingsSpec extends AnyFlatSpec with Matchers:
 
   /** A fake `gh` on a throwaway PATH directory, the same FAKEBIN idiom `LiveProcSpec` uses: it logs
     * every call verbatim to `$GH_CALLS` and answers on the CONFIGURED labels only. Answering on
-    * `lbox-*` and on nothing else is the point: a `LiveGitHub` that ignored its `labels` parameter
-    * and baked in `ready` / `in-progress` / `blocked` would get an empty answer here, so both the
+    * `lbox-*` and on nothing else is the point: a `LiveGitHub` that ignored its config's labels and
+    * baked in `ready` / `in-progress` / `blocked` would get an empty answer here, so both the
     * recorded argv AND the parsed return value catch the regression.
     */
   private def setupLabelRecordingGh(): (Path, Path) =
@@ -329,12 +369,8 @@ class SettingsSpec extends AnyFlatSpec with Matchers:
     (binDir, callsFile)
 
   private def labelledGh(binDir: Path, root: Path): LiveGitHub =
-    LiveGitHub(
-      root,
-      ciAppearCmd = None,
-      mergeCmd = None,
-      extraPath = Some(binDir.toString),
-      labels = Labels("lbox-ready", "lbox-active", "lbox-blocked")
+    LiveGitHub(root, ciAppearCmd = None, mergeCmd = None, extraPath = Some(binDir.toString))(using
+      Config(labels = Labels("lbox-ready", "lbox-active", "lbox-blocked"))
     )
 
   "the configured labels" should "be the ones the three gh query methods put on the wire" in {
@@ -366,20 +402,17 @@ class SettingsSpec extends AnyFlatSpec with Matchers:
     calls should not include "--label blocked"
   }
 
-  /** `Main` builds its `LiveGitHub` with `labels = parsed.cfg.labels`, so the file value has to
-    * survive `Settings.parse` unchanged all the way to that constructor. Passing the parsed config's
-    * own labels (rather than a `Labels` literal) is what closes the loop from HOCON text to argv.
+  /** `Main` builds its `LiveGitHub` against the same `Config` it gives `Machine`, so the file value
+    * has to survive `Settings.parse` unchanged all the way to that constructor. Handing it the
+    * parsed config (rather than a `Labels` literal) is what closes the loop from HOCON text to argv.
     */
   it should "arrive at LiveGitHub straight off the parsed config, with no literal in between" in {
     val root                = tempRoot()
     val (binDir, callsFile) = setupLabelRecordingGh()
-    val gh                  = LiveGitHub(
-      root,
-      ciAppearCmd = None,
-      mergeCmd = None,
-      extraPath = Some(binDir.toString),
-      labels = nonDefaultConfig.labels
-    )
+    val gh                  =
+      LiveGitHub(root, ciAppearCmd = None, mergeCmd = None, extraPath = Some(binDir.toString))(using
+        nonDefaultConfig
+      )
 
     gh.oldestReadyIssue() shouldBe Some(222)
 
@@ -483,7 +516,7 @@ class SettingsSpec extends AnyFlatSpec with Matchers:
 
   "LiveStatusLog" should "write status.jsonl under the configured log-dir, not under the default one" in {
     val root = tempRoot()
-    val log  = LiveStatusLog(root, "1", "custom/logs")
+    val log  = LiveStatusLog(root, "1")(using Config(logDir = "custom/logs"))
 
     log.append(
       StatusEvent(
@@ -501,14 +534,14 @@ class SettingsSpec extends AnyFlatSpec with Matchers:
     val written = root.resolve("custom/logs/status.jsonl")
     Files.isRegularFile(written) shouldBe true
     readString(written) should include("\"phase\":\"IMPL\"")
-    // The default location must stay empty, or the handler is reading Config() rather than its
-    // constructor parameter and the watcher would be tailing a file nothing writes.
+    // The default location must stay empty, or the handler is reading the reference default rather
+    // than the config it was given, and the watcher would be tailing a file nothing writes.
     Files.exists(root.resolve(Config().logDir).resolve("status.jsonl")) shouldBe false
   }
 
   "LiveHarnessFs" should "read the kill switch off the configured stop-file only" in {
     val root = tempRoot()
-    val fs   = LiveHarnessFs(root, stopFile = "HALT.md", conventionsFile = "RULES.md")
+    val fs   = LiveHarnessFs(root)(using Config(stopFile = "HALT.md", conventions = "RULES.md"))
 
     fs.stopRequested() shouldBe false
 
@@ -525,7 +558,7 @@ class SettingsSpec extends AnyFlatSpec with Matchers:
     val root = tempRoot()
     Files.write(root.resolve("RULES.md"), "the house rules\n".getBytes(StandardCharsets.UTF_8))
     Files.write(root.resolve("CONTEXT.md"), "the default file\n".getBytes(StandardCharsets.UTF_8))
-    val fs = LiveHarnessFs(root, stopFile = "HALT.md", conventionsFile = "RULES.md")
+    val fs = LiveHarnessFs(root)(using Config(stopFile = "HALT.md", conventions = "RULES.md"))
 
     // Both files exist, so only reading the configured name can produce this answer. Whatever comes
     // back here is spliced into the reviewer prompt as {{CONVENTIONS}}, which is to say the cold
@@ -534,17 +567,18 @@ class SettingsSpec extends AnyFlatSpec with Matchers:
   }
 
   /** End to end for these three keys: HOCON text in, live handlers out, with `Main`'s own wiring
-    * expressions reproduced verbatim. If a key were read under the wrong name, or a handler kept
-    * defaulting to `Config()`, the paths below would point somewhere nobody configured.
+    * expressions reproduced verbatim — one `Config` in scope, both handlers built off it. If a key
+    * were read under the wrong name, or a handler kept reading the reference defaults, the paths
+    * below would point somewhere nobody configured.
     */
   it should "receive its paths from the parsed config, the way Main wires them" in {
     val root = tempRoot()
-    val cfg  = nonDefaultConfig
+    given cfg: Config = nonDefaultConfig
     Files.write(root.resolve(cfg.conventions), "house rules\n".getBytes(StandardCharsets.UTF_8))
     Files.write(root.resolve(cfg.stopFile), "halt\n".getBytes(StandardCharsets.UTF_8))
 
-    val fs        = LiveHarnessFs(root, cfg.stopFile, cfg.conventions)
-    val statusLog = LiveStatusLog(root, "run-1", cfg.logDir)
+    val fs        = LiveHarnessFs(root)
+    val statusLog = LiveStatusLog(root, "run-1")
 
     fs.stopRequested() shouldBe true
     fs.conventions() shouldBe "house rules\n"

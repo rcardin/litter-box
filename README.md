@@ -38,7 +38,6 @@ gate {
   fast    = "sbt -Werror compile test"
   timeout = 900
 }
-ci { required-check = "build" }
 issues.labels { ready = "ready", active = "in-progress", blocked = "blocked" }
 protect  = [".litter-box/**", ".github/**", "CONTEXT.md"]
 budgets  { repair = 2, max-patch-bytes = 1000000 }
@@ -67,9 +66,10 @@ This is the product. Everything else is plumbing.
 
 - **The worker never picks its own work.** The issue comes from a label query, not from the model.
 - **Protected-path patch guard.** A patch touching any glob in the config's `protect` list is
-  rejected unapplied. That list always covers `.litter-box/**`, i.e. the config file that defines
-  the list, so the loop cannot be talked into widening its own guard, editing its own CI, or
-  rewriting the conventions it is judged against.
+  rejected unapplied. A consumer `protect` list can only widen the protection, never narrow it: the
+  reference entries are unioned in as a floor, so the list always covers `.litter-box/**`, i.e. the
+  config file that defines the list. The loop cannot be talked into loosening its own guard, editing
+  its own CI, or rewriting the conventions it is judged against.
 - **Test-tamper check.** The diff is measured against `origin/main` with `git apply --numstat` and
   the result is handed to the reviewer, which catches the classic failure mode: deleting a failing
   test to go green.
@@ -116,7 +116,7 @@ Everything is configured by environment variable — there are no CLI arguments.
 | `DRY_RUN` | `0` | `1` renders the worker prompt, then stops before any mutation |
 | `REPAIR_BUDGET` | `2` | Fix attempts per issue |
 | `MAX_PATCH_BYTES` | `1000000` | Oversized-patch guard |
-| `GATE_CMD` | `sandbox/run-fast-gate.sh` | The gate. Overriding it skips the whole Docker preflight |
+| `GATE_CMD` | `sbt -Werror compile test` | The gate (overrides `gate.fast`). Overriding it skips the whole Docker preflight |
 | `GATE_TIMEOUT` | `900` | Gate timeout (seconds) |
 | `ITER_TIMEOUT` | `1800` | Worker dispatch timeout |
 | `CI_WAIT_TIMEOUT` / `CI_APPEAR_TIMEOUT` / `CI_APPEAR_INTERVAL` | `900` / `300` / `10` | CI polling |

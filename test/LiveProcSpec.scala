@@ -15,6 +15,11 @@ import scala.jdk.CollectionConverters.*
   */
 class LiveProcSpec extends AnyFlatSpec with Matchers:
 
+  // `LiveGitHub` takes the queue labels off the `Config` in scope. Nothing here is about which
+  // labels reach the argv (SettingsSpec owns that), so the reference defaults are summoned once for
+  // the whole file.
+  private given Config = Config()
+
   private def tempRoot(): Path = Files.createTempDirectory("live-proc-spec")
 
   private def readString(p: Path): String =

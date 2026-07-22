@@ -228,6 +228,32 @@ class MainSpec extends AnyFlatSpec with Matchers:
     Main.resolveRepoRoot(() => LiveProc.Result(0, "  \n", "")).isLeft shouldBe true
   }
 
+  /** The Done criterion that "running from a subdirectory of a consumer repo resolves the same root
+    * as running from its top". The `revParse` thunk is what carries the CWD (`LiveProc.run`'s first
+    * argument), so the only thing that can make the two runs disagree is git being asked from the
+    * wrong place — which is exactly the walk-up this pins. Both are compared to each other AND to
+    * the fixture's own real path, because two runs that both wrongly returned the JVM's cwd would
+    * agree with each other and prove nothing. `toRealPath` is required on macOS, where the temp dir
+    * lives under a `/var -> /private/var` symlink that git resolves and `createTempDirectory` does
+    * not.
+    */
+  it should "resolve the same root from a subdirectory of a consumer repo as from its top" in {
+    val top = java.nio.file.Files.createTempDirectory("main-spec-consumer")
+    LiveProc.run(top, Seq("git", "init", "--quiet"))
+    java.nio.file.Files.createDirectories(top.resolve(Settings.ConfigPath).getParent)
+    java.nio.file.Files.writeString(top.resolve(Settings.ConfigPath), "instance-name = \"other\"\n")
+    val nested = java.nio.file.Files.createDirectories(top.resolve("src/main/scala"))
+
+    def rootFrom(cwd: java.nio.file.Path) =
+      Main.resolveRepoRoot(() => LiveProc.run(cwd, Seq("git", "rev-parse", "--show-toplevel")))
+
+    val fromTop    = rootFrom(top)
+    val fromNested = rootFrom(nested)
+
+    fromNested shouldBe fromTop
+    fromNested shouldBe Right(top.toRealPath())
+  }
+
   it should "resolve this checkout's own root by really shelling out to git" in {
     val real = Main.resolveRepoRoot(() =>
       LiveProc.run(

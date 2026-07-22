@@ -11,6 +11,12 @@ import scala.jdk.CollectionConverters.*
   */
 class LiveSpec extends AnyFlatSpec with Matchers:
 
+  // Both handlers under test take their config-derived names off a `Config` in scope, the same way
+  // `Machine` does. The reference defaults are what every test below wants, so it is summoned once
+  // here rather than restated per construction; the one test that needs another `log-dir` passes
+  // its own `Config` explicitly.
+  private given Config = Config()
+
   private def tempRoot(): Path = Files.createTempDirectory("live-spec")
 
   private def readLines(p: Path): List[String] =
@@ -22,8 +28,8 @@ class LiveSpec extends AnyFlatSpec with Matchers:
   // tests follow it instead of pinning a stale path and failing for the wrong reason.
   private val logDir = Config().logDir
 
-  /** Where `LiveStatusLog` is expected to land its status.jsonl for a given root, when the caller
-    * lets the `logDir` parameter fall back to its configured default.
+  /** Where `LiveStatusLog` is expected to land its status.jsonl for a given root, when the `Config`
+    * in scope carries the reference `log-dir`.
     */
   private def defaultStatusFile(root: Path): Path =
     root.resolve(logDir).resolve("status.jsonl")
@@ -104,14 +110,14 @@ class LiveSpec extends AnyFlatSpec with Matchers:
     line should include(""""logfile":"/etc/foreign/path.log"""")
   }
 
-  it should "write status.jsonl under an explicit non-default logDir" in {
+  it should "write status.jsonl under a non-default log-dir" in {
     val root   = tempRoot()
     val custom = "custom/logs"
-    // The third parameter is the whole point of the change: a consumer repo can put the loop's
-    // artifacts wherever its own `log-dir` says, so an explicitly passed directory must win over
-    // the configured default. Asserting the default location stays EMPTY is the half that would
-    // silently pass if the writer ignored the parameter and kept using its fallback.
-    val log = LiveStatusLog(root, "1", custom)
+    // The configured `log-dir` is the whole point of the change: a consumer repo can put the loop's
+    // artifacts wherever its own config says, so the `Config` in scope must win over the reference
+    // default. Asserting the default location stays EMPTY is the half that would silently pass if
+    // the writer ignored its config and kept using the reference value.
+    val log = LiveStatusLog(root, "1")(using Config(logDir = custom))
 
     log.append(StatusEvent(0, "1", "FAST", "START", 0, 0, "", ""))
 

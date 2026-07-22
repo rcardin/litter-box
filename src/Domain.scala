@@ -157,12 +157,6 @@ final case class Config(
       * is written, relative to the repo root.
       */
     logDir: String = ".litter-box/logs",
-    /** `ci.required-check` — the check name the CI wait is about. Carried for the CI-wait command
-      * `litter-box init` writes and for operator diagnostics; the default CI wait
-      * (`gh pr checks --watch --fail-fast`) waits on ALL checks, so nothing in `Machine` reads it
-      * yet.
-      */
-    requiredCheck: String = "build",
     labels: Labels = Labels(),
     /** `protect` — globs (JDK `glob:` syntax) the patch guard rejects any patch touching. */
     protect: List[String] = List(".litter-box/**", ".github/**", "CONTEXT.md"),

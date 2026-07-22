@@ -40,19 +40,21 @@ private[litterbox] object LiveFiles:
   * `write`/`read`/`sizeBytes` arrive repo-relative from Machine (already carrying the configured
   * `log-dir`) and are resolved against `root`; `root` is a constructor parameter (never hardcoded to
   * the process cwd) so tests can point it at a temp dir.
+  *
+  * The two config-derived names this handler needs (`stop-file`, `conventions`) arrive as the whole
+  * `Config`, threaded the same way `Machine`'s own methods take it — `(using cfg: Config)` — rather
+  * than unpacked into loose `String`s at every call site. `Main` already has the `Config` in scope
+  * as a `given` when it wires this handler, so the summon is free there and tests say which config
+  * they mean instead of leaning on a per-parameter default.
   */
-final class LiveHarnessFs(
-    root: Path,
-    stopFile: String = Config().stopFile,
-    conventionsFile: String = Config().conventions
-) extends HarnessFs:
+final class LiveHarnessFs(root: Path)(using cfg: Config) extends HarnessFs:
 
   /** loop.sh:623 checks `$REPO_ROOT/STOP.md`, i.e. repo-root-relative, not under harness/. The name
     * is `stop-file` in the config now, so a consumer repo that already means something else by
     * `STOP.md` can pick another.
     */
   def stopRequested(): Boolean =
-    Files.isRegularFile(root.resolve(stopFile))
+    Files.isRegularFile(root.resolve(cfg.stopFile))
 
   /** The three prompt templates, `prompts/<name>.md` relative to the repo root. Bash read them from
     * `$SCRIPT_DIR/<name>.md` (loop.sh:116-118), i.e. the harness directory; here the root IS the
@@ -63,7 +65,7 @@ final class LiveHarnessFs(
 
   /** loop.sh:119: `CONVENTIONS="$REPO_ROOT/CONTEXT.md"`, now the `conventions` config key. */
   def conventions(): String =
-    readString(root.resolve(conventionsFile))
+    readString(root.resolve(cfg.conventions))
 
   def write(path: String, content: String): Unit =
     val p = root.resolve(path)
@@ -92,11 +94,12 @@ final class LiveHarnessFs(
   * `root/<log-dir>/status.jsonl`. Fire and forget: the whole write path swallows exceptions,
   * matching bash's `>>"$STATUS_FILE" 2>/dev/null || true`, a wrong/missing event is a wrong banner,
   * never a wrong merge.
+  *
+  * `log-dir` arrives as the whole `Config`, on the same reasoning as `LiveHarnessFs` above.
   */
-final class LiveStatusLog(root: Path, runId: String, logDir: String = Config().logDir)
-    extends StatusLog:
+final class LiveStatusLog(root: Path, runId: String)(using cfg: Config) extends StatusLog:
 
-  private val statusFile = root.resolve(logDir).resolve("status.jsonl")
+  private val statusFile = root.resolve(cfg.logDir).resolve("status.jsonl")
 
   def append(event: StatusEvent): Unit =
     try
@@ -719,14 +722,15 @@ final class LiveGitHub(
     root: Path,
     ciAppearCmd: Option[String],
     mergeCmd: Option[String],
-    extraPath: Option[String] = None,
-    /** The three queue labels off `issues.labels`. Only the three QUERY methods below need them —
-      * they bake a label into the `gh` argv; the label EDITS are `Machine`'s, which threads the same
-      * values off its `Config`. Trailing with a default so the many `extraPath`-only test
-      * constructions stay positional; production (`Main`) always passes the configured value.
-      */
-    labels: Labels = Labels()
-) extends GitHub:
+    extraPath: Option[String] = None
+)(using cfg: Config)
+    extends GitHub:
+
+  /** The three queue labels off `issues.labels`. Only the three QUERY methods below need them —
+    * they bake a label into the `gh` argv; the label EDITS are `Machine`'s, which threads the same
+    * `Config` this handler now takes, so neither side can be handed a different set.
+    */
+  private val labels: Labels = cfg.labels
 
   // "" means unset, folded once on the way in (LiveProc.seam).
   private val ciAppearSeam = LiveProc.seam(ciAppearCmd)

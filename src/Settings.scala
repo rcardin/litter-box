@@ -45,7 +45,6 @@ object Settings:
       |  fast    = "sbt -Werror compile test"
       |  timeout = 900
       |}
-      |ci { required-check = "build" }
       |issues.labels { ready = "ready", active = "in-progress", blocked = "blocked" }
       |protect  = [".litter-box/**", ".github/**", "CONTEXT.md"]
       |budgets  { repair = 2, max-patch-bytes = 1000000 }
@@ -83,12 +82,29 @@ object Settings:
     */
   private[litterbox] def referenceOnly: TsConfig = reference
 
-  /** Merges an already-loaded config file onto [[Reference]]. The seam `parseString`-based tests use
-    * so they never touch a real file.
-    */
-  private[litterbox] def onReference(conf: TsConfig): TsConfig = conf.withFallback(reference)
+  // ---- protect: floor and glob matching ---------------------------------------------------------
 
-  // ---- protect: glob matching ------------------------------------------------------------------
+  /** The consumer's `protect` list with [[Reference]]'s entries unioned in underneath, deduplicated.
+    *
+    * HOCON list semantics are REPLACE, not merge, so `withFallback` gives a repo that sets its own
+    * `protect` exactly that list and nothing else — dropping the reference entries silently, the
+    * moment the consumer writes the key at all. The one it drops that matters is the `.litter-box`
+    * double-star entry: without it the agent under harness can rewrite `.litter-box/config.conf` and
+    * so widen its own guard, which is the single edit no patch may ever make.
+    *
+    * Unioning rather than merging makes the list monotone — a consumer entry can only ever ADD
+    * protection, never take any away — which is what `Machine.touchesProtected`'s scaladoc and the
+    * README already promise. The cost is that a repo cannot un-protect `.github` or `CONTEXT.md` by
+    * omission; that is the intended trade, since both are the loop grading its own work.
+    */
+  private[litterbox] def protectWithFloor(conf: TsConfig): List[String] =
+    (conf.getStringList("protect").asScala.toList ++ protectFloor).distinct
+
+  /** [[Reference]]'s own `protect` entries, read off the parsed reference rather than restated here
+    * so the floor cannot drift from the schema it is supposed to be the floor of.
+    */
+  private lazy val protectFloor: List[String] =
+    reference.getStringList("protect").asScala.toList
 
   /** Compiles one `protect` entry into a matcher over repo-relative paths.
     *
@@ -140,7 +156,7 @@ object Settings:
 
   // ---- config -> Config ------------------------------------------------------------------------
 
-  /** Reads the schema off `conf` (already merged onto [[Reference]] by `loadFile`/`onReference`).
+  /** Reads the schema off `conf` (already merged onto [[Reference]] by `loadFile`).
     * Env overlay is `Main.parseEnv`'s job, not this one's: this function is the file half of the
     * layering and stays free of `sys.env`.
     */
@@ -152,13 +168,12 @@ object Settings:
       logDir = conf.getString("log-dir"),
       gateCmd = conf.getString("gate.fast"),
       gateTimeout = conf.getInt("gate.timeout"),
-      requiredCheck = conf.getString("ci.required-check"),
       labels = Labels(
         ready = conf.getString("issues.labels.ready"),
         active = conf.getString("issues.labels.active"),
         blocked = conf.getString("issues.labels.blocked")
       ),
-      protect = conf.getStringList("protect").asScala.toList,
+      protect = protectWithFloor(conf),
       repairBudget = conf.getInt("budgets.repair"),
       maxPatchBytes = conf.getLong("budgets.max-patch-bytes"),
       iterTimeout = conf.getInt("timeouts.iter"),

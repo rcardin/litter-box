@@ -308,8 +308,7 @@ object Main:
 
     // 8. Wire the Live handlers as a single `using` bundle for Machine.runOnce.
     given Config        = parsed.cfg
-    given GitHub        =
-      LiveGitHub(root, parsed.ciAppearCmd, parsed.mergeCmd, labels = parsed.cfg.labels)
+    given GitHub        = LiveGitHub(root, parsed.ciAppearCmd, parsed.mergeCmd)
     given Git           = LiveGit(root)
     given AgentDispatch =
       LiveAgentDispatch(
@@ -321,9 +320,9 @@ object Main:
         parsed.reviewCmd
       )
     given GateRunner = LiveGateRunner(root, timeoutBin)
-    given StatusLog  = LiveStatusLog(root, runId, parsed.cfg.logDir)
+    given StatusLog  = LiveStatusLog(root, runId)
     given Notify     = LiveNotify(parsed.notifyCmd, parsed.ntfyTopic, LiveLog.log)
-    given HarnessFs  = LiveHarnessFs(root, parsed.cfg.stopFile, parsed.cfg.conventions)
+    given HarnessFs  = LiveHarnessFs(root)
     given Clock      = LiveClock
     given Log        = LiveLog
 

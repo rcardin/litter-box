@@ -19,9 +19,18 @@ object Machine:
     */
   private type Faulting = boundary.Label[LoopExit]
 
-  // (was: `val LogDir = "logs"`.) The artifact directory is `Config.logDir` now — a consumer repo
-  // says where its loop writes, and `watch.sh` / `tail-claude.sh` read the same key. Every site
-  // below takes it off the `Config` in scope.
+  /** Path of one per-iteration artifact (prompt, patch, gate log, marker) for a US.
+    *
+    * (was: `val LogDir = "logs"`.) The artifact directory is `Config.logDir` now — a consumer repo
+    * says where its loop writes, and `watch.sh` / `tail-claude.sh` read the same key. This is the
+    * single place that key and the `issue-<n>` naming convention meet: every artifact site below
+    * goes through here, so the layout cannot drift file by file.
+    *
+    * `suffix` carries its own separator (`.body.md`, `-pass$pass.gate.log`) because the convention
+    * uses both `.` and `-` and the caller is the one that knows which.
+    */
+  private def artifact(issue: Int, suffix: String)(using cfg: Config): String =
+    s"${cfg.logDir}/issue-$issue$suffix"
 
   /** Where the three prompt templates live, relative to the repo root. Bash read them from
     * `$SCRIPT_DIR` (loop.sh:116-118); here the root IS the project, so they sit in the project's own
@@ -161,9 +170,9 @@ object Machine:
     logger.log(s"iteration $n -> issue #$issue")
 
     // Render the worker prompt with the issue body injected (read-only).
-    val bodyFile = s"${cfg.logDir}/issue-$issue.body.md"
+    val bodyFile = artifact(issue, ".body.md")
     fs.write(bodyFile, gh.issueTitleAndBody(issue))
-    val workerPromptFile = s"${cfg.logDir}/issue-$issue.prompt.txt"
+    val workerPromptFile = artifact(issue, ".prompt.txt")
     fs.write(
       workerPromptFile,
       renderTemplate(fs.readTemplate(Template.Iterate), "ISSUE" -> fs.read(bodyFile))
@@ -202,14 +211,14 @@ object Machine:
     var gateStatus                       = ""
     var failureKind: Option[FailureKind] = None
     var currentPatch: Option[String]     = None
-    val reviewFile                       = s"${cfg.logDir}/issue-$issue-review.md"
+    val reviewFile                       = artifact(issue, "-review.md")
     fs.write(reviewFile, "") // empty until the first review
     var reviewed = false
 
     // Initial worker dispatch (fresh context), crossing the patch seam. The tree the worker
     // edited is never committed directly.
-    val implLog   = s"${cfg.logDir}/issue-$issue-iter$n.claude.log"
-    val implPatch = s"${cfg.logDir}/issue-$issue-iter$n.impl.patch"
+    val implLog   = artifact(issue, s"-iter$n.claude.log")
+    val implPatch = artifact(issue, s"-iter$n.impl.patch")
     emit(cur, "IMPL", "start", implLog)
     stagePatch(Role.IMPL, workerPromptFile, implPatch, implLog, currentPatch) match
       case StageResult.Empty =>
@@ -226,7 +235,7 @@ object Machine:
     // repair loop's control flow (bash dispatch_fix + handle_fix_result). Infra faults raise;
     // guard rejections and an empty fix become the terminal FAIL; Ok advances currentPatch.
     def fixRound(pass: Int, failFile: String): Unit =
-      val fixPromptFile = s"${cfg.logDir}/issue-$issue-pass$pass.fix.prompt.txt"
+      val fixPromptFile = artifact(issue, s"-pass$pass.fix.prompt.txt")
       fs.write(
         fixPromptFile,
         renderTemplate(
@@ -235,8 +244,8 @@ object Machine:
           "FAILURE" -> fs.read(failFile)
         )
       )
-      val fixLog   = s"${cfg.logDir}/issue-$issue-pass$pass.fix.claude.log"
-      val fixPatch = s"${cfg.logDir}/issue-$issue-pass$pass.fix.patch"
+      val fixLog   = artifact(issue, s"-pass$pass.fix.claude.log")
+      val fixPatch = artifact(issue, s"-pass$pass.fix.patch")
       emit(cur, "FIX", "start", fixLog)
       stagePatch(Role.FIX, fixPromptFile, fixPatch, fixLog, currentPatch) match
         case StageResult.Empty =>
@@ -258,7 +267,7 @@ object Machine:
       else
         budget -= 1; cur.budget = budget
         logger.log(s"self-repair: budget now $budget — dispatching FIX for ${trigger.text}")
-        val failFile = s"${cfg.logDir}/issue-$issue-pass$pass.failure.md"
+        val failFile = artifact(issue, s"-pass$pass.failure.md")
         fs.write(failFile, failContent)
         fixRound(pass, failFile)
 
@@ -268,7 +277,7 @@ object Machine:
       pass += 1
       git.addAll() // stage so new files show in diff/gate/tamper
       cur.pass = pass
-      val gateLog = s"${cfg.logDir}/issue-$issue-pass$pass.gate.log"
+      val gateLog = artifact(issue, s"-pass$pass.gate.log")
       emit(cur, "FAST_GATE", "start", gateLog)
       gates.run("FAST", cfg.gateCmd, cfg.gateTimeout, gateLog) match
         case GateResult.Timeout =>
@@ -291,11 +300,11 @@ object Machine:
           logger.log(s"FAST gate GREEN (pass $pass) — running tamper check + cold reviewer")
 
           // Tamper check feeds the reviewer (the harness surfaces, does not block).
-          val tamperFile = s"${cfg.logDir}/issue-$issue-tamper.md"
+          val tamperFile = artifact(issue, "-tamper.md")
           fs.write(tamperFile, tamperReport(currentPatch.map(git.applyNumstat).getOrElse("")))
-          val diffFile = s"${cfg.logDir}/issue-$issue-diff.patch"
+          val diffFile = artifact(issue, "-diff.patch")
           fs.write(diffFile, git.diffCachedOriginMain())
-          val reviewPromptFile = s"${cfg.logDir}/issue-$issue-pass$pass.review.prompt.txt"
+          val reviewPromptFile = artifact(issue, s"-pass$pass.review.prompt.txt")
           fs.write(
             reviewPromptFile,
             renderTemplate(
@@ -433,7 +442,7 @@ object Machine:
     else
       prBody ++= "Not auto-merged (v4 merges class-1 + APPROVE only): a human reviews and merges.\n\n"
     prBody ++= s"Closes #$issue\n"
-    fs.write(s"${cfg.logDir}/issue-$issue.pr-body.md", prBody.toString)
+    fs.write(artifact(issue, ".pr-body.md"), prBody.toString)
 
     val prUrl = gh.createPr(
       branch,
@@ -469,7 +478,7 @@ object Machine:
       clock: Clock,
       logger: Log
   )(using Faulting): LoopExit =
-    val ciLog = s"${cfg.logDir}/issue-$issue.ci-wait.log"
+    val ciLog = artifact(issue, ".ci-wait.log")
     emit(cur, "CI_WAIT", "start", ciLog)
     // Discriminate on data, not on the exit code: a fresh PR routinely reports zero checks
     // for a few seconds (push races the workflow scheduler, PR #28 / issue #26). Block until
