@@ -13,6 +13,11 @@
 # equals the reference config's own `instance-name`.
 INSTANCE_NAME="${LITTER_BOX_INSTANCE:-litter-box}"
 IMAGE="${INSTANCE_NAME}-sandbox:v6"
+# The build-tool-free base layer (sandbox/base.Dockerfile). Built locally by build-image.sh and
+# consumed by Dockerfile's ARG, so a checkout never needs the registry. NOT namespaced by
+# INSTANCE_NAME: it carries nothing instance-specific, so two instances sharing it is correct and
+# saves a multi-minute Claude CLI install per instance.
+BASE_IMAGE="litter-box-base:v1"
 PROXY_IMAGE="${INSTANCE_NAME}-sandbox-proxy:v6"
 NETWORK="${INSTANCE_NAME}-net"
 PROXY_NAME="${INSTANCE_NAME}-proxy"
