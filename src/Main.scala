@@ -385,11 +385,14 @@ object Main:
     given Clock      = LiveClock
     given Log        = LiveLog
 
-    // 9. loop.sh:926's start line, copied byte-for-byte. DRY_RUN is rendered as the raw env
-    // string bash would show (`$DRY_RUN` after its own `${DRY_RUN:-0}` default), not the parsed
-    // boolean.
+    // 9. loop.sh:926's start line. Unlike loop.sh, this build has a second way into dry-run
+    // (`--dry-run`), so the raw env var and the mode the run is actually in can now disagree — the
+    // banner has to report `parsed.cfg.dryRun`, the folded value `applyDryRunFlag` already produced,
+    // or an operator who passed `--dry-run` alone would be told DRY_RUN=0 while the run genuinely
+    // stops at the dry-run stop point. The banner is the operator's confirmation of which mode a run
+    // is in, so it must match the mode the run is actually taking, not one of the two inputs to it.
     LiveLog.log(
-      s"v2 loop start (MAX_ITERS=${parsed.maxIters}, ITER_TIMEOUT=${parsed.cfg.iterTimeout}s, REPAIR_BUDGET=${parsed.cfg.repairBudget}, DRY_RUN=${env.getOrElse("DRY_RUN", "0")})"
+      s"v2 loop start (MAX_ITERS=${parsed.maxIters}, ITER_TIMEOUT=${parsed.cfg.iterTimeout}s, REPAIR_BUDGET=${parsed.cfg.repairBudget}, DRY_RUN=${if parsed.cfg.dryRun then "1" else "0"})"
     )
 
     sys.exit(runDriver(parsed.maxIters))
