@@ -230,7 +230,62 @@ object Main:
 
   // ---- Part B: entry point -------------------------------------------------------------------
 
-  @main def litterBoxLoop(): Unit =
+  /** `--dry-run` ORs with `DRY_RUN=1` rather than replacing it.
+    *
+    * One-way on purpose: the flag can turn a dry run ON, never off. `DRY_RUN=1` is what an operator
+    * exports when they want to be sure nothing mutates, and the sandbox test scripts set it the same
+    * way; a flag able to clear it would be a way to mutate a repo somebody believed was safe.
+    */
+  private[litterbox] def applyDryRunFlag(flagged: Boolean, env: Map[String, String]): Boolean =
+    flagged || env.getOrElse("DRY_RUN", "0") == "1"
+
+  /** `litter-box init`. Runs before every preflight the loop does: a repo with no config is the
+    * whole reason to run this, so requiring one would be circular, and there is no reason to insist
+    * on Docker or a credential to write six files.
+    */
+  private def runInit(force: Boolean): Int =
+    val cwd  = Paths.get("").toAbsolutePath
+    val root = resolveRepoRoot(() => LiveProc.run(cwd, Seq("git", "rev-parse", "--show-toplevel")))
+    root match
+      case Left(msg) => LiveLog.log(s"FATAL: $msg"); 1
+      case Right(r)  =>
+        val detected = Init.detect(r, args => LiveProc.run(r, args))
+        Init.run(r, detected, force) match
+          case Left(msg)      => LiveLog.log(s"FATAL: $msg"); 1
+          case Right(written) =>
+            written.foreach(p => LiveLog.log(s"wrote $p"))
+            Init.warnings(detected).foreach(w => LiveLog.log(s"WARNING: $w"))
+            LiveLog.log("next steps:")
+            Init.nextSteps(detected).foreach(s => LiveLog.log(s"  - $s"))
+            0
+
+  /** `litter-box eject <prompt>`. Same reasoning as `runInit` for skipping preflight. */
+  private def runEject(what: String, force: Boolean): Int =
+    val cwd  = Paths.get("").toAbsolutePath
+    resolveRepoRoot(() => LiveProc.run(cwd, Seq("git", "rev-parse", "--show-toplevel"))) match
+      case Left(msg) => LiveLog.log(s"FATAL: $msg"); 1
+      case Right(r)  =>
+        Prompts.eject(r, what, force) match
+          case Left(msg)   => LiveLog.log(s"FATAL: $msg"); 1
+          case Right(dest) =>
+            LiveLog.log(s"wrote ${r.relativize(dest)} — it now overrides the built-in")
+            0
+
+  @main def litterBoxLoop(args: String*): Unit =
+    Cli.parse(args.toList) match
+      case Left(msg) =>
+        LiveLog.log(s"FATAL: $msg")
+        Console.err.println(Cli.Usage)
+        sys.exit(1)
+      case Right(Command.Help) =>
+        Console.out.println(Cli.Usage)
+        sys.exit(0)
+      case Right(Command.Init(force))        => sys.exit(runInit(force))
+      case Right(Command.Eject(what, force)) => sys.exit(runEject(what, force))
+      case Right(Command.Loop(dryRun))       => runLoop(dryRun)
+
+  /** The loop, which is everything this file did before there were subcommands. */
+  private def runLoop(dryRunFlag: Boolean): Unit =
     val env = sys.env
 
     // 1. root = the git work tree the process was launched inside. Everything downstream is
@@ -247,7 +302,10 @@ object Main:
     val fromFile = Settings.loadFile(root) match
       case Right(c)  => c
       case Left(msg) => die50(msg)
-    val parsed = parseEnv(fromFile, env)
+    val parsed0 = parseEnv(fromFile, env)
+    val parsed  = parsed0.copy(cfg =
+      parsed0.cfg.copy(dryRun = applyDryRunFlag(dryRunFlag, env))
+    )
 
     // 2b. instance-name reaches the sandbox scripts as an env var on every child (see
     // LiveProc.export). Set BEFORE the preflight below, which is itself the first child.

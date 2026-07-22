@@ -266,3 +266,22 @@ class MainSpec extends AnyFlatSpec with Matchers:
       java.nio.file.Files.isRegularFile(r.resolve(Settings.ConfigPath))
     ) shouldBe Right(true)
   }
+
+  // ===============================================================================================
+  // applyDryRunFlag: the one-way OR between --dry-run and DRY_RUN=1
+  // ===============================================================================================
+
+  "the --dry-run flag" should "turn dry-run on" in:
+    Main.applyDryRunFlag(flagged = true, Map.empty) shouldBe true
+
+  it should "leave DRY_RUN=1 alone when absent" in:
+    Main.applyDryRunFlag(flagged = false, Map("DRY_RUN" -> "1")) shouldBe true
+
+  it should "never turn an operator's DRY_RUN=1 off" in:
+    // The flag is one-way on purpose. An invocation that could silently disarm a dry run is an
+    // invocation that mutates a repo somebody believed was safe.
+    Main.applyDryRunFlag(flagged = false, Map("DRY_RUN" -> "1")) shouldBe true
+
+  it should "be off when neither says otherwise" in:
+    Main.applyDryRunFlag(flagged = false, Map("DRY_RUN" -> "0")) shouldBe false
+    Main.applyDryRunFlag(flagged = false, Map.empty) shouldBe false
