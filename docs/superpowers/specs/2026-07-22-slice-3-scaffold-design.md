@@ -97,7 +97,9 @@ built-in), so a consumer repo with no `prompts/` directory starts.
 
 ### Slots
 
-Five: `{{ISSUE}}`, `{{PROTECTED}}`, `{{GATE}}`, `{{CONVENTIONS}}`, `{{TAMPER}}`.
+The issue names five — `{{ISSUE}}`, `{{PROTECTED}}`, `{{GATE}}`, `{{CONVENTIONS}}`, `{{TAMPER}}` —
+but two more already exist in the render sites and must be carried: `{{FAILURE}}` (fix) and
+`{{DIFF}}` (review). Seven total.
 
 `Machine.renderTemplate` replaces only the keys it is given and leaves any other `{{KEY}}` line
 verbatim, which means an unsupplied slot ships to the model as literal braces. All three render
@@ -105,12 +107,21 @@ sites therefore pass every slot the template they render can contain:
 
 | Site | Template | Slots passed |
 |---|---|---|
-| `Machine.scala:178` | Iterate | ISSUE, PROTECTED, GATE, CONVENTIONS |
-| `Machine.scala:241` | Fix | ISSUE, PROTECTED, GATE, CONVENTIONS |
-| `Machine.scala:310` | Review | ISSUE, PROTECTED, GATE, CONVENTIONS, TAMPER |
+| `Machine.scala:178` | Iterate | PROTECTED, GATE, CONVENTIONS, ISSUE |
+| `Machine.scala:241` | Fix | PROTECTED, GATE, CONVENTIONS, ISSUE, FAILURE |
+| `Machine.scala:310` | Review | PROTECTED, GATE, CONVENTIONS, ISSUE, TAMPER, DIFF |
 
 `PROTECTED` renders `cfg.protect` as a bulleted list; `GATE` is `cfg.gateCmd`. Both come off
 `Config`, so an operator's `GATE_CMD` override reaches the prompt the same way it reaches the gate.
+
+**Splice order matters and changes.** `renderTemplate` folds left, so a slot spliced early has its
+injected text scanned by every later pass. Today `ISSUE` goes first, which means an issue body
+containing the literal `{{GATE}}` would have that line replaced by the gate command. The order
+above puts the config-derived, trusted slots (PROTECTED, GATE, CONVENTIONS) ahead of every slot
+carrying text the harness did not write (ISSUE from GitHub, FAILURE and TAMPER and DIFF derived
+from agent output), so injected content is never rescanned for slots. Not a privilege escalation —
+every value involved is already visible to the agent — but it stops a prompt from being reshaped by
+its own inputs.
 
 A test asserts no `{{` survives any render. That is the guard against a skeleton edit adding a slot
 nobody splices.
@@ -226,8 +237,10 @@ and there is one source of truth for the base layer. The *scaffolded consumer* D
 
 ### Allowlist
 
-`init` writes `.litter-box/allowlist`, so something has to read it: `start-proxy.sh` prefers
-`.litter-box/allowlist` when present and falls back to `sandbox/proxy/allowlist`.
+`init` writes `.litter-box/allowlist`, so something has to read it. The file is `COPY`ed into the
+proxy image at build time (`sandbox/proxy/Dockerfile:5`), not read at startup, so the override
+belongs in `build-image.sh`: when `.litter-box/allowlist` exists, the proxy image is built from a
+staged context carrying it instead of `sandbox/proxy/allowlist`.
 
 ### Publishing
 
