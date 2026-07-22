@@ -31,7 +31,7 @@ object Cli:
       |  litter-box init [--force]     scaffold .litter-box/ in this repo
       |  litter-box eject <prompt> [--force]
       |                                copy a built-in prompt to .litter-box/prompts/ to override it
-      |  litter-box --help             this message
+      |  litter-box --help | -h | help this message
       |
       |environment variables still work as they always have; a flag beats the matching variable.
       |""".stripMargin
@@ -40,7 +40,7 @@ object Cli:
     case Nil                                => Right(Command.Loop(dryRun = false))
     case ("--help" | "-h" | "help") :: Nil  => Right(Command.Help)
     case "init" :: rest                     => flagsOnly(rest, "--force").map(Command.Init.apply)
-    case "eject" :: what :: rest if !what.startsWith("-") =>
+    case "eject" :: what :: rest if what.nonEmpty && !what.startsWith("-") =>
       flagsOnly(rest, "--force").map(Command.Eject(what, _))
     case "eject" :: _ =>
       Left("eject needs the name of a prompt, e.g. `litter-box eject prompts/iterate-prompt.md`")
@@ -53,6 +53,10 @@ object Cli:
     * because ignoring it would imply `init` has a dry-run mode.
     */
   private def flagsOnly(rest: List[String], flag: String): Either[String, Boolean] = rest match
-    case Nil          => Right(false)
+    case Nil           => Right(false)
     case `flag` :: Nil => Right(true)
-    case other        => Left(s"unexpected argument: ${other.head}")
+    case other =>
+      // The offending token is whichever one isn't the flag this subcommand recognizes — not
+      // necessarily the first one, since a legitimate flag can be followed by a stray argument.
+      val unexpected = other.find(_ != flag).getOrElse(other.head)
+      Left(s"unexpected argument: $unexpected")

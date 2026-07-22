@@ -28,7 +28,16 @@ class CliSpec extends AnyFlatSpec with Matchers:
       Right(Command.Eject("fix-prompt.md", force = true))
 
   it should "reject eject with no argument" in:
-    Cli.parse(List("eject")).isLeft shouldBe true
+    val result = Cli.parse(List("eject"))
+    result.isLeft shouldBe true
+    result.left.toOption.get should include("eject needs the name of a prompt")
+
+  it should "reject eject with an empty prompt name" in:
+    // An empty string does not start with "-", so a guard that only checks for a leading dash
+    // would let it through as if it were a real prompt name.
+    val result = Cli.parse(List("eject", ""))
+    result.isLeft shouldBe true
+    result.left.toOption.get should include("eject needs the name of a prompt")
 
   it should "accept every spelling of help" in:
     Cli.parse(List("--help")) shouldBe Right(Command.Help)
@@ -36,15 +45,29 @@ class CliSpec extends AnyFlatSpec with Matchers:
     Cli.parse(List("help")) shouldBe Right(Command.Help)
 
   it should "reject an unknown subcommand" in:
-    Cli.parse(List("frobnicate")).isLeft shouldBe true
+    val result = Cli.parse(List("frobnicate"))
+    result.isLeft shouldBe true
+    result.left.toOption.get should include("frobnicate")
 
   it should "reject an unknown flag on a known subcommand" in:
-    Cli.parse(List("init", "--wat")).isLeft shouldBe true
+    val result = Cli.parse(List("init", "--wat"))
+    result.isLeft shouldBe true
+    result.left.toOption.get should include("--wat")
 
   it should "reject a flag that belongs to another subcommand" in:
     // --dry-run is a loop flag. Accepting it on `init` silently would suggest init has a dry-run
     // mode, which it does not.
-    Cli.parse(List("init", "--dry-run")).isLeft shouldBe true
+    val result = Cli.parse(List("init", "--dry-run"))
+    result.isLeft shouldBe true
+    result.left.toOption.get should include("--dry-run")
+
+  it should "blame the actual unexpected token, not the legitimate flag next to it" in:
+    // `init --force extra` was previously reported as `unexpected argument: --force`, blaming
+    // the flag the caller got right instead of the token that was actually the problem.
+    val result = Cli.parse(List("init", "--force", "extra"))
+    result.isLeft shouldBe true
+    result.left.toOption.get should include("extra")
+    result.left.toOption.get should not include "unexpected argument: --force"
 
   "the usage text" should "mention every subcommand" in:
     Cli.Usage should include("init")
