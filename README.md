@@ -12,13 +12,83 @@ Extracted from the `harness/` directory of
 and being generalized into an installable tool. See [#1](https://github.com/rcardin/litter-box/issues/1)
 for the design record.
 
-## Not installable yet
+## Status
 
-There is no `litter-box` binary and no `litter-box init` yet. What slice 2 added is the tie-cutting:
-the loop finds its repo with `git rev-parse --show-toplevel` instead of assuming it lives inside one,
-and every repo-specific value now comes from `.litter-box/config.conf` instead of a literal in the
-source. The scaffold command (`#4`) and a published binary (`#6`) still come later.
-**If you are looking for something to install, come back after [#1](https://github.com/rcardin/litter-box/issues/1) closes.**
+`litter-box init` and `litter-box eject` exist and work — see [Getting started](#getting-started).
+What is still missing is a published binary: there is no `brew install litter-box` yet, so for now
+you build one from a checkout. Tracked as [#6](https://github.com/rcardin/litter-box/issues/6).
+
+## Getting started
+
+There is no published binary yet, so build one from a checkout of this repo:
+
+```bash
+scala-cli --power package . -o lb --assembly
+```
+
+Then, from the repo you want to run the loop against:
+
+```bash
+java -jar /path/to/lb init
+```
+
+`init` detects your GitHub remote (via `gh`), whether `build.sbt` is present, and your JDK version,
+then writes six files under `.litter-box/`:
+
+| File | Purpose |
+|---|---|
+| `config.conf` | the loop's only mandatory config — see [Configuration](#configuration) below |
+| `Dockerfile` | `FROM ghcr.io/rcardin/litter-box-base` plus your build tool layer — see [The sandbox image](#the-sandbox-image) |
+| `allowlist` | egress domains the sandbox proxy permits |
+| `prompts/conventions.md` | the one file you own — spliced into every prompt as `{{CONVENTIONS}}` |
+| `.env.example` | the credential the sandboxed worker needs, meant to be copied, never committed |
+| `.gitignore` | ignores `logs/` and `.env` inside `.litter-box/` |
+
+It refuses to overwrite an existing `.litter-box/` unless you pass `--force`, and the check happens
+before the first file is written, so a refused `init` never leaves a half scaffold.
+
+If no `build.sbt` is found, both `Dockerfile` and `config.conf`'s `gate.fast` carry a `TODO` and
+`gate.fast` is written as `"false"` rather than a guessed preset — litter-box will not run a build
+tool nobody has confirmed. Sbt is the only preset today; adding another (Gradle, Maven, ...) is a
+PR — see [Adding a preset](docs/base-image.md#adding-a-preset).
+
+`init` also prints up to three warnings (no remote found, no build tool detected, a JDK other than
+21) and three next steps, none of which it can do on your behalf:
+
+1. **Fill in `.litter-box/prompts/conventions.md`.** It is the highest-value file here: everything
+   true only of your project — layout, test tiers, lint rules, "anything that has bitten you" — is
+   spliced into every worker, fixer and reviewer prompt as `{{CONVENTIONS}}`. The prompt skeletons
+   themselves, the protocol that keeps the loop honest, ship inside the litter-box artifact, not in
+   your repo.
+2. **Provide a credential.** `cp .litter-box/.env.example .litter-box/.env` and fill in
+   `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY`.
+3. **Create the three labels** the state machine drives on:
+   ```bash
+   gh label create ready && gh label create in-progress && gh label create blocked
+   ```
+
+### Overriding a prompt skeleton
+
+The four prompt skeletons — `iterate-prompt.md`, `fix-prompt.md`, `review-prompt.md`,
+`grill-issue-prompt.md` — ship inside the jar. A repo that genuinely needs to change one, not just
+its conventions, ejects it:
+
+```bash
+java -jar /path/to/lb eject iterate-prompt.md
+```
+
+This copies the built-in skeleton to `.litter-box/prompts/iterate-prompt.md`, which then wins over
+the built-in for every later run. `.litter-box/prompts/**` sits inside `.litter-box/**`, which the
+protected-path floor always covers, so a worker under harness cannot rewrite the prompt that
+constrains it. Pass `--force` to overwrite one you already ejected.
+
+### The sandbox image
+
+`.litter-box/Dockerfile` builds `FROM ghcr.io/rcardin/litter-box-base` — a build-tool-free image
+carrying temurin 21, a pinned Claude CLI and a non-root user, with no `ENTRYPOINT` and no
+credentials baked in. **Nothing has been published to ghcr yet** — the first publish happens when a
+tag is cut. See [docs/base-image.md](docs/base-image.md) for the full contract the image guarantees
+and how to add a build-tool preset beyond sbt.
 
 ## Configuration
 
@@ -137,14 +207,19 @@ issue as eligible for auto-merge once CI is green.
 ## Layout
 
 ```
-src/          the loop: Machine (state machine), Live (handlers), Caps, Domain, Main
-test/         the suite, plus golden/ — the frozen log-line contract
-prompts/      worker, fixer and reviewer prompt templates
-sandbox/      the Docker sandbox: gate, agent and reviewer runners, egress proxy
-sandbox/test/ Docker-dependent shell tests, run manually
-lib/          shell helpers for the watch UI
-watch.sh      live run monitor, reads the log stream and status.jsonl
+src/           the loop: Machine (state machine), Live (handlers), Caps, Domain, Main, Init, Cli, Prompts
+test/          the suite, plus golden/ — the frozen log-line contract
+resources/     shipped inside the artifact: prompts/ (built-in skeletons), scaffold/ (init's templates)
+docs/          reference docs, e.g. base-image.md
+sandbox/       the Docker sandbox: base image, gate, agent and reviewer runners, egress proxy
+sandbox/test/  Docker-dependent shell tests, run manually
+lib/           shell helpers for the watch UI
+watch.sh       live run monitor, reads the log stream and status.jsonl
 ```
+
+Prompt skeletons no longer live in a consumer repo's `prompts/` directory — they ship inside the
+artifact under `resources/prompts/`, with `.litter-box/prompts/` as the per-repo override written by
+`litter-box eject` (see [Getting started](#getting-started)).
 
 `Machine` is a pure decision function over a `using` clause of capability traits (`Caps.scala`);
 `Live.scala` holds every real side effect. That is what lets the whole suite run in memory.
