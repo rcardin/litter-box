@@ -100,7 +100,7 @@ config key for a single run, so the layering is **env var > config file > refere
 
 ```hocon
 instance-name = "litter-box"          # namespaces the Docker image/network/proxy/cache names
-conventions   = "CONTEXT.md"          # spliced into the review prompt as {{CONVENTIONS}}
+conventions   = ".litter-box/prompts/conventions.md"  # spliced into the worker, fixer and reviewer prompts as {{CONVENTIONS}}
 stop-file     = "STOP.md"
 log-dir       = ".litter-box/logs"
 
@@ -174,11 +174,13 @@ every other state exits the process immediately. The loop runs at most `MAX_ITER
 ## Running it
 
 ```bash
-scala-cli test .     # the test suite: no Docker, no gh, no credentials
-scala-cli run .      # the loop itself
+scala-cli test .            # the test suite: no Docker, no gh, no credentials
+scala-cli run . -- --help   # usage: init, eject, --dry-run (same binary as `litter-box`)
+scala-cli run .             # the loop itself
 ```
 
-Everything is configured by environment variable — there are no CLI arguments.
+Environment variables still configure the loop — a flag beats the matching variable where both
+exist. See [Getting started](#getting-started) for `init`, `eject`, `--dry-run` and `--help`.
 
 | Variable | Default | Purpose |
 |---|---|---|

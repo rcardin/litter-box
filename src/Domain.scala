@@ -156,7 +156,9 @@ final case class Config(
       * the sandbox scripts as `Settings.InstanceEnvVar`.
       */
     instanceName: String = "litter-box",
-    /** `conventions` — the file spliced into the review prompt as `{{CONVENTIONS}}`. */
+    /** `conventions` — the file spliced into the worker, fixer and reviewer prompts as
+      * `{{CONVENTIONS}}`.
+      */
     conventions: String = "CONTEXT.md",
     /** `stop-file` — the manual kill switch. The loop reads it and never writes it. */
     stopFile: String = "STOP.md",

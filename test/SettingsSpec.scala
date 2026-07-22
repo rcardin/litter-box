@@ -561,8 +561,8 @@ class SettingsSpec extends AnyFlatSpec with Matchers:
     val fs = LiveHarnessFs(root)(using Config(stopFile = "HALT.md", conventions = "RULES.md"))
 
     // Both files exist, so only reading the configured name can produce this answer. Whatever comes
-    // back here is spliced into the reviewer prompt as {{CONVENTIONS}}, which is to say the cold
-    // reviewer grades against it.
+    // back here is spliced into the worker, fixer and reviewer prompts as {{CONVENTIONS}}, which is
+    // to say the cold reviewer grades against the same file the worker was told to follow.
     fs.conventions() shouldBe "the house rules\n"
   }
 
