@@ -7,8 +7,11 @@ import scala.util.control.NonFatal
 
 /** Entry point: `scala-cli run .`. Env parsing, preflight, and the MAX_ITERS driver
   * loop that reproduces the original loop.sh's outer shell (loop.sh:100-215 for startup/preflight,
-  * loop.sh:925-944 for the driver) over the Machine/Live wiring tasks 1-2 built. No CLI args are
-  * consumed; everything is env, exactly like bash.
+  * loop.sh:925-944 for the driver) over the Machine/Live wiring tasks 1-2 built.
+  *
+  * Args reach `Cli.parse` first. `init`, `eject` and `help` run and exit before any preflight,
+  * because a repo with no config is the whole reason to run `init`; everything else the loop needs
+  * still comes from the environment, exactly like bash.
   */
 object Main:
 

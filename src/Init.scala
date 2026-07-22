@@ -55,8 +55,10 @@ object Init:
       try
         val r = exec(Seq("java", "-version"))
         // `java -version` writes to stderr, and has done since 1.0. The major version is the first
-        // dotted component of the quoted version string.
-        "\"(\\d+)".r.findFirstMatchIn(r.stderr + r.stdout).map(_.group(1))
+        // dotted component of the quoted version string on 9 and later ("21.0.5"), but the SECOND
+        // on 8 and earlier, which spell themselves "1.8.0_392". Skipping an optional leading `1.`
+        // reads both, rather than telling an operator on 8 that they build under JDK 1.
+        "\"(?:1\\.)?(\\d+)".r.findFirstMatchIn(r.stderr + r.stdout).map(_.group(1))
       catch case NonFatal(_) => None
 
     Detected(buildTool, remote, jdk)

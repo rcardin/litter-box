@@ -150,6 +150,11 @@ class PromptsSpec extends AnyFlatSpec with Matchers:
       }
     }
 
+  it should "leave no slot in the grill-issue skeleton, which nothing renders" in:
+    // GrillIssue is invoked by hand against a repo, not by Machine: there is no render site to
+    // splice it, so a slot here reaches a human as literal braces rather than as content.
+    Prompts.builtIn(Template.GrillIssue) should not include "{{"
+
   it should "name no project-specific convention" in:
     // The whole point of the slice: a consumer inherits the protocol, never another project's
     // domain. Each of these is a real line the pre-slice-3 skeletons carried.

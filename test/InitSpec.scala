@@ -21,6 +21,14 @@ class InitSpec extends AnyFlatSpec with Matchers:
   private def readString(p: Path): String =
     new String(Files.readAllBytes(p), StandardCharsets.UTF_8)
 
+  /** An `exec` seam that answers only the `java -version` probe, on stderr where the real tool
+    * writes it, and fails everything else so a test asserting on the JDK cannot pass by reading
+    * the `gh` result instead.
+    */
+  private def javaBanner(banner: String): Seq[String] => LiveProc.Result =
+    case Seq("java", _*) => LiveProc.Result(0, "", banner)
+    case _               => LiveProc.Result(1, "", "")
+
   /** Every file under `root`, as repo-relative path strings, sorted. Used to assert that a refused
     * `init` changed literally nothing.
     */
@@ -149,3 +157,13 @@ class InitSpec extends AnyFlatSpec with Matchers:
   it should "survive gh being absent" in:
     val d = Init.detect(tempRoot(), _ => throw java.io.IOException("no gh"))
     d.remote shouldBe None
+
+  it should "read the major version off a modern java -version banner" in:
+    val d = Init.detect(tempRoot(), javaBanner("openjdk version \"21.0.5\" 2024-10-15"))
+    d.jdk shouldBe Some("21")
+
+  it should "read the major version off a legacy 1.x java -version banner" in:
+    // A JDK 8 banner spells its major version as the SECOND dotted component: taking the first
+    // digits after the quote warns the operator that "this repo builds under JDK 1".
+    val d = Init.detect(tempRoot(), javaBanner("java version \"1.8.0_392\""))
+    d.jdk shouldBe Some("8")

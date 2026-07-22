@@ -4,7 +4,9 @@
 
 `src/` holds the loop: `Domain.scala` (types and exit codes), `Machine.scala` (the pure state
 machine), `Caps.scala` (the capability interfaces), `Live.scala` (their real implementations),
-`Settings.scala` (config), `Main.scala` (wiring and the driver). `test/` mirrors it.
+`Settings.scala` (config), `Cli.scala` (argument parsing), `Init.scala` (the `init` scaffolder),
+`Prompts.scala` (template resolution and `eject`), `Main.scala` (wiring and the driver). `test/`
+mirrors it.
 
 The rule: `Machine` is pure and depends only on the capabilities in `Caps.scala`. It never touches
 the filesystem, a subprocess, or the clock directly. Everything that does lives in `Live.scala`

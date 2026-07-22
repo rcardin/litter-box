@@ -36,12 +36,14 @@ criterion that cannot become a failing test is a defect.
 The worker, fixer and reviewer prompts already carry the protocol: one iteration with no memory;
 no branch switching, pushing, PR opening or `gh` commands; a test for every acceptance criterion;
 never weaken, delete or silence a test to go green; the fast tier gates each iteration while the
-slow tier is left to CI. They also carry this project's conventions in full, reproduced below.
-The issue REFERENCES all of that, it does not re-teach it.
+slow tier is left to CI. They also carry this project's conventions in full, spliced in at render
+time. The issue REFERENCES all of that, it does not re-teach it.
 
 ## This project's conventions
 
-{{CONVENTIONS}}
+Read `.litter-box/prompts/conventions.md` in the repository this issue is for, and treat it as
+already known by everyone downstream. Unlike the worker, fixer and reviewer prompts, this one is
+invoked by hand rather than rendered by the loop, so nothing splices that file in for you.
 
 ## Interrogate me until you can fill every slot
 1. **Identity and value.** A story identifier, a one-line title, and the "As a / I want / so
