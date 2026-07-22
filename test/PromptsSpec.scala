@@ -70,3 +70,22 @@ class PromptsSpec extends AnyFlatSpec with Matchers:
     new String(Files.readAllBytes(dest), StandardCharsets.UTF_8) shouldBe Prompts.builtIn(
       Template.Review
     )
+
+  "renderTemplate" should "leave an unsupplied slot in the output verbatim" in:
+    // The reason every render site below must pass every slot its template can contain: an
+    // unsupplied slot is not an error, it is a literal `{{KEY}}` shipped to the model.
+    Machine.renderTemplate("a\n{{GATE}}\nb", "ISSUE" -> "x") shouldBe "a\n{{GATE}}\nb"
+
+  it should "not rescan content it has already spliced" in:
+    // Splice order: the trusted, config-derived slots go first, so text arriving from GitHub or
+    // from agent output can never be reshaped into a different prompt by naming a later slot.
+    val out = Machine.renderTemplate(
+      "{{GATE}}\n{{ISSUE}}",
+      "GATE"  -> "sbt test",
+      "ISSUE" -> "{{GATE}}"
+    )
+    out shouldBe "sbt test\n{{GATE}}"
+
+  "protectedList" should "render one bullet per protect entry" in:
+    Machine.protectedList(List(".litter-box/**", "CONTEXT.md")) shouldBe
+      "- `.litter-box/**`\n- `CONTEXT.md`"
