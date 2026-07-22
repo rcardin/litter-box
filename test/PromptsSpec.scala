@@ -89,3 +89,76 @@ class PromptsSpec extends AnyFlatSpec with Matchers:
   "protectedList" should "render one bullet per protect entry" in:
     Machine.protectedList(List(".litter-box/**", "CONTEXT.md")) shouldBe
       "- `.litter-box/**`\n- `CONTEXT.md`"
+
+  /** The protocol lines: the ones that keep the machine honest. A consumer who deletes one of
+    * these breaks the loop with no error at all — the reviewer stops emitting a parseable verdict,
+    * or the agent starts pushing branches — so they live in the skeleton and this test says so.
+    */
+  "the built-in skeletons" should "keep the verdict contract in the reviewer prompt" in:
+    val rendered = Machine.renderTemplate(
+      Prompts.builtIn(Template.Review),
+      "PROTECTED"   -> Machine.protectedList(List(".litter-box/**")),
+      "GATE"        -> "sbt test",
+      "CONVENTIONS" -> "", // a consumer who wrote nothing at all
+      "ISSUE"       -> "an issue",
+      "TAMPER"      -> "no tampering",
+      "DIFF"        -> "a diff"
+    )
+    rendered should include("VERDICT: APPROVE")
+    rendered should include("VERDICT: REQUEST_CHANGES")
+
+  it should "keep the no-gh and no-success-report rules in the worker prompt" in:
+    val rendered = Machine.renderTemplate(
+      Prompts.builtIn(Template.Iterate),
+      "PROTECTED"   -> Machine.protectedList(List(".litter-box/**")),
+      "GATE"        -> "sbt test",
+      "CONVENTIONS" -> "",
+      "ISSUE"       -> "an issue"
+    )
+    rendered should include("Do not run any `gh` command")
+    rendered should include("You do not report success")
+
+  it should "substitute every slot, leaving no braces behind" in:
+    // Guards the whole slot contract at once: a skeleton edit that adds a slot nobody splices
+    // fails here rather than shipping literal braces to the model.
+    val cases = List(
+      Template.Iterate -> Seq(
+        "PROTECTED"   -> "- `x`",
+        "GATE"        -> "g",
+        "CONVENTIONS" -> "c",
+        "ISSUE"       -> "i"
+      ),
+      Template.Fix -> Seq(
+        "PROTECTED"   -> "- `x`",
+        "GATE"        -> "g",
+        "CONVENTIONS" -> "c",
+        "ISSUE"       -> "i",
+        "FAILURE"     -> "f"
+      ),
+      Template.Review -> Seq(
+        "PROTECTED"   -> "- `x`",
+        "GATE"        -> "g",
+        "CONVENTIONS" -> "c",
+        "ISSUE"       -> "i",
+        "TAMPER"      -> "t",
+        "DIFF"        -> "d"
+      )
+    )
+    cases.foreach { case (t, splices) =>
+      withClue(s"${t.fileName}: ") {
+        Machine.renderTemplate(Prompts.builtIn(t), splices*) should not include "{{"
+      }
+    }
+
+  it should "name no project-specific convention" in:
+    // The whole point of the slice: a consumer inherits the protocol, never another project's
+    // domain. Each of these is a real line the pre-slice-3 skeletons carried.
+    val banned = List("US-1", "Register", "Testcontainers", "onion", "src/it", "@nowarn", "-Werror")
+    Template.values.foreach { t =>
+      val text = Prompts.builtIn(t)
+      banned.foreach { word =>
+        withClue(s"${t.fileName} still mentions '$word': ") {
+          text should not include word
+        }
+      }
+    }

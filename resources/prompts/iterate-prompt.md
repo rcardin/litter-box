@@ -11,34 +11,36 @@ issue other than this one.
 
 ## Hard rules
 
-- Work only inside this repository's working tree on the current branch. Do not switch,
-  create, merge, or delete branches. Do not push. Do not open a PR. Do not run any `gh`
-  command. The harness does all git/GitHub plumbing around you.
-- Follow `CONTEXT.md` conventions exactly: domain errors stay internal to the domain; the
-  use case defines its own error enum that is the only error type crossing into the
-  application layer; keep the `copy/` onion package layout (domain / application / adapter /
-  infrastructure).
-- Use the existing US-1 `Register` slice as your template for shape, naming, and tests.
-- Write tests for every acceptance criterion. Prefer in-memory unit/acceptance tests — use the
-  existing in-memory fixtures / stubs — and put them in `src/test/scala`.
-- **Test-placement rule (tier split).** Integration tests that need a real database
-  (Testcontainers / a JDBC round-trip against Postgres) live in `src/it/scala`. In-memory unit
-  and acceptance tests live in `src/test/scala`. Never put a Docker-dependent test in
-  `src/test` — it will not run in the fast gate and will break the tier split. For most user
-  stories no `src/it` test is needed; add one only if the acceptance criteria require a real
-  Postgres round-trip.
-- The project compiles under `-Werror`. Warnings are build failures. Keep it clean.
-- Do not weaken, delete, or `@nowarn`-silence existing tests to make the build pass.
-- Do not edit files under `harness/`, `docs/`, `PROMPT.md`, or `CONTEXT.md`.
+- Work only inside this repository's working tree on the current branch. Do not switch, create,
+  merge, or delete branches. Do not push. Do not open a PR. Do not run any `gh` command. The
+  harness does all git/GitHub plumbing around you.
+- Do not edit any of these protected paths. A patch that touches one is rejected whole, and
+  you lose the iteration:
+
+{{PROTECTED}}
+
+- Follow this project's conventions exactly. They are reproduced in full below, and they are
+  binding on this iteration in the same way these hard rules are.
+- Write tests for every acceptance criterion in the issue.
+- Two test tiers exist. The fast tier runs here, on every iteration, and gates your work. The
+  slow tier runs in CI after the harness opens a PR. A test that needs external infrastructure
+  belongs in the slow tier: put one in the fast tier and it will not run here, which breaks the
+  split and hides a failure until CI. The conventions below say which directory is which.
+- Do not weaken, delete, or silence existing tests to make the build pass. Suppressing a
+  warning or an assertion to get to green is the same failure as deleting the test.
+
+## This project's conventions
+
+{{CONVENTIONS}}
 
 ## Definition of done for this iteration
 
 - The acceptance criteria in the issue are implemented.
-- `sbt -Werror compile` is clean and `sbt test` (the fast in-memory tier) is green.
-- If you added any `src/it` test, keep it correct: it is judged by CI (a real-Postgres runner),
-  not by a local gate, so it must be self-contained and pass against a fresh Postgres.
+- The fast gate is green. The harness runs it as: `{{GATE}}`
 - Every acceptance criterion maps to at least one test.
+- Any slow-tier test you added is self-contained and passes against fresh infrastructure, since
+  CI judges it and you cannot.
 
-When you believe you are done, stop. The harness runs the fast (in-memory) gate and an independent
-reviewer, opens a PR, and lets CI run the real-Postgres integration tests. You do not report
-success — the gate, the reviewer, and CI do.
+When you believe you are done, stop. The harness runs the fast gate and an independent reviewer,
+opens a PR, and lets CI run the slow tier. You do not report success. The gate, the reviewer, and
+CI do.

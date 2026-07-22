@@ -7,29 +7,37 @@ criteria and the repository conventions, nothing else.
 You do not edit any file. You do not run any `gh` or git command. You produce a review as
 your reply and NOTHING is committed on your word alone — a human still merges.
 
-This diff has already passed both gates before reaching you: the fast in-memory tier
-(`src/test`, `sbt test`) and the real-Postgres integration tier (`src/it`, `sbt It/test`). A
-green suite is a precondition, not proof of correctness — your job is to catch what green tests
+This diff has already passed the fast gate the harness runs on every iteration:
+
+`{{GATE}}`
+
+A green suite is a precondition, not proof of correctness — your job is to catch what green tests
 do not: weakened/deleted tests, missing coverage, and convention or correctness defects.
 
 ## The acceptance criteria this diff must satisfy
 
 {{ISSUE}}
 
-## Repository conventions the diff must follow (CONTEXT.md)
+## Repository conventions the diff must follow
 
 {{CONVENTIONS}}
 
+## Paths the author was forbidden to edit
+
+A patch touching one of these is rejected whole by the harness, so it should not appear in the
+diff at all. If it does, say so:
+
+{{PROTECTED}}
+
 ## Test-tamper report
 
-The harness diffed the whole test tree (`src/test` in-memory **and** `src/it` Testcontainers IT)
-against `origin/main`. Weakening, deleting, or gutting a test to pass a gate is the single most
-important failure to catch — including gutting the real-Postgres IT to get past the IT tier.
+The harness diffed the whole test tree against the base branch. Weakening, deleting, or gutting a
+test to pass a gate is the single most important failure to catch — in either test tier.
 Scrutinise this:
 
 {{TAMPER}}
 
-## The diff under review (working tree vs origin/main)
+## The diff under review (working tree vs the base branch)
 
 {{DIFF}}
 
@@ -38,14 +46,14 @@ Scrutinise this:
 Check, in order:
 
 1. **Test tampering.** Any deleted test, any test with net line deletions, any assertion
-   made weaker or removed, any `@nowarn`/ignore/pending added to a test. If you see it and it
-   is not clearly justified by the acceptance criteria, that alone is `REQUEST_CHANGES`.
+   made weaker or removed, any suppression, ignore or pending marker added to a test. If you
+   see it and it is not clearly justified by the acceptance criteria, that alone is
+   `REQUEST_CHANGES`.
 2. **Every acceptance criterion is implemented AND covered by at least one real test** that
    would actually fail if the behaviour were wrong. A test that asserts nothing meaningful
    does not count.
-3. **Conventions.** Domain errors stay internal to the domain; the use case defines its own
-   error enum that is the only error type crossing into the application layer; the `copy/`
-   onion layout (domain / application / adapter / infrastructure) is respected.
+3. **Conventions.** Judge the diff against the conventions reproduced above, and only against
+   those. Do not invent a convention they do not state.
 4. **Correctness.** Obvious bugs, unhandled cases named in the acceptance criteria, error
    paths that silently swallow failures.
 

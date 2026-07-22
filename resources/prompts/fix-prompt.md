@@ -16,37 +16,40 @@ issue other than this one.
 
 ## Hard rules
 
-- Work only inside this repository's working tree on the current branch. Do not switch,
-  create, merge, or delete branches. Do not push. Do not open a PR. Do not run any `gh`
-  command. The harness does all git/GitHub plumbing around you.
-- Follow `CONTEXT.md` conventions exactly: domain errors stay internal to the domain; the
-  use case defines its own error enum that is the only error type crossing into the
-  application layer; keep the `copy/` onion package layout (domain / application / adapter /
-  infrastructure).
-- Write tests for every acceptance criterion. Prefer in-memory unit/acceptance tests (existing
-  in-memory fixtures / stubs) in `src/test/scala`.
-- **Test-placement rule (tier split).** Integration tests that need a real database
-  (Testcontainers / a JDBC round-trip against Postgres) live in `src/it/scala`. In-memory unit
-  and acceptance tests live in `src/test/scala`. Never put a Docker-dependent test in
-  `src/test` — it will not run in the fast gate and will break the tier split. Only add an
-  `src/it` test if the acceptance criteria require a real Postgres round-trip.
-- The project compiles under `-Werror`. Warnings are build failures. Keep it clean.
-- Do NOT weaken, delete, disable, or `@nowarn`-silence existing tests to make the build pass
-  or to satisfy the reviewer. Deleting a failing test is the failure this loop exists to
-  catch — fix the code, not the test.
+- Work only inside this repository's working tree on the current branch. Do not switch, create,
+  merge, or delete branches. Do not push. Do not open a PR. Do not run any `gh` command. The
+  harness does all git/GitHub plumbing around you.
+- Do not edit any of these protected paths. A patch that touches one is rejected whole, and
+  you lose the iteration:
+
+{{PROTECTED}}
+
+- Follow this project's conventions exactly. They are reproduced in full below, and they are
+  binding on this iteration in the same way these hard rules are.
+- Write tests for every acceptance criterion in the issue.
+- Two test tiers exist. The fast tier runs here, on every iteration, and gates your work. The
+  slow tier runs in CI after the harness opens a PR. A test that needs external infrastructure
+  belongs in the slow tier: put one in the fast tier and it will not run here, which breaks the
+  split and hides a failure until CI. The conventions below say which directory is which.
+- Do NOT weaken, delete, disable, or silence existing tests to make the build pass or to
+  satisfy the reviewer. Deleting a failing test is the failure this loop exists to catch — fix
+  the code, not the test.
 - If the failure above is a reviewer request, address the reasons it gives directly; do not
   argue with them and do not make unrelated changes.
-- Do not edit files under `harness/`, `docs/`, `PROMPT.md`, or `CONTEXT.md`.
+
+## This project's conventions
+
+{{CONVENTIONS}}
 
 ## Definition of done for this iteration
 
 - The failure above is resolved.
 - The acceptance criteria in the issue are implemented.
-- `sbt -Werror compile` is clean and `sbt test` (the fast in-memory tier) is green.
-- If any `src/it` test exists, keep it correct: CI (a real-Postgres runner) judges it, not a
-  local gate, so it must be self-contained and pass against a fresh Postgres.
+- The fast gate is green. The harness runs it as: `{{GATE}}`
 - Every acceptance criterion maps to at least one test.
+- Any slow-tier test that exists stays correct and self-contained, since CI judges it against
+  fresh infrastructure and you cannot.
 
-When you believe you are done, stop. The harness re-runs the fast (in-memory) gate, then the
-independent reviewer, and lets CI run the real-Postgres integration tests. You do not report
-success — the gate, the reviewer, and CI do.
+When you believe you are done, stop. The harness re-runs the fast gate, then the independent
+reviewer, and lets CI run the slow tier. You do not report success. The gate, the reviewer, and
+CI do.
