@@ -187,6 +187,49 @@ class MainSpec extends AnyFlatSpec with Matchers:
   }
 
   // ===============================================================================================
+  // missingGateTool: is the CONFIGURED gate command runnable, whatever build tool it names?
+  // ===============================================================================================
+
+  private val gateRoot = java.nio.file.Path.of("/work/consumer-repo")
+  private val gatePath = List("/usr/bin", "/bin").mkString(java.io.File.pathSeparator)
+
+  "missingGateTool" should "find None when a bare tool name is on PATH" in {
+    Main.missingGateTool(gateRoot, "true", gatePath, _ == "/usr/bin/true") shouldBe None
+  }
+
+  it should "return the bare tool name when it is on no PATH dir" in {
+    Main.missingGateTool(gateRoot, "sbt", gatePath, _ => false) shouldBe Some("sbt")
+  }
+
+  it should "find None when a repo-relative script path resolves to an executable file" in {
+    val script = "/work/consumer-repo/sandbox/run-fast-gate.sh"
+    Main.missingGateTool(
+      gateRoot,
+      "sandbox/run-fast-gate.sh",
+      gatePath,
+      _ == script
+    ) shouldBe None
+  }
+
+  it should "return the resolved absolute path when a repo-relative script is missing" in {
+    val script = "/work/consumer-repo/sandbox/run-fast-gate.sh"
+    Main.missingGateTool(gateRoot, "sandbox/run-fast-gate.sh", gatePath, _ => false) shouldBe
+      Some(script)
+  }
+
+  it should "find None for an empty gate command, bash's own no-op reading" in {
+    Main.missingGateTool(gateRoot, "", gatePath, _ => false) shouldBe None
+  }
+
+  it should "find None for a whitespace-only gate command" in {
+    Main.missingGateTool(gateRoot, "   ", gatePath, _ => false) shouldBe None
+  }
+
+  it should "accept GATE_CMD=true, the shape the dry-run verification and sandbox scripts use" in {
+    Main.missingGateTool(gateRoot, "true", gatePath, _ == "/bin/true") shouldBe None
+  }
+
+  // ===============================================================================================
   // resolveRepoRoot: the CONSUMER repo's work tree, per `git rev-parse --show-toplevel`
   // ===============================================================================================
 

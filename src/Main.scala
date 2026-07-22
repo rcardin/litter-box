@@ -105,6 +105,56 @@ object Main:
   private def onRealPath(pathEnv: String, name: String): Option[String] =
     findOnPath(pathEnv, name, p => Files.isExecutable(Path.of(p)))
 
+  // ---- gate-tool preflight: is the CONFIGURED gate command runnable at all? ------------------
+
+  /** Whether the configured gate command can actually be launched, checked the same way
+    * `LiveGateRunner.run` itself resolves and launches it — word-split, then argv[0] resolved
+    * against `root` by `resolveArgv0` — rather than by a hard-coded guess at what build tool the
+    * gate happens to use.
+    *
+    * Replaces a former hard-coded `sbt` PATH probe (loop.sh:196), a verbatim port of a bash script
+    * that only ever ran one repo's own sbt build. That assumption does not survive `litter-box`
+    * becoming a tool other repos consume: THIS repo's own `gate.fast` is `sandbox/run-fast-gate.sh`,
+    * a script that `docker run`s a container — sbt executes INSIDE that container and the host never
+    * needs it, so the old check was preflighting a binary the run does not use. A scaffolded
+    * consumer's gate is whatever `gate.fast` says, sbt or not; hard-coding `sbt` there produced the
+    * wrong diagnostic (`sbt not found`) for every non-sbt consumer. Probing the CONFIGURED command's
+    * own argv0 is the one preflight that is correct for every consumer, because it is the exact
+    * thing `LiveGateRunner` is about to try to exec.
+    *
+    * An empty/whitespace-only `gateCmd` returns `None` (nothing missing), not an error:
+    * `LiveProc.wordSplit` gives it bash's own no-op reading, the same one `LiveGateRunner.run`'s
+    * empty-argv branch relies on (Live.scala:450-464) to stay green on an empty gate. A preflight
+    * that treated an empty gate as a missing tool would reject a configuration the gate runner
+    * itself accepts and runs green — a regression this function must not introduce.
+    *
+    * TEST AFFORDANCE, deliberate, same shape as `findOnPath`'s `exists`: injected so the resolution
+    * can be exercised against invented PATHs, repo roots and gate commands without depending on what
+    * the host machine happens to have installed. THE ONLY PRODUCTION CALLER IS `onRealGateTool`
+    * below, which passes the real `Files.isExecutable`.
+    *
+    * Returns the argv0 AS RESOLVED — a repo-relative script made absolute under `root`, a bare name
+    * left untouched — when it could not be found, so the operator sees the actual thing that was
+    * looked for rather than the raw config string.
+    */
+  private[litterbox] def missingGateTool(
+      root: Path,
+      gateCmd: String,
+      pathEnv: String,
+      exists: String => Boolean
+  ): Option[String] =
+    LiveProc.wordSplit(gateCmd) match
+      case Seq() => None // empty/whitespace-only gate: bash's no-op, nothing to find
+      case words =>
+        val argv0 = LiveGateRunner.resolveArgv0(root, words).head
+        val runnable =
+          if argv0.contains('/') then exists(argv0)
+          else findOnPath(pathEnv, argv0, exists).isDefined
+        Option.unless(runnable)(argv0)
+
+  private def onRealGateTool(root: Path, gateCmd: String, pathEnv: String): Option[String] =
+    missingGateTool(root, gateCmd, pathEnv, p => Files.isExecutable(Path.of(p)))
+
   // ---- Part B: driver rc -> process-exit-code map (loop.sh:925-944) ------------------------
 
   enum DriverAction:
@@ -326,9 +376,12 @@ object Main:
 
     val pathEnv = env.getOrElse("PATH", "")
 
-    // 6a. gh/sbt/claude must be findable on PATH (loop.sh:195-197).
+    // 6a. gh/claude must be findable on PATH (loop.sh:195-197); the gate command must be launchable
+    // whatever it is (see `missingGateTool` — this repo's own gate never runs sbt on the host).
     if onRealPath(pathEnv, "gh").isEmpty then die("gh not found")
-    if onRealPath(pathEnv, "sbt").isEmpty then die("sbt not found")
+    onRealGateTool(root, parsed.cfg.gateCmd, pathEnv).foreach(t =>
+      die(s"gate command not runnable: $t not found (gate.fast in .litter-box/config.conf)")
+    )
     if onRealPath(pathEnv, "claude").isEmpty then die("claude not found")
 
     // 6b. Sandbox preflight (loop.sh:198-211), skipped entirely when GATE_CMD is overridden.
