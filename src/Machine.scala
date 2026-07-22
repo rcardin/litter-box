@@ -32,12 +32,6 @@ object Machine:
   private def artifact(issue: Int, suffix: String)(using cfg: Config): String =
     s"${cfg.logDir}/issue-$issue$suffix"
 
-  /** Where the three prompt templates live, relative to the repo root. Bash read them from
-    * `$SCRIPT_DIR` (loop.sh:116-118); here the root IS the project, so they sit in the project's own
-    * `prompts/`. The filenames hang off `Template.fileName`.
-    */
-  val PromptDir = "prompts"
-
   /** Where the container launcher scripts live, relative to the repo root — bash's
     * `$SCRIPT_DIR/sandbox` (loop.sh:198-211).
     */

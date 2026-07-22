@@ -224,17 +224,19 @@ class LiveSpec extends AnyFlatSpec with Matchers:
     fs.stopRequested() shouldBe true
   }
 
-  it should "read the three template paths under prompts/" in {
+  it should "read templates through Prompts: built-in by default, ejected file on top" in {
     val root = tempRoot()
-    Files.createDirectories(root.resolve("prompts"))
-    Files.write(root.resolve("prompts/iterate-prompt.md"), "ITERATE".getBytes)
-    Files.write(root.resolve("prompts/fix-prompt.md"), "FIX".getBytes)
-    Files.write(root.resolve("prompts/review-prompt.md"), "REVIEW".getBytes)
-    val fs = LiveHarnessFs(root)
+    val fs   = LiveHarnessFs(root)
 
-    fs.readTemplate(Template.Iterate) shouldBe "ITERATE"
+    // No ejected override anywhere under root: falls through to the artifact copy.
+    fs.readTemplate(Template.Iterate) shouldBe Prompts.builtIn(Template.Iterate)
+
+    // An ejected .litter-box/prompts/<file> wins over the built-in, per-template.
+    Files.createDirectories(root.resolve(Prompts.EjectDir))
+    Files.write(root.resolve(Prompts.EjectDir).resolve("fix-prompt.md"), "FIX".getBytes)
+
     fs.readTemplate(Template.Fix) shouldBe "FIX"
-    fs.readTemplate(Template.Review) shouldBe "REVIEW"
+    fs.readTemplate(Template.Review) shouldBe Prompts.builtIn(Template.Review)
   }
 
   it should "read CONTEXT.md for conventions()" in {

@@ -297,10 +297,11 @@ object Main:
         ()
       }
 
-    // 6c. Prompt template / conventions file existence (loop.sh:116-119, 212-215).
+    // 6c. Conventions file existence (loop.sh:119, 212-215). The prompt-template check that used
+    // to sit here is gone: the skeletons ship in the artifact now (`Prompts.builtIn`), so there is
+    // no consumer-side file whose absence could be a startup failure. A consumer repo that has
+    // never ejected anything has no `prompts/` directory at all, and that is the normal case.
     val conventions = root.resolve(parsed.cfg.conventions)
-    for f <- Template.values.map(t => root.resolve(Machine.PromptDir).resolve(t.fileName)) do
-      if !Files.isRegularFile(f) then die(s"missing prompt template: $f")
     if !Files.isRegularFile(conventions) then die(s"missing conventions file: $conventions")
 
     // 7. timeoutBin = first of `timeout`, `gtimeout` found on PATH, else None (loop.sh:174).

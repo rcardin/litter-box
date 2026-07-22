@@ -88,13 +88,20 @@ enum Role:
   case IMPL, FIX
 
 /** Prompt templates the harness renders ({{KEY}} line-splice contract of render_template). Each
-  * case carries its own filename under `Machine.PromptDir`, so the reader and the startup preflight
-  * check cannot drift apart.
+  * case carries its own filename, resolved through `Prompts` (built into the artifact, overridable
+  * per repo), so the reader and `Prompts.parseName` cannot drift apart.
   */
 enum Template(val fileName: String):
   case Iterate extends Template("iterate-prompt.md")
   case Fix     extends Template("fix-prompt.md")
   case Review  extends Template("review-prompt.md")
+
+  /** Not dispatched by `Machine` today. It exists as a case anyway because `Prompts` enumerates
+    * `Template.values` to decide what can be ejected and what ships in the artifact: a fourth
+    * skeleton that is not a case is a skeleton a consumer cannot override and the build cannot
+    * check, which is a worse failure than an unused case.
+    */
+  case GrillIssue extends Template("grill-issue-prompt.md")
 
 /** One line of `git apply --numstat` output: "<added>\t<deleted>\t<path>". `added`/`deleted` stay
   * `String` (not `Int`) because binary files report "-" instead of a line count.

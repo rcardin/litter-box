@@ -56,12 +56,13 @@ final class LiveHarnessFs(root: Path)(using cfg: Config) extends HarnessFs:
   def stopRequested(): Boolean =
     Files.isRegularFile(root.resolve(cfg.stopFile))
 
-  /** The three prompt templates, `prompts/<name>.md` relative to the repo root. Bash read them from
-    * `$SCRIPT_DIR/<name>.md` (loop.sh:116-118), i.e. the harness directory; here the root IS the
-    * project, so they live in the project's own `prompts/` directory.
+  /** The skeleton for `t`, resolved by `Prompts`: an ejected `.litter-box/prompts/<file>` if the
+    * repo has one, else the copy that ships in the artifact. Slice 2 read
+    * `prompts/<file>` out of the consumer repo, which made every consumer the owner of the
+    * protocol; `Prompts` explains why that moved.
     */
   def readTemplate(t: Template): String =
-    readString(root.resolve(Machine.PromptDir).resolve(t.fileName))
+    Prompts.resolve(root, t)
 
   /** loop.sh:119: `CONVENTIONS="$REPO_ROOT/CONTEXT.md"`, now the `conventions` config key. */
   def conventions(): String =

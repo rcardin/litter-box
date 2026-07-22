@@ -6,3 +6,8 @@
 //> using dep "com.typesafe:config:1.4.9"
 //> using test.dep "org.scalatest::scalatest:3.2.20"
 //> using options -deprecation -feature -unchecked
+
+// The prompt skeletons ship in the artifact, not in the consumer repo: a consumer who carries a
+// copy of the protocol carries a copy that silently rots when the tool updates. `Prompts.resolve`
+// reads them from here and lets `.litter-box/prompts/` override per file.
+//> using resourceDir ./resources
