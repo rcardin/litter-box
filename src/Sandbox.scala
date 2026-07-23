@@ -152,7 +152,7 @@ object Sandbox:
           StandardOpenOption.WRITE
         )
         if isScript(rel) then makeExecutable(staged)
-        Files.move(staged, dest, StandardCopyOption.ATOMIC_MOVE)
+        Files.move(staged, dest, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
       finally Files.deleteIfExists(staged)
     }
 
