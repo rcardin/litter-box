@@ -10,6 +10,16 @@ source "$SCRIPT_DIR/lib.sh"
   exit 1
 }
 
+# Staged build contexts, removed on any exit. One trap for all of them: a second `trap ... EXIT`
+# REPLACES the first rather than adding to it, so a per-context trap would leak every context but
+# the last one registered.
+staged_ctxs=()
+cleanup_staged_ctxs() {
+  [[ ${#staged_ctxs[@]} -gt 0 ]] && rm -rf "${staged_ctxs[@]}"
+  return 0
+}
+trap cleanup_staged_ctxs EXIT
+
 log "building $BASE_IMAGE ..."
 docker build -t "$BASE_IMAGE" -f "$SANDBOX_DIR/base.Dockerfile" "$SANDBOX_DIR"
 
@@ -31,9 +41,29 @@ GATE_DOCKERFILE="$REPO_ROOT/.litter-box/Dockerfile"
   exit 1
 }
 
+# The context is a STAGED COPY of .litter-box, not .litter-box itself, because that directory is
+# where the credential lives: `init` writes .env.example and tells the operator to copy it to
+# .env, which holds the token the sandboxed worker authenticates with. `docker build` streams its
+# whole context to the daemon, so pointing it at .litter-box would hand the daemon the token on
+# every build and let any `COPY . .` a consumer adds bake it into the image — in the one image
+# whose stated contract (docs/base-image.md) is that it carries no credentials.
+#
+# A copy rather than a context of exactly one file: the consumer owns this Dockerfile, and a
+# `COPY settings.xml /home/gate/.m2/` next to their build tool layer is a reasonable thing for
+# them to write. Everything in .litter-box stays reachable EXCEPT the two things that must not be
+# in an image — .env* (the credential and its template) and logs/ (run output, potentially large).
+gate_ctx="$(mktemp -d)"
+staged_ctxs+=("$gate_ctx")
+(
+  cd "$REPO_ROOT/.litter-box"
+  find . -mindepth 1 -maxdepth 1 \
+    ! -name '.env' ! -name '.env.*' ! -name 'logs' \
+    -exec cp -R {} "$gate_ctx/" \;
+)
+
 log "building $IMAGE from .litter-box/Dockerfile ..."
 docker build --build-arg "BASE_IMAGE=$BASE_IMAGE" -t "$IMAGE" \
-  -f "$GATE_DOCKERFILE" "$REPO_ROOT/.litter-box"
+  -f "$GATE_DOCKERFILE" "$gate_ctx"
 
 # The egress allowlist. `litter-box init` writes .litter-box/allowlist into the repo, so that is
 # the file an operator edits and it wins. The shipped proxy/allowlist is the fallback for a repo
@@ -47,7 +77,7 @@ docker build --build-arg "BASE_IMAGE=$BASE_IMAGE" -t "$IMAGE" \
 proxy_ctx="$SANDBOX_DIR/proxy"
 if [[ -f "$REPO_ROOT/.litter-box/allowlist" ]]; then
   proxy_ctx="$(mktemp -d)"
-  trap 'rm -rf "$proxy_ctx"' EXIT
+  staged_ctxs+=("$proxy_ctx")
   cp "$SANDBOX_DIR/proxy/Dockerfile" "$SANDBOX_DIR/proxy/tinyproxy.conf" "$proxy_ctx/"
   cp "$REPO_ROOT/.litter-box/allowlist" "$proxy_ctx/allowlist"
   log "using allowlist $REPO_ROOT/.litter-box/allowlist"

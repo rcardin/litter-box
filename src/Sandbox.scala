@@ -2,8 +2,9 @@ package in.rcard.litterbox
 
 import java.nio.charset.StandardCharsets
 import java.nio.file.attribute.PosixFilePermission
-import java.nio.file.{Files, Path, Paths, StandardOpenOption}
+import java.nio.file.{Files, Path, Paths, StandardCopyOption, StandardOpenOption}
 import java.security.MessageDigest
+import java.util.UUID
 import scala.jdk.CollectionConverters.*
 import scala.util.control.NonFatal
 
@@ -102,7 +103,36 @@ object Sandbox:
   def cacheDir(home: Path): Path =
     home.resolve(".cache").resolve("litter-box").resolve("sandbox").resolve(digest)
 
+  /** Adds the executable bit for owner, group and other, leaving the rest of the mode alone.
+    *
+    * A filesystem with no POSIX permission view cannot run these scripts anyway. Failing the whole
+    * extraction here would turn "your Docker sandbox will not work" into "litter-box will not
+    * start", which is a worse diagnostic for the same condition.
+    */
+  private def makeExecutable(file: Path): Unit =
+    try
+      val perms = Files.getPosixFilePermissions(file).asScala
+      Files.setPosixFilePermissions(
+        file,
+        (perms ++ Set(
+          PosixFilePermission.OWNER_EXECUTE,
+          PosixFilePermission.GROUP_EXECUTE,
+          PosixFilePermission.OTHERS_EXECUTE
+        )).asJava
+      )
+    catch case NonFatal(_) => ()
+
   /** Writes the shipped tree into `dir`, creating it. Total: overwrites whatever is already there.
+    *
+    * Every file is written to a sibling temporary and renamed into place, so a shipped path is
+    * never observable in a half-written state. Writing `dest` directly would truncate it to zero
+    * length before the bytes landed, and `resolve` decides whether a tree is complete by asking
+    * whether its files EXIST — a second process landing in that window would find a full listing,
+    * skip extraction, and exec an empty `lib.sh`. The same window swallows a `^C` between the
+    * truncate and the write, which is the interrupted-extraction case `resolve` claims to catch.
+    *
+    * The rename is atomic and the temporary is a sibling, so it is on the same filesystem; the
+    * executable bit goes on before the move, so the visible file never lacks it either.
     *
     * Split out of `resolve` so the extraction itself can be tested against a temp directory,
     * without a cache, a `$HOME`, or an opinion about when extraction is skipped.
@@ -111,28 +141,19 @@ object Sandbox:
     ShippedFiles.foreach { rel =>
       val dest = dir.resolve(rel)
       Files.createDirectories(dest.getParent)
-      Files.write(
-        dest,
-        builtIn(rel),
-        StandardOpenOption.CREATE,
-        StandardOpenOption.WRITE,
-        StandardOpenOption.TRUNCATE_EXISTING
-      )
-      if isScript(rel) then
-        try
-          val perms = Files.getPosixFilePermissions(dest).asScala
-          Files.setPosixFilePermissions(
-            dest,
-            (perms ++ Set(
-              PosixFilePermission.OWNER_EXECUTE,
-              PosixFilePermission.GROUP_EXECUTE,
-              PosixFilePermission.OTHERS_EXECUTE
-            )).asJava
-          )
-        // A filesystem with no POSIX permission view cannot run these scripts anyway. Failing the
-        // whole extraction here would turn "your Docker sandbox will not work" into "litter-box
-        // will not start", which is a worse diagnostic for the same condition.
-        catch case NonFatal(_) => ()
+      val staged = dest.resolveSibling(s".${dest.getFileName}.${UUID.randomUUID()}.tmp")
+      try
+        // Files.write rather than Files.createTempFile: the latter creates owner-only by
+        // construction, which would ship these files at 0700 instead of whatever the umask says.
+        Files.write(
+          staged,
+          builtIn(rel),
+          StandardOpenOption.CREATE_NEW,
+          StandardOpenOption.WRITE
+        )
+        if isScript(rel) then makeExecutable(staged)
+        Files.move(staged, dest, StandardCopyOption.ATOMIC_MOVE)
+      finally Files.deleteIfExists(staged)
     }
 
   /** The sandbox directory to run from, extracting it on first use for this build.
@@ -142,10 +163,14 @@ object Sandbox:
     * and has no `lib.sh` in it. A complete tree is not re-extracted, because the digest already
     * guarantees its contents.
     *
-    * Deliberately NOT staged-then-atomically-moved: two litter-box processes racing here write
-    * byte-identical files (same digest, same bytes), so no interleaving can produce a wrong tree,
-    * while a rename dance would add a failure mode where one process replaces the directory the
-    * other is mid-way through executing from.
+    * Existence is a sound proxy for completeness only because `extract` renames each file into
+    * place whole (see there); a directly-written file exists at zero length first, which is
+    * precisely what this check would then wave through.
+    *
+    * The DIRECTORY is deliberately not staged and moved as a unit. Two litter-box processes racing
+    * here write byte-identical files — same digest, same bytes — so per-file renames converge on
+    * the right tree no matter how they interleave, whereas swapping the directory would add a
+    * failure mode where one process replaces the tree the other is mid-way through executing from.
     */
   def resolve(home: Path): Path =
     val dir = cacheDir(home)

@@ -88,6 +88,51 @@ class SandboxSpec extends AnyFlatSpec with Matchers:
       not be "clobbered"
   }
 
+  it should "leave no temporary files behind" in {
+    // The staged-then-renamed write is invisible by design, and the way it stops being invisible is
+    // a cache directory that accumulates .tmp siblings until someone notices.
+    val dir = Files.createTempDirectory("sandbox-spec")
+    Sandbox.extract(dir)
+
+    val stray = Files
+      .walk(dir)
+      .iterator
+      .asScala
+      .filter(Files.isRegularFile(_))
+      .map(dir.relativize(_).toString)
+      .filterNot(Sandbox.ShippedFiles.contains)
+      .toList
+
+    stray shouldBe empty
+  }
+
+  it should "never expose a shipped file at less than its full length" in {
+    // The race #9's first pass got wrong: writing dest directly truncates it to zero before the
+    // bytes land, and `resolve` decides a tree is complete by asking whether its files exist. A
+    // second process landing in that window skips extraction and execs an empty lib.sh.
+    val dir      = Files.createTempDirectory("sandbox-spec")
+    val expected = Sandbox.ShippedFiles.map(rel => rel -> Sandbox.builtIn(rel).length.toLong).toMap
+    val short    = java.util.concurrent.ConcurrentLinkedQueue[String]()
+
+    val writing = java.util.concurrent.atomic.AtomicBoolean(true)
+    val writers = (1 to 4).map(_ => Thread(() => (1 to 20).foreach(_ => Sandbox.extract(dir))))
+    val reader = Thread { () =>
+      while writing.get() do
+        Sandbox.ShippedFiles.foreach { rel =>
+          val f = dir.resolve(rel)
+          if Files.isRegularFile(f) && Files.size(f) != expected(rel) then short.add(rel)
+        }
+    }
+
+    writers.foreach(_.start())
+    reader.start()
+    writers.foreach(_.join())
+    writing.set(false)
+    reader.join()
+
+    short.asScala.toList.distinct shouldBe empty
+  }
+
   "resolve" should "extract on first use and re-extract only what has gone missing" in {
     val home = Files.createTempDirectory("sandbox-spec-home")
 
