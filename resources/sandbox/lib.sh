@@ -13,10 +13,10 @@
 # equals the reference config's own `instance-name`.
 INSTANCE_NAME="${LITTER_BOX_INSTANCE:-litter-box}"
 IMAGE="${INSTANCE_NAME}-sandbox:v6"
-# The build-tool-free base layer (sandbox/base.Dockerfile). Built locally by build-image.sh and
-# consumed by Dockerfile's ARG, so a checkout never needs the registry. NOT namespaced by
-# INSTANCE_NAME: it carries nothing instance-specific, so two instances sharing it is correct and
-# saves a multi-minute Claude CLI install per instance.
+# The build-tool-free base layer (base.Dockerfile). Built locally by build-image.sh and consumed by
+# the consumer's .litter-box/Dockerfile through its BASE_IMAGE ARG, so a checkout never needs the
+# registry. NOT namespaced by INSTANCE_NAME: it carries nothing instance-specific, so two instances
+# sharing it is correct and saves a multi-minute Claude CLI install per instance.
 BASE_IMAGE="litter-box-base:v1"
 PROXY_IMAGE="${INSTANCE_NAME}-sandbox-proxy:v6"
 NETWORK="${INSTANCE_NAME}-net"
@@ -26,6 +26,20 @@ COURSIER_VOLUME="${INSTANCE_NAME}-coursier-cache"
 SANDBOX_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 log() { printf '[sandbox] %s\n' "$*" >&2; }
+
+# The repo the loop is working on, which is NOT derivable from SANDBOX_DIR any more (#9). These
+# scripts ship inside the litter-box artifact and run from an extraction cache
+# (~/.cache/litter-box/sandbox/<digest>, see Sandbox.scala), so `$SANDBOX_DIR/..` names a directory
+# with no relationship to the consumer's repo. Two ways in, in order:
+#
+#   LITTER_BOX_REPO_ROOT  exported onto every child by the loop (Settings.childEnv), the only path
+#                         that is correct when the sandbox lives in the cache
+#   git rev-parse         for a hand-run script (sandbox/test/*, a manual build-image.sh), where
+#                         the operator's cwd IS the repo they mean
+#
+# Neither answering is fatal HERE — lib.sh is sourced by scripts that do not all need a repo root —
+# so REPO_ROOT is left empty and the scripts that do need one say so themselves.
+REPO_ROOT="${LITTER_BOX_REPO_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || true)}"
 
 # --- shared preflight + wait-rc guard (extracted from the three runners) -----------------------
 # CONTRACT: both helpers below call `infra_fault "<msg>"` on failure. infra_fault is deliberately

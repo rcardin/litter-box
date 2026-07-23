@@ -18,7 +18,9 @@
 # filtered CONNECT gets "HTTP/1.1 403 Filtered", which curl reports as a failed tunnel — curl exit
 # code 7, http_code 000. Requires the proxy sidecar already running (start-proxy.sh) and $NETWORK.
 set -euo pipefail
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+# The sandbox scripts ship in the artifact and live under resources/ (#9); these tests run
+# them straight out of the source tree rather than out of an extraction cache.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../resources/sandbox" && pwd)"
 source "$SCRIPT_DIR/lib.sh"
 
 # The reviewer/worker/fixer's actual critical allowlist entry — the host that must be reachable for

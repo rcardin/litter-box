@@ -5,7 +5,9 @@
 # both the prior work AND the new edit. This test drives the entrypoint on the host (paths made
 # overridable for exactly this) with a fake `claude`, so it needs no container, no key, no daemon.
 set -euo pipefail
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+# The sandbox scripts ship in the artifact and live under resources/ (#9); these tests run
+# them straight out of the source tree rather than out of an extraction cache.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../resources/sandbox" && pwd)"
 ENTRYPOINT="$SCRIPT_DIR/agent-entrypoint.sh"
 
 pass=0; fail=0

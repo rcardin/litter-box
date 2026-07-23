@@ -5,9 +5,16 @@
 # gate run measurably faster than the first). NOT wired into `sbt test` -- needs Docker + network
 # egress, same category as the pre-existing IT gate.
 set -euo pipefail
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+# The sandbox scripts ship in the artifact and live under resources/ (#9); these tests run
+# them straight out of the source tree rather than out of an extraction cache.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../resources/sandbox" && pwd)"
 source "$SCRIPT_DIR/lib.sh"
-REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+TEST_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# The gate command this repo's own .litter-box/config.conf configures. Passed explicitly because
+# run-fast-gate.sh takes the command as an argument now (#9) instead of appending sbt's flags to
+# the image ENTRYPOINT.
+GATE_CMD="scala-cli test . --server=false --jvm system"
 
 # Single EXIT trap installed once, up front; GIT_INDEX_FILE is only set later (AC6), so
 # cleanup tolerates it being unset.
@@ -21,12 +28,12 @@ trap cleanup EXIT
 "$SCRIPT_DIR/start-proxy.sh"
 
 fail=0
-"$SCRIPT_DIR/test/image-smoke-test.sh" || fail=1
-"$SCRIPT_DIR/test/egress-policy-test.sh" || fail=1
-"$SCRIPT_DIR/test/infra-fault-test.sh" || fail=1
-"$SCRIPT_DIR/test/agent-infra-fault-test.sh" || fail=1
-"$SCRIPT_DIR/test/reviewer-infra-fault-test.sh" || fail=1
-"$SCRIPT_DIR/test/agent-entrypoint-test.sh" || fail=1
+"$TEST_DIR/image-smoke-test.sh" || fail=1
+"$TEST_DIR/egress-policy-test.sh" || fail=1
+"$TEST_DIR/infra-fault-test.sh" || fail=1
+"$TEST_DIR/agent-infra-fault-test.sh" || fail=1
+"$TEST_DIR/reviewer-infra-fault-test.sh" || fail=1
+"$TEST_DIR/agent-entrypoint-test.sh" || fail=1
 
 echo "== AC6: coursier cache volume speed check (first run vs second run) ==" >&2
 cd "$REPO_ROOT"
@@ -39,8 +46,8 @@ git add -A
 log1="$(mktemp)"; log2="$(mktemp)"
 # `|| rcN=$?` keeps set -e from aborting before the exit code is captured.
 rc1=0; rc2=0
-t0=$(date +%s); "$SCRIPT_DIR/run-fast-gate.sh" >"$log1" 2>&1 || rc1=$?; t1=$(date +%s)
-t2=$(date +%s); "$SCRIPT_DIR/run-fast-gate.sh" >"$log2" 2>&1 || rc2=$?; t3=$(date +%s)
+t0=$(date +%s); "$SCRIPT_DIR/run-fast-gate.sh" "$GATE_CMD" >"$log1" 2>&1 || rc1=$?; t1=$(date +%s)
+t2=$(date +%s); "$SCRIPT_DIR/run-fast-gate.sh" "$GATE_CMD" >"$log2" 2>&1 || rc2=$?; t3=$(date +%s)
 d1=$((t1 - t0)); d2=$((t3 - t2))
 echo "  run1: rc=$rc1 ${d1}s   run2: rc=$rc2 ${d2}s   (logs: $log1 $log2)" >&2
 if [[ "$rc1" != "0" || "$rc2" != "0" ]]; then

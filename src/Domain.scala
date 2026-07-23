@@ -169,12 +169,27 @@ final case class Config(
     labels: Labels = Labels(),
     /** `protect` — globs (JDK `glob:` syntax) the patch guard rejects any patch touching. */
     protect: List[String] = List(".litter-box/**", ".github/**", "CONTEXT.md"),
-    /** `gate.fast`, overridable by GATE_CMD (loop.sh:133). Held repo-RELATIVE, unlike bash's absolute
+    /** `gate.fast`, overridable by GATE_CMD (loop.sh:133). The command itself, not a path to a
+      * runner: where it runs is `gateSandboxed`'s job below.
+      *
+      * A HOST command is held repo-RELATIVE, unlike bash's absolute
       * `$SCRIPT_DIR/sandbox/run-fast-gate.sh`, because this record is pure config and knows no repo
-      * root. `LiveGateRunner.resolveArgv0` re-absolutises it against that runner's `root` using
-      * bash's own lookup rule, so the launched command is identical.
+      * root; `LiveGateRunner.resolveArgv0` re-absolutises it against that runner's `root` using
+      * bash's own lookup rule, so the launched command is identical. A SANDBOXED command is never
+      * resolved here at all — it is read by bash inside the container, against the image's PATH.
       */
     gateCmd: String = "sbt -Werror compile test",
+    /** `gate.sandboxed` — whether `gateCmd` runs inside the sandbox container or on the host.
+      *
+      * Sandboxed is the default because isolation is the reason litter-box exists, and because the
+      * alternative default is the one that was silently in force before #9: `litter-box init`
+      * scaffolded a host `sbt` command while THIS repo ran its own gate in a container, so every
+      * consumer quietly got a weaker gate tier than the tool's own, and nothing said so.
+      *
+      * Forced false when the `GATE_CMD` env var is set (`Main.parseEnv`): that override already
+      * skips the sandbox preflight entirely, so there would be no image to run the command in.
+      */
+    gateSandboxed: Boolean = true,
     /** CI_WAIT_CMD seam (loop.sh:446): overrides the WHOLE CI-wait gate command, including the PR
       * number (bash: `cmd="${CI_WAIT_CMD:-gh pr checks $pr_num --watch --fail-fast}"`; the override
       * contains no pr interpolation, it replaces the default verbatim). `None` (the default) means

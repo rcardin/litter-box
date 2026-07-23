@@ -6,7 +6,9 @@
 # contract's exit code without needing a real container (the timeout kill itself is a trap in
 # run-agent.sh over the same detached-container + docker-wait pattern the FAST gate already ships).
 set -euo pipefail
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+# The sandbox scripts ship in the artifact and live under resources/ (#9); these tests run
+# them straight out of the source tree rather than out of an extraction cache.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../resources/sandbox" && pwd)"
 source "$SCRIPT_DIR/lib.sh"
 
 fail=0

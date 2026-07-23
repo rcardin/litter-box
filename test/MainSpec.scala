@@ -3,6 +3,8 @@ package in.rcard.litterbox
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 
+import java.nio.file.{Files, Path}
+
 /** Unit tests for the pure parts of `Main`: env parsing (Part C) and the driver's rc ->
   * process-exit-code map (Part B). Preflight (PATH scanning against the real host,
   * build-image.sh/start-proxy.sh subprocesses) is deliberately NOT exercised here; those are
@@ -84,6 +86,17 @@ class MainSpec extends AnyFlatSpec with Matchers:
 
     parsed.gateOverridden shouldBe true
     parsed.cfg.gateCmd shouldBe "sbt -Werror compile test"
+  }
+
+  it should "run a GATE_CMD override on the host, whatever gate.sandboxed says" in {
+    // The override already skips the sandbox preflight (Main step 6b), so the image the command
+    // would run in is never built. Honouring `sandboxed = true` here would hand the operator's
+    // command to a container that does not exist.
+    Main.parseEnv(Settings.referenceOnly, Map.empty).cfg.gateSandboxed shouldBe true
+    Main
+      .parseEnv(Settings.referenceOnly, Map("GATE_CMD" -> "true"))
+      .cfg
+      .gateSandboxed shouldBe false
   }
 
   it should "parse DRY_RUN=1 as true, and treat 0 / absent / any other string as false" in {
@@ -305,9 +318,15 @@ class MainSpec extends AnyFlatSpec with Matchers:
       )
     )
 
-    real.map(r =>
-      java.nio.file.Files.isRegularFile(r.resolve(Settings.ConfigPath))
-    ) shouldBe Right(true)
+    // Two environments, one real subprocess, an assertion for each. The sandboxed gate runs this
+    // suite against a `git archive` extraction with NO `.git` in it by construction (#9), so there
+    // the contract under test is the failure one: say so, rather than quietly falling back to the
+    // cwd and letting the loop write into whatever directory it was launched from.
+    if Files.isDirectory(Path.of(".git")) then
+      real.map(r =>
+        java.nio.file.Files.isRegularFile(r.resolve(Settings.ConfigPath))
+      ) shouldBe Right(true)
+    else real.isLeft shouldBe true
   }
 
   // ===============================================================================================

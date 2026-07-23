@@ -221,9 +221,11 @@ private[litterbox] object LiveProc:
     * this by `export`ing into its own environment, a JVM cannot, so `builder` — the one choke point
     * every `ProcessBuilder` in the harness goes through — does it per child instead.
     *
-    * Today this carries `LITTER_BOX_INSTANCE` (`Settings.childEnv`), which `sandbox/lib.sh` turns
-    * into the Docker image/network/proxy/volume names. Set once by `Main` at startup; empty
-    * everywhere else, so a test that never sets it sees an unmodified child environment.
+    * Today this carries `LITTER_BOX_INSTANCE` and `LITTER_BOX_REPO_ROOT` (`Settings.childEnv`),
+    * which `lib.sh` turns into the Docker image/network/proxy/volume names and the answer to "which
+    * repo is this run about" — the second one being unanswerable from inside the sandbox scripts
+    * since they stopped living in the repo (#9). Set once by `Main` at startup; empty everywhere
+    * else, so a test that never sets it sees an unmodified child environment.
     */
   @volatile private var exported: Map[String, String] = Map.empty
 
@@ -433,8 +435,19 @@ private[litterbox] object LiveProc:
   * resolved once by Main (`command -v timeout || command -v gtimeout`, verified loop.sh:174) and
   * passed in; when `None` the gate runs unbounded, matching bash's own fallback when neither binary
   * is on PATH. `cmd` is WORD-SPLIT, never `eval`'d (GATE_CMD/MERGE_CMD class).
+  *
+  * `sandboxRunner` is the extracted `run-fast-gate.sh` (`Sandbox.resolve`) when `gate.sandboxed` is
+  * on, and `None` when the command runs on the host. Note the two paths differ in more than a
+  * prefix: a sandboxed command is passed through as ONE argument, unsplit, because the thing that
+  * splits it is `bash -c` inside the container, and word-splitting it here would only mean rejoining
+  * it there — losing every quote the operator wrote in the process. Host commands keep bash's
+  * splitting verbatim, as they always have.
   */
-final class LiveGateRunner(root: Path, timeoutBin: Option[String]) extends GateRunner:
+final class LiveGateRunner(
+    root: Path,
+    timeoutBin: Option[String],
+    sandboxRunner: Option[Path] = None
+) extends GateRunner:
 
   def run(label: String, cmd: String, timeoutSec: Int, logFile: String): GateResult =
     // loop.sh:244: `log "$label gate: $cmd (timeout ${tmo}s) -> $logfile"`. Every call site passes
@@ -442,8 +455,15 @@ final class LiveGateRunner(root: Path, timeoutBin: Option[String]) extends GateR
     // the resolved path. (The `logfile` field of a status.jsonl event is the opposite contract:
     // repo-relative, normalized at loop.sh:161's choke point. Do not confuse the two.)
     val logPath = root.resolve(logFile)
-    LiveLog.log(s"$label gate: $cmd (timeout ${timeoutSec}s) -> $logPath")
-    val words    = LiveGateRunner.resolveArgv0(root, LiveProc.wordSplit(cmd))
+    val where   = if sandboxRunner.isDefined then " sandboxed" else ""
+    LiveLog.log(s"$label gate:$where $cmd (timeout ${timeoutSec}s) -> $logPath")
+    val split = LiveProc.wordSplit(cmd)
+    val words = sandboxRunner match
+      // An empty/whitespace-only command falls through to the host branch even when sandboxed, so
+      // the "empty gate is green" reading below stays the same answer in both modes rather than
+      // becoming an infra fault from inside the container in one of them.
+      case Some(runner) if split.nonEmpty => Seq(runner.toString, cmd)
+      case _                              => LiveGateRunner.resolveArgv0(root, split)
     val fullArgs = timeoutBin match
       case Some(tb) => tb +: timeoutSec.toString +: words
       case None     => words
@@ -488,11 +508,13 @@ object LiveGateRunner:
     * resolved relative to the (bash) cwd = `root`; a word with NO slash is a bare binary name that
     * must come off PATH and is left untouched; an already-absolute path is left untouched because
     * resolving it against `root` is a no-op anyway. Only argv[0] is touched — later words are the
-    * command's own arguments and bash never resolves those. So the default (Domain.scala:
-    * `harness/sandbox/run-fast-gate.sh`) lands on the repo root exactly like bash's
-    * `$SCRIPT_DIR/sandbox/run-fast-gate.sh` (loop.sh:133), while a `GATE_CMD` / `CI_WAIT_CMD`
-    * override keeps bash's word-splitting AND its lookup semantics verbatim (`gh pr checks ...`
-    * still resolves `gh` off PATH).
+    * command's own arguments and bash never resolves those. So a repo-relative gate script
+    * (bash's `$SCRIPT_DIR/sandbox/run-fast-gate.sh`, loop.sh:133) lands on the repo root, while a
+    * `GATE_CMD` / `CI_WAIT_CMD` override keeps bash's word-splitting AND its lookup semantics
+    * verbatim (`gh pr checks ...` still resolves `gh` off PATH).
+    *
+    * Only the HOST path comes through here now. A sandboxed gate command is resolved by bash inside
+    * the container, against that image's PATH, and never reaches this function.
     */
   private[litterbox] def resolveArgv0(root: Path, words: Seq[String]): Seq[String] =
     words match
@@ -510,6 +532,7 @@ object LiveGateRunner:
   */
 final class LiveAgentDispatch(
     root: Path,
+    sandboxDir: Path,
     timeoutBin: Option[String],
     iterTimeout: Int,
     implCmd: Option[String],
@@ -547,8 +570,9 @@ final class LiveAgentDispatch(
         LiveLog.log(s"$role stub exited rc=$rc")
         if rc == 124 then DispatchOutcome.TimedOut else DispatchOutcome.Done
       case None =>
-        // Real path: harness/sandbox/run-agent.sh PROMPT_FILE PATCH_OUT [CURRENT_PATCH].
-        val runner          = root.resolve(Machine.SandboxDir).resolve("run-agent.sh").toString
+        // Real path: <sandbox>/run-agent.sh PROMPT_FILE PATCH_OUT [CURRENT_PATCH], where <sandbox>
+        // is the extracted shipped tree (Sandbox.resolve), NOT a directory in the consumer's repo.
+        val runner          = sandboxDir.resolve("run-agent.sh").toString
         val promptAbs       = root.resolve(promptFile).toString
         val currentPatchArg = currentPatch.map(root.resolve(_).toString).getOrElse("")
         val args            = (timeoutBin match
@@ -580,7 +604,7 @@ final class LiveAgentDispatch(
         DispatchOutcome.Done // bash asymmetry: the stub path never reads back rc==124
       case None =>
         // Real path: REVIEW_PROMPT env carries the prompt text, never argv.
-        val runner = root.resolve(Machine.SandboxDir).resolve("run-reviewer.sh").toString
+        val runner = sandboxDir.resolve("run-reviewer.sh").toString
         val args   = (timeoutBin match
           case Some(tb) => Seq(tb, iterTimeout.toString)
           case None     => Seq.empty

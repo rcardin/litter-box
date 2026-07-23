@@ -60,6 +60,11 @@ object Main:
       repairBudget = int("REPAIR_BUDGET", base.repairBudget),
       maxPatchBytes = long("MAX_PATCH_BYTES", base.maxPatchBytes),
       gateCmd = str("GATE_CMD").getOrElse(base.gateCmd),
+      // A `GATE_CMD` override is by definition a host command: it is what an operator exports to
+      // run the loop with no sandbox at all, and it already skips the preflight that would build
+      // the image (step 6b below). Leaving `gate.sandboxed` true there would hand the override to
+      // a container that was never built.
+      gateSandboxed = base.gateSandboxed && !gateOverridden,
       ciWaitCmd = str("CI_WAIT_CMD"),
       gateTimeout = int("GATE_TIMEOUT", base.gateTimeout),
       iterTimeout = int("ITER_TIMEOUT", base.iterTimeout),
@@ -117,13 +122,14 @@ object Main:
     *
     * Replaces a former hard-coded `sbt` PATH probe (loop.sh:196), a verbatim port of a bash script
     * that only ever ran one repo's own sbt build. That assumption does not survive `litter-box`
-    * becoming a tool other repos consume: THIS repo's own `gate.fast` is `sandbox/run-fast-gate.sh`,
-    * a script that `docker run`s a container — sbt executes INSIDE that container and the host never
-    * needs it, so the old check was preflighting a binary the run does not use. A scaffolded
-    * consumer's gate is whatever `gate.fast` says, sbt or not; hard-coding `sbt` there produced the
-    * wrong diagnostic (`sbt not found`) for every non-sbt consumer. Probing the CONFIGURED command's
-    * own argv0 is the one preflight that is correct for every consumer, because it is the exact
-    * thing `LiveGateRunner` is about to try to exec.
+    * becoming a tool other repos consume: a scaffolded consumer's gate is whatever `gate.fast`
+    * says, sbt or not, and hard-coding `sbt` produced the wrong diagnostic (`sbt not found`) for
+    * every one of them. Probing the CONFIGURED command's own argv0 is the one preflight correct for
+    * every consumer, because it is the exact thing `LiveGateRunner` is about to try to exec.
+    *
+    * Only asked about a HOST gate. A sandboxed `gate.fast` (the scaffolded default, and this repo's
+    * own) executes against the image's PATH, so the host has no opinion worth having about it —
+    * see the call site in `runLoop`.
     *
     * An empty/whitespace-only `gateCmd` returns `None` (nothing missing), not an error:
     * `LiveProc.wordSplit` gives it bash's own no-op reading, the same one `LiveGateRunner.run`'s
@@ -360,9 +366,16 @@ object Main:
       parsed0.cfg.copy(dryRun = applyDryRunFlag(dryRunFlag, env))
     )
 
-    // 2b. instance-name reaches the sandbox scripts as an env var on every child (see
+    // 2b. instance-name and the repo root reach the sandbox scripts as env vars on every child (see
     // LiveProc.export). Set BEFORE the preflight below, which is itself the first child.
-    LiveProc.exportEnv(Settings.childEnv(parsed.cfg))
+    LiveProc.exportEnv(Settings.childEnv(parsed.cfg, root))
+
+    // 2c. The sandbox scripts, extracted from the artifact to a content-addressed cache. They used
+    // to be read from `<repo>/sandbox`, which no repo but litter-box's own ever had — see `Sandbox`.
+    // Done before the preflight because the preflight is two of these scripts.
+    val sandboxDir =
+      try Sandbox.resolve()
+      catch case NonFatal(e) => die50(s"could not unpack the sandbox scripts: ${e.getMessage}")
 
     // 3. (was: the JAVA_HOME pin block, loop.sh:176-192.) Bash pinned JDK 25 onto every child it
     // forked because the old effect library needed JDK 25's StructuredTaskScope API. That dependency
@@ -379,12 +392,17 @@ object Main:
 
     val pathEnv = env.getOrElse("PATH", "")
 
-    // 6a. gh/claude must be findable on PATH (loop.sh:195-197); the gate command must be launchable
-    // whatever it is (see `missingGateTool` — this repo's own gate never runs sbt on the host).
+    // 6a. gh/claude must be findable on PATH (loop.sh:195-197); a HOST gate command must be
+    // launchable whatever it is (see `missingGateTool`).
+    //
+    // A sandboxed gate is exempt: its argv0 is resolved by bash INSIDE the container, against that
+    // image's PATH, so probing the host for it would reject a correct configuration — a Gradle
+    // consumer whose gradle lives only in the image is the normal case, not an error.
     if onRealPath(pathEnv, "gh").isEmpty then die("gh not found")
-    onRealGateTool(root, parsed.cfg.gateCmd, pathEnv).foreach(t =>
-      die(s"gate command not runnable: $t not found (gate.fast in .litter-box/config.conf)")
-    )
+    if !parsed.cfg.gateSandboxed then
+      onRealGateTool(root, parsed.cfg.gateCmd, pathEnv).foreach(t =>
+        die(s"gate command not runnable: $t not found (gate.fast in .litter-box/config.conf)")
+      )
     if onRealPath(pathEnv, "claude").isEmpty then die("claude not found")
 
     // 6b. Sandbox preflight (loop.sh:198-211), skipped entirely when GATE_CMD is overridden.
@@ -396,17 +414,15 @@ object Main:
         die(
           "neither CLAUDE_CODE_OAUTH_TOKEN nor ANTHROPIC_API_KEY set — the sandboxed worker/fixer has no other way to authenticate"
         )
-      if runPreflightScript(root, root.resolve(Machine.SandboxDir).resolve("build-image.sh")) != 0
-      then
+      if runPreflightScript(root, sandboxDir.resolve("build-image.sh")) != 0 then
         die("sandbox image build failed")
-      if runPreflightScript(root, root.resolve(Machine.SandboxDir).resolve("start-proxy.sh")) != 0
-      then
+      if runPreflightScript(root, sandboxDir.resolve("start-proxy.sh")) != 0 then
         die("sandbox proxy failed to start")
       // loop.sh:210's `trap ... EXIT` equivalent: fires on normal completion, any sys.exit
       // (including from a later die()), or an uncaught exception; addShutdownHook guarantees
       // this the same way bash's EXIT trap does.
       sys.addShutdownHook {
-        try runTeardownScript(root, root.resolve(Machine.SandboxDir).resolve("stop-proxy.sh"))
+        try runTeardownScript(root, sandboxDir.resolve("stop-proxy.sh"))
         catch case NonFatal(_) => 0
         ()
       }
@@ -428,13 +444,19 @@ object Main:
     given AgentDispatch =
       LiveAgentDispatch(
         root,
+        sandboxDir,
         timeoutBin,
         parsed.cfg.iterTimeout,
         parsed.implCmd,
         parsed.fixCmd,
         parsed.reviewCmd
       )
-    given GateRunner = LiveGateRunner(root, timeoutBin)
+    given GateRunner =
+      LiveGateRunner(
+        root,
+        timeoutBin,
+        Option.when(parsed.cfg.gateSandboxed)(sandboxDir.resolve("run-fast-gate.sh"))
+      )
     given StatusLog  = LiveStatusLog(root, runId)
     given Notify     = LiveNotify(parsed.notifyCmd, parsed.ntfyTopic, LiveLog.log)
     given HarnessFs  = LiveHarnessFs(root)

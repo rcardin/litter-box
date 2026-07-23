@@ -424,21 +424,25 @@ class SettingsSpec extends AnyFlatSpec with Matchers:
   // ===============================================================================================
 
   "Settings.childEnv" should "carry the configured instance name under LITTER_BOX_INSTANCE" in {
-    Settings.childEnv(nonDefaultConfig) shouldBe Map(Settings.InstanceEnvVar -> "other")
-    Settings.childEnv(Config()) shouldBe Map(Settings.InstanceEnvVar -> "litter-box")
+    val root = Path.of("/some/consumer/repo")
+    Settings.childEnv(nonDefaultConfig, root) shouldBe Map(
+      Settings.InstanceEnvVar -> "other",
+      Settings.RepoRootEnvVar -> "/some/consumer/repo"
+    )
+    Settings.childEnv(Config(), root) shouldBe Map(
+      Settings.InstanceEnvVar -> "litter-box",
+      Settings.RepoRootEnvVar -> "/some/consumer/repo"
+    )
   }
 
-  /** Finds `sandbox/lib.sh` by walking up from the JVM cwd, so the test does not care whether the
-    * runner starts in the project root or in a subdirectory.
+  /** `lib.sh` as the loop will actually run it: extracted out of the artifact (`Sandbox`), not read
+    * out of the source tree. Was a walk up from the JVM cwd looking for `sandbox/lib.sh`, which is
+    * a directory no install has any more (#9).
     */
   private def libSh(): Path =
-    var dir: Path = Path.of("").toAbsolutePath.normalize
-    var found     = Option.empty[Path]
-    while found.isEmpty && dir != null do
-      val candidate = dir.resolve(Machine.SandboxDir).resolve("lib.sh")
-      if Files.isRegularFile(candidate) then found = Some(candidate)
-      dir = dir.getParent
-    found.getOrElse(fail("could not locate sandbox/lib.sh from the JVM cwd"))
+    val dir = Files.createTempDirectory("settings-spec-sandbox")
+    Sandbox.extract(dir)
+    dir.resolve("lib.sh")
 
   /** Sources `sandbox/lib.sh` in a bash child and prints the five derived docker identifiers.
     *

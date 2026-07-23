@@ -32,10 +32,10 @@ object Machine:
   private def artifact(issue: Int, suffix: String)(using cfg: Config): String =
     s"${cfg.logDir}/issue-$issue$suffix"
 
-  /** Where the container launcher scripts live, relative to the repo root — bash's
-    * `$SCRIPT_DIR/sandbox` (loop.sh:198-211).
-    */
-  val SandboxDir = "sandbox"
+  // (was: `val SandboxDir = "sandbox"`.) Bash's `$SCRIPT_DIR/sandbox` (loop.sh:198-211) was a
+  // directory in the repo being worked on, which was correct only while that repo and litter-box's
+  // own checkout were the same one. The scripts ship in the artifact now and run from an extraction
+  // cache — see `Sandbox`, and #9 for the three ways the old answer broke a scaffolded consumer.
 
   /** The four CUR_* globals of loop.sh: the status-event context. iterate() keeps them current;
     * emit() only reads them, so a terminal DONE from the driver still carries the right issue.

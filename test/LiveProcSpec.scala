@@ -280,6 +280,55 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
     )
   }
 
+  // ---- the sandboxed gate (issue #9) ----------------------------------------------------------
+
+  it should "hand a sandboxed gate command to the runner as ONE unsplit argument" in {
+    // The bug this is the fix for: before #9 the runner took no command at all — it appended
+    // `-batch -no-colors compile test` to the image's ENTRYPOINT, so a Gradle consumer's sandbox
+    // ran `gradle` with sbt's flags. The command is a parameter now, and it must arrive whole:
+    // `bash -c` INSIDE the container is what splits it, so splitting it here would mean rejoining
+    // it there and losing every quote the operator wrote in between.
+    val root   = tempRoot()
+    val runner =
+      writeExecutable(root, "run-fast-gate.sh", "#!/usr/bin/env bash\nprintf '%s\\n' \"$@\"\n")
+    val gate = LiveGateRunner(root, timeoutBin = None, sandboxRunner = Some(runner))
+
+    gate.run(
+      "FAST",
+      """sbt -Werror "testOnly *Spec"""",
+      timeoutSec = 5,
+      logFile = "logs/g.log"
+    ) shouldBe GateResult.Green
+
+    // One line, not four: argc is 1.
+    readString(root.resolve("logs/g.log")) shouldBe """sbt -Werror "testOnly *Spec"""" + "\n"
+  }
+
+  it should "keep an empty gate command green in sandboxed mode, exactly as on the host" in {
+    // An empty gate is bash's no-op green (see the host case above). Routing it into the container
+    // instead would turn it into an infra fault raised from inside a docker run — a different
+    // answer to the same configuration depending on a flag that is not about emptiness.
+    val root   = tempRoot()
+    val runner = writeExecutable(root, "run-fast-gate.sh", "#!/usr/bin/env bash\nexit 1\n")
+    val gate   = LiveGateRunner(root, timeoutBin = None, sandboxRunner = Some(runner))
+
+    gate.run("FAST", "   ", timeoutSec = 5, logFile = "logs/g.log") shouldBe GateResult.Green
+  }
+
+  it should "say in the log which side of the sandbox boundary the gate ran on" in {
+    val root   = tempRoot()
+    val runner = writeExecutable(root, "run-fast-gate.sh", "#!/usr/bin/env bash\nexit 0\n")
+    val gate   = LiveGateRunner(root, timeoutBin = None, sandboxRunner = Some(runner))
+
+    val lines = captureLogLines {
+      gate.run("FAST", "sbt test", timeoutSec = 900, logFile = "logs/g.log")
+    }
+
+    lines should contain(
+      s"FAST gate: sandboxed sbt test (timeout 900s) -> ${root.resolve("logs/g.log")}"
+    )
+  }
+
   // =============================================================================================
   // LiveAgentDispatch
   // =============================================================================================
@@ -288,6 +337,8 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
     val root     = tempRoot()
     val dispatch = LiveAgentDispatch(
       root,
+      // Never reached: every case below drives a stub seam (IMPL_CMD/FIX_CMD/REVIEW_CMD).
+      sandboxDir = root.resolve("sandbox-unused"),
       timeoutBin = None,
       iterTimeout = 5,
       implCmd = Some("echo hello patch > \"$PATCH_OUT\""),
@@ -312,6 +363,8 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
     val dispatch =
       LiveAgentDispatch(
         root,
+        // Never reached: every case below drives a stub seam (IMPL_CMD/FIX_CMD/REVIEW_CMD).
+        sandboxDir = root.resolve("sandbox-unused"),
         timeoutBin = None,
         iterTimeout = 5,
         implCmd = Some("exit 124"),
@@ -333,6 +386,8 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
     val dispatch =
       LiveAgentDispatch(
         root,
+        // Never reached: every case below drives a stub seam (IMPL_CMD/FIX_CMD/REVIEW_CMD).
+        sandboxDir = root.resolve("sandbox-unused"),
         timeoutBin = None,
         iterTimeout = 5,
         implCmd = Some("exit 7"),
@@ -353,6 +408,8 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
     val root     = tempRoot()
     val dispatch = LiveAgentDispatch(
       root,
+      // Never reached: every case below drives a stub seam (IMPL_CMD/FIX_CMD/REVIEW_CMD).
+      sandboxDir = root.resolve("sandbox-unused"),
       timeoutBin = None,
       iterTimeout = 5,
       implCmd = Some("exit 1"), // would fold to Done too, but must not be the one that runs
@@ -374,6 +431,8 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
     val root     = tempRoot()
     val dispatch = LiveAgentDispatch(
       root,
+      // Never reached: every case below drives a stub seam (IMPL_CMD/FIX_CMD/REVIEW_CMD).
+      sandboxDir = root.resolve("sandbox-unused"),
       timeoutBin = None,
       iterTimeout = 5,
       implCmd = Some("echo worker-stdout; echo worker-stderr 1>&2"),
@@ -401,6 +460,8 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
     val dispatch =
       LiveAgentDispatch(
         root,
+        // Never reached: every case below drives a stub seam (IMPL_CMD/FIX_CMD/REVIEW_CMD).
+        sandboxDir = root.resolve("sandbox-unused"),
         timeoutBin = None,
         iterTimeout = 5,
         implCmd = Some("true"),
@@ -427,6 +488,8 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
     val root     = tempRoot()
     val dispatch = LiveAgentDispatch(
       root,
+      // Never reached: every case below drives a stub seam (IMPL_CMD/FIX_CMD/REVIEW_CMD).
+      sandboxDir = root.resolve("sandbox-unused"),
       timeoutBin = None,
       iterTimeout = 5,
       implCmd = None,
@@ -448,6 +511,8 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
     val dispatch =
       LiveAgentDispatch(
         root,
+        // Never reached: every case below drives a stub seam (IMPL_CMD/FIX_CMD/REVIEW_CMD).
+        sandboxDir = root.resolve("sandbox-unused"),
         timeoutBin = None,
         iterTimeout = 5,
         implCmd = None,
@@ -467,6 +532,8 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
     val dispatch =
       LiveAgentDispatch(
         root,
+        // Never reached: every case below drives a stub seam (IMPL_CMD/FIX_CMD/REVIEW_CMD).
+        sandboxDir = root.resolve("sandbox-unused"),
         timeoutBin = None,
         iterTimeout = 5,
         implCmd = None,

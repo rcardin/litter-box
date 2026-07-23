@@ -31,8 +31,8 @@ jobs:
 
       - uses: docker/build-push-action@v6
         with:
-          context: sandbox
-          file: sandbox/base.Dockerfile
+          context: resources/sandbox
+          file: resources/sandbox/base.Dockerfile
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

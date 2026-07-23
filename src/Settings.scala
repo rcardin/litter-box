@@ -42,8 +42,9 @@ object Settings:
       |log-dir       = ".litter-box/logs"
       |
       |gate {
-      |  fast    = "sbt -Werror compile test"
-      |  timeout = 900
+      |  fast      = "sbt -Werror compile test"
+      |  sandboxed = true
+      |  timeout   = 900
       |}
       |issues.labels { ready = "ready", active = "in-progress", blocked = "blocked" }
       |protect  = [".litter-box/**", ".github/**", "CONTEXT.md"]
@@ -138,7 +139,7 @@ object Settings:
 
   // ---- sandbox naming --------------------------------------------------------------------------
 
-  /** Env var carrying `instance-name` into every sandbox script. `sandbox/lib.sh` derives the Docker
+  /** Env var carrying `instance-name` into every sandbox script. `lib.sh` derives the Docker
     * image, network, proxy-container and cache-volume names from it.
     *
     * This matters even though litter-box never runs two instances at once: `start-proxy.sh` does
@@ -148,11 +149,20 @@ object Settings:
     */
   val InstanceEnvVar = "LITTER_BOX_INSTANCE"
 
-  /** The environment every child of the loop inherits. One entry today; a function rather than a
-    * constant so the call sites in `Main` stay honest about it being config-derived.
+  /** Env var carrying the repo the loop is working on into every sandbox script.
+    *
+    * The scripts cannot derive it any more. They used to live at `<repo>/sandbox`, so `$SCRIPT_DIR/..`
+    * WAS the repo; they now ship in the artifact and run from a cache directory (`Sandbox`) that has
+    * no relationship to the repo at all. `build-image.sh` needs the answer to find
+    * `.litter-box/Dockerfile` and `.litter-box/allowlist`, which are the two files a consumer owns.
     */
-  def childEnv(cfg: Config): Map[String, String] =
-    Map(InstanceEnvVar -> cfg.instanceName)
+  val RepoRootEnvVar = "LITTER_BOX_REPO_ROOT"
+
+  /** The environment every child of the loop inherits. A function rather than a constant so the
+    * call sites in `Main` stay honest about the entries being derived, not fixed.
+    */
+  def childEnv(cfg: Config, root: Path): Map[String, String] =
+    Map(InstanceEnvVar -> cfg.instanceName, RepoRootEnvVar -> root.toString)
 
   // ---- config -> Config ------------------------------------------------------------------------
 
@@ -167,6 +177,7 @@ object Settings:
       stopFile = conf.getString("stop-file"),
       logDir = conf.getString("log-dir"),
       gateCmd = conf.getString("gate.fast"),
+      gateSandboxed = conf.getBoolean("gate.sandboxed"),
       gateTimeout = conf.getInt("gate.timeout"),
       labels = Labels(
         ready = conf.getString("issues.labels.ready"),

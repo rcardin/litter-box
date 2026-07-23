@@ -85,8 +85,9 @@ constrains it. Pass `--force` to overwrite one you already ejected.
 ### The sandbox image
 
 `.litter-box/Dockerfile` builds `FROM ghcr.io/rcardin/litter-box-base` — a build-tool-free image
-carrying temurin 21, a pinned Claude CLI and a non-root user, with no `ENTRYPOINT` and no
-credentials baked in. **Nothing has been published to ghcr yet** — the first publish happens when a
+carrying temurin 21, a pinned Claude CLI and a non-root user, with no build tool and no credentials
+baked in. Your Dockerfile installs the build tool and nothing else: it needs no `ENTRYPOINT`, because
+all three runners override it and run `gate.fast` (or the agent entrypoint) through `bash -c`. **Nothing has been published to ghcr yet** — the first publish happens when a
 tag is cut. See [docs/base-image.md](docs/base-image.md) for the full contract the image guarantees
 and how to add a build-tool preset beyond sbt.
 
@@ -105,8 +106,9 @@ stop-file     = "STOP.md"
 log-dir       = ".litter-box/logs"
 
 gate {
-  fast    = "sbt -Werror compile test"
-  timeout = 900
+  fast      = "sbt -Werror compile test"   # runs INSIDE the sandbox image, so read against its PATH
+  sandboxed = true                          # false runs it on the host instead, with everything your shell has
+  timeout   = 900
 }
 issues.labels { ready = "ready", active = "in-progress", blocked = "blocked" }
 protect  = [".litter-box/**", ".github/**", "CONTEXT.md"]
@@ -115,7 +117,7 @@ timeouts { iter = 1800, ci-wait = 900, ci-appear = 300, ci-appear-interval = 10 
 ```
 
 `instance-name` earns its place even though litter-box never runs two instances at once:
-`sandbox/start-proxy.sh` does `docker rm -f "$PROXY_NAME"` at startup, before any issue label is
+`start-proxy.sh` does `docker rm -f "$PROXY_NAME"` at startup, before any issue label is
 read, so with machine-global names a mistaken second launch kills the running instance's proxy
 mid-iteration and no label discipline can prevent it.
 
@@ -211,10 +213,11 @@ issue as eligible for auto-merge once CI is green.
 ```
 src/           the loop: Machine (state machine), Live (handlers), Caps, Domain, Main, Init, Cli, Prompts
 test/          the suite, plus golden/ — the frozen log-line contract
-resources/     shipped inside the artifact: prompts/ (built-in skeletons), scaffold/ (init's templates)
+resources/     shipped inside the artifact: prompts/ (built-in skeletons), scaffold/ (init's
+               templates), sandbox/ (the Docker sandbox: base image, gate, agent and reviewer
+               runners, egress proxy)
 docs/          reference docs, e.g. base-image.md
-sandbox/       the Docker sandbox: base image, gate, agent and reviewer runners, egress proxy
-sandbox/test/  Docker-dependent shell tests, run manually
+sandbox/test/  Docker-dependent shell tests of resources/sandbox, run manually
 lib/           shell helpers for the watch UI
 watch.sh       live run monitor, reads the log stream and status.jsonl
 ```
@@ -222,6 +225,12 @@ watch.sh       live run monitor, reads the log stream and status.jsonl
 Prompt skeletons no longer live in a consumer repo's `prompts/` directory — they ship inside the
 artifact under `resources/prompts/`, with `.litter-box/prompts/` as the per-repo override written by
 `litter-box eject` (see [Getting started](#getting-started)).
+
+The sandbox scripts ship the same way, for the same reason: they are protocol, not configuration, so
+a consumer carrying a copy would carry one that rots the moment litter-box updates. On each run they
+are unpacked to `~/.cache/litter-box/sandbox/<digest>`, keyed by the contents so an upgrade lands in
+a new directory on its own. A consumer owns exactly two files of the sandbox — `.litter-box/Dockerfile`
+(what the gate image is built from) and `.litter-box/allowlist` (what it may talk to).
 
 `Machine` is a pure decision function over a `using` clause of capability traits (`Caps.scala`);
 `Live.scala` holds every real side effect. That is what lets the whole suite run in memory.

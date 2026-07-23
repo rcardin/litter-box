@@ -3,7 +3,9 @@
 # spent) when Docker is unreachable. Deterministic and daemon-free: a bogus DOCKER_HOST makes
 # the very first `docker info` probe fail.
 set -euo pipefail
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+# The sandbox scripts ship in the artifact and live under resources/ (#9); these tests run
+# them straight out of the source tree rather than out of an extraction cache.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../resources/sandbox" && pwd)"
 source "$SCRIPT_DIR/lib.sh"
 
 fail=0
