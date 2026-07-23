@@ -1,7 +1,17 @@
 #!/usr/bin/env bash
-# The FAST gate's GATE_CMD default (issue #34): runs `sbt compile test` inside the sandboxed,
-# no-credentials container instead of on the host. loop.sh calls this as a single
-# word-splittable command — see the GATE_CMD/GATE_OVERRIDDEN seam in harness/loop.sh.
+# The sandboxed FAST gate: runs the repo's own gate command inside the no-credentials container
+# instead of on the host. The loop invokes this when `gate.sandboxed` is true (Settings/Config),
+# passing `gate.fast` through as a single argument.
+#
+# Usage: run-fast-gate.sh "<gate command>"
+#
+# The command arrives as ONE argument and is handed to `bash -c` inside the container, so it keeps
+# the shell semantics an operator writing a command string in config expects. Before #9 the command
+# was not a parameter at all: this script appended `-batch -no-colors compile test` to the image's
+# ENTRYPOINT, which meant the sandbox was still an sbt sandbox one layer below the ENTRYPOINT hole
+# that #4 opened to remove exactly that coupling. A Gradle consumer got `gradle -batch -no-colors
+# compile test`. The image's ENTRYPOINT is now overridden here and ignored, the same way
+# run-agent.sh has always overridden it.
 set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib.sh"
@@ -13,6 +23,12 @@ source "$SCRIPT_DIR/lib.sh"
 infra_fault() { echo "[run-fast-gate] INFRA FAULT: $*" >&2; exit 124; }
 
 sandbox_preflight   # docker reachable + image present + proxy running (shared, see lib.sh)
+
+# Checked AFTER the preflight, not before: an operator running this by hand with no arguments is
+# far more likely to be missing Docker than to be missing the argument, and the preflight's
+# diagnostic is the more useful one to reach first.
+GATE_CMD="${1:-}"
+[[ -n "${GATE_CMD//[[:space:]]/}" ]] || infra_fault "no gate command given (usage: run-fast-gate.sh \"<command>\")"
 
 # --- read-only clone: git write-tree + git archive, no live bind mount, no .git ------------
 # loop.sh runs `git add -A` immediately before invoking GATE_CMD in every pass, so the index
@@ -63,25 +79,39 @@ trap on_signal TERM INT
 tree_oid="$(git write-tree)" || infra_fault "git write-tree failed"
 git archive "$tree_oid" | tar -x -C "$tmpdir" || infra_fault "git archive/extract failed"
 
-# --- gate container: no credentials, no host env, proxy via JVM system properties ---------
+# --- gate container: no credentials, no host env, proxy addressed two ways ----------------
 # No -e ANTHROPIC_API_KEY, no GH_TOKEN, no gh config mount, no host env passthrough beyond the
-# two JAVA_TOOL_OPTIONS proxy properties below (coursier/sbt run inside a JVM, which does not
-# read HTTP_PROXY/HTTPS_PROXY automatically — the proxy container's name is only known at
-# `docker run` time, so this can't be baked into the image).
+# proxy plumbing below. The proxy container's name is only known at `docker run` time, so none of
+# this can be baked into the image.
+#
+# BOTH forms are set, because "the build tool" is no longer assumed to be a JVM one (#9):
+#   JAVA_TOOL_OPTIONS   a JVM ignores HTTP_PROXY/HTTPS_PROXY and reads system properties instead;
+#                       this is what sbt/coursier need
+#   HTTP(S)_PROXY       what everything else honours — a native launcher (scala-cli, which is a
+#                       Bun/Graal binary before it is ever a JVM), curl, npm, cargo, go
+# Setting only the first was the sbt assumption surviving one layer below the ENTRYPOINT hole #4
+# opened: a non-JVM gate got a container with no route out at all and failed on DNS. Neither form
+# widens egress — both address the same allowlisting proxy, and the network has no other exit.
+# NO_PROXY is cleared so nothing in the image's own environment can carve an exception.
 #
 # Detached (see cname comment above), and NOT --rm: AutoRemove races `docker wait` for the
 # exit code, so the container is removed explicitly in cleanup() instead.
+proxy_url="http://$PROXY_NAME:$PROXY_PORT"
 docker run -d --name "$cname" \
   --network "$NETWORK" \
   --user gate \
   --cap-drop=ALL \
   --security-opt=no-new-privileges \
   -e JAVA_TOOL_OPTIONS="-Dhttp.proxyHost=$PROXY_NAME -Dhttp.proxyPort=$PROXY_PORT -Dhttps.proxyHost=$PROXY_NAME -Dhttps.proxyPort=$PROXY_PORT" \
+  -e HTTP_PROXY="$proxy_url" -e HTTPS_PROXY="$proxy_url" \
+  -e http_proxy="$proxy_url" -e https_proxy="$proxy_url" \
+  -e NO_PROXY="" -e no_proxy="" \
   -v "$tmpdir:/workspace" \
   -v "$COURSIER_VOLUME:/home/gate/.cache/coursier" \
   -w /workspace \
+  --entrypoint /bin/bash \
   "$IMAGE" \
-  -batch -no-colors compile test >/dev/null \
+  -c "$GATE_CMD" >/dev/null \
   || infra_fault "docker run failed to start the gate container"
 
 # Stream the container's output into this wrapper's stdout so run_gate()'s gate log still

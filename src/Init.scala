@@ -85,41 +85,46 @@ object Init:
     * acquire an sbt gate. So the non-sbt case writes an explicit `false`, which is a command that
     * exists on every system and always fails. The loop then reports a red gate on iteration one,
     * which is the correct answer to "you have not told me how to build this".
+    *
+    * The command runs INSIDE the sandbox container (`gate.sandboxed`, defaulted true in the
+    * scaffolded config.conf), so it is read against that image's PATH and not the host's. Before #9
+    * it was a host command, which meant every scaffolded repo ran a weaker gate tier than litter-box
+    * ran on itself and nothing anywhere said so.
     */
   private def configConf(d: Detected): String =
     val gate = d.buildTool match
-      case Some(BuildTool.Sbt) => """  fast    = "sbt -Werror compile test""""
+      case Some(BuildTool.Sbt) => """  fast      = "sbt -Werror compile test""""
       case None                =>
         """  # TODO: your fast gate command. It must compile and run the in-memory test tier, and
-          |  # must NOT need Docker, the network beyond .litter-box/allowlist, or a credential.
-          |  # Until you set it, `false` keeps the gate honestly red rather than inheriting a
-          |  # build tool nobody confirmed this project uses.
-          |  fast    = "false"""".stripMargin
+          |  # must NOT need Docker, the network beyond .litter-box/allowlist, or a credential. It
+          |  # runs inside the container built from .litter-box/Dockerfile, so name the tool you
+          |  # installed there. Until you set it, `false` keeps the gate honestly red rather than
+          |  # inheriting a build tool nobody confirmed this project uses.
+          |  fast      = "false"""".stripMargin
     Machine.renderTemplate(resource("config.conf"), "GATE" -> gate)
 
+  /** The gate image. One hole: the build tool.
+    *
+    * No ENTRYPOINT hole any more (#9). All three runners override the image's entrypoint — the gate
+    * runs `gate.fast` through `bash -c`, the agent and reviewer run their own entrypoint script — so
+    * an ENTRYPOINT here would be dead, and the sbt preset's `ENTRYPOINT ["sbt"]` was worse than
+    * dead: `run-fast-gate.sh` appended sbt's own flags to whatever it was, which put the build-tool
+    * coupling straight back one layer below where #4 removed it.
+    */
   private def dockerfile(d: Detected): String =
-    val (install, entrypoint) = d.buildTool match
+    val install = d.buildTool match
       case Some(BuildTool.Sbt) =>
-        (
-          """ARG SBT_VERSION=1.12.9
-            |RUN curl -fsSL "https://github.com/sbt/sbt/releases/download/v${SBT_VERSION}/sbt-${SBT_VERSION}.tgz" \
-            |      -o /tmp/sbt.tgz \
-            |    && tar -xzf /tmp/sbt.tgz -C /usr/local \
-            |    && rm /tmp/sbt.tgz \
-            |    && ln -s /usr/local/sbt/bin/sbt /usr/local/bin/sbt""".stripMargin,
-          """ENTRYPOINT ["sbt"]"""
-        )
+        """ARG SBT_VERSION=1.12.9
+          |RUN curl -fsSL "https://github.com/sbt/sbt/releases/download/v${SBT_VERSION}/sbt-${SBT_VERSION}.tgz" \
+          |      -o /tmp/sbt.tgz \
+          |    && tar -xzf /tmp/sbt.tgz -C /usr/local \
+          |    && rm /tmp/sbt.tgz \
+          |    && ln -s /usr/local/sbt/bin/sbt /usr/local/bin/sbt""".stripMargin
       case None =>
-        (
-          """# TODO: install your build tool here, pinned to an exact version so image rebuilds
-            |# are reproducible. It must land on PATH for the non-root `gate` user.""".stripMargin,
-          """# TODO: ENTRYPOINT ["<your build tool>"]"""
-        )
-    Machine.renderTemplate(
-      resource("Dockerfile"),
-      "BUILD_TOOL" -> install,
-      "ENTRYPOINT" -> entrypoint
-    )
+        """# TODO: install your build tool here, pinned to an exact version so image rebuilds
+          |# are reproducible. It must land on PATH for the non-root `gate` user, because
+          |# gate.fast is run as that user inside this image.""".stripMargin
+    Machine.renderTemplate(resource("Dockerfile"), "BUILD_TOOL" -> install)
 
   /** What went unanswered, in the operator's words. Printed to stderr after a successful `init`,
     * because every one of these is a thing that will otherwise fail on iteration one.

@@ -94,6 +94,29 @@ class InitSpec extends AnyFlatSpec with Matchers:
     env should include("ANTHROPIC_API_KEY=")
     env should not include "sk-ant"
 
+  it should "scaffold a SANDBOXED gate, not a host one" in:
+    // The defect this exists for (issue #9): `init` wrote a host `sbt` command while litter-box's
+    // own repo ran its gate inside a container, so every scaffolded consumer silently got a weaker
+    // gate tier than the tool ran on itself, and nothing told them the isolation they installed
+    // litter-box for did not cover the gate.
+    val root = tempRoot()
+    Init.run(root, sbtRepo, force = false)
+    val cfg = Settings.parse(Settings.loadFile(root).toOption.get)
+    cfg.gateSandboxed shouldBe true
+
+  it should "write a Dockerfile the sandbox actually builds from" in:
+    // The other half of #9: `init` wrote .litter-box/Dockerfile and build-image.sh built
+    // litter-box's own sbt-hardcoded sandbox/Dockerfile instead, so this file was read by nothing.
+    val root = tempRoot()
+    Init.run(root, sbtRepo, force = false)
+    val dockerfile = readString(root.resolve(".litter-box/Dockerfile"))
+    dockerfile should include("FROM ${BASE_IMAGE}")
+    dockerfile should include("sbt")
+    // No ENTRYPOINT instruction (the comments explain its absence, hence the line-level check):
+    // all three runners override it, and the sbt preset's `ENTRYPOINT ["sbt"]` was what let
+    // run-fast-gate.sh append sbt's own flags to every consumer's build tool.
+    dockerfile.linesIterator.exists(_.trim.startsWith("ENTRYPOINT")) shouldBe false
+
   "a non-sbt repo" should "get a TODO Dockerfile and no sbt anywhere" in:
     val root = tempRoot()
     Init.run(root, plainRepo, force = false).isRight shouldBe true

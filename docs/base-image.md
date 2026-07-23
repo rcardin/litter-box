@@ -1,7 +1,7 @@
 # `ghcr.io/rcardin/litter-box-base`
 
 The part of the litter-box gate sandbox that is not about any one project. Built from
-`sandbox/base.Dockerfile`, published on tag by `.github/workflows/base-image.yml`.
+`resources/sandbox/base.Dockerfile`, published on tag by `.github/workflows/base-image.yml`.
 
 ## What it guarantees
 
@@ -17,13 +17,15 @@ The part of the litter-box gate sandbox that is not about any one project. Built
 ## What it deliberately does not have
 
 - **No build tool.** Not sbt, not Gradle, not Maven, not npm. That is the consumer's layer.
-- **No `ENTRYPOINT` of its own.** The consumer sets it to their build tool. `base.Dockerfile` never
-  writes one, but note that `eclipse-temurin` ships `ENTRYPOINT ["/__cacert_entrypoint.sh"]` and
-  `CMD ["jshell"]`, so an image built on this one that sets no `ENTRYPOINT` inherits those rather
-  than getting nothing. Set yours.
+- **No `ENTRYPOINT` of its own**, and none is wanted from the consumer either. All three runners
+  override it: the gate runs `gate.fast` through `bash -c`, the worker and reviewer run their own
+  entrypoint script. What the image inherits from `eclipse-temurin`
+  (`ENTRYPOINT ["/__cacert_entrypoint.sh"]`, `CMD ["jshell"]`) is therefore never reached.
+  This was not always true — until #9 the gate ran the image's `ENTRYPOINT` with sbt's own flags
+  appended, so the "no build tool" promise held one layer up and was broken one layer down.
 - **No credentials.** No API key, no OAuth token, no `gh` token, no registry login. Credentials
   reach a running container as environment variables at `docker run` time and are never baked in.
-  See `sandbox/lib.sh:sandbox_credential_env`.
+  See `resources/sandbox/lib.sh:sandbox_credential_env`.
 
 ## Using it
 
@@ -35,20 +37,22 @@ USER root
 # install your build tool, pinned to an exact version
 USER gate
 WORKDIR /workspace
-ENTRYPOINT ["your-build-tool"]
 ```
 
-`litter-box init` writes exactly this file, filled in, to `.litter-box/Dockerfile`.
+`litter-box init` writes exactly this file, filled in, to `.litter-box/Dockerfile`, and
+`build-image.sh` builds the gate image from it — that file, with no fallback. The build tool you
+install here is what `gate.fast` in `.litter-box/config.conf` is read against, so the two have to
+name the same thing.
 
 ## Adding a preset
 
 `init` scaffolds an sbt Dockerfile because sbt is the only build tool a litter-box loop has
 actually been run against end to end. A Gradle or Maven preset is a PR: add a case to
-`Init.BuildTool`, its install block and entrypoint in `Init.dockerfile`, its gate command in
-`Init.configConf`, and a detection rule in `Init.detect`. Adding a case is a claim that you ran the
+`Init.BuildTool`, its install block in `Init.dockerfile`, its gate command in `Init.configConf`, and
+a detection rule in `Init.detect`. Adding a case is a claim that you ran the
 loop with it, so please say so in the PR.
 
 ## Bumping the Claude CLI
 
-`CLAUDE_VERSION` is an explicit `ARG` in `sandbox/base.Dockerfile`. Bump it in a commit of its own,
+`CLAUDE_VERSION` is an explicit `ARG` in `resources/sandbox/base.Dockerfile`. Bump it in a commit of its own,
 together with the image tag, so a broken CLI release is one revert.
