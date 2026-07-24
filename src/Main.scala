@@ -40,8 +40,17 @@ object Main:
     * one key it has always meant. Nothing here reads a default of its own any more — a key's default
     * is whatever the reference says, which is why the `int`/`long`/`str` helpers take the
     * config-derived value as their fallback instead of a literal.
+    *
+    * TWO environments, not one, and the split is the whole point: `env` is the layered environment
+    * (`.litter-box/.env` under the ambient one, see `layerDotEnv`) and answers every VALUE lookup,
+    * while `ambient` is the exported environment alone and answers the single question that is about
+    * the operator rather than about a value — `gateOverridden`.
     */
-  def parseEnv(fromFile: TsConfig, env: Map[String, String]): ParsedEnv =
+  def parseEnv(
+      fromFile: TsConfig,
+      env: Map[String, String],
+      ambient: Map[String, String]
+  ): ParsedEnv =
     val base = Settings.parse(fromFile)
 
     def str(key: String): Option[String]    = env.get(key).filter(_.nonEmpty)
@@ -51,9 +60,14 @@ object Main:
 
     // loop.sh:129-133: GATE_OVERRIDDEN is captured BEFORE GATE_CMD's own default is applied, so
     // setting GATE_CMD to its own default value still counts as "overridden". It is deliberately
-    // about the ENV var alone: a `gate.fast` in the config file is the repo's normal gate, not an
-    // operator saying "skip the sandbox preflight for this run".
-    val gateOverridden = env.get("GATE_CMD").exists(_.nonEmpty)
+    // about the EXPORTED env var alone: a `gate.fast` in the config file is the repo's normal gate,
+    // not an operator saying "skip the sandbox preflight for this run". `.litter-box/.env` is the
+    // config-file case too, not the export case — it is a permanent, untracked, invisible file, so a
+    // `GATE_CMD` written there would switch the preflight (and with it the credential check that
+    // file exists to feed) off for every future run, silently. Hence `ambient` here while `gateCmd`
+    // below still takes the layered value: a `.env` gate command is honoured, it just does not get
+    // to claim it is an operator bypassing the sandbox for one run.
+    val gateOverridden = ambient.get("GATE_CMD").exists(_.nonEmpty)
 
     val cfg = base.copy(
       dryRun = env.getOrElse("DRY_RUN", "0") == "1", // loop.sh:654: `[[ "$DRY_RUN" == "1" ]]`
@@ -86,6 +100,17 @@ object Main:
       gateOverridden = gateOverridden
     )
 
+  /** The same parse for a run with NO `.litter-box/.env`, where the layered environment and the
+    * exported one are the same map.
+    *
+    * THE ONLY CALLERS ARE TESTS, deliberately: `runLoop` always holds both answers (step 1b), so
+    * leaving the three-argument form the only production door means production cannot collapse the
+    * distinction by omission. A default argument would not do — Scala lets a default refer only to an
+    * earlier parameter LIST, and splitting the parameters would make the ordinary call read as two.
+    */
+  def parseEnv(fromFile: TsConfig, env: Map[String, String]): ParsedEnv =
+    parseEnv(fromFile, env, env)
+
   // ---- `.litter-box/.env` layered under the ambient environment (issue #12) -------------------
 
   /** The environment the run actually has, plus the part of it a child would not inherit on its own.
@@ -109,19 +134,25 @@ object Main:
     * down instead of exported. An operator exporting a variable for one run must not be silently
     * overruled by a file they filled in weeks ago.
     *
-    * PRESENCE decides, not emptiness: a variable exported as the empty string still shadows the
-    * file's value, exactly like `GATE_CMD=""` still counts as an override to the layering above.
-    * What each consumer then makes of an empty value stays that consumer's own rule.
+    * An EMPTY exported value overrules nothing, which is again the existing rule rather than a second
+    * one: `parseEnv` already reads every value through `filter(_.nonEmpty)` / `exists(_.nonEmpty)`,
+    * so an empty variable is an absent one everywhere else in the loop and has to be one here too.
+    * It is also the shape operators really have — `resources/scaffold/env.example` hands them
+    * `ANTHROPIC_API_KEY=`, and a CI `env:` block built from a missing secret produces the same thing —
+    * so letting it shadow the file would reproduce the FATAL this layering exists to remove.
     *
-    * `forChildren` is the file's entries MINUS every key the ambient environment already has,
+    * `forChildren` is the file's entries MINUS every key the ambient environment actually answers,
     * because a child inherits this JVM's environment before anything is stamped on it: stamping a
-    * contested key would hand the child the loser of the comparison just made.
+    * contested key would hand the child the loser of the comparison just made. `effective` is then
+    * built FROM `forChildren`, so the two halves cannot disagree about who won a contested key.
     */
   private[litterbox] def layerDotEnv(
       dotEnv: Map[String, String],
       ambient: Map[String, String]
   ): DotEnvLayer =
-    DotEnvLayer(effective = dotEnv ++ ambient, forChildren = dotEnv -- ambient.keySet)
+    val shadowing   = ambient.filter((_, v) => v.nonEmpty).keySet
+    val fileEntries = dotEnv -- shadowing
+    DotEnvLayer(effective = ambient ++ fileEntries, forChildren = fileEntries)
 
   // ---- `command -v` equivalent ---------------------------------------------------------------
 
@@ -355,6 +386,10 @@ object Main:
     * One-way on purpose: the flag can turn a dry run ON, never off. `DRY_RUN=1` is what an operator
     * exports when they want to be sure nothing mutates, and the sandbox test scripts set it the same
     * way; a flag able to clear it would be a way to mutate a repo somebody believed was safe.
+    *
+    * Unlike `gateOverridden`, this one reads the LAYERED environment, `.litter-box/.env` included,
+    * and that is safe for the same reason the OR is one-way: every way in can only arm a dry run,
+    * and an armed dry run is the state in which nothing is mutated and no safety check is skipped.
     */
   private[litterbox] def applyDryRunFlag(flagged: Boolean, env: Map[String, String]): Boolean =
     flagged || env.getOrElse("DRY_RUN", "0") == "1"
@@ -436,7 +471,10 @@ object Main:
     val fromFile = Settings.loadFile(root) match
       case Right(c)  => c
       case Left(msg) => die50(msg)
-    val parsed0 = parseEnv(fromFile, env)
+    // `ambient` is passed alongside the layered `env` on purpose: every value comes from the layered
+    // one, but "the operator is bypassing the sandbox preflight for this run" can only be said by an
+    // exported variable — see `parseEnv`.
+    val parsed0 = parseEnv(fromFile, env, ambient)
     val parsed  = parsed0.copy(cfg =
       parsed0.cfg.copy(dryRun = applyDryRunFlag(dryRunFlag, env))
     )

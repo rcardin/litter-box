@@ -41,7 +41,7 @@ then writes six files under `.litter-box/`:
 | `Dockerfile` | `FROM ghcr.io/rcardin/litter-box-base` plus your build tool layer — see [The sandbox image](#the-sandbox-image) |
 | `allowlist` | egress domains the sandbox proxy permits |
 | `prompts/conventions.md` | the one file you own — spliced into every prompt as `{{CONVENTIONS}}` |
-| `.env.example` | the credential the sandboxed worker needs, meant to be copied, never committed |
+| `.env.example` | the credential the sandboxed worker needs, and any other variable from [Running it](#running-it); meant to be copied to `.env`, never committed |
 | `.gitignore` | ignores `logs/` and `.env` inside `.litter-box/` |
 
 It refuses to overwrite an existing `.litter-box/` unless you pass `--force`, and the check happens
@@ -63,7 +63,8 @@ PR — see [Adding a preset](docs/base-image.md#adding-a-preset).
 2. **Provide a credential.** `cp .litter-box/.env.example .litter-box/.env` and fill in
    `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY`. The loop reads that file at startup and passes
    what it finds to the sandboxed worker, fixer and reviewer. Exporting the variable instead works
-   just as well, and an exported variable wins over the file.
+   just as well; the file takes any other variable from [Running it](#running-it) too, and which one
+   wins is the layering in [Configuration](#configuration).
 3. **Create the three labels** the state machine drives on:
    ```bash
    gh label create ready && gh label create in-progress && gh label create blocked
@@ -99,7 +100,9 @@ One HOCON file at the repo root, `.litter-box/config.conf`. It is mandatory: wit
 exits `50` (infra fault) and names `litter-box init`, rather than guessing and acting on the wrong
 labels. Anything omitted falls back to the reference schema in `src/Settings.scala`; every knob
 loop.sh took from an env var (`GATE_CMD`, `REPAIR_BUDGET`, `ITER_TIMEOUT`, ...) still overrides its
-config key for a single run, so the layering is **env var > config file > reference default**.
+config key for a single run. The full precedence, `.litter-box/.env` and its two qualifications
+included, is stated once in the `Settings` object's scaladoc in `src/Settings.scala`, so that this
+README and `ARCHITECTURE.md` cannot drift from the code that applies it.
 
 ```hocon
 instance-name = "litter-box"          # namespaces the Docker image/network/proxy/cache names
@@ -192,7 +195,7 @@ exist. See [Getting started](#getting-started) for `init`, `eject`, `--dry-run` 
 | `DRY_RUN` | `0` | `1` renders the worker prompt, then stops before any mutation |
 | `REPAIR_BUDGET` | `2` | Fix attempts per issue |
 | `MAX_PATCH_BYTES` | `1000000` | Oversized-patch guard |
-| `GATE_CMD` | `sbt -Werror compile test` | The gate (overrides `gate.fast`). Overriding it skips the whole Docker preflight |
+| `GATE_CMD` | `sbt -Werror compile test` | The gate (overrides `gate.fast`). Exporting it also skips the whole Docker preflight; setting it in `.litter-box/.env` only changes the command |
 | `GATE_TIMEOUT` | `900` | Gate timeout (seconds) |
 | `ITER_TIMEOUT` | `1800` | Worker dispatch timeout |
 | `CI_WAIT_TIMEOUT` / `CI_APPEAR_TIMEOUT` / `CI_APPEAR_INTERVAL` | `900` / `300` / `10` | CI polling |
@@ -202,8 +205,20 @@ exist. See [Getting started](#getting-started) for `init`, `eject`, `--dry-run` 
 are test seams: each replaces one subprocess so the loop can be driven without Docker or GitHub.
 
 Preflight requires `gh`, `sbt` and `claude` on `PATH`, and either `CLAUDE_CODE_OAUTH_TOKEN` or
-`ANTHROPIC_API_KEY` for the sandboxed worker, exported or written in `.litter-box/.env`. Every
-variable in that file is layered under the process environment, so an exported one always wins.
+`ANTHROPIC_API_KEY` for the sandboxed worker, exported or written in `.litter-box/.env`. That file is
+not credentials-only: any variable in the table above can live in it, and it reaches the credential
+check, the config layering and the seams by the same door an export does. Two things it cannot do,
+both of them deliberate:
+
+- **It cannot skip the sandbox preflight.** A `GATE_CMD` there sets the gate command and stops
+  there; only an exported `GATE_CMD` is an operator saying "no sandbox for this run", because the
+  file is permanent and untracked and would otherwise switch the preflight off for every future run,
+  silently.
+- **An empty export does not shadow it.** `FOO=` exported is an absent `FOO` everywhere else in the
+  loop, so it loses to the file's value rather than blanking it — which is what makes a sourced
+  `.env.example` or a CI `env:` entry built from a missing secret harmless.
+
+For which layer wins in general, see [Configuration](#configuration).
 
 ### Issue labels
 

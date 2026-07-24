@@ -1174,6 +1174,23 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
     verdict shouldBe GateResult.Green
   }
 
+  it should "pin nothing when unset, leaving the child's inherited JAVA_HOME and PATH untouched" in {
+    val root = tempRoot()
+
+    // Unpinned is exactly bash's behaviour when the pinned JDK is missing: it warns and exports
+    // neither var, so the child sees whatever this process itself inherited.
+    val r = withJdkPin(None) {
+      LiveProc.run(
+        root,
+        Seq("bash", "-c", "printf '%s\\n%s\\n' \"${JAVA_HOME-<unset>}\" \"$PATH\"")
+      )
+    }
+
+    val Array(javaHome, path) = r.stdoutTrimmedTrailingNewlines.split("\n", 2)
+    javaHome shouldBe sys.env.getOrElse("JAVA_HOME", "<unset>")
+    path shouldBe sys.env.getOrElse("PATH", "")
+  }
+
   // =============================================================================================
   // The exported child environment (LiveProc.exportEnv): the same mechanism as the JDK pin, for
   // the config-derived vars and for the `.litter-box/.env` entries this JVM's own environment does
@@ -1181,7 +1198,10 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
   // this stamping is the only thing that puts it there.
   // =============================================================================================
 
-  /** Runs `f` with the process-wide child-environment export set, always clearing it afterwards. */
+  /** `LiveProc.exportEnv` is process-wide state, not a parameter, so a test that set it and then
+    * failed would silently stamp its vars onto every child every later suite spawns. The clear is in
+    * a `finally` for that reason: the leak has to be impossible, not merely unlikely.
+    */
   private def withExportedEnv[A](vars: Map[String, String])(f: => A): A =
     LiveProc.exportEnv(vars)
     try f
@@ -1205,21 +1225,4 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
     }
 
     r.stdout shouldBe "<unset>"
-  }
-
-  it should "pin nothing when unset, leaving the child's inherited JAVA_HOME and PATH untouched" in {
-    val root = tempRoot()
-
-    // Unpinned is exactly bash's behaviour when the pinned JDK is missing: it warns and exports
-    // neither var, so the child sees whatever this process itself inherited.
-    val r = withJdkPin(None) {
-      LiveProc.run(
-        root,
-        Seq("bash", "-c", "printf '%s\\n%s\\n' \"${JAVA_HOME-<unset>}\" \"$PATH\"")
-      )
-    }
-
-    val Array(javaHome, path) = r.stdoutTrimmedTrailingNewlines.split("\n", 2)
-    javaHome shouldBe sys.env.getOrElse("JAVA_HOME", "<unset>")
-    path shouldBe sys.env.getOrElse("PATH", "")
   }

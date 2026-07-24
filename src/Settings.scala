@@ -15,13 +15,26 @@ import scala.util.control.NonFatal
   * cutting that tie: `Machine`/`Live` read the values off `Config`, `Config` is built here, and the
   * only thing left that knows a literal like `in-progress` is the reference block below.
   *
-  * Layering, outermost wins: **env var > `.litter-box/.env` > config file > [[Reference]]**. The
-  * file may set any subset of the schema; the rest falls back to the reference, so a consumer repo's
-  * config stays as short as the things it actually changes. Env vars keep the exact names and
-  * meanings loop.sh gave them (`GATE_CMD`, `REPAIR_BUDGET`, ...), so an operator can still override
-  * one knob for one run without editing a tracked file — and `.litter-box/.env` (see [[loadDotEnv]])
-  * is the same variables written down instead of exported, so it loses to an export for the same
-  * reason the config file does.
+  * Layering, outermost wins: **env var > `.litter-box/.env` > config file > [[Reference]]**.
+  *
+  * THIS PARAGRAPH IS THE PROJECT'S ONE STATEMENT OF THAT ORDER. `Main.layerDotEnv`, `MainSpec`,
+  * `ARCHITECTURE.md` and the README all point here instead of repeating it, because a rule written
+  * down in six places is a rule that takes six edits to change and only has to be missed once to
+  * leave a copy that lies. It lives with [[Reference]] rather than in a doc because the bottom
+  * layer, the config file's parse and `.litter-box/.env`'s parse are all in this file.
+  *
+  * The config file may set any subset of the schema; the rest falls back to the reference, so a
+  * consumer repo's config stays as short as the things it actually changes. Env vars keep the exact
+  * names and meanings loop.sh gave them (`GATE_CMD`, `REPAIR_BUDGET`, ...), so an operator can still
+  * override one knob for one run without editing a tracked file — and `.litter-box/.env` (see
+  * [[loadDotEnv]]) is the same variables written down instead of exported, so it loses to an export
+  * for the same reason the config file does.
+  *
+  * Two qualifications, each of them this same rule rather than a second one, with the reasoning at
+  * the site that implements it: an EMPTY exported variable is an absent one everywhere else in the
+  * loop and so shadows nothing the file says (`Main.layerDotEnv`), and a `GATE_CMD` read from the
+  * file sets the gate command but never counts as an operator bypassing the sandbox preflight, which
+  * only an export can say (`Main.parseEnv`).
   */
 object Settings:
 
@@ -125,10 +138,9 @@ object Settings:
     * wholesale over a stray line would reproduce the exact FATAL issue #12 is about, for a file that
     * holds a perfectly good token two lines further down.
     *
-    * The value is everything after the first `=`, stripped, with ONE matched pair of surrounding
-    * quotes removed. Nothing else is interpreted: no escape sequences, and in particular no trailing
-    * `#` comment, because a credential is opaque text and silently truncating one at a character it
-    * may legally contain is a 401 that looks like an outage.
+    * Nothing inside a value is interpreted, and the `#` that would open a comment in a shell least of
+    * all: a credential is opaque text, so silently truncating one at a character it may legally
+    * contain is a 401 that looks like an outage.
     */
   private[litterbox] def parseDotEnv(text: String): Map[String, String] =
     text.linesIterator.flatMap(dotEnvEntry).toMap

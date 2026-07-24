@@ -88,6 +88,35 @@ class MainSpec extends AnyFlatSpec with Matchers:
     parsed.cfg.gateCmd shouldBe "sbt -Werror compile test"
   }
 
+  /** `.litter-box/.env` reaches `parseEnv` through the layered environment (issue #12), which is
+    * exactly what it must do for the credential and every ordinary value. It must NOT reach
+    * `gateOverridden`: that flag means "an operator is skipping the sandbox preflight for this run",
+    * and a permanent untracked file is the config-file case, not the per-run export case. Were it to
+    * flip, the credential check the file exists to feed would be the first thing skipped.
+    */
+  it should "not let a GATE_CMD from .litter-box/.env flip gateOverridden" in {
+    val ambient = Map.empty[String, String]
+    val layered = Main.layerDotEnv(dotEnv = Map("GATE_CMD" -> "true"), ambient = ambient)
+
+    val parsed = Main.parseEnv(Settings.referenceOnly, layered.effective, ambient)
+
+    parsed.gateOverridden shouldBe false
+    // The value still lands, and still runs sandboxed: a `.env` gate command is a configured gate,
+    // indistinguishable in kind from a `gate.fast` in `config.conf`.
+    parsed.cfg.gateCmd shouldBe "true"
+    parsed.cfg.gateSandboxed shouldBe true
+  }
+
+  it should "still flip gateOverridden for a GATE_CMD the operator exported for this run" in {
+    val ambient = Map("GATE_CMD" -> "true")
+    val layered = Main.layerDotEnv(dotEnv = Map.empty, ambient = ambient)
+
+    val parsed = Main.parseEnv(Settings.referenceOnly, layered.effective, ambient)
+
+    parsed.gateOverridden shouldBe true
+    parsed.cfg.gateSandboxed shouldBe false
+  }
+
   it should "run a GATE_CMD override on the host, whatever gate.sandboxed says" in {
     // The override already skips the sandbox preflight (Main step 6b), so the image the command
     // would run in is never built. Honouring `sandboxed = true` here would hand the operator's
@@ -387,6 +416,35 @@ class MainSpec extends AnyFlatSpec with Matchers:
     // Nothing to stamp for the contested key: the child inherits the ambient value already, and
     // stamping the file's would hand the child the loser of the very comparison just made.
     layered.forChildren shouldBe Map("MAX_ITERS" -> "9")
+  }
+
+  /** `export ANTHROPIC_API_KEY=` is not an operator overruling the file: it is the shape
+    * `resources/scaffold/env.example` hands operators, and the shape a CI `env:` block produces from
+    * a missing secret. Letting it shadow would reproduce the very FATAL issue #12 exists to fix, and
+    * it would be a SECOND precedence rule on top of the one `parseEnv` already applies to every value
+    * it reads (`filter(_.nonEmpty)`).
+    */
+  it should "not let an empty ambient value shadow a non-empty .env value" in {
+    val layered = Main.layerDotEnv(
+      dotEnv = Map("ANTHROPIC_API_KEY" -> "from-file"),
+      ambient = Map("ANTHROPIC_API_KEY" -> "", "PATH" -> "/usr/bin")
+    )
+
+    layered.effective shouldBe Map("ANTHROPIC_API_KEY" -> "from-file", "PATH" -> "/usr/bin")
+    // Both halves have to name the same winner: the child inherits the empty ambient value from this
+    // JVM, so a key the file won here and did not stamp there is a dispatch authenticating with the
+    // value the preflight just decided to ignore.
+    layered.forChildren shouldBe Map("ANTHROPIC_API_KEY" -> "from-file")
+  }
+
+  it should "keep an empty ambient value the .env does not answer" in {
+    // Empty-is-absent is about which of TWO values wins, never about deleting an environment variable
+    // this process really has: `effective` is what the run reasons with, so it stays the truth about
+    // the environment wherever there is nothing to compare against.
+    val layered = Main.layerDotEnv(dotEnv = Map.empty, ambient = Map("NTFY_TOPIC" -> ""))
+
+    layered.effective shouldBe Map("NTFY_TOPIC" -> "")
+    layered.forChildren shouldBe Map.empty
   }
 
   it should "be the ambient environment untouched when there is no .env at all" in {

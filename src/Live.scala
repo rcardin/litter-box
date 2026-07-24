@@ -217,15 +217,26 @@ private[litterbox] object LiveProc:
 
   def pinJdk(javaHome: Option[String]): Unit = jdkPin = javaHome
 
-  /** Config-derived variables stamped onto EVERY child, on the same reasoning as `jdkPin`: bash got
-    * this by `export`ing into its own environment, a JVM cannot, so `builder` — the one choke point
-    * every `ProcessBuilder` in the harness goes through — does it per child instead.
+  /** Variables stamped onto EVERY child, on the same reasoning as `jdkPin`: bash got this by
+    * `export`ing into its own environment, a JVM cannot, so `builder` — the one choke point every
+    * `ProcessBuilder` in the harness goes through — does it per child instead.
     *
-    * Today this carries `LITTER_BOX_INSTANCE` and `LITTER_BOX_REPO_ROOT` (`Settings.childEnv`),
-    * which `lib.sh` turns into the Docker image/network/proxy/volume names and the answer to "which
-    * repo is this run about" — the second one being unanswerable from inside the sandbox scripts
-    * since they stopped living in the repo (#9). Set once by `Main` at startup; empty everywhere
-    * else, so a test that never sets it sees an unmodified child environment.
+    * Two sources, composed in this order by `Main.runLoop` (step 2b). FIRST the `.litter-box/.env`
+    * entries the ambient environment did not answer (`Main.layerDotEnv`'s `forChildren`), because
+    * the sandbox scripts read the credential off THEIR OWN environment — `resources/sandbox/lib.sh`'s
+    * `sandbox_credential_env` tests `$CLAUDE_CODE_OAUTH_TOKEN` then `$ANTHROPIC_API_KEY` and never
+    * asks the loop for either — so a file entry that only reached this JVM would satisfy the
+    * credential preflight and then fail the first dispatch one step later (#12).
+    *
+    * SECOND, and therefore winning any contested key, the config-derived `LITTER_BOX_INSTANCE` /
+    * `LITTER_BOX_REPO_ROOT` pair (`Settings.childEnv`), which `lib.sh` turns into the Docker
+    * image/network/proxy/volume names and the answer to "which repo is this run about" — the
+    * second one being unanswerable from inside the sandbox scripts since they stopped living in the
+    * repo (#9). Last on purpose: the loop reasons with those two values itself, so a `.env` allowed
+    * to overwrite them would rename the Docker resources out from under the run in flight.
+    *
+    * Set once by `Main` at startup; empty everywhere else, so a test that never sets it sees an
+    * unmodified child environment.
     */
   @volatile private var exported: Map[String, String] = Map.empty
 
