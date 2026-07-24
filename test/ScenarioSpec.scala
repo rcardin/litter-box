@@ -193,6 +193,23 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     )
   }
 
+  // ---- issue #11: which runner each tier gets ----------------------------------------------
+
+  it should "send the CI wait to the host runner and only the FAST gate to the sandboxable one" in {
+    // The regression: with `gate.sandboxed` on (the default) both tiers shared one sandboxed
+    // runner, so `gh pr checks --watch` ran in a container with no gh, no credentials and no
+    // github.com egress. Its `command not found` rc is indistinguishable from a red check, so a
+    // green PR was annotated CI RED and the issue parked at needs-human.
+    val w = TestWorld()
+    w.labels = List("ready", "class-1")
+
+    val exit = w.runLoop(Config(gateSandboxed = true))
+
+    exit shouldBe LoopExit.Success
+    w.gateRunnerCalls.map(_._1).toList shouldBe List("FAST")
+    w.hostRunnerCalls.toList shouldBe List("CI-WAIT" -> "gh pr checks 123 --watch --fail-fast")
+  }
+
   // ---- Scenario B: REQUEST_CHANGES -> exactly one fix, re-gate, re-review APPROVE ----------
 
   it should "dispatch exactly one FIX on REQUEST_CHANGES, re-gate, and approve (Scenario B)" in {

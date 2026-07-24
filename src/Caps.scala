@@ -105,6 +105,19 @@ trait AgentDispatch:
 trait GateRunner:
   def run(label: String, cmd: String, timeoutSec: Int, logFile: String): GateResult
 
+/** The runner for tiers that borrow `run_gate`'s mechanics (one command, one timeout, one captured
+  * log) but must execute on the HOST rather than inside the gate container. The CI wait is the only
+  * one: `gh pr checks --watch` needs the `gh` binary, the operator's credentials and github.com
+  * egress, and the gate image is built to have none of the three.
+  *
+  * A distinct type rather than a second `GateRunner` given, because a single given is exactly how
+  * the bug happened (issue #11): `gate.sandboxed` is on by default, so the one runner Main built
+  * was the sandboxed one, and the CI watch it also served died with `gh: command not found`, a
+  * non-zero rc the loop read as CI RED on a green PR. Two types mean the wiring has to say which
+  * runner each tier gets, and the compiler checks that it did.
+  */
+final case class HostGateRunner(runner: GateRunner)
+
 /** status.jsonl appender. Pure observability: a wrong event is a wrong banner, never a wrong merge.
   * Sanitization/normalization happens in Machine before the event reaches here.
   */

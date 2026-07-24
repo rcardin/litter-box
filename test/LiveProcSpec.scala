@@ -329,6 +329,45 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
     )
   }
 
+  // ---- which runner each tier gets (issue #11) -------------------------------------------------
+
+  "Main.gateRunners" should "sandbox the FAST gate while leaving the CI wait on the host" in {
+    // `gate.sandboxed` is about agent-authored code, not about `gh`. One shared runner sent the CI
+    // watch into a container with no gh, no credentials and no github.com egress; the rc that came
+    // back was read as CI RED on a green PR.
+    val root       = tempRoot()
+    val sandboxDir = Files.createDirectories(root.resolve("sandbox"))
+    // Stands in for the container: it fails whatever it is handed, and only a sandboxed runner
+    // hands it anything at all.
+    writeExecutable(sandboxDir, "run-fast-gate.sh", "#!/usr/bin/env bash\nexit 7\n")
+
+    val (fast, host) = Main.gateRunners(root, timeoutBin = None, sandboxDir, sandboxed = true)
+
+    fast.run("FAST", "true", timeoutSec = 5, logFile = "logs/fast.log") shouldBe GateResult.Red
+    host.runner.run(
+      "CI-WAIT",
+      "true",
+      timeoutSec = 5,
+      logFile = "logs/ci.log"
+    ) shouldBe GateResult.Green
+  }
+
+  it should "keep the FAST gate on the host too when gate.sandboxed is off" in {
+    val root       = tempRoot()
+    val sandboxDir = Files.createDirectories(root.resolve("sandbox"))
+    writeExecutable(sandboxDir, "run-fast-gate.sh", "#!/usr/bin/env bash\nexit 7\n")
+
+    val (fast, host) = Main.gateRunners(root, timeoutBin = None, sandboxDir, sandboxed = false)
+
+    fast.run("FAST", "true", timeoutSec = 5, logFile = "logs/fast.log") shouldBe GateResult.Green
+    host.runner.run(
+      "CI-WAIT",
+      "true",
+      timeoutSec = 5,
+      logFile = "logs/ci.log"
+    ) shouldBe GateResult.Green
+  }
+
   // =============================================================================================
   // LiveAgentDispatch
   // =============================================================================================

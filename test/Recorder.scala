@@ -208,14 +208,35 @@ final class TestWorld:
             case ReviewScript.Says(out) => files(reviewFile) = out; DispatchOutcome.Done
             case ReviewScript.TimedOut  => DispatchOutcome.TimedOut
 
+  /** Which tier reached which runner, kept in separate books from `calls`.
+    *
+    * The merged recorder cannot answer the question issue #11 turned into a correctness property:
+    * both runners log the same `gate <label> ...` line, so "CI-WAIT ran" and "CI-WAIT ran on the
+    * host" look identical there. Here the receiving runner is the buffer it lands in.
+    */
+  val gateRunnerCalls: mutable.ArrayBuffer[(String, String)] = mutable.ArrayBuffer.empty
+  val hostRunnerCalls: mutable.ArrayBuffer[(String, String)] = mutable.ArrayBuffer.empty
+
+  private def runGate(label: String, cmd: String, logFile: String): GateResult =
+    record(s"gate $label cmd=$cmd log=$logFile")
+    if label == "CI-WAIT" then ciWaitResult
+    else
+      gateResults match
+        case Nil    => GateResult.Green
+        case h :: t => gateResults = t; h
+
+  /** The runner Main sandboxes when `gate.sandboxed` is on: the FAST gate's, and nothing else. */
   val gates: GateRunner = new GateRunner:
     def run(label: String, cmd: String, timeoutSec: Int, logFile: String): GateResult =
-      record(s"gate $label cmd=$cmd log=$logFile")
-      if label == "CI-WAIT" then ciWaitResult
-      else
-        gateResults match
-          case Nil    => GateResult.Green
-          case h :: t => gateResults = t; h
+      gateRunnerCalls += (label -> cmd)
+      runGate(label, cmd, logFile)
+
+  /** The runner that always stays on the host: the CI wait's. */
+  val hostGates: HostGateRunner = HostGateRunner(new GateRunner:
+    def run(label: String, cmd: String, timeoutSec: Int, logFile: String): GateResult =
+      hostRunnerCalls += (label -> cmd)
+      runGate(label, cmd, logFile)
+  )
 
   val status: StatusLog = new StatusLog:
     def append(event: StatusEvent): Unit = events += event
@@ -254,6 +275,7 @@ final class TestWorld:
       git,
       agents,
       gates,
+      hostGates,
       status,
       notifier,
       fs,

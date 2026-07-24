@@ -164,6 +164,35 @@ object Main:
   private def onRealGateTool(root: Path, gateCmd: String, pathEnv: String): Option[String] =
     missingGateTool(root, gateCmd, pathEnv, p => Files.isExecutable(Path.of(p)))
 
+  /** The two runners the loop needs, built together so the difference between them is stated once,
+    * here, instead of being a property of whichever single instance the wiring happened to reach
+    * for.
+    *
+    * The FAST gate is the tier `gate.sandboxed` is about: agent-authored code compiled and tested
+    * behind the container's network policy. The CI wait is not that tier at all: it is `gh pr
+    * checks --watch` against github.com, and the gate image carries no `gh`, no credentials and no
+    * egress to it, so a sandboxed CI wait cannot do anything but exit non-zero. That non-zero rc is
+    * indistinguishable from a genuinely red check, which is how one shared runner turned a green PR
+    * into `CI RED -> needs-human` for every consumer on the default config (issue #11).
+    *
+    * Both runners keep the same `root`, the same `timeoutBin` and the same log capture: the ONLY
+    * difference is which side of the sandbox boundary the command runs on.
+    */
+  private[litterbox] def gateRunners(
+      root: Path,
+      timeoutBin: Option[String],
+      sandboxDir: Path,
+      sandboxed: Boolean
+  ): (GateRunner, HostGateRunner) =
+    (
+      LiveGateRunner(
+        root,
+        timeoutBin,
+        Option.when(sandboxed)(sandboxDir.resolve("run-fast-gate.sh"))
+      ),
+      HostGateRunner(LiveGateRunner(root, timeoutBin))
+    )
+
   // ---- Part B: driver rc -> process-exit-code map (loop.sh:925-944) ------------------------
 
   enum DriverAction:
@@ -233,6 +262,7 @@ object Main:
       Git,
       AgentDispatch,
       GateRunner,
+      HostGateRunner,
       StatusLog,
       Notify,
       HarnessFs,
@@ -451,17 +481,15 @@ object Main:
         parsed.fixCmd,
         parsed.reviewCmd
       )
-    given GateRunner =
-      LiveGateRunner(
-        root,
-        timeoutBin,
-        Option.when(parsed.cfg.gateSandboxed)(sandboxDir.resolve("run-fast-gate.sh"))
-      )
-    given StatusLog  = LiveStatusLog(root, runId)
-    given Notify     = LiveNotify(parsed.notifyCmd, parsed.ntfyTopic, LiveLog.log)
-    given HarnessFs  = LiveHarnessFs(root)
-    given Clock      = LiveClock
-    given Log        = LiveLog
+    val (fastGates, hostGates) =
+      gateRunners(root, timeoutBin, sandboxDir, parsed.cfg.gateSandboxed)
+    given GateRunner     = fastGates
+    given HostGateRunner = hostGates
+    given StatusLog      = LiveStatusLog(root, runId)
+    given Notify         = LiveNotify(parsed.notifyCmd, parsed.ntfyTopic, LiveLog.log)
+    given HarnessFs      = LiveHarnessFs(root)
+    given Clock          = LiveClock
+    given Log            = LiveLog
 
     // 9. loop.sh:926's start line. Unlike loop.sh, this build has a second way into dry-run
     // (`--dry-run`), so the raw env var and the mode the run is actually in can now disagree — the
