@@ -42,7 +42,7 @@ echo "== egress policy test: every container role reaches allowlisted hosts, is 
 # while testing the wrong fence. start-proxy.sh is what keeps the two equal; assert it here, where
 # the equality is what makes the rest of this file mean anything.
 effective="$(effective_allowlist)"
-if [[ "$(proxy_allowlist_in_force)" == "$(cat "$effective")" ]]; then
+if proxy_enforces "$effective"; then
   echo "  ok   proxy enforces the effective allowlist ($effective)"
 else
   echo "  FAIL proxy is enforcing an allowlist other than $effective; rerun start-proxy.sh" >&2; fail=1

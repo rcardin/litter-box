@@ -258,17 +258,21 @@ a new directory on its own. A consumer owns exactly two files of the sandbox —
 `.litter-box/allowlist` is one host per line, matched against the CONNECT hostname; a line starting
 with `#` is a comment. `init` seeds it with the hosts a JVM build resolves artifacts from plus
 `api.anthropic.com`, and whatever is not named there is refused by the proxy with `403 Filtered`.
-The file wins over the copy that ships in the artifact, so it can only be widened by editing it,
-never bypassed: add the hosts your build needs, and expect a missing one to surface as a resolution
-failure inside the gate rather than as a network timeout.
+The file replaces the copy that ships in the artifact rather than extending it, so an edit can
+narrow egress as well as widen it, and nothing at run time enforces that it stays a superset of the
+shipped list: add the hosts your build needs, keep the seeded ones, and expect a missing one to
+surface as a resolution failure inside the gate rather than as a network timeout.
 
-The list is baked into the proxy image rather than read at run time, deliberately: a worker editing
-its repo can reach `.litter-box/allowlist`, and a fence read from a file the sandbox can write is
-not a fence. Applying an edit is therefore `start-proxy.sh`'s job, and it needs nothing from you:
-every run recreates the proxy container from the current image, and a container found enforcing an
-allowlist other than yours has the image rebuilt under it before the loop is allowed to proceed. If
-the two still disagree after that rebuild, the run stops there instead of gating against a fence
-nobody wrote.
+The list is baked into the proxy image rather than read at run time, deliberately: the copy in the
+image is what the proxy enforces from preflight to teardown, so the fence stays fixed for the whole
+of a run and a worker editing `.litter-box/allowlist` cannot move the fence it is running behind.
+An edit lands at the next image build instead, and the loop needs nothing from you to get there:
+preflight runs `build-image.sh` immediately before `start-proxy.sh`, and that build bakes whatever
+the file currently says into the proxy image. `start-proxy.sh` is what proves it took. It recreates
+the container from the current image and reads back the list in force, so the run proceeds only
+once the running proxy demonstrably enforces your file. A proxy found enforcing anything else, the
+case a `start-proxy.sh` invoked on its own has to cover, gets one rebuild under it; if the two
+still disagree after that, the run stops instead of gating against a fence nobody wrote.
 
 ### The log contract
 

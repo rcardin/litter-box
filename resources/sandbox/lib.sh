@@ -60,11 +60,26 @@ effective_allowlist() {
   fi
 }
 
-# The allowlist the RUNNING proxy is enforcing, on stdout. Empty when there is no such container or
-# its copy cannot be read, which compares unequal to any real allowlist and so reads as a mismatch:
-# the safe direction, since a mismatch only ever costs a rebuild.
-proxy_allowlist_in_force() {
-  docker exec "$PROXY_NAME" cat /etc/tinyproxy/allowlist 2>/dev/null || true
+# Does the RUNNING proxy enforce the allowlist named by $1? Three callers ask it: start-proxy.sh
+# before its rebuild and again after it, and egress-policy-test.sh before it lets a single per-role
+# result mean anything. Three inline spellings of the comparison is exactly the drift these shared
+# helpers exist to prevent, so the question is answered once, here.
+#
+# Three answers, not two, because the two states behind "no" want opposite handling:
+#   0  the proxy enforces exactly that list
+#   1  it enforces a DIFFERENT list, which rebuilding the image under it fixes
+#   2  the list in force could not be read at all: no such container, a docker daemon hiccup, an
+#      exec the daemon refused
+#
+# Collapsing 2 into 1 was the bug (a swallowed `2>/dev/null || true` left an empty string that
+# compares unequal to every real allowlist). Callers that fail hard on "differs" would then abort a
+# run under a story about the fence being wrong when nothing is wrong with the fence, so a docker
+# fault says docker instead. Any nonzero still means "do not trust this proxy", so a caller that
+# only wants the yes/no can keep testing for zero.
+proxy_enforces() {
+  local allowlist="$1" in_force
+  in_force="$(docker exec "$PROXY_NAME" cat /etc/tinyproxy/allowlist 2>/dev/null)" || return 2
+  [[ "$in_force" == "$(cat "$allowlist")" ]]
 }
 
 # Staged build contexts, removed by the EXIT trap every script that builds an image installs. One
@@ -80,10 +95,10 @@ sandbox_cleanup_staged_ctxs() {
 # builds all three images, and by start-proxy.sh, which rebuilds this one alone when it catches the
 # running proxy enforcing something else.
 #
-# The list is COPYed into the image (proxy/Dockerfile) and not bind-mounted at run time, which is
-# what makes a rebuild necessary at all. Deliberate: a mount would read the fence out of a file the
-# sandboxed worker can reach in the repo it is editing, so a worker could widen its own egress. The
-# image is the one copy nothing inside the sandbox can write.
+# The list is COPYed into the image (proxy/Dockerfile) and not bind mounted at run time, which is
+# what makes a rebuild necessary at all. Deliberate: the baked copy is what the proxy enforces for
+# the whole of a run, so a worker that edits .litter-box/allowlist while it works does not move the
+# fence it is running behind. That edit lands at the next image build, not under the worker.
 #
 # mktemp -d, not an in-place copy over the shipped proxy/allowlist: the sandbox tree is a
 # content-addressed cache directory (Sandbox.scala), so writing into it would make its contents

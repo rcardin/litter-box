@@ -44,15 +44,29 @@ class InitSpec extends AnyFlatSpec with Matchers:
         .toList
         .sorted
 
-  /** The entries tinyproxy would actually load out of an allowlist: its filter reader ends a line
-    * at the first whitespace or unescaped `#` and skips whatever is left empty, so a full-line
-    * comment contributes nothing and everything else is a host pattern.
+  /** tinyproxy's filter reader ends a line at the first whitespace or unescaped `#` and skips
+    * whatever is left empty, so a full-line comment contributes nothing and everything else is a
+    * host pattern.
     */
   private def allowlistEntries(text: String): List[String] =
     text.linesIterator.map(_.strip).filterNot(l => l.isEmpty || l.startsWith("#")).toList
 
   private val sbtRepo   = Init.Detected(Some(Init.BuildTool.Sbt), Some("rcardin/x"), Some("21"))
   private val plainRepo = Init.Detected(None, None, Some("21"))
+
+  /** Handed back raw rather than as entries because one of the allowlist tests is precisely about
+    * the comment lines `allowlistEntries` drops.
+    */
+  private def scaffoldedAllowlist(): String =
+    val root = tempRoot()
+    Init.run(root, sbtRepo, force = false)
+    readString(root.resolve(".litter-box/allowlist"))
+
+  /** The fallback the scaffolded file overrides, and therefore the floor the scaffold is measured
+    * against.
+    */
+  private val builtInAllowlist: String =
+    new String(Sandbox.builtIn("proxy/allowlist"), StandardCharsets.UTF_8)
 
   "plan" should "write every file the slice promises" in:
     val paths = Init.plan(sbtRepo).map(_._1)
@@ -130,11 +144,8 @@ class InitSpec extends AnyFlatSpec with Matchers:
     // proxy/allowlist whenever it exists. So running `init` NARROWED egress to something no JVM
     // build can resolve through, and a repo that had never been scaffolded was better off. The
     // scaffold may say more than the fallback, never less.
-    val root = tempRoot()
-    Init.run(root, sbtRepo, force = false)
-    val scaffolded = allowlistEntries(readString(root.resolve(".litter-box/allowlist")))
-    val builtIn    =
-      allowlistEntries(new String(Sandbox.builtIn("proxy/allowlist"), StandardCharsets.UTF_8))
+    val scaffolded = allowlistEntries(scaffoldedAllowlist())
+    val builtIn    = allowlistEntries(builtInAllowlist)
 
     builtIn should not be empty
     scaffolded should contain allElementsOf builtIn
@@ -143,14 +154,8 @@ class InitSpec extends AnyFlatSpec with Matchers:
     // Named on its own because it is the one host the failure in #14 proved is needed and that
     // neither file had: the launcher resolves itself through repo.typesafe.com before any build
     // definition is read, so a gate without it dies before the project is even loaded.
-    val root = tempRoot()
-    Init.run(root, sbtRepo, force = false)
-    allowlistEntries(readString(root.resolve(".litter-box/allowlist"))) should contain(
-      "repo.typesafe.com"
-    )
-    allowlistEntries(
-      new String(Sandbox.builtIn("proxy/allowlist"), StandardCharsets.UTF_8)
-    ) should contain("repo.typesafe.com")
+    allowlistEntries(scaffoldedAllowlist()) should contain("repo.typesafe.com")
+    allowlistEntries(builtInAllowlist) should contain("repo.typesafe.com")
 
   it should "explain itself in lines tinyproxy reads as comments" in:
     // The header is only safe because tinyproxy's filter reader treats a leading `#` as a comment
@@ -158,9 +163,7 @@ class InitSpec extends AnyFlatSpec with Matchers:
     // guarantee is that no entry can hide a comment or a stray word: an entry is cut at the first
     // whitespace, so `foo.example.com # mirror` silently becomes a pattern and anything with a
     // space in it becomes a DIFFERENT pattern than the file appears to name.
-    val root = tempRoot()
-    Init.run(root, sbtRepo, force = false)
-    val text = readString(root.resolve(".litter-box/allowlist"))
+    val text = scaffoldedAllowlist()
 
     text.linesIterator.exists(_.startsWith("#")) shouldBe true
     allowlistEntries(text).foreach(e => e should fullyMatch regex "[A-Za-z0-9.*?-]+")
