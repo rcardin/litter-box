@@ -61,7 +61,9 @@ PR — see [Adding a preset](docs/base-image.md#adding-a-preset).
    themselves, the protocol that keeps the loop honest, ship inside the litter-box artifact, not in
    your repo.
 2. **Provide a credential.** `cp .litter-box/.env.example .litter-box/.env` and fill in
-   `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY`.
+   `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY`. The loop reads that file at startup and passes
+   what it finds to the sandboxed worker, fixer and reviewer. Exporting the variable instead works
+   just as well, and an exported variable wins over the file.
 3. **Create the three labels** the state machine drives on:
    ```bash
    gh label create ready && gh label create in-progress && gh label create blocked
@@ -200,7 +202,8 @@ exist. See [Getting started](#getting-started) for `init`, `eject`, `--dry-run` 
 are test seams: each replaces one subprocess so the loop can be driven without Docker or GitHub.
 
 Preflight requires `gh`, `sbt` and `claude` on `PATH`, and either `CLAUDE_CODE_OAUTH_TOKEN` or
-`ANTHROPIC_API_KEY` for the sandboxed worker.
+`ANTHROPIC_API_KEY` for the sandboxed worker, exported or written in `.litter-box/.env`. Every
+variable in that file is layered under the process environment, so an exported one always wins.
 
 ### Issue labels
 

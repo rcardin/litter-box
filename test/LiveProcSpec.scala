@@ -1174,6 +1174,39 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
     verdict shouldBe GateResult.Green
   }
 
+  // =============================================================================================
+  // The exported child environment (LiveProc.exportEnv): the same mechanism as the JDK pin, for
+  // the config-derived vars and for the `.litter-box/.env` entries this JVM's own environment does
+  // not carry (issue #12). The sandbox scripts read the credential off their own environment, so
+  // this stamping is the only thing that puts it there.
+  // =============================================================================================
+
+  /** Runs `f` with the process-wide child-environment export set, always clearing it afterwards. */
+  private def withExportedEnv[A](vars: Map[String, String])(f: => A): A =
+    LiveProc.exportEnv(vars)
+    try f
+    finally LiveProc.exportEnv(Map.empty)
+
+  "the exported child environment" should "reach a child the harness builds" in {
+    val root = tempRoot()
+
+    val r = withExportedEnv(Map("LB_SPEC_EXPORTED" -> "carried")) {
+      LiveProc.run(root, Seq("bash", "-c", "printf '%s' \"${LB_SPEC_EXPORTED-<unset>}\""))
+    }
+
+    r.stdout shouldBe "carried"
+  }
+
+  it should "leave the child's environment alone when nothing was exported" in {
+    val root = tempRoot()
+
+    val r = withExportedEnv(Map.empty) {
+      LiveProc.run(root, Seq("bash", "-c", "printf '%s' \"${LB_SPEC_EXPORTED-<unset>}\""))
+    }
+
+    r.stdout shouldBe "<unset>"
+  }
+
   it should "pin nothing when unset, leaving the child's inherited JAVA_HOME and PATH untouched" in {
     val root = tempRoot()
 

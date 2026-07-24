@@ -86,6 +86,43 @@ object Main:
       gateOverridden = gateOverridden
     )
 
+  // ---- `.litter-box/.env` layered under the ambient environment (issue #12) -------------------
+
+  /** The environment the run actually has, plus the part of it a child would not inherit on its own.
+    *
+    * Two answers rather than one because a JVM cannot mutate its own environment: `effective` is
+    * what THIS process reasons with (`parseEnv`, the credential preflight, the PATH scans), while
+    * `forChildren` is what has to be stamped onto every child through `LiveProc.exportEnv`, since
+    * the sandbox scripts read the credential off their own environment (`lib.sh`'s
+    * `sandbox_credential_env`) and never ask the loop for it. Deriving both here, in one place,
+    * is what keeps them from drifting into two different ideas of what the environment is.
+    */
+  private[litterbox] final case class DotEnvLayer(
+      effective: Map[String, String],
+      forChildren: Map[String, String]
+  )
+
+  /** `.litter-box/.env` UNDER the ambient process environment.
+    *
+    * The precedence is the project's existing one, not a second rule: `Settings`' layering already
+    * says an environment variable beats the config file, and this file is the same variables written
+    * down instead of exported. An operator exporting a variable for one run must not be silently
+    * overruled by a file they filled in weeks ago.
+    *
+    * PRESENCE decides, not emptiness: a variable exported as the empty string still shadows the
+    * file's value, exactly like `GATE_CMD=""` still counts as an override to the layering above.
+    * What each consumer then makes of an empty value stays that consumer's own rule.
+    *
+    * `forChildren` is the file's entries MINUS every key the ambient environment already has,
+    * because a child inherits this JVM's environment before anything is stamped on it: stamping a
+    * contested key would hand the child the loser of the comparison just made.
+    */
+  private[litterbox] def layerDotEnv(
+      dotEnv: Map[String, String],
+      ambient: Map[String, String]
+  ): DotEnvLayer =
+    DotEnvLayer(effective = dotEnv ++ ambient, forChildren = dotEnv -- ambient.keySet)
+
   // ---- `command -v` equivalent ---------------------------------------------------------------
 
   /** Scans `pathEnv` (colon-separated, like `$PATH`) for an executable named `name`.
@@ -369,7 +406,7 @@ object Main:
 
   /** The loop, which is everything this file did before there were subcommands. */
   private def runLoop(dryRunFlag: Boolean): Unit =
-    val env = sys.env
+    val ambient = sys.env
 
     // 1. root = the git work tree the process was launched inside. Everything downstream is
     // relative to it, so an unanswerable question here is rc 50 and no further work.
@@ -379,6 +416,20 @@ object Main:
     ) match
       case Right(r)  => r
       case Left(msg) => die50(msg)
+
+    // 1b. `.litter-box/.env`, the file `init` tells the operator to fill in, layered UNDER the
+    // ambient environment (issue #12). Everything below this line reads `env`, so the file reaches
+    // the credential preflight, `parseEnv` and the seams by the same door an export does.
+    val dotEnv = Settings.loadDotEnv(root) match
+      case Right(vars) => vars
+      case Left(msg)   => die50(msg)
+    val layered = layerDotEnv(dotEnv, ambient)
+    val env     = layered.effective
+    if dotEnv.nonEmpty then
+      // Count only. The file holds a credential, so nothing here names a key or a value.
+      LiveLog.log(
+        s"loaded ${dotEnv.size} variable(s) from ${Settings.DotEnvPath} (an exported variable still wins)"
+      )
 
     // 2. Config file, then env vars on top of it (Part C). A repo with no config has not been
     // `litter-box init`ed; that is an infra fault, not a loop failure.
@@ -391,8 +442,13 @@ object Main:
     )
 
     // 2b. instance-name and the repo root reach the sandbox scripts as env vars on every child (see
-    // LiveProc.export). Set BEFORE the preflight below, which is itself the first child.
-    LiveProc.exportEnv(Settings.childEnv(parsed.cfg, root))
+    // LiveProc.export), and so do the `.litter-box/.env` entries this JVM's own environment does not
+    // carry — the sandboxed worker, fixer, reviewer and gate read the credential off THEIR OWN
+    // environment, so a file entry that stopped at the preflight would fail one dispatch later.
+    // The config-derived pair is stamped last: it is derived from `config.conf`, which the loop's
+    // own docker naming must agree with, so a `.env` cannot rename the containers out from under it.
+    // Set BEFORE the preflight below, which is itself the first child.
+    LiveProc.exportEnv(layered.forChildren ++ Settings.childEnv(parsed.cfg, root))
 
     // 2c. The sandbox scripts, extracted from the artifact to a content-addressed cache. They used
     // to be read from `<repo>/sandbox`, which no repo but litter-box's own ever had — see `Sandbox`.
@@ -435,8 +491,10 @@ object Main:
           .getOrElse("CLAUDE_CODE_OAUTH_TOKEN", "")
           .isEmpty && env.getOrElse("ANTHROPIC_API_KEY", "").isEmpty
       then
+        // Both places the credential may live are named, because the message used to send an
+        // operator who HAD filled in `.litter-box/.env` looking for a bug in their shell (issue #12).
         die(
-          "neither CLAUDE_CODE_OAUTH_TOKEN nor ANTHROPIC_API_KEY set — the sandboxed worker/fixer has no other way to authenticate"
+          s"neither CLAUDE_CODE_OAUTH_TOKEN nor ANTHROPIC_API_KEY set, in the environment or in ${Settings.DotEnvPath} — the sandboxed worker/fixer has no other way to authenticate"
         )
       if runPreflightScript(root, sandboxDir.resolve("build-image.sh")) != 0 then
         die("sandbox image build failed")

@@ -349,3 +349,49 @@ class MainSpec extends AnyFlatSpec with Matchers:
   it should "be off when neither says otherwise" in:
     Main.applyDryRunFlag(flagged = false, Map("DRY_RUN" -> "0")) shouldBe false
     Main.applyDryRunFlag(flagged = false, Map.empty) shouldBe false
+
+  // ===============================================================================================
+  // layerDotEnv: `.litter-box/.env` UNDER the ambient environment (GitHub issue #12)
+  // ===============================================================================================
+
+  /** The file the operator was told to fill in has to reach the credential check, or `init`'s own
+    * next step ends in a FATAL saying the credential is unset. `forChildren` is the other half: the
+    * sandboxed worker, fixer, reviewer and gate all read the credential out of THEIR OWN
+    * environment (`lib.sh`'s `sandbox_credential_env`), so an entry that reached only this JVM would
+    * fix the preflight and then fail one dispatch later.
+    */
+  "layerDotEnv" should "carry a file-only entry into the effective env and onto every child" in {
+    val layered = Main.layerDotEnv(
+      dotEnv = Map("CLAUDE_CODE_OAUTH_TOKEN" -> "from-file"),
+      ambient = Map("PATH" -> "/usr/bin")
+    )
+
+    layered.effective shouldBe Map("CLAUDE_CODE_OAUTH_TOKEN" -> "from-file", "PATH" -> "/usr/bin")
+    // A child inherits this JVM's own environment, so only the entry it would otherwise MISS has to
+    // be stamped on it.
+    layered.forChildren shouldBe Map("CLAUDE_CODE_OAUTH_TOKEN" -> "from-file")
+  }
+
+  /** The precedence the project already states for `config.conf` (`Settings`' layering scaladoc: an
+    * environment variable beats the file), applied to the credential file rather than invented
+    * again. An operator who exports a variable for one run must not be silently overruled by a file
+    * they filled in weeks ago.
+    */
+  it should "let the ambient environment win on a key both set" in {
+    val layered = Main.layerDotEnv(
+      dotEnv = Map("ANTHROPIC_API_KEY" -> "from-file", "MAX_ITERS" -> "9"),
+      ambient = Map("ANTHROPIC_API_KEY" -> "from-shell")
+    )
+
+    layered.effective shouldBe Map("ANTHROPIC_API_KEY" -> "from-shell", "MAX_ITERS" -> "9")
+    // Nothing to stamp for the contested key: the child inherits the ambient value already, and
+    // stamping the file's would hand the child the loser of the very comparison just made.
+    layered.forChildren shouldBe Map("MAX_ITERS" -> "9")
+  }
+
+  it should "be the ambient environment untouched when there is no .env at all" in {
+    val layered = Main.layerDotEnv(Map.empty, Map("PATH" -> "/usr/bin"))
+
+    layered.effective shouldBe Map("PATH" -> "/usr/bin")
+    layered.forChildren shouldBe Map.empty
+  }

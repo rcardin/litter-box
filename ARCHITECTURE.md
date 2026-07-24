@@ -34,9 +34,17 @@ commits and PR notes), `InfraFault`, `Role`, `Template`, `Config`.
 
 ### Configuration layering
 
-**env var > `.litter-box/config.conf` > `Settings.Reference`.** `src/Settings.scala` holds the
-reference schema as HOCON text; `Main.parseEnv` layers env vars on top. A missing config file is a
-`Left`, never silent defaults — the loop exits 50 and names `litter-box init`.
+**env var > `.litter-box/.env` > `.litter-box/config.conf` > `Settings.Reference`.**
+`src/Settings.scala` holds the reference schema as HOCON text; `Main.parseEnv` layers env vars on
+top. A missing config file is a `Left`, never silent defaults — the loop exits 50 and names
+`litter-box init`.
+
+`.litter-box/.env` (`Settings.loadDotEnv`, `Main.layerDotEnv`) is the credential file `init`
+scaffolds an example of, read as plain `KEY=value` lines. It is OPTIONAL, unlike `config.conf`:
+exporting the variable is the other equally supported way, and an exported variable wins on
+conflict. A JVM cannot mutate its own environment, so the entries the ambient environment does not
+already carry are stamped onto every child through `LiveProc.exportEnv` — the sandbox scripts read
+the credential off their own environment, never off the loop.
 
 `protect` is a floor, not a list: a consumer's entries are **unioned** with the reference floor, so
 `.litter-box/**` is always covered and the loop cannot be talked into loosening its own guard.
