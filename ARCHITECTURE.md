@@ -5,7 +5,12 @@
 The central split, and the reason the whole suite runs in memory:
 
 - `src/Caps.scala` — capability traits (`GitHub`, `Git`, `HarnessFs`, `GateRunner`, `AgentDispatch`,
-  `Notify`, `Log`, `StatusLog`, `Clock`), passed as `using` context parameters.
+  `Notify`, `Log`, `StatusLog`, `Clock`), passed as `using` context parameters. It also holds
+  `HostGateRunner`, which is not a capability of its own but a case class wrapping a `GateRunner`
+  (pointedly not a subtype of one, so it can never win `using GateRunner` resolution): same
+  mechanics on the host side of the sandbox boundary, a second type purely so `Main.gateRunners`
+  has to wire each tier by name from its own `LiveGateRunner` rather than reuse one instance (the
+  why is in the `HostGateRunner` scaladoc, issue #11).
 - `src/Machine.scala` — `Machine.iterate` / `runOnce`: pure decision logic. Touches the world through
   nothing but the capabilities. No filesystem, no subprocess, no clock.
 - `src/Live.scala` — every real side effect (`LiveGit`, `LiveGitHub`, `LiveGateRunner`,

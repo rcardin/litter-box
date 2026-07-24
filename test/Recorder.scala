@@ -208,14 +208,27 @@ final class TestWorld:
             case ReviewScript.Says(out) => files(reviewFile) = out; DispatchOutcome.Done
             case ReviewScript.TimedOut  => DispatchOutcome.TimedOut
 
+  /** The receiving runner is recorded as a trailing `runner=` field rather than in a second book, so
+    * the routing property (see `HostGateRunner`, issue #11) is asserted against the same `calls`
+    * every other scenario reads. It trails `cmd=`/`log=` because scenarios match gate calls by
+    * substring prefix, so a field appended at the end cannot silently unmatch them.
+    */
+  private def runGate(runner: String, label: String, cmd: String, logFile: String): GateResult =
+    record(s"gate $label cmd=$cmd log=$logFile runner=$runner")
+    if label == "CI-WAIT" then ciWaitResult
+    else
+      gateResults match
+        case Nil    => GateResult.Green
+        case h :: t => gateResults = t; h
+
   val gates: GateRunner = new GateRunner:
     def run(label: String, cmd: String, timeoutSec: Int, logFile: String): GateResult =
-      record(s"gate $label cmd=$cmd log=$logFile")
-      if label == "CI-WAIT" then ciWaitResult
-      else
-        gateResults match
-          case Nil    => GateResult.Green
-          case h :: t => gateResults = t; h
+      runGate("sandboxable", label, cmd, logFile)
+
+  val hostGates: HostGateRunner = HostGateRunner(new GateRunner:
+    def run(label: String, cmd: String, timeoutSec: Int, logFile: String): GateResult =
+      runGate("host", label, cmd, logFile)
+  )
 
   val status: StatusLog = new StatusLog:
     def append(event: StatusEvent): Unit = events += event
@@ -254,6 +267,7 @@ final class TestWorld:
       git,
       agents,
       gates,
+      hostGates,
       status,
       notifier,
       fs,
