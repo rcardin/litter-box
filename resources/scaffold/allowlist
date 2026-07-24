@@ -1,1 +1,16 @@
+# The hosts a JVM build resolves its artifacts from, plus the endpoint `claude` itself talks to.
+# Every other host is refused by the sandbox proxy with `403 Filtered`, so add the ones YOUR build
+# needs (a company mirror, a plugin portal, a JDK download) rather than deleting these.
+#
+# One host per line, matched by fnmatch against the CONNECT hostname. tinyproxy ends an entry at
+# the first whitespace or unescaped `#`, so a line starting with `#` is a comment and a hostname
+# has to be bare.
+#
+# An edit here lands the next time the proxy starts: start-proxy.sh rebuilds the proxy image when
+# the running container is enforcing anything else, and the loop starts the proxy on every run.
 api.anthropic.com
+repo1.maven.org
+repo.maven.apache.org
+repo.scala-sbt.org
+repo.typesafe.com
+oss.sonatype.org
