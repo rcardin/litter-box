@@ -28,7 +28,7 @@ source "$SCRIPT_DIR/lib.sh"
 # entry the roles genuinely depend on. No credentials needed: we only assert the proxy TUNNEL opens
 # (curl exit 0), not a 2xx — an allowlisted host may legitimately answer 401/404/405, which still
 # proves the fence let the CONNECT through.
-ALLOWED_HOST="api.anthropic.com"  # on sandbox/proxy/allowlist — the roles' critical egress target
+ALLOWED_HOST="api.anthropic.com"  # on resources/sandbox/proxy/allowlist, the critical egress target
 BLOCKED_HOST="example.com"        # deliberately not on the allowlist
 fail=0
 
@@ -36,6 +36,17 @@ fail=0
   || { echo "  FAIL proxy $PROXY_NAME is not running -- run harness/sandbox/start-proxy.sh first" >&2; exit 1; }
 
 echo "== egress policy test: every container role reaches allowlisted hosts, is refused elsewhere ==" >&2
+
+# Issue #14: the list a running proxy enforces is the copy baked into its image, so it can be an
+# older list than the file the operator edited and every per-role check below would still pass
+# while testing the wrong fence. start-proxy.sh is what keeps the two equal; assert it here, where
+# the equality is what makes the rest of this file mean anything.
+effective="$(effective_allowlist)"
+if [[ "$(proxy_allowlist_in_force)" == "$(cat "$effective")" ]]; then
+  echo "  ok   proxy enforces the effective allowlist ($effective)"
+else
+  echo "  FAIL proxy is enforcing an allowlist other than $effective; rerun start-proxy.sh" >&2; fail=1
+fi
 
 proxy_url="http://$PROXY_NAME:$PROXY_PORT"
 

@@ -39,7 +39,7 @@ then writes six files under `.litter-box/`:
 |---|---|
 | `config.conf` | the loop's only mandatory config — see [Configuration](#configuration) below |
 | `Dockerfile` | `FROM ghcr.io/rcardin/litter-box-base` plus your build tool layer — see [The sandbox image](#the-sandbox-image) |
-| `allowlist` | egress domains the sandbox proxy permits |
+| `allowlist` | egress hosts the sandbox proxy permits (see [The egress allowlist](#the-egress-allowlist)) |
 | `prompts/conventions.md` | the one file you own — spliced into every prompt as `{{CONVENTIONS}}` |
 | `.env.example` | the credential the sandboxed worker needs, and any other variable from [Running it](#running-it); meant to be copied to `.env`, never committed |
 | `.gitignore` | ignores `logs/` and `.env` inside `.litter-box/` |
@@ -252,6 +252,23 @@ a new directory on its own. A consumer owns exactly two files of the sandbox —
 
 `Machine` is a pure decision function over a `using` clause of capability traits (`Caps.scala`);
 `Live.scala` holds every real side effect. That is what lets the whole suite run in memory.
+
+### The egress allowlist
+
+`.litter-box/allowlist` is one host per line, matched against the CONNECT hostname; a line starting
+with `#` is a comment. `init` seeds it with the hosts a JVM build resolves artifacts from plus
+`api.anthropic.com`, and whatever is not named there is refused by the proxy with `403 Filtered`.
+The file wins over the copy that ships in the artifact, so it can only be widened by editing it,
+never bypassed: add the hosts your build needs, and expect a missing one to surface as a resolution
+failure inside the gate rather than as a network timeout.
+
+The list is baked into the proxy image rather than read at run time, deliberately: a worker editing
+its repo can reach `.litter-box/allowlist`, and a fence read from a file the sandbox can write is
+not a fence. Applying an edit is therefore `start-proxy.sh`'s job, and it needs nothing from you:
+every run recreates the proxy container from the current image, and a container found enforcing an
+allowlist other than yours has the image rebuilt under it before the loop is allowed to proceed. If
+the two still disagree after that rebuild, the run stops there instead of gating against a fence
+nobody wrote.
 
 ### The log contract
 

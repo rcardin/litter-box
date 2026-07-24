@@ -153,7 +153,48 @@ class SandboxSpec extends AnyFlatSpec with Matchers:
     Sandbox.digest should fullyMatch regex "[0-9a-f]{12}"
   }
 
-  "the extracted lib.sh" should "take the repo root from the loop, not from its own location" in {
+  /** Sources the extracted `lib.sh` for the given repo root and prints one expression, the way the
+    * sandbox scripts consume it. Same seam as the REPO_ROOT test below: bash is the only thing that
+    * can answer what a bash function returns, and neither of the two answers here needs Docker.
+    */
+  private def libSays(sandboxDir: Path, repoRoot: String, expr: String): String =
+    val script = s"""set -eu
+                    |source "$$1"
+                    |$expr
+                    |""".stripMargin
+    val pb     = new ProcessBuilder("bash", "-c", script, "bash", sandboxDir.resolve("lib.sh").toString)
+    pb.environment().put(Settings.RepoRootEnvVar, repoRoot)
+    val proc = pb.start()
+    val out  = new String(proc.getInputStream.readAllBytes(), StandardCharsets.UTF_8)
+    proc.waitFor() shouldBe 0
+    out.strip
+
+  "the extracted lib.sh" should "name the shipped allowlist when the repo has not scaffolded one" in {
+    val dir  = Files.createTempDirectory("sandbox-spec")
+    val repo = Files.createTempDirectory("sandbox-spec-repo")
+    Sandbox.extract(dir)
+
+    Path.of(libSays(dir, repo.toString, "effective_allowlist")).toRealPath() shouldBe
+      dir.resolve("proxy/allowlist").toRealPath()
+  }
+
+  it should "prefer the repo's own allowlist once init has written one" in {
+    // Issue #14 turned this from a build-image.sh local into a shared function: start-proxy.sh has
+    // to answer "which list must the running proxy be enforcing" with exactly the file the image
+    // was built from, and two independent derivations of that is how the image and the file drift
+    // apart with nothing noticing.
+    val dir  = Files.createTempDirectory("sandbox-spec")
+    val repo = Files.createTempDirectory("sandbox-spec-repo")
+    Sandbox.extract(dir)
+    Files.createDirectories(repo.resolve(".litter-box"))
+    val scaffolded = repo.resolve(".litter-box/allowlist")
+    Files.write(scaffolded, "example.invalid\n".getBytes(StandardCharsets.UTF_8))
+
+    Path.of(libSays(dir, repo.toString, "effective_allowlist")).toRealPath() shouldBe
+      scaffolded.toRealPath()
+  }
+
+  it should "take the repo root from the loop, not from its own location" in {
     // The bug this is the fix for: `REPO_ROOT="$(cd "$SANDBOX_DIR/.." && pwd)"` was correct only
     // while the scripts lived inside the repo they operated on. From the extraction cache it names
     // a directory under ~/.cache, so build-image.sh looked for .litter-box/Dockerfile there and

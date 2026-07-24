@@ -44,6 +44,13 @@ class InitSpec extends AnyFlatSpec with Matchers:
         .toList
         .sorted
 
+  /** The entries tinyproxy would actually load out of an allowlist: its filter reader ends a line
+    * at the first whitespace or unescaped `#` and skips whatever is left empty, so a full-line
+    * comment contributes nothing and everything else is a host pattern.
+    */
+  private def allowlistEntries(text: String): List[String] =
+    text.linesIterator.map(_.strip).filterNot(l => l.isEmpty || l.startsWith("#")).toList
+
   private val sbtRepo   = Init.Detected(Some(Init.BuildTool.Sbt), Some("rcardin/x"), Some("21"))
   private val plainRepo = Init.Detected(None, None, Some("21"))
 
@@ -116,6 +123,47 @@ class InitSpec extends AnyFlatSpec with Matchers:
     // all three runners override it, and the sbt preset's `ENTRYPOINT ["sbt"]` was what let
     // run-fast-gate.sh append sbt's own flags to every consumer's build tool.
     dockerfile.linesIterator.exists(_.trim.startsWith("ENTRYPOINT")) shouldBe false
+
+  it should "scaffold an allowlist no narrower than the built-in one it overrides" in:
+    // The defect this exists for (issue #14): the scaffolded file was the single line
+    // `api.anthropic.com`, and build-image.sh prefers .litter-box/allowlist over the shipped
+    // proxy/allowlist whenever it exists. So running `init` NARROWED egress to something no JVM
+    // build can resolve through, and a repo that had never been scaffolded was better off. The
+    // scaffold may say more than the fallback, never less.
+    val root = tempRoot()
+    Init.run(root, sbtRepo, force = false)
+    val scaffolded = allowlistEntries(readString(root.resolve(".litter-box/allowlist")))
+    val builtIn    =
+      allowlistEntries(new String(Sandbox.builtIn("proxy/allowlist"), StandardCharsets.UTF_8))
+
+    builtIn should not be empty
+    scaffolded should contain allElementsOf builtIn
+
+  it should "carry the host the sbt launcher probes" in:
+    // Named on its own because it is the one host the failure in #14 proved is needed and that
+    // neither file had: the launcher resolves itself through repo.typesafe.com before any build
+    // definition is read, so a gate without it dies before the project is even loaded.
+    val root = tempRoot()
+    Init.run(root, sbtRepo, force = false)
+    allowlistEntries(readString(root.resolve(".litter-box/allowlist"))) should contain(
+      "repo.typesafe.com"
+    )
+    allowlistEntries(
+      new String(Sandbox.builtIn("proxy/allowlist"), StandardCharsets.UTF_8)
+    ) should contain("repo.typesafe.com")
+
+  it should "explain itself in lines tinyproxy reads as comments" in:
+    // The header is only safe because tinyproxy's filter reader treats a leading `#` as a comment
+    // (src/filter.c, verified against the 1.11.2 the alpine image ships). The other half of that
+    // guarantee is that no entry can hide a comment or a stray word: an entry is cut at the first
+    // whitespace, so `foo.example.com # mirror` silently becomes a pattern and anything with a
+    // space in it becomes a DIFFERENT pattern than the file appears to name.
+    val root = tempRoot()
+    Init.run(root, sbtRepo, force = false)
+    val text = readString(root.resolve(".litter-box/allowlist"))
+
+    text.linesIterator.exists(_.startsWith("#")) shouldBe true
+    allowlistEntries(text).foreach(e => e should fullyMatch regex "[A-Za-z0-9.*?-]+")
 
   "a non-sbt repo" should "get a TODO Dockerfile and no sbt anywhere" in:
     val root = tempRoot()
