@@ -332,9 +332,8 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
   // ---- which runner each tier gets (issue #11) -------------------------------------------------
 
   "Main.gateRunners" should "sandbox the FAST gate while leaving the CI wait on the host" in {
-    // `gate.sandboxed` is about agent-authored code, not about `gh`. One shared runner sent the CI
-    // watch into a container with no gh, no credentials and no github.com egress; the rc that came
-    // back was read as CI RED on a green PR.
+    // `gate.sandboxed` is about agent-authored code, never about the CI wait — see
+    // `HostGateRunner` (issue #11). This pins the wiring half of that split.
     val root       = tempRoot()
     val sandboxDir = Files.createDirectories(root.resolve("sandbox"))
     // Stands in for the container: it fails whatever it is handed, and only a sandboxed runner
@@ -344,7 +343,7 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
     val (fast, host) = Main.gateRunners(root, timeoutBin = None, sandboxDir, sandboxed = true)
 
     fast.run("FAST", "true", timeoutSec = 5, logFile = "logs/fast.log") shouldBe GateResult.Red
-    host.runner.run(
+    host.run(
       "CI-WAIT",
       "true",
       timeoutSec = 5,
@@ -353,14 +352,22 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
   }
 
   it should "keep the FAST gate on the host too when gate.sandboxed is off" in {
+    // The mirror of the case above, and it has to be asserted on evidence that only a host-side run
+    // can produce: a plain Green says nothing, since most commands are green through the container
+    // too. The probe is the discriminator. Run directly it exits 0 and leaves its own output in the
+    // gate log; handed to the sandbox stand-in below it would never run at all, and the rc 7 that
+    // script returns whatever it is given would come back Red with an empty log.
     val root       = tempRoot()
     val sandboxDir = Files.createDirectories(root.resolve("sandbox"))
     writeExecutable(sandboxDir, "run-fast-gate.sh", "#!/usr/bin/env bash\nexit 7\n")
+    writeExecutable(root, "probe.sh", "#!/usr/bin/env bash\nprintf 'ran on the host\\n'\n")
 
     val (fast, host) = Main.gateRunners(root, timeoutBin = None, sandboxDir, sandboxed = false)
 
-    fast.run("FAST", "true", timeoutSec = 5, logFile = "logs/fast.log") shouldBe GateResult.Green
-    host.runner.run(
+    fast.run("FAST", "./probe.sh", timeoutSec = 5, logFile = "logs/fast.log") shouldBe
+      GateResult.Green
+    readString(root.resolve("logs/fast.log")) shouldBe "ran on the host\n"
+    host.run(
       "CI-WAIT",
       "true",
       timeoutSec = 5,

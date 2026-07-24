@@ -510,9 +510,8 @@ object Machine:
       infraFault(
         s"no CI check registered on PR #$prNum within ${cfg.ciAppearTimeout}s — infra fault; PR open, issue stays in-progress"
       )
-    // The HOST runner, never the gate one: this is `gh` talking to github.com with the operator's
-    // credentials, so routing it through the sandbox reads a green CI as red (issue #11).
-    hostGates.runner.run(
+    // The HOST runner, never the gate one — see `HostGateRunner` (issue #11).
+    hostGates.run(
       "CI-WAIT",
       cfg.ciWaitCmd.getOrElse(s"gh pr checks $prNum --watch --fail-fast"),
       cfg.ciWaitTimeout,

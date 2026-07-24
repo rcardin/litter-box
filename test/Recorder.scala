@@ -208,34 +208,26 @@ final class TestWorld:
             case ReviewScript.Says(out) => files(reviewFile) = out; DispatchOutcome.Done
             case ReviewScript.TimedOut  => DispatchOutcome.TimedOut
 
-  /** Which tier reached which runner, kept in separate books from `calls`.
-    *
-    * The merged recorder cannot answer the question issue #11 turned into a correctness property:
-    * both runners log the same `gate <label> ...` line, so "CI-WAIT ran" and "CI-WAIT ran on the
-    * host" look identical there. Here the receiving runner is the buffer it lands in.
+  /** The receiving runner is recorded as a trailing `runner=` field rather than in a second book, so
+    * the routing property (see `HostGateRunner`, issue #11) is asserted against the same `calls`
+    * every other scenario reads. It trails `cmd=`/`log=` because scenarios match gate calls by
+    * substring prefix, so a field appended at the end cannot silently unmatch them.
     */
-  val gateRunnerCalls: mutable.ArrayBuffer[(String, String)] = mutable.ArrayBuffer.empty
-  val hostRunnerCalls: mutable.ArrayBuffer[(String, String)] = mutable.ArrayBuffer.empty
-
-  private def runGate(label: String, cmd: String, logFile: String): GateResult =
-    record(s"gate $label cmd=$cmd log=$logFile")
+  private def runGate(runner: String, label: String, cmd: String, logFile: String): GateResult =
+    record(s"gate $label cmd=$cmd log=$logFile runner=$runner")
     if label == "CI-WAIT" then ciWaitResult
     else
       gateResults match
         case Nil    => GateResult.Green
         case h :: t => gateResults = t; h
 
-  /** The runner Main sandboxes when `gate.sandboxed` is on: the FAST gate's, and nothing else. */
   val gates: GateRunner = new GateRunner:
     def run(label: String, cmd: String, timeoutSec: Int, logFile: String): GateResult =
-      gateRunnerCalls += (label -> cmd)
-      runGate(label, cmd, logFile)
+      runGate("sandboxable", label, cmd, logFile)
 
-  /** The runner that always stays on the host: the CI wait's. */
   val hostGates: HostGateRunner = HostGateRunner(new GateRunner:
     def run(label: String, cmd: String, timeoutSec: Int, logFile: String): GateResult =
-      hostRunnerCalls += (label -> cmd)
-      runGate(label, cmd, logFile)
+      runGate("host", label, cmd, logFile)
   )
 
   val status: StatusLog = new StatusLog:

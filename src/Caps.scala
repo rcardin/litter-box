@@ -113,10 +113,17 @@ trait GateRunner:
   * A distinct type rather than a second `GateRunner` given, because a single given is exactly how
   * the bug happened (issue #11): `gate.sandboxed` is on by default, so the one runner Main built
   * was the sandboxed one, and the CI watch it also served died with `gh: command not found`, a
-  * non-zero rc the loop read as CI RED on a green PR. Two types mean the wiring has to say which
-  * runner each tier gets, and the compiler checks that it did.
+  * non-zero rc indistinguishable from a genuinely red check — so a green PR was annotated `CI RED
+  * -> needs-human` for every consumer on the default config. Two types mean the wiring has to say
+  * which runner each tier gets, and the compiler checks that it did.
+  *
+  * This scaladoc is the one home for that argument; the call sites (`Main.gateRunners`, the CI-WAIT
+  * step in `Machine`, `TestWorld.runGate`, `LiveProcSpec`, `ScenarioSpec`) point here instead of
+  * restating it.
   */
-final case class HostGateRunner(runner: GateRunner)
+final case class HostGateRunner(runner: GateRunner):
+  def run(label: String, cmd: String, timeoutSec: Int, logFile: String): GateResult =
+    runner.run(label, cmd, timeoutSec, logFile)
 
 /** status.jsonl appender. Pure observability: a wrong event is a wrong banner, never a wrong merge.
   * Sanitization/normalization happens in Machine before the event reaches here.

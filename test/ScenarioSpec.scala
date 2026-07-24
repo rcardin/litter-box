@@ -196,19 +196,35 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
   // ---- issue #11: which runner each tier gets ----------------------------------------------
 
   it should "send the CI wait to the host runner and only the FAST gate to the sandboxable one" in {
-    // The regression: with `gate.sandboxed` on (the default) both tiers shared one sandboxed
-    // runner, so `gh pr checks --watch` ran in a container with no gh, no credentials and no
-    // github.com egress. Its `command not found` rc is indistinguishable from a red check, so a
-    // green PR was annotated CI RED and the issue parked at needs-human.
+    // The half of the split the Machine owns (see `HostGateRunner`, issue #11): each tier goes to
+    // the runner the wiring handed it, CI-WAIT never to the sandboxable one. Whether the wiring
+    // itself sandboxes FAST and leaves the host runner bare is `Main.gateRunners` in
+    // `test/LiveProcSpec.scala`.
     val w = TestWorld()
     w.labels = List("ready", "class-1")
 
-    val exit = w.runLoop(Config(gateSandboxed = true))
+    val exit = w.runLoop()
 
     exit shouldBe LoopExit.Success
-    w.gateRunnerCalls.map(_._1).toList shouldBe List("FAST")
-    w.hostRunnerCalls.toList shouldBe List("CI-WAIT" -> "gh pr checks 123 --watch --fail-fast")
+    // Exact list, not a containment check: it pins BOTH directions of the routing, so sending the
+    // CI wait back through the sandboxable runner fails it, and so does letting any tier other than
+    // FAST reach that runner.
+    w.calls.filter(_.startsWith("gate ")).map(gateRouting).toList shouldBe List(
+      "FAST"    -> "sandboxable",
+      "CI-WAIT" -> "host"
+    )
+    w.called(
+      s"gate CI-WAIT cmd=gh pr checks 123 --watch --fail-fast " +
+        s"log=$logDir/issue-999.ci-wait.log runner=host"
+    ) shouldBe true
   }
+
+  /** label -> runner of a recorded `gate <label> cmd=<cmd> log=<log> runner=<runner>` line. The
+    * command itself contains spaces, so only the first and last fields are read positionally.
+    */
+  private def gateRouting(call: String): (String, String) =
+    val fields = call.split(" ")
+    fields(1) -> fields.last.stripPrefix("runner=")
 
   // ---- Scenario B: REQUEST_CHANGES -> exactly one fix, re-gate, re-review APPROVE ----------
 

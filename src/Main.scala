@@ -166,17 +166,11 @@ object Main:
 
   /** The two runners the loop needs, built together so the difference between them is stated once,
     * here, instead of being a property of whichever single instance the wiring happened to reach
-    * for.
+    * for. `gate.sandboxed` is about the FAST gate's agent-authored code, never about the CI wait —
+    * see `HostGateRunner` (issue #11).
     *
-    * The FAST gate is the tier `gate.sandboxed` is about: agent-authored code compiled and tested
-    * behind the container's network policy. The CI wait is not that tier at all: it is `gh pr
-    * checks --watch` against github.com, and the gate image carries no `gh`, no credentials and no
-    * egress to it, so a sandboxed CI wait cannot do anything but exit non-zero. That non-zero rc is
-    * indistinguishable from a genuinely red check, which is how one shared runner turned a green PR
-    * into `CI RED -> needs-human` for every consumer on the default config (issue #11).
-    *
-    * Both runners keep the same `root`, the same `timeoutBin` and the same log capture: the ONLY
-    * difference is which side of the sandbox boundary the command runs on.
+    * Constraint on future edits: the sandbox boundary must stay the only difference between the two,
+    * or the loop grows a second policy split that no type checks.
     */
   private[litterbox] def gateRunners(
       root: Path,
