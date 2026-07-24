@@ -2,8 +2,10 @@ package in.rcard.litterbox
 
 import com.typesafe.config.{Config as TsConfig, ConfigException, ConfigFactory, ConfigParseOptions}
 
+import java.nio.charset.StandardCharsets
 import java.nio.file.{FileSystems, Files, Path, PathMatcher}
 import scala.jdk.CollectionConverters.*
+import scala.util.control.NonFatal
 
 /** `.litter-box/config.conf` — everything repo-specific, in one HOCON file at the consumer repo's
   * root.
@@ -13,11 +15,26 @@ import scala.jdk.CollectionConverters.*
   * cutting that tie: `Machine`/`Live` read the values off `Config`, `Config` is built here, and the
   * only thing left that knows a literal like `in-progress` is the reference block below.
   *
-  * Layering, outermost wins: **env var > config file > [[Reference]]**. The file may set any subset
-  * of the schema; the rest falls back to the reference, so a consumer repo's config stays as short
-  * as the things it actually changes. Env vars keep the exact names and meanings loop.sh gave them
-  * (`GATE_CMD`, `REPAIR_BUDGET`, ...), so an operator can still override one knob for one run
-  * without editing a tracked file.
+  * Layering, outermost wins: **env var > `.litter-box/.env` > config file > [[Reference]]**.
+  *
+  * THIS PARAGRAPH IS THE PROJECT'S ONE STATEMENT OF THAT ORDER. `Main.layerDotEnv`, `MainSpec`,
+  * `ARCHITECTURE.md` and the README all point here instead of repeating it, because a rule written
+  * down in six places is a rule that takes six edits to change and only has to be missed once to
+  * leave a copy that lies. It lives with [[Reference]] rather than in a doc because the bottom
+  * layer, the config file's parse and `.litter-box/.env`'s parse are all in this file.
+  *
+  * The config file may set any subset of the schema; the rest falls back to the reference, so a
+  * consumer repo's config stays as short as the things it actually changes. Env vars keep the exact
+  * names and meanings loop.sh gave them (`GATE_CMD`, `REPAIR_BUDGET`, ...), so an operator can still
+  * override one knob for one run without editing a tracked file — and `.litter-box/.env` (see
+  * [[loadDotEnv]]) is the same variables written down instead of exported, so it loses to an export
+  * for the same reason the config file does.
+  *
+  * Two qualifications, each of them this same rule rather than a second one, with the reasoning at
+  * the site that implements it: an EMPTY exported variable is an absent one everywhere else in the
+  * loop and so shadows nothing the file says (`Main.layerDotEnv`), and a `GATE_CMD` read from the
+  * file sets the gate command but never counts as an operator bypassing the sandbox preflight, which
+  * only an export can say (`Main.parseEnv`).
   */
 object Settings:
 
@@ -82,6 +99,69 @@ object Settings:
     * production always goes through `loadFile`.
     */
   private[litterbox] def referenceOnly: TsConfig = reference
+
+  // ---- .litter-box/.env ------------------------------------------------------------------------
+
+  /** The credential file `litter-box init` scaffolds an example of and tells the operator to fill
+    * in. Read here rather than nowhere: until issue #12 nothing in `src/` opened it, so an operator
+    * who followed `init`'s next steps to the letter got a FATAL saying the credential was unset in a
+    * repo where it was present and correct.
+    */
+  val DotEnvPath = ".litter-box/.env"
+
+  /** `root/.litter-box/.env` as a variable map, or the reason it could not be read.
+    *
+    * A MISSING file is `Right(empty)`, the opposite of [[loadFile]]'s treatment of `config.conf`,
+    * and the difference is deliberate: `config.conf` is what tells the loop which repo it is acting
+    * on, while this file is one of two equally supported ways to supply a credential — exporting the
+    * variable in the shell is the other, and is what CI does. A file that EXISTS but cannot be read
+    * is a `Left`, because it is the operator saying "the credential is in here" and the loop
+    * failing to look; the caller turns that into rc 50 like any other unusable environment.
+    */
+def loadDotEnv(root: Path): Either[String, Map[String, String]] =
+  val file = root.resolve(DotEnvPath)
+  try Right(parseDotEnv(new String(Files.readAllBytes(file), StandardCharsets.UTF_8)))
+  catch
+    case _: java.nio.file.NoSuchFileException => Right(Map.empty)
+    case NonFatal(e)                         => Left(s"could not read $file: ${e.getMessage}")
+
+  /** A valid environment-variable name, and the only thing this parser will accept as a key. Junk
+    * that is not one is a line to skip, not a variable to invent.
+    */
+  private val EnvName = "[A-Za-z_][A-Za-z0-9_]*".r
+
+  /** The `KEY=value` shape `resources/scaffold/env.example` produces, parsed the way an operator
+    * editing that file expects and no further.
+    *
+    * TOTAL BY CONSTRUCTION: a line this does not understand is skipped, never thrown on. The file is
+    * hand-edited at the one moment the loop has never run successfully yet, so a parser that gave up
+    * wholesale over a stray line would reproduce the exact FATAL issue #12 is about, for a file that
+    * holds a perfectly good token two lines further down.
+    *
+    * Nothing inside a value is interpreted, and the `#` that would open a comment in a shell least of
+    * all: a credential is opaque text, so silently truncating one at a character it may legally
+    * contain is a 401 that looks like an outage.
+    */
+  private[litterbox] def parseDotEnv(text: String): Map[String, String] =
+    text.linesIterator.flatMap(dotEnvEntry).toMap
+
+  private def dotEnvEntry(rawLine: String): Option[(String, String)] =
+    // `export KEY=value` is accepted because the workaround issue #12 documents is
+    // `set -a; source .litter-box/.env`: operators have been writing this file as something bash
+    // sources, and a file that sources correctly must load correctly.
+    val line = rawLine.strip.stripPrefix("export ").strip
+    if line.isEmpty || line.startsWith("#") then None
+    else
+      line.split("=", 2) match
+        case Array(rawKey, rawValue) if EnvName.matches(rawKey.strip) =>
+          Some(rawKey.strip -> unquote(rawValue.strip))
+        case _ => None
+
+  private def unquote(value: String): String =
+    val quoted = value.length >= 2 &&
+      ((value.startsWith("\"") && value.endsWith("\"")) ||
+        (value.startsWith("'") && value.endsWith("'")))
+    if quoted then value.substring(1, value.length - 1) else value
 
   // ---- protect: floor and glob matching ---------------------------------------------------------
 

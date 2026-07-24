@@ -592,3 +592,87 @@ class SettingsSpec extends AnyFlatSpec with Matchers:
     )
     Files.isRegularFile(root.resolve(cfg.logDir).resolve("status.jsonl")) shouldBe true
   }
+
+  // ===============================================================================================
+  // 9. `.litter-box/.env` (GitHub issue #12)
+  // ===============================================================================================
+
+  /** Writes a `.litter-box/.env` under a fresh root and returns the root. */
+  private def rootWithDotEnv(content: String): Path =
+    val root = tempRoot()
+    val file = root.resolve(Settings.DotEnvPath)
+    Files.createDirectories(file.getParent)
+    Files.write(file, content.getBytes(StandardCharsets.UTF_8))
+    root
+
+  private def dotEnvOf(root: Path): Map[String, String] =
+    Settings.loadDotEnv(root).getOrElse(fail("expected a Right"))
+
+  /** The file `init` tells the operator to create is OPTIONAL, unlike `config.conf`: a repo whose
+    * credential is exported in the shell is the normal case and must not be turned into a startup
+    * failure by the absence of a file nobody promised to write.
+    */
+  "Settings.loadDotEnv" should "be an empty map when .litter-box/.env is absent" in {
+    dotEnvOf(tempRoot()) shouldBe Map.empty
+  }
+
+  /** The whole point of issue #12: an operator who followed `init`'s own next step to the letter has
+    * the token in this file and nowhere else.
+    */
+  it should "read the credential out of the file init tells the operator to create" in {
+    val root = rootWithDotEnv("CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat-not-a-real-token\n")
+
+    dotEnvOf(root) shouldBe Map("CLAUDE_CODE_OAUTH_TOKEN" -> "sk-ant-oat-not-a-real-token")
+  }
+
+  /** Exactly the shape `resources/scaffold/env.example` produces once filled in: a comment header,
+    * blank lines, and the second credential left as an empty assignment. Plus the two tolerances an
+    * operator editing a shell-ish file expects, surrounding whitespace and quotes.
+    */
+  it should "skip comments and blank lines, and tolerate whitespace and matched quotes" in {
+    val root = rootWithDotEnv(
+      """# Copy to .env and fill in ONE of the two.
+        |
+        |CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat-not-a-real-token
+        |ANTHROPIC_API_KEY=
+        |   # an indented comment
+        |  SPACED  =   spaced-value
+        |QUOTED="double quoted"
+        |SINGLE='single quoted'
+        |""".stripMargin
+    )
+
+    dotEnvOf(root) shouldBe Map(
+      "CLAUDE_CODE_OAUTH_TOKEN" -> "sk-ant-oat-not-a-real-token",
+      "ANTHROPIC_API_KEY"       -> "",
+      "SPACED"                  -> "spaced-value",
+      "QUOTED"                  -> "double quoted",
+      "SINGLE"                  -> "single quoted"
+    )
+  }
+
+  /** A junk line must cost the operator that line, never the credential on the line below it: this
+    * file is edited by hand, at the exact moment the loop has never run successfully yet, so a parse
+    * that gave up wholesale would reproduce the very FATAL issue #12 is about.
+    */
+  it should "ignore a malformed line rather than losing the rest of the file" in {
+    val root = rootWithDotEnv(
+      """this line has no equals sign
+        |=novalue
+        |1BAD_NAME=x
+        |CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat-not-a-real-token
+        |""".stripMargin
+    )
+
+    dotEnvOf(root) shouldBe Map("CLAUDE_CODE_OAUTH_TOKEN" -> "sk-ant-oat-not-a-real-token")
+  }
+
+  /** The workaround issue #12 documents is `set -a; source .litter-box/.env`, so operators have been
+    * writing this file as something bash sources. A file that sources correctly must load correctly,
+    * and an `export` silently swallowed as a malformed key would put the original FATAL back.
+    */
+  it should "tolerate a leading export, the way the documented `source` workaround does" in {
+    val root = rootWithDotEnv("export CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat-not-a-real-token\n")
+
+    dotEnvOf(root) shouldBe Map("CLAUDE_CODE_OAUTH_TOKEN" -> "sk-ant-oat-not-a-real-token")
+  }
