@@ -118,12 +118,12 @@ object Settings:
     * is a `Left`, because it is the operator saying "the credential is in here" and the loop
     * failing to look; the caller turns that into rc 50 like any other unusable environment.
     */
-  def loadDotEnv(root: Path): Either[String, Map[String, String]] =
-    val file = root.resolve(DotEnvPath)
-    if !Files.isRegularFile(file) then Right(Map.empty)
-    else
-      try Right(parseDotEnv(new String(Files.readAllBytes(file), StandardCharsets.UTF_8)))
-      catch case NonFatal(e) => Left(s"could not read $file: ${e.getMessage}")
+def loadDotEnv(root: Path): Either[String, Map[String, String]] =
+  val file = root.resolve(DotEnvPath)
+  try Right(parseDotEnv(new String(Files.readAllBytes(file), StandardCharsets.UTF_8)))
+  catch
+    case _: java.nio.file.NoSuchFileException => Right(Map.empty)
+    case NonFatal(e)                         => Left(s"could not read $file: ${e.getMessage}")
 
   /** A valid environment-variable name, and the only thing this parser will accept as a key. Junk
     * that is not one is a line to skip, not a variable to invent.
