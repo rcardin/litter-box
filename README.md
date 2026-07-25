@@ -38,7 +38,7 @@ then writes six files under `.litter-box/`:
 | File | Purpose |
 |---|---|
 | `config.conf` | the loop's only mandatory config — see [Configuration](#configuration) below |
-| `Dockerfile` | `FROM ghcr.io/rcardin/litter-box-base` plus your build tool layer — see [The sandbox image](#the-sandbox-image) |
+| `Dockerfile` | `FROM ghcr.io/rcardin/litter-box-base` plus a `TODO` for your JDK and build tool layer — see [The sandbox image](#the-sandbox-image) |
 | `allowlist` | egress hosts the sandbox proxy permits (see [The egress allowlist](#the-egress-allowlist)) |
 | `prompts/conventions.md` | the one file you own — spliced into every prompt as `{{CONVENTIONS}}` |
 | `.env.example` | the credential the sandboxed worker needs, and any other variable from [Running it](#running-it); meant to be copied to `.env`, never committed |
@@ -47,13 +47,17 @@ then writes six files under `.litter-box/`:
 It refuses to overwrite an existing `.litter-box/` unless you pass `--force`, and the check happens
 before the first file is written, so a refused `init` never leaves a half scaffold.
 
-If no `build.sbt` is found, both `Dockerfile` and `config.conf`'s `gate.fast` carry a `TODO` and
-`gate.fast` is written as `"false"` rather than a guessed preset — litter-box will not run a build
-tool nobody has confirmed. Sbt is the only preset today; adding another (Gradle, Maven, ...) is a
-PR — see [Adding a preset](docs/base-image.md#adding-a-preset).
+`Dockerfile` and `config.conf`'s `gate.fast` always carry a `TODO`, whatever was detected, and
+`gate.fast` is always written as `"false"` — a command that exists everywhere and always fails, so
+iteration one goes honestly red instead of running something nobody confirmed. There are no
+build-tool presets: what `init` detected is written into those TODOs as evidence for you to act on,
+because seeing a `build.sbt` names the tool and never the command, and reading `java -version` names
+what the host builds under and never what the container should carry. See
+[Why the middle is a TODO](docs/base-image.md#why-the-middle-is-a-todo-and-not-a-preset) for the two
+defects that taught us this.
 
-`init` also prints up to three warnings (no remote found, no build tool detected, a JDK other than
-21) and three next steps, none of which it can do on your behalf:
+`init` also prints up to three warnings (what it found or failed to find for your build tool, no
+remote found, a JDK other than 21) and three next steps, none of which it can do on your behalf:
 
 1. **Fill in `.litter-box/prompts/conventions.md`.** It is the highest-value file here: everything
    true only of your project — layout, test tiers, lint rules, "anything that has bitten you" — is
@@ -89,10 +93,12 @@ constrains it. Pass `--force` to overwrite one you already ejected.
 
 `.litter-box/Dockerfile` builds `FROM ghcr.io/rcardin/litter-box-base` — a build-tool-free image
 carrying temurin 21, a pinned Claude CLI and a non-root user, with no build tool and no credentials
-baked in. Your Dockerfile installs the build tool and nothing else: it needs no `ENTRYPOINT`, because
-all three runners override it and run `gate.fast` (or the agent entrypoint) through `bash -c`. **Nothing has been published to ghcr yet** — the first publish happens when a
-tag is cut. See [docs/base-image.md](docs/base-image.md) for the full contract the image guarantees
-and how to add a build-tool preset beyond sbt.
+baked in. Your Dockerfile installs the JDK and build tool this project needs and nothing else: it
+needs no `ENTRYPOINT`, because all three runners override it and run `gate.fast` (or the agent
+entrypoint) through `bash -c`. `init` scaffolds that file with the install layer left as a `TODO`,
+which is the whole of what litter-box claims to know about your build. **Nothing has been published
+to ghcr yet** — the first publish happens when a tag is cut. See
+[docs/base-image.md](docs/base-image.md) for the full contract the image guarantees.
 
 ## Configuration
 
@@ -111,7 +117,8 @@ stop-file     = "STOP.md"
 log-dir       = ".litter-box/logs"
 
 gate {
-  fast      = "sbt -Werror compile test"   # runs INSIDE the sandbox image, so read against its PATH
+  fast      = "scala-cli test ."            # runs INSIDE the sandbox image, so read against its PATH;
+                                            # `init` scaffolds `false` plus a TODO, never a guess
   sandboxed = true                          # false runs it on the host instead, with everything your shell has
   timeout   = 900
 }
@@ -195,7 +202,7 @@ exist. See [Getting started](#getting-started) for `init`, `eject`, `--dry-run` 
 | `DRY_RUN` | `0` | `1` renders the worker prompt, then stops before any mutation |
 | `REPAIR_BUDGET` | `2` | Fix attempts per issue |
 | `MAX_PATCH_BYTES` | `1000000` | Oversized-patch guard |
-| `GATE_CMD` | `sbt -Werror compile test` | The gate (overrides `gate.fast`). Exporting it also skips the whole Docker preflight; setting it in `.litter-box/.env` only changes the command |
+| `GATE_CMD` | `false` | The gate (overrides `gate.fast`); the default fails on purpose, because litter-box never guesses your build command. Exporting it also skips the whole Docker preflight; setting it in `.litter-box/.env` only changes the command |
 | `GATE_TIMEOUT` | `900` | Gate timeout (seconds) |
 | `ITER_TIMEOUT` | `1800` | Worker dispatch timeout |
 | `CI_WAIT_TIMEOUT` / `CI_APPEAR_TIMEOUT` / `CI_APPEAR_INTERVAL` | `900` / `300` / `10` | CI polling |

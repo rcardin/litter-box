@@ -28,7 +28,7 @@ class MainSpec extends AnyFlatSpec with Matchers:
     parsed.cfg.dryRun shouldBe false
     parsed.cfg.repairBudget shouldBe 2
     parsed.cfg.maxPatchBytes shouldBe 1_000_000L
-    parsed.cfg.gateCmd shouldBe "sbt -Werror compile test"
+    parsed.cfg.gateCmd shouldBe "false"
     parsed.cfg.ciWaitCmd shouldBe None
     parsed.cfg.gateTimeout shouldBe 900
     parsed.cfg.iterTimeout shouldBe 1800

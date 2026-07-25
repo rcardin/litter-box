@@ -34,23 +34,32 @@ ARG BASE_IMAGE=ghcr.io/rcardin/litter-box-base:0.1.0
 FROM ${BASE_IMAGE}
 
 USER root
-# install your build tool, pinned to an exact version
+# TODO: install this project's JDK and build tool, pinned to exact versions
 USER gate
 WORKDIR /workspace
 ```
 
-`litter-box init` writes exactly this file, filled in, to `.litter-box/Dockerfile`, and
-`build-image.sh` builds the gate image from it — that file, with no fallback. The build tool you
-install here is what `gate.fast` in `.litter-box/config.conf` is read against, so the two have to
-name the same thing.
+`litter-box init` writes exactly this file to `.litter-box/Dockerfile` — skeleton written, middle
+left to you — and `build-image.sh` builds the gate image from it, that file, with no fallback. The
+build tool you install here is what `gate.fast` in `.litter-box/config.conf` is read against, so the
+two have to name the same thing.
 
-## Adding a preset
+## Why the middle is a TODO and not a preset
 
-`init` scaffolds an sbt Dockerfile because sbt is the only build tool a litter-box loop has
-actually been run against end to end. A Gradle or Maven preset is a PR: add a case to
-`Init.BuildTool`, its install block in `Init.dockerfile`, its gate command in `Init.configConf`, and
-a detection rule in `Init.detect`. Adding a case is a claim that you ran the
-loop with it, so please say so in the PR.
+There are no build-tool presets, for any build tool, and there is no extension point to add one
+(#13). `init` detects your build tool and your JDK, and it writes what it found into the TODO above
+as evidence. It does not act on it:
+
+- Seeing a `build.sbt` tells you the tool, not the invocation. `init` used to scaffold
+  `sbt -Werror compile test`, which sbt rejects outright: `-Werror` is a scalac flag, sbt parses
+  bare arguments as commands, and it answers `Not a valid command: -`. Every sbt repo ever
+  scaffolded got a gate that could not run.
+- Reading `java -version` tells you what the HOST builds under, not what the container should carry.
+  A project on `-release:25` over this temurin 21 base fails as late as the tier allows: image
+  built, proxy up, sources compiled, then `25 is not a valid choice for -java-output-version`.
+
+Both are the same mistake, so the fix is one rule rather than a better guess: `init` scaffolds the
+lines that keep the sandbox sound and marks everything project-specific as unanswered.
 
 ## Bumping the Claude CLI
 

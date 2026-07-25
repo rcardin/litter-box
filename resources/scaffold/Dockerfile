@@ -1,5 +1,12 @@
 # The gate container for this repository.
 #
+# What `litter-box init` writes is the CONTRACT SKELETON and nothing else: the handful of lines
+# litter-box can guarantee keep the sandbox sound. The project-specific layer — your JDK, your build
+# tool — is left as a TODO for you to confirm, because detecting is not verifying. Seeing a build
+# file tells you the build tool, not the invocation, and reading `java -version` tells you what the
+# HOST builds under, not what this container should carry. `init` says what it saw in the TODO
+# below and stops there, rather than scaffolding a guess that fails on iteration one.
+#
 # FROM the litter-box base image, which carries a JDK, the pinned Claude CLI and a non-root `gate`
 # user, and NO credentials of any kind. It deliberately carries no build tool: that is this file's
 # job, and it is the only part of the sandbox that knows what this project is built with. See
@@ -16,7 +23,9 @@
 ARG BASE_IMAGE=ghcr.io/rcardin/litter-box-base:0.1.0
 FROM ${BASE_IMAGE}
 
+# root for the install below only. The image MUST end back on `gate`: the fast gate runs as that
+# user, and a container whose gate is root is not the sandbox you installed litter-box for.
 USER root
-{{BUILD_TOOL}}
+{{PROJECT_LAYER}}
 USER gate
 WORKDIR /workspace
