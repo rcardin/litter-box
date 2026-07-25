@@ -1,8 +1,8 @@
 # The gate container for this repository.
 #
 # What `litter-box init` writes is the CONTRACT SKELETON and nothing else: the handful of lines
-# litter-box can guarantee keep the sandbox sound. The project-specific layer — your JDK, your build
-# tool — is left as a TODO for you to confirm, because detecting is not verifying. Seeing a build
+# litter-box can guarantee keep the sandbox sound. The project-specific layer (your JDK, your build
+# tool) is left as a TODO for you to confirm, because detecting is not verifying. Seeing a build
 # file tells you the build tool, not the invocation, and reading `java -version` tells you what the
 # HOST builds under, not what this container should carry. `init` says what it saw in the TODO
 # below and stops there, rather than scaffolding a guess that fails on iteration one.

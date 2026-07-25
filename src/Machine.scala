@@ -311,7 +311,9 @@ object Machine:
           logger.log(s"FAST gate RED (pass $pass, see $gateLog)")
           spendOrExhaust(
             FailureKind.GateRed,
-            s"## Fast-gate failure — `${cfg.gateCmd}` (compile under -Werror, then in-memory tests)\n\n" +
+            s"## FAST gate RED (pass $pass)\n\n" +
+              s"The fast tier gate command is `${cfg.gateCmd}`. It ran at the repository root and " +
+              s"exited with a nonzero status.\n\n" +
               s"Tail of the fast-gate log:\n\n```\n${fs.read(gateLog)}\n```\n"
           )
         case GateResult.Green =>

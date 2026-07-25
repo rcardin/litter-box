@@ -180,7 +180,7 @@ class InitSpec extends AnyFlatSpec with Matchers:
   it should "leave the project layer a TODO instead of installing anything" in:
     // The defect this exists for (issue #13): a detected `build.sbt` bought a curl-and-untar block
     // pinning an sbt version nobody confirmed this project wants. Detection is not verification, so
-    // no detection result may produce an install instruction any more — a scaffold with a RUN in it
+    // no detection result may produce an install instruction any more: a scaffold with a RUN in it
     // is a scaffold that asserted something `init` cannot know.
     everyRepo.foreach { d =>
       withClue(s"Dockerfile scaffolded for $d: ") {
@@ -197,7 +197,7 @@ class InitSpec extends AnyFlatSpec with Matchers:
 
   it should "carry the JDK it detected, rather than warning and scaffolding otherwise" in:
     // The second half of #13: `Init.detect` read the JDK and `Init.warnings` warned about it, but
-    // `dockerfile` never looked at `d.jdk` — so `init` knew the answer, told the operator the
+    // `dockerfile` never looked at `d.jdk`, so `init` knew the answer, told the operator the
     // answer, and then scaffolded a container that contradicted it. Against yaes (`-release:25`
     // over the temurin 21 base) that surfaced as `25 is not a valid choice for
     // -java-output-version`, after a successful image build and 50 compiled sources.
@@ -208,6 +208,26 @@ class InitSpec extends AnyFlatSpec with Matchers:
     // A JDK that could not be read is its own answer and has to say so, or the TODO reads as if 21
     // had been confirmed.
     scaffolded(noJdkRepo, ".litter-box/Dockerfile") should include("could not be read")
+
+  it should "report the host matching the base image as evidence, never as a decision" in:
+    // The branch that reads hardest as harmless and is the likeliest to be wrong: the host happens
+    // to run the version the base image ships, so the TODO used to conclude that "this project
+    // probably needs no JDK layer at all". That is a claim about the CONTAINER drawn from a reading
+    // of the HOST, which is the whole defect #13 exists to remove, and a project can perfectly well
+    // target a JDK other than the one its developer runs. The branch stays because the coincidence
+    // is worth knowing; what it may not do is decide.
+    val matched = scaffolded(sbtRepo, ".litter-box/Dockerfile")
+    matched should include("the same version the base image ships")
+    matched.toLowerCase should include("confirm")
+    matched.toLowerCase should not include "needs no jdk layer"
+
+  it should "point the JDK install at the layer the TODO sits in" in:
+    // The whole TODO is spliced into the scaffold as {{PROJECT_LAYER}}, which sits between
+    // `USER root` and `USER gate`. So "install it above" sends the operator at `FROM` and
+    // `USER root`, and an install there is either impossible or lands outside the root window.
+    val mismatched = scaffolded(jdk25Repo, ".litter-box/Dockerfile")
+    mismatched should include("in this block")
+    mismatched should not include "targets above"
 
   "the scaffolded gate command" should "be the explicit non-command, whatever was detected" in:
     // `sbt -Werror compile test` is not a valid sbt invocation: sbt parses bare arguments as
@@ -298,6 +318,26 @@ class InitSpec extends AnyFlatSpec with Matchers:
 
   it should "not be warned when it builds under the 21 the base image ships" in:
     Init.warnings(sbtRepo).mkString(" ") should not include "JDK"
+
+  it should "be measured against the JDK the base image actually ships" in:
+    // The guard `Init.BaseImageJdk` exists for. That constant is a COPY of a fact decided in
+    // `resources/sandbox/base.Dockerfile`, and no compiler ties the two together, so a base image
+    // bumped to a newer temurin would leave every scaffolded Dockerfile and every warning quoting
+    // the version that is gone. Reading the `FROM` line back turns that into a red test here
+    // rather than a gate that dies inside a container on `is not a valid choice for
+    // -java-output-version`.
+    val baseImage = new String(Sandbox.builtIn("base.Dockerfile"), StandardCharsets.UTF_8)
+    val shipped = "(?m)^FROM eclipse-temurin:(\\d+)".r
+      .findFirstMatchIn(baseImage)
+      .map(_.group(1))
+      .getOrElse(fail("base.Dockerfile no longer names its JDK as FROM eclipse-temurin:<major>"))
+
+    // The prose the operator reads has to name that same version, and a host already on it has
+    // nothing to be warned about.
+    scaffolded(noJdkRepo, ".litter-box/Dockerfile") should include(s"temurin $shipped")
+    Init
+      .warnings(Init.Detected(None, Some("rcardin/x"), Some(shipped)))
+      .mkString(" ") should not include "JDK"
 
   "a second init" should "fail and change nothing without --force" in:
     val root = tempRoot()

@@ -19,14 +19,78 @@ object Init:
 
   val Dir = ".litter-box"
 
+  /** The JDK major version the litter-box base image ships, which `init` compares the detected host
+    * JDK against and quotes back in the Dockerfile TODO and the warning.
+    *
+    * It is a constant because the fact is asserted here in five places and DECIDED in neither: the
+    * base image is built `FROM eclipse-temurin:21-jdk` in `resources/sandbox/base.Dockerfile`, and
+    * the tag consumers pin lives in `resources/scaffold/Dockerfile` as `ARG BASE_IMAGE`. Bump those
+    * and this line together; leaving them apart is the #13 defect in miniature, a fact restated in
+    * more places than it is known, with no compiler and no test to notice the drift.
+    */
+  private val BaseImageJdk = "21"
+
   /** Build tools `init` can put a NAME to. Not presets: since #13 nothing here buys an install
     * block or a gate command, so a case is only a claim that we can recognise the marker file and
     * say so in the TODO the operator fills in. Adding one is correspondingly cheap, and buys
-    * correspondingly little — the honest trade, given that seeing a build file tells you the tool
-    * and never the invocation.
+    * correspondingly little. That is the honest trade, given that seeing a build file tells you the
+    * tool and never the invocation.
     */
   enum BuildTool:
     case Sbt
+
+  /** Everything `init` says about the build tool, in the three voices it says it in: the comment
+    * spliced into the scaffolded `config.conf`, the comment spliced into the scaffolded
+    * `Dockerfile`, and the warning printed to the operator.
+    *
+    * One detected fact, so one match. Before this the three lived in `configConf`, `dockerfile` and
+    * `warnings` as three separate cascades over the same `Option[BuildTool]`, which made the enum's
+    * claim above (that a case is cheap) false: a new case cost four edits in four places, and the
+    * compiler could only vouch for the ones it could see were exhaustive. Now `toolEvidence` is the
+    * only reader of `Detected.buildTool`, so adding a tool is one arm here plus `detect`.
+    *
+    * The two comments are stored already indented, and differently, because their templates nest
+    * differently: `config.conf` splices into the `gate { }` block, the `Dockerfile` into column
+    * zero. Rendered text is what the tests assert on, so it is what this holds.
+    */
+  private final case class ToolEvidence(
+      configComment: String,
+      dockerComment: String,
+      warning: String
+  )
+
+  private def toolEvidence(t: Option[BuildTool]): ToolEvidence = t match
+    case Some(BuildTool.Sbt) =>
+      ToolEvidence(
+        configComment =
+          """  # build.sbt was found at the repo root, so this project builds with sbt. That is the end
+            |  # of what detection knows. Scalac flags in particular are not sbt commands: sbt reads a
+            |  # bare `-Werror` as a command and answers "Not a valid command: -", so a build that
+            |  # wants it either sets scalacOptions in build.sbt or forces it with
+            |  #   sbt 'set ThisBuild/scalacOptions += "-Werror"' compile test""".stripMargin,
+        dockerComment =
+          """# Build tool: build.sbt was found at the repo root, so this project builds with sbt.
+            |# litter-box still does not install it for you. The launcher and the version are this
+            |# project's decision, and a pin nobody confirmed is a gate that breaks on the first
+            |# rebuild, in a container, where it is hardest to read.""".stripMargin,
+        warning =
+          "build.sbt found, so this project builds with sbt, which names the tool and not the " +
+            "command. The scaffolded Dockerfile and gate.fast both carry a TODO; fill them in " +
+            "before the first run, or the gate is red by construction."
+      )
+    case None =>
+      ToolEvidence(
+        configComment =
+          """  # No build file litter-box recognises was found at the repo root, so it has nothing to
+            |  # say about what this project is built with.""".stripMargin,
+        dockerComment =
+          """# Build tool: no build file litter-box recognises was found at the repo root, so it has
+            |# nothing to say about what this project is built with.""".stripMargin,
+        warning =
+          "no build tool detected (no build.sbt at the repo root). The scaffolded Dockerfile and " +
+            "gate.fast both carry a TODO: litter-box will not guess, because a command nobody " +
+            "has run is worse than no command."
+      )
 
   final case class Detected(
       buildTool: Option[BuildTool],
@@ -68,7 +132,7 @@ object Init:
   /** Every file `init` writes, as repo-relative path to content. Total: there is no detection
     * result for which this returns a partial scaffold, and since #13 no detection result for which
     * it returns a DIFFERENT one either. Every repo gets the same six files, with the two
-    * project-shaped holes — the Dockerfile's install layer and `gate.fast` — filled by a TODO that
+    * project-shaped holes (the Dockerfile's install layer and `gate.fast`) filled by a TODO that
     * quotes what was detected rather than by a command nobody has run.
     */
   def plan(d: Detected): List[(String, String)] =
@@ -94,7 +158,7 @@ object Init:
     * a scalac flag, sbt parses bare arguments as commands, and it answers `Not a valid command: -`.
     * So the case we were confident about was the only one we got wrong, and nothing caught it
     * because litter-box's own gate is scala-cli and no test can run sbt. The lesson is not "fix the
-    * sbt string" — it is that detecting a build tool tells you the tool and never the invocation,
+    * sbt string": it is that detecting a build tool tells you the tool and never the invocation,
     * so there is no string to fix. Detection survives here as the TEXT of the TODO, which is the
     * most it was ever entitled to be.
     *
@@ -104,16 +168,7 @@ object Init:
     * ran on itself and nothing anywhere said so.
     */
   private def configConf(d: Detected): String =
-    val detected = d.buildTool match
-      case Some(BuildTool.Sbt) =>
-        """  # build.sbt was found at the repo root, so this project builds with sbt. That is the end
-          |  # of what detection knows. Scalac flags in particular are not sbt commands: sbt reads a
-          |  # bare `-Werror` as a command and answers "Not a valid command: -", so a build that
-          |  # wants it either sets scalacOptions in build.sbt or forces it with
-          |  #   sbt 'set ThisBuild/scalacOptions += "-Werror"' compile test""".stripMargin
-      case None =>
-        """  # No build file litter-box recognises was found at the repo root, so it has nothing to
-          |  # say about what this project is built with.""".stripMargin
+    val detected = toolEvidence(d.buildTool).configComment
     val gate =
       s"""  # TODO: your fast gate command.
          |$detected
@@ -127,12 +182,12 @@ object Init:
 
   /** The gate image. One hole, and it is a TODO in every case: the project-specific layer.
     *
-    * The skeleton around the hole is everything litter-box can actually guarantee — the
+    * The skeleton around the hole is everything litter-box can actually guarantee: the
     * `ARG BASE_IMAGE`/`FROM` pair, `USER root` for the install, `USER gate` to come back down to a
     * non-root user, `WORKDIR /workspace`, no ENTRYPOINT. Those lines are the sandbox contract. The
     * JDK and the build tool are not: they are properties of a project litter-box has read two files
     * of, and #13 is what asserting them cost. `detect` reads the HOST's `java -version` and
-    * `warnings` duly told the operator their JDK was not 21 — and then this method filled only the
+    * `warnings` duly told the operator their JDK was not 21; then this method filled only the
     * build-tool hole and scaffolded temurin 21 anyway, so `init` contradicted its own warning
     * inside the same run. Against a `-release:25` project that fails as late as the tier allows:
     * image built, proxy up, 50 sources compiled, then `25 is not a valid choice for
@@ -147,28 +202,22 @@ object Init:
     */
   private def dockerfile(d: Detected): String =
     val jdkNote = d.jdk match
-      case Some("21") =>
-        """# JDK: `java -version` here reported 21, which is what the base image already ships, so
-          |# this project probably needs no JDK layer at all. Confirm that and move on.""".stripMargin
+      case Some(BaseImageJdk) =>
+        s"""# JDK: `java -version` here reported $BaseImageJdk, the same version the base image ships. That is
+           |# a fact about this HOST and not about this project, which can target a JDK other than
+           |# the one its developer happens to run. Confirm $BaseImageJdk is what this container should
+           |# carry.""".stripMargin
       case Some(v) =>
-        s"""# JDK: `java -version` here reported $v, and the base image ships temurin 21. Mind the
+        s"""# JDK: `java -version` here reported $v, and the base image ships temurin $BaseImageJdk. Mind the
            |# gap: nothing fails early on it. The image builds, the proxy starts, the sources
            |# compile, and then the gate dies on something like `$v is not a valid choice for
-           |# -java-output-version`. Install the JDK this project targets above, or confirm 21 is
-           |# what it should be built against.""".stripMargin
+           |# -java-output-version`. Install the JDK this project targets in this block, or confirm
+           |# $BaseImageJdk is what it should be built against.""".stripMargin
       case None =>
-        """# JDK: the version this host builds under could not be read, so nothing was assumed about
-          |# it. The base image ships temurin 21 — confirm that is what this project wants.""".stripMargin
+        s"""# JDK: the version this host builds under could not be read, so nothing was assumed about
+           |# it. The base image ships temurin $BaseImageJdk. Confirm that is what this project wants.""".stripMargin
 
-    val toolNote = d.buildTool match
-      case Some(BuildTool.Sbt) =>
-        """# Build tool: build.sbt was found at the repo root, so this project builds with sbt.
-          |# litter-box still does not install it for you. The launcher and the version are this
-          |# project's decision, and a pin nobody confirmed is a gate that breaks on the first
-          |# rebuild, in a container, where it is hardest to read.""".stripMargin
-      case None =>
-        """# Build tool: no build file litter-box recognises was found at the repo root, so it has
-          |# nothing to say about what this project is built with.""".stripMargin
+    val toolNote = toolEvidence(d.buildTool).dockerComment
 
     val layer =
       s"""# TODO: install this project's JDK and build tool here. This block is the only part of the
@@ -193,24 +242,14 @@ object Init:
     * now has two of them.
     */
   def warnings(d: Detected): List[String] =
-    List(
-      Some(d.buildTool match
-        case Some(BuildTool.Sbt) =>
-          "build.sbt found, so this project builds with sbt — which names the tool and not the " +
-            "command. The scaffolded Dockerfile and gate.fast both carry a TODO; fill them in " +
-            "before the first run, or the gate is red by construction."
-        case None =>
-          "no build tool detected (no build.sbt at the repo root). The scaffolded Dockerfile and " +
-            "gate.fast both carry a TODO — litter-box will not guess, because a command nobody " +
-            "has run is worse than no command."
-      ),
+    toolEvidence(d.buildTool).warning :: List(
       Option.when(d.remote.isEmpty)(
         "no GitHub remote found via `gh`. The loop reads and writes issues, labels and PRs, so it " +
           "needs one before it can run."
       ),
-      d.jdk.filterNot(_ == "21").map { v =>
-        s"this repo builds under JDK $v, but the litter-box base image ships temurin 21. Either " +
-          "add your JDK in .litter-box/Dockerfile or confirm 21 is fine."
+      d.jdk.filterNot(_ == BaseImageJdk).map { v =>
+        s"this repo builds under JDK $v, but the litter-box base image ships temurin $BaseImageJdk. Either " +
+          s"add your JDK in .litter-box/Dockerfile or confirm $BaseImageJdk is fine."
       }
     ).flatten
 

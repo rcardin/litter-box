@@ -178,7 +178,7 @@ final case class Config(
       * bash's own lookup rule, so the launched command is identical. A SANDBOXED command is never
       * resolved here at all — it is read by bash inside the container, against the image's PATH.
       *
-      * The default is `false` — the shell builtin that always fails — for the reason `Init` refuses
+      * The default is `false`, the shell builtin that always fails, for the reason `Init` refuses
       * to scaffold a build-tool preset (#13): a default gate is a gate litter-box has not verified,
       * and the failure mode of guessing wrong is a repo whose gate cannot run, or worse, one whose
       * gate passes without checking what the operator thought it checked. `false` is the only

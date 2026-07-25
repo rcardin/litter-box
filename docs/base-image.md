@@ -39,8 +39,8 @@ USER gate
 WORKDIR /workspace
 ```
 
-`litter-box init` writes exactly this file to `.litter-box/Dockerfile` — skeleton written, middle
-left to you — and `build-image.sh` builds the gate image from it, that file, with no fallback. The
+`litter-box init` writes exactly this file to `.litter-box/Dockerfile` (skeleton written, middle
+left to you), and `build-image.sh` builds the gate image from it, that file, with no fallback. The
 build tool you install here is what `gate.fast` in `.litter-box/config.conf` is read against, so the
 two have to name the same thing.
 

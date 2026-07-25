@@ -38,7 +38,7 @@ then writes six files under `.litter-box/`:
 | File | Purpose |
 |---|---|
 | `config.conf` | the loop's only mandatory config — see [Configuration](#configuration) below |
-| `Dockerfile` | `FROM ghcr.io/rcardin/litter-box-base` plus a `TODO` for your JDK and build tool layer — see [The sandbox image](#the-sandbox-image) |
+| `Dockerfile` | `FROM ghcr.io/rcardin/litter-box-base` plus a `TODO` for your JDK and build tool layer (see [The sandbox image](#the-sandbox-image)) |
 | `allowlist` | egress hosts the sandbox proxy permits (see [The egress allowlist](#the-egress-allowlist)) |
 | `prompts/conventions.md` | the one file you own — spliced into every prompt as `{{CONVENTIONS}}` |
 | `.env.example` | the credential the sandboxed worker needs, and any other variable from [Running it](#running-it); meant to be copied to `.env`, never committed |
@@ -48,7 +48,7 @@ It refuses to overwrite an existing `.litter-box/` unless you pass `--force`, an
 before the first file is written, so a refused `init` never leaves a half scaffold.
 
 `Dockerfile` and `config.conf`'s `gate.fast` always carry a `TODO`, whatever was detected, and
-`gate.fast` is always written as `"false"` — a command that exists everywhere and always fails, so
+`gate.fast` is always written as `"false"`, a command that exists everywhere and always fails, so
 iteration one goes honestly red instead of running something nobody confirmed. There are no
 build-tool presets: what `init` detected is written into those TODOs as evidence for you to act on,
 because seeing a `build.sbt` names the tool and never the command, and reading `java -version` names
@@ -97,7 +97,7 @@ baked in. Your Dockerfile installs the JDK and build tool this project needs and
 needs no `ENTRYPOINT`, because all three runners override it and run `gate.fast` (or the agent
 entrypoint) through `bash -c`. `init` scaffolds that file with the install layer left as a `TODO`,
 which is the whole of what litter-box claims to know about your build. **Nothing has been published
-to ghcr yet** — the first publish happens when a tag is cut. See
+to ghcr yet**: the first publish happens when a tag is cut. See
 [docs/base-image.md](docs/base-image.md) for the full contract the image guarantees.
 
 ## Configuration
@@ -211,7 +211,9 @@ exist. See [Getting started](#getting-started) for `init`, `eject`, `--dry-run` 
 `IMPL_CMD`, `FIX_CMD`, `REVIEW_CMD`, `NOTIFY_CMD`, `CI_WAIT_CMD`, `CI_APPEAR_CMD` and `MERGE_CMD`
 are test seams: each replaces one subprocess so the loop can be driven without Docker or GitHub.
 
-Preflight requires `gh`, `sbt` and `claude` on `PATH`, and either `CLAUDE_CODE_OAUTH_TOKEN` or
+Preflight requires `gh` and `claude` on `PATH`, plus whatever tool the first word of your gate
+command names (that probe is skipped when the gate runs sandboxed, because the tool lives in the
+image rather than on the host), and either `CLAUDE_CODE_OAUTH_TOKEN` or
 `ANTHROPIC_API_KEY` for the sandboxed worker, exported or written in `.litter-box/.env`. That file is
 not credentials-only: any variable in the table above can live in it, and it reaches the credential
 check, the config layering and the seams by the same door an export does. Two things it cannot do,
