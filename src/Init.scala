@@ -26,7 +26,11 @@ object Init:
     * base image is built `FROM eclipse-temurin:21-jdk` in `resources/sandbox/base.Dockerfile`, and
     * the tag consumers pin lives in `resources/scaffold/Dockerfile` as `ARG BASE_IMAGE`. Bump those
     * and this line together; leaving them apart is the #13 defect in miniature, a fact restated in
-    * more places than it is known, with no compiler and no test to notice the drift.
+    * more places than it is known, with no compiler to notice the drift. A test does: `InitSpec`'s
+    * "be measured against the JDK the base image actually ships" reads the `FROM` line of
+    * `resources/sandbox/base.Dockerfile` back and asserts this constant still agrees with it, so a
+    * bumped base image goes red there instead of shipping a scaffold that quotes a JDK the image no
+    * longer has. Do not delete that test; it is the only thing holding these copies together.
     */
   private val BaseImageJdk = "21"
 
