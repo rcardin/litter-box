@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 #
-# Live-follow the JSONL log a stream-json `claude -p` iteration writes (loop.sh dispatch).
+# Live-follow the JSONL log a stream-json `claude -p` iteration writes (the loop's agent dispatch).
 # Passive observability only — reads nothing back into the loop, just renders for a human.
 #
-# Usage:  harness/tail-claude.sh [logfile]
+# Usage:  litter-box tail [logfile]
 #         (no arg → follows the newest *.claude.log under the `log-dir` config default)
+#
+# Ships in the artifact and is unpacked to ~/.cache/litter-box/observe/<digest>; see watch.sh.
 #
 # Each line of the log is one stream-json event; this collapses them to one readable line:
 #   🗣  assistant prose      🔧 tool call + truncated input      ↳ tool result (truncated)

@@ -426,6 +426,63 @@ object Main:
             LiveLog.log(s"wrote ${r.relativize(dest)} — it now overrides the built-in")
             0
 
+  /** `litter-box watch` / `litter-box tail`: exec one of the shipped observability scripts against
+    * this repo.
+    *
+    * The whole subcommand exists because these scripts are invoked by a HUMAN (issue #15). The loop
+    * is happy to resolve `~/.cache/litter-box/observe/9d1badf60ba2/watch.sh`; nobody types a content
+    * digest that changes on every upgrade, so shipping them without a front door would ship them
+    * unreachable.
+    *
+    * Preflight is `jq` and nothing else. No config, no credential, no Docker, no `gh`: watching is
+    * passive, it reads a file the loop already wrote, and a run that has gone wrong is exactly when
+    * an operator needs this to start. `jq` is checked HERE rather than in the loop's own preflight
+    * for the same reason — the loop does not use it, and a missing jq must not stop a run.
+    *
+    * The child inherits stdio and this process waits on it, rather than the exec-and-replace bash
+    * would do, because a JVM cannot replace itself. The practical difference is signals, and there
+    * is none that matters: a `^C` at the terminal goes to the whole foreground process group, so
+    * `watch.sh`'s own INT trap still restores the terminal.
+    */
+  private def runObserve(tool: ObserveTool, target: Option[String]): Int =
+    val cwd = Paths.get("").toAbsolutePath
+    // Lazy so that a `watch` outside a git work tree fails on the repo, and writes nothing to the
+    // cache on the way to saying so.
+    lazy val extracted =
+      try Right(Observe.resolve())
+      catch
+        case NonFatal(e) => Left(s"could not unpack the observability scripts: ${e.getMessage}")
+
+    val prepared =
+      for
+        root <- resolveRepoRoot(() => LiveProc.run(cwd, Seq("git", "rev-parse", "--show-toplevel")))
+        _    <- Either.cond(
+                  onRealPath(sys.env.getOrElse("PATH", ""), "jq").isDefined,
+                  (),
+                  s"jq not found — `litter-box ${tool.subcommand}` renders the loop's JSON logs through it"
+                )
+        dir <- extracted
+      yield (root, dir)
+
+    prepared match
+      case Left(msg)          => LiveLog.log(s"FATAL: $msg"); 1
+      case Right((root, dir)) =>
+        // Made absolute against the CALLER's cwd, before the child is handed the repo root as its
+        // own: a relative path an operator typed means "relative to where I typed it", and the
+        // script is about to be run from somewhere else.
+        val args = target.map(t => cwd.resolve(t).toString).toList
+        val pb   = LiveProc.builder(dir.resolve(tool.script).toString :: args)
+        pb.directory(root.toFile)
+        // The repo's own log-dir, so a repo that moved it gets a watcher that follows. A repo with
+        // no readable config is not an error here — the scripts carry the reference default, and
+        // refusing to watch a run because the config went missing would be the wrong moment to
+        // insist on one.
+        Settings.loadFile(root).foreach { conf =>
+          pb.environment().put(Settings.LogDirEnvVar, Settings.parse(conf).logDir)
+        }
+        pb.inheritIO()
+        pb.start().waitFor()
+
   @main def litterBoxLoop(args: String*): Unit =
     Cli.parse(args.toList) match
       case Left(msg) =>
@@ -435,9 +492,10 @@ object Main:
       case Right(Command.Help) =>
         Console.out.println(Cli.Usage)
         sys.exit(0)
-      case Right(Command.Init(force))        => sys.exit(runInit(force))
-      case Right(Command.Eject(what, force)) => sys.exit(runEject(what, force))
-      case Right(Command.Loop(dryRun))       => runLoop(dryRun)
+      case Right(Command.Init(force))           => sys.exit(runInit(force))
+      case Right(Command.Eject(what, force))    => sys.exit(runEject(what, force))
+      case Right(Command.Observe(tool, target)) => sys.exit(runObserve(tool, target))
+      case Right(Command.Loop(dryRun))          => runLoop(dryRun)
 
   /** The loop, which is everything this file did before there were subcommands. */
   private def runLoop(dryRunFlag: Boolean): Unit =

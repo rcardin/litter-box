@@ -284,6 +284,18 @@ object Settings:
     */
   val RepoRootEnvVar = "LITTER_BOX_REPO_ROOT"
 
+  /** Env var carrying `log-dir` into the observability scripts (`watch.sh`, `tail-claude.sh`).
+    *
+    * They have to find the log directory of the repo they are pointed at, and they cannot read HOCON.
+    * `litter-box watch` stamps this from the repo's own `config.conf`, so an operator who moved
+    * `log-dir` gets a watcher that follows the move; the scripts keep their own fallback to the
+    * reference default for the case where they are invoked by hand with no loop around them.
+    *
+    * Not part of [[childEnv]], deliberately: nothing the LOOP forks reads it, and adding it there
+    * would put a value into the sandbox containers that no script inside them has a use for.
+    */
+  val LogDirEnvVar = "LITTER_BOX_LOG_DIR"
+
   /** The environment every child of the loop inherits. A function rather than a constant so the
     * call sites in `Main` stay honest about the entries being derived, not fixed.
     */

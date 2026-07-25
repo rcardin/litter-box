@@ -577,19 +577,20 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
   it should "guard every protected path class and let ordinary source paths through" in {
     def numstat(p: String) = s"1\t0\t$p"
     // This repo's OWN `.litter-box/config.conf` protect list, as globs. Before slice 2 the same
-    // eleven paths were a literal `startsWith`/`==` chain inside Machine; the point of keeping the
-    // case list identical here is that moving them into config must not have quietly changed which
-    // patches the guard rejects for the repo the loop actually runs on.
+    // paths were a literal `startsWith`/`==` chain inside Machine; the point of keeping the case
+    // list identical here is that moving them into config must not have quietly changed which
+    // patches the guard rejects for the repo the loop actually runs on. Issue #15 folded the former
+    // `lib/**`, `watch.sh` and `tail-claude.sh` entries into `resources/**` by moving the files
+    // there, so the class they stood for — the observability scripts — is still covered, by one
+    // entry instead of three.
     val protect = List(
       ".litter-box/**",
       ".github/**",
       "sandbox/**",
-      "lib/**",
+      "resources/**",
       "prompts/**",
       "docs/**",
       "project.scala",
-      "watch.sh",
-      "tail-claude.sh",
       "CONTEXT.md",
       "PROMPT.md",
       "STOP.md"
@@ -598,12 +599,12 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
       List(
         ".github/workflows/evil.yml",
         "sandbox/evil.sh",
-        "lib/evil.jar",
+        "resources/observe/watch.sh",
+        "resources/observe/lib/banner.sh",
+        "resources/sandbox/lib.sh",
         "prompts/evil.md",
         "docs/x.md",
         "project.scala",
-        "watch.sh",
-        "tail-claude.sh",
         "CONTEXT.md",
         "PROMPT.md",
         "STOP.md",

@@ -1,13 +1,18 @@
 #!/usr/bin/env bash
 #
-# Live view of a harness/loop.sh run: a pinned four-line phase banner over a log pane that
+# Live view of a litter-box run: a pinned four-line phase banner over a log pane that
 # follows whichever file the current phase is writing.
 #
 # Passive observability only: reads nothing back into the loop, never writes to the repo,
 # never invokes gh. Attach, kill and reattach at any point in a run; the loop cannot tell.
 #
-# Usage:  harness/watch.sh [status.jsonl]
+# Usage:  litter-box watch [status.jsonl]
 #         (no arg → <repo root>/.litter-box/logs/status.jsonl, the `log-dir` config default)
+#
+# This file SHIPS in the artifact and is unpacked to ~/.cache/litter-box/observe/<digest>
+# (src/Observe.scala), so `litter-box watch` is the supported way to reach it; nobody types a
+# content digest. Running it by path out of a checkout keeps working and is what the loop's own
+# developers do.
 #
 # The PARENT is the only writer to the terminal. The child `tail -f` writes into a FIFO and
 # the parent prints what it reads, so a banner redraw can never interleave with a log line

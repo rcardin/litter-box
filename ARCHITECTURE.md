@@ -54,15 +54,23 @@ read the credential off their own environment, never off the loop.
 
 ### What ships in the artifact vs what a consumer owns
 
-Both prompt skeletons and sandbox scripts are **protocol, not configuration**, so they live under
-`resources/` and travel inside the jar (`//> using resourceDir ./resources`):
+Prompt skeletons, sandbox scripts and the observability scripts are all **protocol, not
+configuration**, so they live under `resources/` and travel inside the jar
+(`//> using resourceDir ./resources`):
 
 - `src/Prompts.scala` — resolves `Template` skeletons from the classpath, with
   `.litter-box/prompts/<name>` overriding per file (written by `litter-box eject`).
-- `src/Sandbox.scala` — materialises `resources/sandbox/**` to `~/.cache/litter-box/sandbox/<digest>`,
-  keyed by content digest so an upgrade lands in a new directory with no cache-busting step.
-  `Sandbox.ShippedFiles` is an explicit list; `SandboxSpec` fails if `resources/sandbox/` gains a file
-  that is not in it.
+- `src/Shipped.scala` — one implementation of "get a tree of files out of the jar and onto disk
+  intact": materialises `resources/<tree>/**` to `~/.cache/litter-box/<tree>/<digest>`, keyed by
+  content digest so an upgrade lands in a new directory with no cache-busting step. Each tree is a
+  subclass naming its directory and its explicit `ShippedFiles` manifest; `test/ShippedSpec.scala`
+  runs the whole spec against every tree in `Trees` and fails if a `resources/<tree>/` directory
+  gains a file that is not in its manifest.
+- `src/Sandbox.scala` — the Docker sandbox tree, run by the loop.
+- `src/Observe.scala` — `watch.sh`, `tail-claude.sh` and their `lib/`, run by a human. Fronted by
+  `litter-box watch` / `litter-box tail` (`ObserveTool` in `Cli.scala`, `Main.runObserve`), because
+  nobody types a content digest. They ship rather than scaffold because `watch.sh` parses the
+  `status.jsonl` schema `LiveStatusLog` writes, so a consumer-side copy would rot silently.
 - `src/Init.scala` — `litter-box init` scaffolds six files from `resources/scaffold/` into
   `.litter-box/`. A consumer owns only `Dockerfile`, `allowlist`, `config.conf` and
   `prompts/conventions.md`.

@@ -14,7 +14,8 @@ for the design record.
 
 ## Status
 
-`litter-box init` and `litter-box eject` exist and work — see [Getting started](#getting-started).
+`litter-box init`, `litter-box eject`, `litter-box watch` and `litter-box tail` exist and work — see
+[Getting started](#getting-started) and [Watching a run](#watching-a-run).
 What is still missing is a published binary: there is no `brew install litter-box` yet, so for now
 you build one from a checkout. Tracked as [#6](https://github.com/rcardin/litter-box/issues/6).
 
@@ -195,12 +196,13 @@ every other state exits the process immediately. The loop runs at most `MAX_ITER
 
 ```bash
 scala-cli test .            # the test suite: no Docker, no gh, no credentials
-scala-cli run . -- --help   # usage: init, eject, --dry-run (same binary as `litter-box`)
+scala-cli run . -- --help   # usage: init, eject, watch, tail, --dry-run (same binary as `litter-box`)
 scala-cli run .             # the loop itself
 ```
 
 Environment variables still configure the loop — a flag beats the matching variable where both
-exist. See [Getting started](#getting-started) for `init`, `eject`, `--dry-run` and `--help`.
+exist. See [Getting started](#getting-started) for `init`, `eject`, `--dry-run` and `--help`, and
+[Watching a run](#watching-a-run) for `watch` and `tail`.
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -235,6 +237,28 @@ both of them deliberate:
 
 For which layer wins in general, see [Configuration](#configuration).
 
+`watch` and `tail` (below) need one more tool, `jq`, and nothing else: no credential, no Docker, no
+`gh`. It is checked when you run them rather than at loop startup, because the loop itself never
+calls jq and a missing one must not stop a run.
+
+### Watching a run
+
+```bash
+litter-box watch            # pinned phase banner over the log the current phase is writing
+litter-box tail             # follow the newest worker log, one readable line per stream-json event
+litter-box watch <status.jsonl>   # or point either at a specific file
+litter-box tail <logfile>
+```
+
+Both are passive: they read `status.jsonl` and the log files the run already writes, never write to
+the repo, never call `gh`, and the loop cannot tell whether anything is attached. Attach, kill and
+reattach at any point in a run. Run them from anywhere inside the repo you want to watch — the repo
+is found the same way the loop finds it, with `git rev-parse --show-toplevel`, and a relative path
+you pass is resolved against the directory you typed it in.
+
+`watch` reads your repo's `log-dir` out of `.litter-box/config.conf`, so a repo that moved its logs
+gets a watcher that follows.
+
 ### Issue labels
 
 `ready` → `in-progress` → `needs-review` or `needs-human`. `blocked` issues carry a
@@ -248,11 +272,9 @@ src/           the loop: Machine (state machine), Live (handlers), Caps, Domain,
 test/          the suite, plus golden/ — the frozen log-line contract
 resources/     shipped inside the artifact: prompts/ (built-in skeletons), scaffold/ (init's
                templates), sandbox/ (the Docker sandbox: base image, gate, agent and reviewer
-               runners, egress proxy)
+               runners, egress proxy), observe/ (watch.sh, tail-claude.sh and their lib/)
 docs/          reference docs, e.g. base-image.md
 sandbox/test/  Docker-dependent shell tests of resources/sandbox, run manually
-lib/           shell helpers for the watch UI
-watch.sh       live run monitor, reads the log stream and status.jsonl
 ```
 
 Prompt skeletons no longer live in a consumer repo's `prompts/` directory — they ship inside the
@@ -264,6 +286,11 @@ a consumer carrying a copy would carry one that rots the moment litter-box updat
 are unpacked to `~/.cache/litter-box/sandbox/<digest>`, keyed by the contents so an upgrade lands in
 a new directory on its own. A consumer owns exactly two files of the sandbox — `.litter-box/Dockerfile`
 (what the gate image is built from) and `.litter-box/allowlist` (what it may talk to).
+
+So do the observability scripts, under `~/.cache/litter-box/observe/<digest>`, and there the reason
+is sharper still: `watch.sh` PARSES `status.jsonl`, so a scaffolded copy would silently misread a
+renamed field in every repo that ever ran `init`. Nobody types a content digest, so they get a front
+door instead — see [Watching a run](#watching-a-run).
 
 `Machine` is a pure decision function over a `using` clause of capability traits (`Caps.scala`);
 `Live.scala` holds every real side effect. That is what lets the whole suite run in memory.

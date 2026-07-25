@@ -39,6 +39,36 @@ class CliSpec extends AnyFlatSpec with Matchers:
     result.isLeft shouldBe true
     result.left.toOption.get should include("eject needs the name of a prompt")
 
+  it should "accept watch and tail, with and without a path" in:
+    Cli.parse(List("watch")) shouldBe Right(Command.Observe(ObserveTool.Watch, None))
+    Cli.parse(List("watch", "logs/status.jsonl")) shouldBe
+      Right(Command.Observe(ObserveTool.Watch, Some("logs/status.jsonl")))
+    Cli.parse(List("tail")) shouldBe Right(Command.Observe(ObserveTool.Tail, None))
+    Cli.parse(List("tail", "logs/issue-5-iter1.claude.log")) shouldBe
+      Right(Command.Observe(ObserveTool.Tail, Some("logs/issue-5-iter1.claude.log")))
+
+  it should "reject a second argument to watch, blaming the extra one" in:
+    // Same rule as `init --force extra`: naming the first path sends the operator to inspect the
+    // argument they got right.
+    val result = Cli.parse(List("watch", "one.jsonl", "two.jsonl"))
+    result.isLeft shouldBe true
+    result.left.toOption.get should include("at most one argument")
+    result.left.toOption.get should include("two.jsonl")
+    result.left.toOption.get should not include "one.jsonl"
+
+  it should "reject a flag on watch rather than passing it through as a path" in:
+    // These subcommands take no flags at all, so a `--follow` an operator guessed at has to fail
+    // here saying so, instead of reaching bash as a filename that does not exist.
+    val result = Cli.parse(List("watch", "--follow"))
+    result.isLeft shouldBe true
+    result.left.toOption.get should include("takes no flags")
+    result.left.toOption.get should include("--follow")
+
+  it should "reject an empty path argument" in:
+    // Same hole `eject ""` had: an empty string does not start with "-", so a guard that only looks
+    // for a leading dash would pass it to the script as a path.
+    Cli.parse(List("tail", "")).isLeft shouldBe true
+
   it should "accept every spelling of help" in:
     Cli.parse(List("--help")) shouldBe Right(Command.Help)
     Cli.parse(List("-h")) shouldBe Right(Command.Help)
@@ -73,3 +103,4 @@ class CliSpec extends AnyFlatSpec with Matchers:
     Cli.Usage should include("init")
     Cli.Usage should include("eject")
     Cli.Usage should include("--dry-run")
+    ObserveTool.values.foreach(tool => Cli.Usage should include(tool.subcommand))
