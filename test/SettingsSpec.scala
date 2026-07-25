@@ -676,3 +676,67 @@ class SettingsSpec extends AnyFlatSpec with Matchers:
 
     dotEnvOf(root) shouldBe Map("CLAUDE_CODE_OAUTH_TOKEN" -> "sk-ant-oat-not-a-real-token")
   }
+
+  // ===============================================================================================
+  // 10. The gate.sandboxed migration warning (GitHub issue #17)
+  // ===============================================================================================
+
+  /** Writes a `.litter-box/config.conf` under a fresh root and returns the root. */
+  private def rootWithConfig(content: String): Path =
+    val root = tempRoot()
+    val file = root.resolve(Settings.ConfigPath)
+    Files.createDirectories(file.getParent)
+    Files.write(file, content.getBytes(StandardCharsets.UTF_8))
+    root
+
+  /** THE QUESTION `withFallback` CANNOT ANSWER, and the whole reason this reads the file again: the
+    * config `loadFile` returns has `gate.sandboxed` set either way, so it cannot tell a repo that
+    * asked for a sandboxed gate from one that inherited it by being written before the key existed.
+    * That inheritance is silent and it moves the gate off the host and into a container, which is
+    * the single most consequential thing about a gate run.
+    */
+  "Settings.omitsGateSandboxed" should "be true for a config written before the key existed" in {
+    val root = rootWithConfig(
+      """instance-name = "other"
+        |gate { fast = "sbt -Werror compile test", timeout = 900 }
+        |""".stripMargin
+    )
+
+    Settings.omitsGateSandboxed(root) shouldBe true
+    // And the value it inherits really is the container, so the warning is about a flip that
+    // happens rather than about one that might.
+    val merged = Settings.parse(Settings.loadFile(root).getOrElse(fail("expected a Right")))
+    merged.gateSandboxed shouldBe true
+  }
+
+  /** Both ways out of the warning, and they are the two the message names. Saying `true` has to
+    * silence it as surely as saying `false`: an operator who read the message and decided the
+    * container is what they want must not keep being told about a decision they have made.
+    */
+  it should "be false once the consumer says so, whichever answer they give" in {
+    Settings.omitsGateSandboxed(rootWithConfig("gate.sandboxed = false\n")) shouldBe false
+    Settings.omitsGateSandboxed(rootWithConfig("gate.sandboxed = true\n")) shouldBe false
+    // The block form the scaffold writes, not just the dotted one, since that is the shape a
+    // consumer editing `config.conf` by hand actually has in front of them.
+    val block = rootWithConfig("gate {\n  fast = \"true\"\n  sandboxed = false\n}\n")
+    Settings.omitsGateSandboxed(block) shouldBe false
+  }
+
+  /** A warning must never be the thing that reports a broken install: both of these are already a
+    * `Left` out of `loadFile` and an rc 50 out of `Main`, so answering "nothing to warn about" here
+    * leaves the real diagnostic as the only one the operator sees.
+    */
+  it should "be false when there is no readable config to have an opinion about" in {
+    Settings.omitsGateSandboxed(tempRoot()) shouldBe false
+    Settings.omitsGateSandboxed(rootWithConfig("gate { fast = \n")) shouldBe false
+  }
+
+  /** The message is the whole deliverable: a warning that does not say how to opt out is a warning
+    * that only tells an operator they have a problem.
+    */
+  "the gate.sandboxed warning" should "name the key, the file and both ways to answer it" in {
+    Settings.GateSandboxedWarning should include(Settings.ConfigPath)
+    Settings.GateSandboxedWarning should include("gate.sandboxed")
+    Settings.GateSandboxedWarning should include("sandboxed = false")
+    Settings.GateSandboxedWarning should include("sandboxed = true")
+  }

@@ -3,7 +3,7 @@ package in.rcard.litterbox
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 
-import java.nio.file.{Files, Path}
+import java.nio.file.Files
 
 /** Unit tests for the pure parts of `Main`: env parsing (Part C) and the driver's rc ->
   * process-exit-code map (Part B). Preflight (PATH scanning against the real host,
@@ -339,23 +339,55 @@ class MainSpec extends AnyFlatSpec with Matchers:
     fromNested shouldBe Right(top.toRealPath())
   }
 
-  it should "resolve this checkout's own root by really shelling out to git" in {
+  /** The real-subprocess half of the contract, over a work tree this test BUILDS rather than over
+    * the checkout it happens to be running in (#17).
+    *
+    * It used to branch on `Files.isDirectory(".git")` and assert the success contract only when one
+    * was there. That made the success path unreachable in the environment this project made
+    * canonical for its own gate: `run-fast-gate.sh` materialises the workspace with `git archive`,
+    * so there is no `.git` by construction (#9), and the branch quietly reported green while
+    * covering half of what it claimed. Building the work tree here removes the condition instead of
+    * testing around it, so both contracts below hold in every environment the suite runs in.
+    *
+    * `toRealPath` is required on macOS, where the temp dir lives under a `/var -> /private/var`
+    * symlink that git resolves and `createTempDirectory` does not.
+    */
+  it should "resolve a real work tree's root by really shelling out to git" in {
+    val top = Files.createTempDirectory("main-spec-real-git").toRealPath()
+    LiveProc.run(top, Seq("git", "init", "--quiet"))
+    Files.createDirectories(top.resolve(Settings.ConfigPath).getParent)
+    Files.writeString(top.resolve(Settings.ConfigPath), "instance-name = \"other\"\n")
+
+    val real =
+      Main.resolveRepoRoot(() => LiveProc.run(top, Seq("git", "rev-parse", "--show-toplevel")))
+
+    real shouldBe Right(top)
+    // The root is what every path downstream hangs off, so the assertion that matters is not that
+    // git answered but that the answer is the directory holding this repo's config.
+    real.map(r => Files.isRegularFile(r.resolve(Settings.ConfigPath))) shouldBe Right(true)
+  }
+
+  /** The failure contract against the same real subprocess, and the reason it is manufacturable
+    * after all: `GIT_CEILING_DIRECTORIES` stops git's walk up the tree at the temp directory's
+    * parent, so the answer cannot depend on whether the machine happens to keep its temp directory
+    * inside somebody's checkout. Without it this case would be a bet on the host's filesystem.
+    *
+    * The alternative — quietly falling back to the cwd — is a loop that writes logs, reads
+    * conventions and applies patches in whatever directory it was launched from.
+    */
+  it should "fail on a real directory that is inside no work tree" in {
+    val outside = Files.createTempDirectory("main-spec-no-git").toRealPath()
+
     val real = Main.resolveRepoRoot(() =>
       LiveProc.run(
-        java.nio.file.Paths.get("").toAbsolutePath,
-        Seq("git", "rev-parse", "--show-toplevel")
+        outside,
+        Seq("git", "rev-parse", "--show-toplevel"),
+        env = Map("GIT_CEILING_DIRECTORIES" -> outside.getParent.toString)
       )
     )
 
-    // Two environments, one real subprocess, an assertion for each. The sandboxed gate runs this
-    // suite against a `git archive` extraction with NO `.git` in it by construction (#9), so there
-    // the contract under test is the failure one: say so, rather than quietly falling back to the
-    // cwd and letting the loop write into whatever directory it was launched from.
-    if Files.isDirectory(Path.of(".git")) then
-      real.map(r =>
-        java.nio.file.Files.isRegularFile(r.resolve(Settings.ConfigPath))
-      ) shouldBe Right(true)
-    else real.isLeft shouldBe true
+    real.isLeft shouldBe true
+    real.swap.getOrElse("") should include("git rev-parse")
   }
 
   // ===============================================================================================
