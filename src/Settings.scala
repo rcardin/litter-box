@@ -59,7 +59,7 @@ object Settings:
       |log-dir       = ".litter-box/logs"
       |
       |gate {
-      |  fast      = "sbt -Werror compile test"
+      |  fast      = "false"
       |  sandboxed = true
       |  timeout   = 900
       |}
