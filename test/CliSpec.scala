@@ -39,6 +39,13 @@ class CliSpec extends AnyFlatSpec with Matchers:
     result.isLeft shouldBe true
     result.left.toOption.get should include("eject needs the name of a prompt")
 
+  it should "reject eject with a whitespace-only prompt name" in:
+    // Whitespace is not emptiness to `nonEmpty`, but it is to a filesystem: `eject "  "` would
+    // otherwise reach `Prompts.eject` as a name no built-in can match.
+    val result = Cli.parse(List("eject", "   "))
+    result.isLeft shouldBe true
+    result.left.toOption.get should include("eject needs the name of a prompt")
+
   it should "accept watch and tail, with and without a path" in:
     Cli.parse(List("watch")) shouldBe Right(Command.Observe(ObserveTool.Watch, None))
     Cli.parse(List("watch", "logs/status.jsonl")) shouldBe

@@ -72,7 +72,7 @@ object Cli:
     case Nil                                => Right(Command.Loop(dryRun = false))
     case ("--help" | "-h" | "help") :: Nil  => Right(Command.Help)
     case "init" :: rest                     => flagsOnly(rest, "--force").map(Command.Init.apply)
-    case "eject" :: what :: rest if what.nonEmpty && !what.startsWith("-") =>
+    case "eject" :: what :: rest if !what.isBlank && !what.startsWith("-") =>
       flagsOnly(rest, "--force").map(Command.Eject(what, _))
     case "eject" :: _ =>
       Left("eject needs the name of a prompt, e.g. `litter-box eject prompts/iterate-prompt.md`")
