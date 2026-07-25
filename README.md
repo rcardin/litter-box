@@ -39,7 +39,7 @@ then writes six files under `.litter-box/`:
 |---|---|
 | `config.conf` | the loop's only mandatory config — see [Configuration](#configuration) below |
 | `Dockerfile` | `FROM ghcr.io/rcardin/litter-box-base` plus your build tool layer — see [The sandbox image](#the-sandbox-image) |
-| `allowlist` | egress domains the sandbox proxy permits |
+| `allowlist` | egress hosts the sandbox proxy permits (see [The egress allowlist](#the-egress-allowlist)) |
 | `prompts/conventions.md` | the one file you own — spliced into every prompt as `{{CONVENTIONS}}` |
 | `.env.example` | the credential the sandboxed worker needs, and any other variable from [Running it](#running-it); meant to be copied to `.env`, never committed |
 | `.gitignore` | ignores `logs/` and `.env` inside `.litter-box/` |
@@ -252,6 +252,27 @@ a new directory on its own. A consumer owns exactly two files of the sandbox —
 
 `Machine` is a pure decision function over a `using` clause of capability traits (`Caps.scala`);
 `Live.scala` holds every real side effect. That is what lets the whole suite run in memory.
+
+### The egress allowlist
+
+`.litter-box/allowlist` is one host per line, matched against the CONNECT hostname; a line starting
+with `#` is a comment. `init` seeds it with the hosts a JVM build resolves artifacts from plus
+`api.anthropic.com`, and whatever is not named there is refused by the proxy with `403 Filtered`.
+The file replaces the copy that ships in the artifact rather than extending it, so an edit can
+narrow egress as well as widen it, and nothing at run time enforces that it stays a superset of the
+shipped list: add the hosts your build needs, keep the seeded ones, and expect a missing one to
+surface as a resolution failure inside the gate rather than as a network timeout.
+
+The list is baked into the proxy image rather than read at run time, deliberately: the copy in the
+image is what the proxy enforces from preflight to teardown, so the fence stays fixed for the whole
+of a run and a worker editing `.litter-box/allowlist` cannot move the fence it is running behind.
+An edit lands at the next image build instead, and the loop needs nothing from you to get there:
+preflight runs `build-image.sh` immediately before `start-proxy.sh`, and that build bakes whatever
+the file currently says into the proxy image. `start-proxy.sh` is what proves it took. It recreates
+the container from the current image and reads back the list in force, so the run proceeds only
+once the running proxy demonstrably enforces your file. A proxy found enforcing anything else, the
+case a `start-proxy.sh` invoked on its own has to cover, gets one rebuild under it; if the two
+still disagree after that, the run stops instead of gating against a fence nobody wrote.
 
 ### The log contract
 

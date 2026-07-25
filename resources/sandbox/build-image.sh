@@ -10,15 +10,10 @@ source "$SCRIPT_DIR/lib.sh"
   exit 1
 }
 
-# Staged build contexts, removed on any exit. One trap for all of them: a second `trap ... EXIT`
-# REPLACES the first rather than adding to it, so a per-context trap would leak every context but
-# the last one registered.
-staged_ctxs=()
-cleanup_staged_ctxs() {
-  [[ ${#staged_ctxs[@]} -gt 0 ]] && rm -rf "${staged_ctxs[@]}"
-  return 0
-}
-trap cleanup_staged_ctxs EXIT
+# Staged build contexts, removed on any exit. The array and its cleanup live in lib.sh because
+# start-proxy.sh stages one too (issue #14); the reason there is exactly one trap is documented
+# with them.
+trap sandbox_cleanup_staged_ctxs EXIT
 
 log "building $BASE_IMAGE ..."
 docker build -t "$BASE_IMAGE" -f "$SANDBOX_DIR/base.Dockerfile" "$SANDBOX_DIR"
@@ -53,7 +48,7 @@ GATE_DOCKERFILE="$REPO_ROOT/.litter-box/Dockerfile"
 # them to write. Everything in .litter-box stays reachable EXCEPT the two things that must not be
 # in an image — .env* (the credential and its template) and logs/ (run output, potentially large).
 gate_ctx="$(mktemp -d)"
-staged_ctxs+=("$gate_ctx")
+SANDBOX_STAGED_CTXS+=("$gate_ctx")
 (
   cd "$REPO_ROOT/.litter-box"
   find . -mindepth 1 -maxdepth 1 \
@@ -65,25 +60,10 @@ log "building $IMAGE from .litter-box/Dockerfile ..."
 docker build --build-arg "BASE_IMAGE=$BASE_IMAGE" -t "$IMAGE" \
   -f "$GATE_DOCKERFILE" "$gate_ctx"
 
-# The egress allowlist. `litter-box init` writes .litter-box/allowlist into the repo, so that is
-# the file an operator edits and it wins. The shipped proxy/allowlist is the fallback for a repo
-# that has never been scaffolded.
-#
-# The list is COPYed into the image (proxy/Dockerfile), not read at run time, so overriding it
-# means building from a staged context rather than pointing a flag at a path. mktemp -d, not an
-# in-place copy over the shipped proxy/allowlist: the sandbox tree is a content-addressed cache
-# directory (Sandbox.scala), so writing into it would make its contents disagree with the digest
-# that names it.
-proxy_ctx="$SANDBOX_DIR/proxy"
-if [[ -f "$REPO_ROOT/.litter-box/allowlist" ]]; then
-  proxy_ctx="$(mktemp -d)"
-  staged_ctxs+=("$proxy_ctx")
-  cp "$SANDBOX_DIR/proxy/Dockerfile" "$SANDBOX_DIR/proxy/tinyproxy.conf" "$proxy_ctx/"
-  cp "$REPO_ROOT/.litter-box/allowlist" "$proxy_ctx/allowlist"
-  log "using allowlist $REPO_ROOT/.litter-box/allowlist"
-fi
-
-log "building $PROXY_IMAGE ..."
-docker build -t "$PROXY_IMAGE" -f "$proxy_ctx/Dockerfile" "$proxy_ctx"
+# The egress allowlist, staged and baked by `build_proxy_image` (lib.sh). It moved there so that
+# start-proxy.sh can rebuild this one image on its own when it finds the running proxy enforcing a
+# different list (issue #14). Which file that is, and why it is baked rather than mounted, is
+# documented with it.
+build_proxy_image
 
 log "images built: $BASE_IMAGE, $IMAGE, $PROXY_IMAGE"

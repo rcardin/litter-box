@@ -41,6 +41,83 @@ log() { printf '[sandbox] %s\n' "$*" >&2; }
 # so REPO_ROOT is left empty and the scripts that do need one say so themselves.
 REPO_ROOT="${LITTER_BOX_REPO_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || true)}"
 
+# --- the egress allowlist: one derivation, two readers ----------------------------------------
+# `litter-box init` writes .litter-box/allowlist into the consumer's repo, so that is the file an
+# operator edits and it wins. The shipped proxy/allowlist is the fallback for a repo that has never
+# been scaffolded.
+#
+# The answer lives HERE rather than inline in build-image.sh, where it used to, because two scripts
+# need it and they must never disagree (issue #14): build-image.sh bakes that file into the proxy
+# image, and start-proxy.sh checks the list a running proxy is really enforcing against it. Two
+# independent derivations of "the allowlist" is exactly how the image and the file could drift with
+# nothing noticing.
+effective_allowlist() {
+  local scaffolded="$REPO_ROOT/.litter-box/allowlist"
+  if [[ -n "$REPO_ROOT" && -f "$scaffolded" ]]; then
+    printf '%s\n' "$scaffolded"
+  else
+    printf '%s\n' "$SANDBOX_DIR/proxy/allowlist"
+  fi
+}
+
+# Does the RUNNING proxy enforce the allowlist named by $1? Three callers ask it: start-proxy.sh
+# before its rebuild and again after it, and egress-policy-test.sh before it lets a single per-role
+# result mean anything. Three inline spellings of the comparison is exactly the drift these shared
+# helpers exist to prevent, so the question is answered once, here.
+#
+# Three answers, not two, because the two states behind "no" want opposite handling:
+#   0  the proxy enforces exactly that list
+#   1  it enforces a DIFFERENT list, which rebuilding the image under it fixes
+#   2  the list in force could not be read at all: no such container, a docker daemon hiccup, an
+#      exec the daemon refused
+#
+# Collapsing 2 into 1 was the bug (a swallowed `2>/dev/null || true` left an empty string that
+# compares unequal to every real allowlist). Callers that fail hard on "differs" would then abort a
+# run under a story about the fence being wrong when nothing is wrong with the fence, so a docker
+# fault says docker instead. Any nonzero still means "do not trust this proxy", so a caller that
+# only wants the yes/no can keep testing for zero.
+proxy_enforces() {
+  local allowlist="$1" in_force
+  in_force="$(docker exec "$PROXY_NAME" cat /etc/tinyproxy/allowlist 2>/dev/null)" || return 2
+  [[ "$in_force" == "$(cat "$allowlist")" ]]
+}
+
+# Staged build contexts, removed by the EXIT trap every script that builds an image installs. One
+# trap for all of them: a second `trap ... EXIT` REPLACES the first rather than adding to it, so a
+# per-context trap would leak every context but the last one registered.
+SANDBOX_STAGED_CTXS=()
+sandbox_cleanup_staged_ctxs() {
+  [[ ${#SANDBOX_STAGED_CTXS[@]} -gt 0 ]] && rm -rf "${SANDBOX_STAGED_CTXS[@]}"
+  return 0
+}
+
+# Builds the proxy image from whatever `effective_allowlist` names. Shared by build-image.sh, which
+# builds all three images, and by start-proxy.sh, which rebuilds this one alone when it catches the
+# running proxy enforcing something else.
+#
+# The list is COPYed into the image (proxy/Dockerfile) and not bind mounted at run time, which is
+# what makes a rebuild necessary at all. Deliberate: the baked copy is what the proxy enforces for
+# the whole of a run, so a worker that edits .litter-box/allowlist while it works does not move the
+# fence it is running behind. That edit lands at the next image build, not under the worker.
+#
+# mktemp -d, not an in-place copy over the shipped proxy/allowlist: the sandbox tree is a
+# content-addressed cache directory (Sandbox.scala), so writing into it would make its contents
+# disagree with the digest that names it.
+build_proxy_image() {
+  local allowlist ctx
+  allowlist="$(effective_allowlist)"
+  ctx="$SANDBOX_DIR/proxy"
+  if [[ "$allowlist" != "$ctx/allowlist" ]]; then
+    ctx="$(mktemp -d)"
+    SANDBOX_STAGED_CTXS+=("$ctx")
+    cp "$SANDBOX_DIR/proxy/Dockerfile" "$SANDBOX_DIR/proxy/tinyproxy.conf" "$ctx/"
+    cp "$allowlist" "$ctx/allowlist"
+    log "using allowlist $allowlist"
+  fi
+  log "building $PROXY_IMAGE ..."
+  docker build -t "$PROXY_IMAGE" -f "$ctx/Dockerfile" "$ctx"
+}
+
 # --- shared preflight + wait-rc guard (extracted from the three runners) -----------------------
 # CONTRACT: both helpers below call `infra_fault "<msg>"` on failure. infra_fault is deliberately
 # NOT defined here — each runner defines it with its own role tag ([run-agent] / [run-fast-gate] /
