@@ -576,7 +576,8 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
 
   it should "guard every protected path class and let ordinary source paths through" in {
     def numstat(p: String) = s"1\t0\t$p"
-    // This repo's OWN `.litter-box/config.conf` protect list, as globs. Before slice 2 the same
+    // This repo's OWN `.litter-box/config.conf` protect list, as globs, plus the `CONTEXT.md` that
+    // `Settings.protectFloor` unions in underneath every load. Before slice 2 the same
     // paths were a literal `startsWith`/`==` chain inside Machine; the point of keeping the case
     // list identical here is that moving them into config must not have quietly changed which
     // patches the guard rejects for the repo the loop actually runs on. Issue #15 folded the former
@@ -588,11 +589,9 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
       ".github/**",
       "sandbox/**",
       "resources/**",
-      "prompts/**",
       "docs/**",
       "project.scala",
       "CONTEXT.md",
-      "PROMPT.md",
       "STOP.md"
     )
     val protectedPaths =
@@ -602,11 +601,9 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
         "resources/observe/watch.sh",
         "resources/observe/lib/banner.sh",
         "resources/sandbox/lib.sh",
-        "prompts/evil.md",
         "docs/x.md",
         "project.scala",
         "CONTEXT.md",
-        "PROMPT.md",
         "STOP.md",
         ".litter-box/config.conf" // the guard list now protects the file that defines it
       )

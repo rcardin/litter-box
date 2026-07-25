@@ -67,7 +67,16 @@ class CliSpec extends AnyFlatSpec with Matchers:
   it should "reject an empty path argument" in:
     // Same hole `eject ""` had: an empty string does not start with "-", so a guard that only looks
     // for a leading dash would pass it to the script as a path.
-    Cli.parse(List("tail", "")).isLeft shouldBe true
+    val result = Cli.parse(List("tail", ""))
+    result.isLeft shouldBe true
+    // An empty argument is not a flag, so it must not be diagnosed as one: the flag message would
+    // quote the offender back, and here there is nothing to quote.
+    result.left.toOption.get shouldBe "tail was given an empty logfile path"
+
+  it should "reject a whitespace-only path argument the same way" in:
+    val result = Cli.parse(List("watch", "   "))
+    result.isLeft shouldBe true
+    result.left.toOption.get shouldBe "watch was given an empty status.jsonl path"
 
   it should "accept every spelling of help" in:
     Cli.parse(List("--help")) shouldBe Right(Command.Help)

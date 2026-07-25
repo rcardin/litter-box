@@ -31,7 +31,7 @@ enum Command:
   * `subcommand` is deliberately not the script's basename: `litter-box tail-claude` would spell the
   * implementation into the CLI grammar, and the grammar is the part that cannot change later.
   */
-enum ObserveTool(val subcommand: String, val script: String, val takes: String):
+enum ObserveTool(val subcommand: String, val script: String, val argName: String):
   case Watch extends ObserveTool("watch", "watch.sh", "status.jsonl")
   case Tail  extends ObserveTool("tail", "tail-claude.sh", "logfile")
 
@@ -101,22 +101,19 @@ object Cli:
     * treat it as a filename: these subcommands take no flags at all, so a `--follow` an operator
     * guessed at must fail here saying so, not reach bash as a path that does not exist.
     *
-    * The two rejections are separate messages because they are separate mistakes, and each names the
+    * The rejections are separate messages because they are separate mistakes, and each names the
     * token that is actually the problem — the same rule `flagsOnly` follows, for the same reason:
     * `watch a.jsonl b.jsonl` blaming `a.jsonl` sends the operator to inspect the argument they got
-    * right.
+    * right. A blank argument gets its own message rather than the flag one: it is not a flag, and
+    * quoting it back would name nothing at all.
     */
   private def optionalPath(rest: List[String], tool: ObserveTool): Either[String, Option[String]] =
-    def isPath(arg: String): Boolean = arg.nonEmpty && !arg.startsWith("-")
     rest match
       case Nil => Right(None)
-      case first :: extras =>
-        if !isPath(first) then
-          Left(s"${tool.subcommand} takes no flags, only an optional ${tool.takes} path: $first")
-        else
-          extras.headOption match
-            case None => Right(Some(first))
-            case Some(extra) =>
-              Left(
-                s"${tool.subcommand} takes at most one argument, a ${tool.takes} path: $extra"
-              )
+      case first :: _ if first.isBlank =>
+        Left(s"${tool.subcommand} was given an empty ${tool.argName} path")
+      case first :: _ if first.startsWith("-") =>
+        Left(s"${tool.subcommand} takes no flags, only an optional ${tool.argName} path: $first")
+      case path :: Nil => Right(Some(path))
+      case _ :: extra :: _ =>
+        Left(s"${tool.subcommand} takes at most one argument, a ${tool.argName} path: $extra")

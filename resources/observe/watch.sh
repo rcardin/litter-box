@@ -29,11 +29,18 @@ cd "$REPO_ROOT"     # `logfile` fields are repo-relative
 # The loop's `log-dir` config key. LITTER_BOX_LOG_DIR overrides it for a repo that changed it;
 # the fallback is the reference default (src/Settings.scala).
 LOG_DIR="${LITTER_BOX_LOG_DIR:-.litter-box/logs}"
+# Resolved the way the loop resolves it (`root.resolve(cfg.logDir)` in Main.runLoop): an absolute
+# value stands on its own, a relative one hangs off the repo root. Both the stamped config value
+# and a LITTER_BOX_LOG_DIR an operator exported by hand arrive here, and either may be absolute.
+case "$LOG_DIR" in
+  /*) LOG_PATH="$LOG_DIR" ;;
+  *)  LOG_PATH="$REPO_ROOT/$LOG_DIR" ;;
+esac
 
 # shellcheck source=lib/banner.sh
 . "$SCRIPT_DIR/lib/banner.sh"
 
-STATUS="${1:-$REPO_ROOT/$LOG_DIR/status.jsonl}"
+STATUS="${1:-$LOG_PATH/status.jsonl}"
 FILTER="$SCRIPT_DIR/lib/claude-fmt.jq"
 command -v jq >/dev/null || { echo "jq not found" >&2; exit 1; }
 [[ -f "$FILTER" ]] || { echo "missing filter: $FILTER" >&2; exit 1; }

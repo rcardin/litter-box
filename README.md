@@ -219,10 +219,11 @@ exist. See [Getting started](#getting-started) for `init`, `eject`, `--dry-run` 
 `IMPL_CMD`, `FIX_CMD`, `REVIEW_CMD`, `NOTIFY_CMD`, `CI_WAIT_CMD`, `CI_APPEAR_CMD` and `MERGE_CMD`
 are test seams: each replaces one subprocess so the loop can be driven without Docker or GitHub.
 
-Preflight requires `gh` and `claude` on `PATH`, plus whatever tool the first word of your gate
-command names (that probe is skipped when the gate runs sandboxed, because the tool lives in the
-image rather than on the host), and either `CLAUDE_CODE_OAUTH_TOKEN` or
-`ANTHROPIC_API_KEY` for the sandboxed worker, exported or written in `.litter-box/.env`. That file is
+Preflight requires `gh` and `claude` on `PATH` (but not `jq`, which only `watch` and `tail` need and
+which the loop never calls), plus whatever tool the first word of your gate command names (that
+probe is skipped when the gate runs sandboxed, because the tool lives in the image rather than on
+the host), and either `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY` for the sandboxed worker,
+exported or written in `.litter-box/.env`. That file is
 not credentials-only: any variable in the table above can live in it, and it reaches the credential
 check, the config layering and the seams by the same door an export does. Two things it cannot do,
 both of them deliberate:
@@ -237,9 +238,8 @@ both of them deliberate:
 
 For which layer wins in general, see [Configuration](#configuration).
 
-`watch` and `tail` (below) need one more tool, `jq`, and nothing else: no credential, no Docker, no
-`gh`. It is checked when you run them rather than at loop startup, because the loop itself never
-calls jq and a missing one must not stop a run.
+`watch` and `tail` (below) need `jq` and nothing else: no credential, no Docker, no `gh`. It is
+checked when you run them rather than at loop startup, so a missing `jq` never stops a run.
 
 ### Watching a run
 
@@ -274,7 +274,7 @@ resources/     shipped inside the artifact: prompts/ (built-in skeletons), scaff
                templates), sandbox/ (the Docker sandbox: base image, gate, agent and reviewer
                runners, egress proxy), observe/ (watch.sh, tail-claude.sh and their lib/)
 docs/          reference docs, e.g. base-image.md
-sandbox/test/  Docker-dependent shell tests of resources/sandbox, run manually
+sandbox/test/  shell tests of resources/sandbox (needs Docker) and resources/observe, run manually
 ```
 
 Prompt skeletons no longer live in a consumer repo's `prompts/` directory — they ship inside the
