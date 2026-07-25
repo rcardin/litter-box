@@ -479,6 +479,15 @@ object Main:
       parsed0.cfg.copy(dryRun = applyDryRunFlag(dryRunFlag, env))
     )
 
+    // 2a. `gate.sandboxed` defaults to true, so a repo whose config predates the key starts running
+    // its gate in a container the first time the operator upgrades the binary. Warn rather than
+    // fail: the inherited value is the SAFER of the two, and refusing to start over a key nobody
+    // was ever asked for would break every upgrade. Asked of the run's EFFECTIVE answer as well as
+    // of the file, because a `GATE_CMD` export has already forced the sandbox back off (`parseEnv`)
+    // and there would be nothing to warn about.
+    if parsed.cfg.gateSandboxed && Settings.omitsGateSandboxed(root) then
+      LiveLog.log(s"WARNING: ${Settings.GateSandboxedWarning}")
+
     // 2b. instance-name and the repo root reach the sandbox scripts as env vars on every child (see
     // LiveProc.export), and so do the `.litter-box/.env` entries this JVM's own environment does not
     // carry — the sandboxed worker, fixer, reviewer and gate read the credential off THEIR OWN

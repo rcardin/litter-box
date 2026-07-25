@@ -128,6 +128,12 @@ budgets  { repair = 2, max-patch-bytes = 1000000 }
 timeouts { iter = 1800, ci-wait = 900, ci-appear = 300, ci-appear-interval = 10 }
 ```
 
+`gate.sandboxed` defaults to `true`, so a `config.conf` written before the key existed inherits the
+container without ever asking for it, and a `gate.fast` written for the host stops running on the
+host the moment the binary is upgraded. A config that leaves the key unsaid therefore gets a
+`WARNING` at startup naming both ways to answer it; writing `sandboxed = true` is as good an answer
+as `sandboxed = false` and silences it just the same.
+
 `instance-name` earns its place even though litter-box never runs two instances at once:
 `start-proxy.sh` does `docker rm -f "$PROXY_NAME"` at startup, before any issue label is
 read, so with machine-global names a mistaken second launch kills the running instance's proxy

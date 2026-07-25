@@ -112,6 +112,16 @@ class InitSpec extends AnyFlatSpec with Matchers:
     cfg.conventions shouldBe ".litter-box/prompts/conventions.md"
     cfg.gateCmd shouldBe "false"
 
+  /** A scaffolded repo must never be in the state the `gate.sandboxed` migration warning is about
+    * (#17): the warning exists for configs written before the key, and `init` writes it explicitly.
+    * This is what notices if someone ever trims the scaffold to "the default is fine", which would
+    * hand every freshly scaffolded repo a warning about a decision `init` made for it.
+    */
+  it should "say gate.sandboxed out loud, so the migration warning never fires on a fresh scaffold" in:
+    val root = tempRoot()
+    Init.run(root, sbtRepo, force = false)
+    Settings.omitsGateSandboxed(root) shouldBe false
+
   it should "point conventions at a file it actually wrote" in:
     val root = tempRoot()
     Init.run(root, sbtRepo, force = false)

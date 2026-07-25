@@ -100,6 +100,52 @@ object Settings:
     */
   private[litterbox] def referenceOnly: TsConfig = reference
 
+  // ---- gate.sandboxed: the one default whose flip an existing repo has to be told about ---------
+
+  /** The one key two functions have to agree about: [[parse]] reads its VALUE off the merged config,
+    * [[omitsGateSandboxed]] asks whether the consumer's own file MENTIONS it. A rename that reached
+    * only one of them would leave the warning firing on every repo, or on none.
+    */
+  private val GateSandboxedKey = "gate.sandboxed"
+
+  /** What an operator whose `config.conf` predates [[GateSandboxedKey]] is told at startup.
+    *
+    * Where the gate lands, host or container, is the single most consequential thing about a gate
+    * run: a `gate.fast` written for the host (`sbt -Werror compile test`, say) suddenly executes
+    * against an image's PATH, with no credentials, no `.git` and a read-only copy of the staged
+    * tree. That is a behaviour change an upgrade must never make in silence, and a config written
+    * before the key existed inherits it purely by falling back to [[Reference]]. So the loop says
+    * so, once per run, and names both ways to stop being asked.
+    */
+  val GateSandboxedWarning: String =
+    s"$ConfigPath does not set gate.sandboxed, so it takes the default `true`: `gate.fast` runs " +
+      "INSIDE the sandbox container built from .litter-box/Dockerfile, against that image's PATH, " +
+      "not on this host. A config written before litter-box had the key ran its gate on the host. " +
+      "Write `sandboxed = false` in the `gate` block to keep that, or `sandboxed = true` to say " +
+      "the container is what you want and silence this."
+
+  /** Whether the CONSUMER's own `config.conf` leaves `gate.sandboxed` unsaid.
+    *
+    * Asked of the raw file, which means parsing it a second time after [[loadFile]] already did:
+    * the merged config `loadFile` returns has the key present by construction (that is what
+    * `withFallback` is for), so it cannot tell an operator who chose the container from one who
+    * inherited it. Re-reading one small file once per run is the cheap half of that trade, and it
+    * keeps `loadFile` returning the merged config every caller actually wants.
+    *
+    * FALSE on anything that is not a readable file with a parseable answer, `config.conf` missing
+    * included: the only caller is a warning, and [[loadFile]] has already turned both of those into
+    * the rc 50 that stops the run. A warning must never be the thing that reports them.
+    */
+  def omitsGateSandboxed(root: Path): Boolean =
+    val file = root.resolve(ConfigPath)
+    Files.isRegularFile(file) && {
+      try
+        !ConfigFactory
+          .parseFile(file.toFile, ConfigParseOptions.defaults().setAllowMissing(false))
+          .hasPath(GateSandboxedKey)
+      catch case _: ConfigException => false
+    }
+
   // ---- .litter-box/.env ------------------------------------------------------------------------
 
   /** The credential file `litter-box init` scaffolds an example of and tells the operator to fill
@@ -257,7 +303,7 @@ object Settings:
       stopFile = conf.getString("stop-file"),
       logDir = conf.getString("log-dir"),
       gateCmd = conf.getString("gate.fast"),
-      gateSandboxed = conf.getBoolean("gate.sandboxed"),
+      gateSandboxed = conf.getBoolean(GateSandboxedKey),
       gateTimeout = conf.getInt("gate.timeout"),
       labels = Labels(
         ready = conf.getString("issues.labels.ready"),
