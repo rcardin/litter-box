@@ -211,6 +211,11 @@ class ShippedSpec extends AnyFlatSpec with Matchers:
     val dir = Files.createTempDirectory("shipped-spec")
     Observe.extract(dir)
 
+    assume(
+      Main.findOnPath(sys.env.getOrElse("PATH", ""), "jq", p => Files.isExecutable(Path.of(p))).isDefined,
+      "jq not found on PATH (required for banner rendering)"
+    )
+
     val script = s"""set -eu
                     |. "$$1/lib/banner.sh"
                     |render_banner "$$1/does-not-exist.jsonl" 1 1000
