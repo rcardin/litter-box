@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Characterises lib/claude-fmt.jq against a fixed stream-json fixture.
+# Characterises resources/observe/lib/claude-fmt.jq against a fixed stream-json fixture.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-FILTER="$REPO_ROOT/lib/claude-fmt.jq"
+FILTER="$REPO_ROOT/resources/observe/lib/claude-fmt.jq"
 
 pass=0; fail=0
 check() { # check DESC EXPECTED ACTUAL

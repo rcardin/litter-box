@@ -18,7 +18,8 @@ add a `build.sbt`.
 ```bash
 scala-cli test .                              # the whole suite: no Docker, no gh, no credentials
 scala-cli test . --test-only 'in.rcard.litterbox.CliSpec'   # one suite (glob over FQCN)
-scala-cli run . -- --help                     # usage: init, eject, --dry-run
+scala-cli run . -- --help                     # usage: init, eject, watch, tail, --dry-run
+scala-cli run . -- watch                      # live view of a run in this repo (needs jq)
 scala-cli run .                               # the loop itself
 scala-cli --power package . -o lb --assembly  # build the `lb` fat jar
 

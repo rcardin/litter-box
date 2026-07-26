@@ -710,8 +710,8 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
     * command substitution keeps whatever reached stdout no matter how the command exited. If the
     * port dropped stdout on a nonzero rc, rows git DID emit would vanish and
     * `Machine.touchesProtected` — the guard whose job is to block writes to `.github/`, `sandbox/`,
-    * `lib/`, `prompts/`, `docs/`, project.scala, watch.sh, tail-claude.sh, CONTEXT.md, PROMPT.md,
-    * STOP.md — would see an empty file list and wave the patch
+    * `resources/` (the prompts, the sandbox scripts and the observability scripts), `docs/`,
+    * project.scala, CONTEXT.md, PROMPT.md, STOP.md — would see an empty file list and wave the patch
     * through: failing open WIDER than bash, in the one guard where that matters most.
     *
     * Real git 2.50.1 parses a patch in full before emitting any numstat row, so no natural patch we

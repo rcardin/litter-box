@@ -3,7 +3,7 @@ package in.rcard.litterbox
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 
-import java.nio.file.Files
+import java.nio.file.{Files, Path, Paths}
 
 /** Unit tests for the pure parts of `Main`: env parsing (Part C) and the driver's rc ->
   * process-exit-code map (Part B). Preflight (PATH scanning against the real host,
@@ -484,4 +484,136 @@ class MainSpec extends AnyFlatSpec with Matchers:
 
     layered.effective shouldBe Map("PATH" -> "/usr/bin")
     layered.forChildren shouldBe Map.empty
+  }
+
+  // ===============================================================================================
+  // observeChild: what `litter-box watch` / `litter-box tail` is about to run (GitHub issue #15)
+  // ===============================================================================================
+
+  /** A repo the observe subcommands can be pointed at. `toRealPath` for the same macOS reason the
+    * git cases above give, so an assertion comparing a path this test built against one the function
+    * returned cannot fail on `/var` vs `/private/var` alone.
+    */
+  private def observeRoot(config: String): Path =
+    val root = Files.createTempDirectory("main-spec-observe").toRealPath()
+    val file = root.resolve(Settings.ConfigPath)
+    Files.createDirectories(file.getParent)
+    Files.writeString(file, config)
+    root
+
+  /** Stands in for the content-addressed cache the scripts are unpacked into. A real directory
+    * rather than an invented string, so the argv the child gets is built the way production builds
+    * it and the assertions stay about the decisions rather than about path syntax.
+    */
+  private def observeScripts(): Path = Files.createTempDirectory("main-spec-observe-scripts")
+
+  private val ObserveConfig =
+    """instance-name = "other"
+      |log-dir       = "moved/logs"
+      |""".stripMargin
+
+  /** The precedence the scripts themselves document (`${LITTER_BOX_LOG_DIR:-...}`), pinned on the
+    * side that a repo's own config could silently take back. An operator who exported the variable
+    * is pointing the watcher at a copied log directory on purpose.
+    */
+  "observeChild" should "let an exported LITTER_BOX_LOG_DIR beat the repo's log-dir" in {
+    val child = Main.observeChild(
+      root = observeRoot(ObserveConfig),
+      callerCwd = Paths.get("").toAbsolutePath,
+      scriptDir = observeScripts(),
+      inherited = Map(Settings.LogDirEnvVar -> "/copied/logs"),
+      tool = ObserveTool.Watch,
+      target = None
+    )
+
+    // Nothing stamped at all, rather than the exported value stamped back over itself: the child
+    // inherits it already, so anything here would be the config winning.
+    child.env shouldBe Map.empty
+  }
+
+  it should "stamp the repo's own log-dir when the environment leaves the variable unset" in {
+    val root    = observeRoot(ObserveConfig)
+    val scripts = observeScripts()
+
+    def envFor(inherited: Map[String, String]) =
+      Main
+        .observeChild(root, Paths.get("").toAbsolutePath, scripts, inherited, ObserveTool.Watch, None)
+        .env
+
+    // A repo that moved its log-dir has to get a watcher that follows it there.
+    envFor(Map.empty) shouldBe Map(Settings.LogDirEnvVar -> "moved/logs")
+    // Empty-is-absent, the rule `parseEnv` and `layerDotEnv` already apply to every value they read,
+    // and the shape a CI `env:` block built from an unset variable really produces.
+    envFor(Map(Settings.LogDirEnvVar -> "")) shouldBe Map(Settings.LogDirEnvVar -> "moved/logs")
+  }
+
+  it should "stamp nothing when neither the environment nor a readable config answers" in {
+    // No `.litter-box/config.conf` at all. Watching is passive and a run that has gone wrong is
+    // exactly when an operator needs this to start, so the variable is left alone and the scripts
+    // fall back to the default they carry themselves.
+    val root = Files.createTempDirectory("main-spec-observe-bare").toRealPath()
+
+    val child =
+      Main.observeChild(root, root, observeScripts(), Map.empty, ObserveTool.Tail, None)
+
+    child.env shouldBe Map.empty
+    child.cwd shouldBe root
+  }
+
+  it should "make a relative target absolute against the caller's cwd" in {
+    val root    = observeRoot(ObserveConfig)
+    val scripts = observeScripts()
+    val caller  = Files.createDirectories(root.resolve("modules/core"))
+
+    val child = Main.observeChild(
+      root,
+      callerCwd = caller,
+      scriptDir = scripts,
+      inherited = Map.empty,
+      tool = ObserveTool.Tail,
+      target = Some("logs/iter-3.log")
+    )
+
+    child.command shouldBe List(
+      scripts.resolve("tail-claude.sh").toString,
+      caller.resolve("logs/iter-3.log").toString
+    )
+    // And the reason the argument cannot stay relative: the child is run from the repo root, which
+    // is not where the operator typed the path.
+    child.cwd shouldBe root
+  }
+
+  it should "pass an absolute target through untouched" in {
+    val scripts = observeScripts()
+
+    val child = Main.observeChild(
+      observeRoot(ObserveConfig),
+      callerCwd = Files.createTempDirectory("main-spec-observe-caller"),
+      scriptDir = scripts,
+      inherited = Map.empty,
+      tool = ObserveTool.Watch,
+      target = Some("/var/tmp/copied/status.jsonl")
+    )
+
+    child.command shouldBe List(
+      scripts.resolve("watch.sh").toString,
+      "/var/tmp/copied/status.jsonl"
+    )
+  }
+
+  it should "hand the script no argument when the operator named no target" in {
+    val scripts = observeScripts()
+
+    val child = Main.observeChild(
+      observeRoot(ObserveConfig),
+      Paths.get("").toAbsolutePath,
+      scripts,
+      Map.empty,
+      ObserveTool.Watch,
+      target = None
+    )
+
+    // An empty string argument is not the same thing as no argument: the scripts default the path
+    // themselves, and only an absent one lets them.
+    child.command shouldBe List(scripts.resolve("watch.sh").toString)
   }

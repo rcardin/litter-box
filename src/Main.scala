@@ -299,6 +299,15 @@ object Main:
       )
     else Right(Path.of(out).toAbsolutePath.normalize)
 
+  /** The one place the seam above is tied to the live world: the real `git` subprocess, run from the
+    * process's own CWD. Every entry point asks the same question of the same directory, so binding
+    * it once keeps `resolveRepoRoot` injectable for the tests while leaving the callers with nothing
+    * to get subtly different from each other.
+    */
+  private def liveRepoRoot(): Either[String, Path] =
+    val cwd = Paths.get("").toAbsolutePath
+    resolveRepoRoot(() => LiveProc.run(cwd, Seq("git", "rev-parse", "--show-toplevel")))
+
   /** The exact bash log line for one iteration's outcome (loop.sh:932-941), copied byte-for-byte
     * including loop.sh's em-dash separator character. rc 50's notify already fires inside
     * `Machine.runOnce` (Machine.scala:69); this function only logs, it never notifies a second time.
@@ -399,9 +408,7 @@ object Main:
     * on Docker or a credential to write six files.
     */
   private def runInit(force: Boolean): Int =
-    val cwd  = Paths.get("").toAbsolutePath
-    val root = resolveRepoRoot(() => LiveProc.run(cwd, Seq("git", "rev-parse", "--show-toplevel")))
-    root match
+    liveRepoRoot() match
       case Left(msg) => LiveLog.log(s"FATAL: $msg"); 1
       case Right(r)  =>
         val detected = Init.detect(r, args => LiveProc.run(r, args))
@@ -416,8 +423,7 @@ object Main:
 
   /** `litter-box eject <prompt>`. Same reasoning as `runInit` for skipping preflight. */
   private def runEject(what: String, force: Boolean): Int =
-    val cwd  = Paths.get("").toAbsolutePath
-    resolveRepoRoot(() => LiveProc.run(cwd, Seq("git", "rev-parse", "--show-toplevel"))) match
+    liveRepoRoot() match
       case Left(msg) => LiveLog.log(s"FATAL: $msg"); 1
       case Right(r)  =>
         Prompts.eject(r, what, force) match
@@ -425,6 +431,107 @@ object Main:
           case Right(dest) =>
             LiveLog.log(s"wrote ${r.relativize(dest)} — it now overrides the built-in")
             0
+
+  /** The child one of the shipped observability scripts is: its argv, the directory to run it from,
+    * and the variables that have to be stamped on top of the ones it inherits.
+    */
+  private[litterbox] final case class ObserveChild(
+      command: List[String],
+      cwd: Path,
+      env: Map[String, String]
+  )
+
+  /** WHAT `litter-box watch` / `litter-box tail` runs, decided apart from running it.
+    *
+    * Same visibility idiom as `resolveRepoRoot`, and for the same reason: both deciding branches
+    * below are invisible from outside a child that has already been launched with inherited stdio,
+    * so leaving them inside the live wrapper would leave them untestable. The wrapper keeps only the
+    * part that genuinely needs the live world: resolving jq, resolving the repo, unpacking the tree.
+    *
+    * The target is made absolute against the CALLER's cwd rather than left alone, because the child
+    * is about to be run from the repo root instead: a relative path an operator typed means
+    * "relative to where I typed it".
+    *
+    * Log-dir precedence, as the scripts themselves document it (`${LITTER_BOX_LOG_DIR:-...}` in
+    * watch.sh): an exported LITTER_BOX_LOG_DIR first, then the repo's own log-dir so a repo that
+    * moved it gets a watcher that follows, then the reference default the scripts carry. So the
+    * config value is stamped only when the inherited environment left the variable unset or empty
+    * (empty-is-absent, the same rule `parseEnv` and `layerDotEnv` already apply to every value they
+    * read), because an operator pointing this at a copied log directory is being deliberate and the
+    * config must not silently take it back. A repo with no readable config stamps nothing rather
+    * than failing: refusing to watch a run because the config went missing would be the wrong moment
+    * to insist on one.
+    */
+  private[litterbox] def observeChild(
+      root: Path,
+      callerCwd: Path,
+      scriptDir: Path,
+      inherited: Map[String, String],
+      tool: ObserveTool,
+      target: Option[String]
+  ): ObserveChild =
+    val logDir =
+      if inherited.get(Settings.LogDirEnvVar).exists(_.nonEmpty) then None
+      else Settings.loadFile(root).toOption.map(conf => Settings.parse(conf).logDir)
+    ObserveChild(
+      command = scriptDir.resolve(tool.script).toString :: target
+        .map(t => callerCwd.resolve(t).toString)
+        .toList,
+      cwd = root,
+      env = logDir.map(Settings.LogDirEnvVar -> _).toMap
+    )
+
+  /** `litter-box watch` / `litter-box tail`: exec one of the shipped observability scripts against
+    * this repo.
+    *
+    * The whole subcommand exists because these scripts are invoked by a HUMAN (issue #15). The loop
+    * is happy to resolve `~/.cache/litter-box/observe/9d1badf60ba2/watch.sh`; nobody types a content
+    * digest that changes on every upgrade, so shipping them without a front door would ship them
+    * unreachable.
+    *
+    * Preflight is `jq` and nothing else. No config, no credential, no Docker, no `gh`: watching is
+    * passive, it reads a file the loop already wrote, and a run that has gone wrong is exactly when
+    * an operator needs this to start. `jq` is checked HERE rather than in the loop's own preflight
+    * for the same reason — the loop does not use it, and a missing jq must not stop a run.
+    *
+    * The child inherits stdio and this process waits on it, rather than the exec-and-replace bash
+    * would do, because a JVM cannot replace itself. The practical difference is signals, and there
+    * is none that matters: a `^C` at the terminal goes to the whole foreground process group, so
+    * `watch.sh`'s own INT trap still restores the terminal.
+    */
+  private def runObserve(tool: ObserveTool, target: Option[String]): Int =
+    val cwd = Paths.get("").toAbsolutePath
+    // Lazy so that a `watch` outside a git work tree fails on the repo, and writes nothing to the
+    // cache on the way to saying so.
+    lazy val extracted =
+      try Right(Observe.resolve())
+      catch
+        case NonFatal(e) => Left(s"could not unpack the observability scripts: ${e.getMessage}")
+
+    val prepared =
+      for
+        root <- liveRepoRoot()
+        _    <- Either.cond(
+                  onRealPath(sys.env.getOrElse("PATH", ""), "jq").isDefined,
+                  (),
+                  s"jq not found — `litter-box ${tool.subcommand}` renders the loop's JSON logs through it"
+                )
+        dir <- extracted
+      yield (root, dir)
+
+    prepared match
+      case Left(msg)          => LiveLog.log(s"FATAL: $msg"); 1
+      case Right((root, dir)) =>
+        // `sys.env` IS the environment the child inherits on this path: nothing here calls
+        // `LiveProc.exportEnv` (that is the loop's own wiring, step 2b below), so this JVM's
+        // environment reaches the child unmodified and is what the precedence must be decided
+        // against.
+        val child = observeChild(root, cwd, dir, sys.env, tool, target)
+        val pb    = LiveProc.builder(child.command)
+        pb.directory(child.cwd.toFile)
+        child.env.foreach((k, v) => pb.environment().put(k, v))
+        pb.inheritIO()
+        pb.start().waitFor()
 
   @main def litterBoxLoop(args: String*): Unit =
     Cli.parse(args.toList) match
@@ -435,9 +542,10 @@ object Main:
       case Right(Command.Help) =>
         Console.out.println(Cli.Usage)
         sys.exit(0)
-      case Right(Command.Init(force))        => sys.exit(runInit(force))
-      case Right(Command.Eject(what, force)) => sys.exit(runEject(what, force))
-      case Right(Command.Loop(dryRun))       => runLoop(dryRun)
+      case Right(Command.Init(force))           => sys.exit(runInit(force))
+      case Right(Command.Eject(what, force))    => sys.exit(runEject(what, force))
+      case Right(Command.Observe(tool, target)) => sys.exit(runObserve(tool, target))
+      case Right(Command.Loop(dryRun))          => runLoop(dryRun)
 
   /** The loop, which is everything this file did before there were subcommands. */
   private def runLoop(dryRunFlag: Boolean): Unit =
@@ -445,10 +553,7 @@ object Main:
 
     // 1. root = the git work tree the process was launched inside. Everything downstream is
     // relative to it, so an unanswerable question here is rc 50 and no further work.
-    val cwd  = Paths.get("").toAbsolutePath
-    val root = resolveRepoRoot(() =>
-      LiveProc.run(cwd, Seq("git", "rev-parse", "--show-toplevel"))
-    ) match
+    val root = liveRepoRoot() match
       case Right(r)  => r
       case Left(msg) => die50(msg)
 

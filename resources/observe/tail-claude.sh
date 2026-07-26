@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 #
-# Live-follow the JSONL log a stream-json `claude -p` iteration writes (loop.sh dispatch).
+# Live-follow the JSONL log a stream-json `claude -p` iteration writes (the loop's agent dispatch).
 # Passive observability only — reads nothing back into the loop, just renders for a human.
 #
-# Usage:  harness/tail-claude.sh [logfile]
+# Usage:  litter-box tail [logfile]
 #         (no arg → follows the newest *.claude.log under the `log-dir` config default)
+#
+# Ships in the artifact and is unpacked to ~/.cache/litter-box/observe/<digest>; see watch.sh.
 #
 # Each line of the log is one stream-json event; this collapses them to one readable line:
 #   🗣  assistant prose      🔧 tool call + truncated input      ↳ tool result (truncated)
@@ -15,8 +17,16 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || echo "$SCRIPT_DIR")"
 # The loop's `log-dir` config key; see watch.sh for why the fallback is the reference default.
 LOG_DIR="${LITTER_BOX_LOG_DIR:-.litter-box/logs}"
-LOG="${1:-$(ls -t "$REPO_ROOT/$LOG_DIR"/*.claude.log 2>/dev/null | head -1 || true)}"
-[[ -n "$LOG" ]] || { echo "no *.claude.log under $REPO_ROOT/$LOG_DIR — has a run started?" >&2; exit 1; }
+# Absolute stays absolute, relative hangs off the repo root; see watch.sh for why both shapes reach here.
+case "$LOG_DIR" in
+  /*) LOG_PATH="$LOG_DIR" ;;
+  *)  LOG_PATH="$REPO_ROOT/$LOG_DIR" ;;
+esac
+LOG="${1:-$(ls -t "$LOG_PATH"/*.claude.log 2>/dev/null | head -1 || true)}"
+[[ -n "$LOG" ]] || { echo "no *.claude.log under $LOG_PATH — has a run started?" >&2; exit 1; }
+# Checked up front because the pipeline below tolerates its own failures (see the `|| true` there),
+# so a typo'd path would otherwise read as a clean watch that just printed nothing.
+[[ -r "$LOG" ]] || { echo "cannot read $LOG" >&2; exit 1; }
 command -v jq >/dev/null || { echo "jq not found" >&2; exit 1; }
 
 echo "tailing $LOG  (Ctrl-C to stop)" >&2
