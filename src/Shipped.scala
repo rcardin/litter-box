@@ -80,10 +80,16 @@ abstract class Shipped(val treeName: String):
 
   /** Where an extracted tree lives, given a home directory: `~/.cache/litter-box/<tree>/<digest>`.
     *
-    * Under `$HOME` rather than `$TMPDIR` for the reason `run-fast-gate.sh` already documents at
-    * length: on macOS + colima only `$HOME` is mounted into the Docker VM, and some of these files
-    * are `docker build` contexts. A tree under the real TMPDIR would silently build from an empty
-    * one.
+    * Under `$HOME` rather than `$TMPDIR` because this is a CACHE: the digest keys it, so an
+    * unchanged litter-box build re-extracts nothing across runs, days and reboots. `$TMPDIR` is
+    * swept, which turns every run into a fresh extraction of the whole tree.
+    *
+    * NOT for the Docker-visibility reason `run-fast-gate.sh:41-45` documents. That one is about a
+    * BIND MOUNT (`-v "$tmpdir:/workspace"`), which under colima only works beneath `$HOME`; this
+    * tree is never bind-mounted. Its only Docker use is as a `docker build` context
+    * (`build-image.sh:19`, `lib.sh:build_proxy_image`), and a context is streamed to the daemon as
+    * a TAR, so it works from anywhere — `build-image.sh` proves it, building both the proxy and the
+    * gate from `mktemp -d` contexts on macOS.
     */
   def cacheDir(home: Path): Path =
     home.resolve(".cache").resolve("litter-box").resolve(treeName).resolve(digest)
