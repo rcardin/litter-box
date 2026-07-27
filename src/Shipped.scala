@@ -88,8 +88,8 @@ abstract class Shipped(val treeName: String):
     * BIND MOUNT (`-v "$tmpdir:/workspace"`), which under colima only works beneath `$HOME`; this
     * tree is never bind-mounted. Its only Docker use is as a `docker build` context
     * (`build-image.sh:19`, `lib.sh:build_proxy_image`), and a context is streamed to the daemon as
-    * a TAR, so it works from anywhere — `build-image.sh` proves it, building both the proxy and the
-    * gate from `mktemp -d` contexts on macOS.
+    * a TAR, so it works from anywhere — `build-image.sh` proves it by staging the gate build context
+    * in a plain `mktemp -d` directory on macOS.
     */
   def cacheDir(home: Path): Path =
     home.resolve(".cache").resolve("litter-box").resolve(treeName).resolve(digest)
