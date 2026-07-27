@@ -46,10 +46,10 @@ two have to name the same thing.
 
 The `ARG` default above is not the path a loop run takes. `build-image.sh:19` builds this base image
 locally from `resources/sandbox/base.Dockerfile` first, then passes that local tag as
-`--build-arg BASE_IMAGE` when it builds the gate image (`build-image.sh:60`). So the registry is
-never consulted during a run — every consumer builds and pays for the Claude-CLI install locally, and
-the sandbox needs no registry credentials or network at all. The `ghcr.io` default is what a hand-run
-`docker build -f .litter-box/Dockerfile` gets, and only that.
+`--build-arg BASE_IMAGE` when it builds the gate image (`build-image.sh:60`). So `ghcr.io` is never
+consulted during a run — every consumer builds and pays for the Claude-CLI install locally, and the
+sandbox needs no registry credentials. (It may still pull public base layers like `eclipse-temurin`
+if they aren't already cached.) The `ghcr.io` default is what a hand-run `docker build -f .litter-box/Dockerfile` gets, and only that.
 
 ## Why the middle is a TODO and not a preset
 
