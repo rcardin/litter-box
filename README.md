@@ -103,8 +103,9 @@ whole of what litter-box claims to know about your build.
 `resources/sandbox/base.Dockerfile` on every run and passes the local tag as `--build-arg
 BASE_IMAGE`, so the scaffolded `ARG BASE_IMAGE=ghcr.io/rcardin/litter-box-base:…` default only
 applies when you run `docker build` against that Dockerfile by hand. The cost of that choice is a
-local Claude-CLI install; what it buys is a sandbox that needs no registry. Nothing has been
-published to ghcr yet either — the first publish happens when a tag is cut. See
+local Claude-CLI install; what it buys is a sandbox that doesn't depend on pulling a prebuilt base
+from ghcr or any registry credentials. Nothing has been published to ghcr yet either — the first
+publish happens when a tag is cut. See
 [docs/base-image.md](docs/base-image.md) for the full contract the image guarantees.
 
 ## Configuration
