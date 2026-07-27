@@ -44,6 +44,13 @@ left to you), and `build-image.sh` builds the gate image from it, that file, wit
 build tool you install here is what `gate.fast` in `.litter-box/config.conf` is read against, so the
 two have to name the same thing.
 
+The `ARG` default above is not the path a loop run takes. `build-image.sh:19` builds this base image
+locally from `resources/sandbox/base.Dockerfile` first, then passes that local tag as
+`--build-arg BASE_IMAGE` when it builds the gate image (`build-image.sh:60`). So `ghcr.io` is never
+consulted during a run — every consumer builds and pays for the Claude-CLI install locally, and the
+sandbox needs no registry credentials. (It may still pull public base layers like `eclipse-temurin`
+if they aren't already cached.) The `ghcr.io` default is what a hand-run `docker build -f .litter-box/Dockerfile` gets, and only that.
+
 ## Why the middle is a TODO and not a preset
 
 There are no build-tool presets, for any build tool, and there is no extension point to add one

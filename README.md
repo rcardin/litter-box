@@ -92,13 +92,20 @@ constrains it. Pass `--force` to overwrite one you already ejected.
 
 ### The sandbox image
 
-`.litter-box/Dockerfile` builds `FROM ghcr.io/rcardin/litter-box-base` — a build-tool-free image
-carrying temurin 21, a pinned Claude CLI and a non-root user, with no build tool and no credentials
-baked in. Your Dockerfile installs the JDK and build tool this project needs and nothing else: it
-needs no `ENTRYPOINT`, because all three runners override it and run `gate.fast` (or the agent
-entrypoint) through `bash -c`. `init` scaffolds that file with the install layer left as a `TODO`,
-which is the whole of what litter-box claims to know about your build. **Nothing has been published
-to ghcr yet**: the first publish happens when a tag is cut. See
+`.litter-box/Dockerfile` builds `FROM ${BASE_IMAGE}` — a build-tool-free image carrying temurin 21, a
+pinned Claude CLI and a non-root user, with no build tool and no credentials baked in. Your
+Dockerfile installs the JDK and build tool this project needs and nothing else: it needs no
+`ENTRYPOINT`, because all three runners override it and run `gate.fast` (or the agent entrypoint)
+through `bash -c`. `init` scaffolds that file with the install layer left as a `TODO`, which is the
+whole of what litter-box claims to know about your build.
+
+**A normal run never pulls that base image.** `build-image.sh` builds it locally from
+`resources/sandbox/base.Dockerfile` on every run and passes the local tag as `--build-arg
+BASE_IMAGE`, so the scaffolded `ARG BASE_IMAGE=ghcr.io/rcardin/litter-box-base:…` default only
+applies when you run `docker build` against that Dockerfile by hand. The cost of that choice is a
+local Claude-CLI install; what it buys is a sandbox that doesn't depend on pulling a prebuilt base
+from ghcr or any registry credentials. Nothing has been published to ghcr yet either — the first
+publish happens when a tag is cut. See
 [docs/base-image.md](docs/base-image.md) for the full contract the image guarantees.
 
 ## Configuration
@@ -210,7 +217,7 @@ exist. See [Getting started](#getting-started) for `init`, `eject`, `--dry-run` 
 | `DRY_RUN` | `0` | `1` renders the worker prompt, then stops before any mutation |
 | `REPAIR_BUDGET` | `2` | Fix attempts per issue |
 | `MAX_PATCH_BYTES` | `1000000` | Oversized-patch guard |
-| `GATE_CMD` | `false` | The gate (overrides `gate.fast`); the default fails on purpose, because litter-box never guesses your build command. Exporting it also skips the whole Docker preflight; setting it in `.litter-box/.env` only changes the command |
+| `GATE_CMD` | `false` | The gate (overrides `gate.fast`); the default fails on purpose, because litter-box never guesses your build command. Exporting it also forces `gate.sandboxed` to false — the gate runs on the host with everything your shell has, not in the container — and skips the whole Docker preflight that would have built that container; setting it in `.litter-box/.env` only changes the command |
 | `GATE_TIMEOUT` | `900` | Gate timeout (seconds) |
 | `ITER_TIMEOUT` | `1800` | Worker dispatch timeout |
 | `CI_WAIT_TIMEOUT` / `CI_APPEAR_TIMEOUT` / `CI_APPEAR_INTERVAL` | `900` / `300` / `10` | CI polling |
