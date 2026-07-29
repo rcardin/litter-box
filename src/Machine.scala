@@ -163,158 +163,10 @@ object Machine:
       case ready: PickAndSetup.Ready       => ready
     import setup.{issue, bodyFile, workerPromptFile, isClass1, branch}
 
-    // --- bounded self-repair state -------------------------------------------------------
-    // Declared BEFORE the initial dispatch: a patch-guard rejection on the very first worker
-    // patch sets outcome/failureKind and skips the loop straight to the terminal.
-    var budget                           = cfg.repairBudget
-    var pass                             = 0
-    var outcome: Option[Outcome]         = None
-    var gateStatus                       = ""
-    var failureKind: Option[FailureKind] = None
-    var currentPatch: Option[String]     = None
-    val reviewFile                       = artifact(issue, "-review.md")
-    fs.write(reviewFile, "") // empty until the first review
-    var reviewed = false
-
-    // Initial worker dispatch (fresh context), crossing the patch seam. The tree the worker
-    // edited is never committed directly.
-    val implLog   = artifact(issue, s"-iter$n.claude.log")
-    val implPatch = artifact(issue, s"-iter$n.impl.patch")
-    emit(cur, "IMPL", "start", implLog)
-    stagePatch(Role.IMPL, workerPromptFile, implPatch, implLog, currentPatch) match
-      case StageResult.Empty =>
-        emit(cur, "IMPL", "ok", implLog, "no diff")
-        logger.log("no changes produced by the iteration — leaving issue in-progress, not opening a PR")
-        return LoopExit.NothingMade
-      case result =>
-        handleStageResult(cur, Role.IMPL, implLog, result) match
-          case StageVerdict.Applied(p)     => currentPatch = Some(p)
-          case StageVerdict.Rejected(kind) =>
-            outcome = Some(Outcome.Fail); failureKind = Some(kind); gateStatus = "SKIPPED"
-
-    // The fixer dispatch across the patch seam plus the mapping of its StageResult onto the
-    // repair loop's control flow (bash dispatch_fix + handle_fix_result). Infra faults raise;
-    // guard rejections and an empty fix become the terminal FAIL; Ok advances currentPatch.
-    def fixRound(pass: Int, failFile: String): Unit =
-      val fixPromptFile = artifact(issue, s"-pass$pass.fix.prompt.txt")
-      fs.write(
-        fixPromptFile,
-        renderTemplate(
-          fs.readTemplate(Template.Fix),
-          "PROTECTED"   -> protectedList(cfg.protect),
-          "GATE"        -> cfg.gateCmd,
-          "CONVENTIONS" -> fs.conventions(),
-          "ISSUE"       -> fs.read(bodyFile),
-          "FAILURE"     -> fs.read(failFile)
-        )
-      )
-      val fixLog   = artifact(issue, s"-pass$pass.fix.claude.log")
-      val fixPatch = artifact(issue, s"-pass$pass.fix.patch")
-      emit(cur, "FIX", "start", fixLog)
-      stagePatch(Role.FIX, fixPromptFile, fixPatch, fixLog, currentPatch) match
-        case StageResult.Empty =>
-          // The fixer reverted all prior work — route to needs-human, never re-gate an empty tree.
-          emit(cur, "FIX", "red", fixLog, "empty fix")
-          logger.log("FIX produced no diff (the fixer reverted all prior work); routing to needs-human")
-          outcome = Some(Outcome.Fail); failureKind = Some(FailureKind.EmptyFix)
-        case result =>
-          handleStageResult(cur, Role.FIX, fixLog, result) match
-            case StageVerdict.Applied(p)     => currentPatch = Some(p)
-            case StageVerdict.Rejected(kind) =>
-              outcome = Some(Outcome.Fail); failureKind = Some(kind)
-
-    // Shared shape of both repair triggers (gate-RED, REQUEST_CHANGES): out of budget fails the
-    // outcome, otherwise spend one unit, write the fail file with the stage-specific content, and
-    // dispatch a FIX round. failureKind/gateStatus are set by the caller before this runs.
-    def spendOrExhaust(trigger: FailureKind, failContent: String): Unit =
-      if budget == 0 then outcome = Some(Outcome.Fail)
-      else
-        budget -= 1; cur.budget = budget
-        logger.log(s"self-repair: budget now $budget — dispatching FIX for ${trigger.text}")
-        val failFile = artifact(issue, s"-pass$pass.failure.md")
-        fs.write(failFile, failContent)
-        fixRound(pass, failFile)
-
-    // --- bounded self-repair loop --------------------------------------------------------
-    // Skipped entirely if the initial patch was already rejected (outcome set above).
-    while outcome.isEmpty do
-      pass += 1
-      git.addAll() // stage so new files show in diff/gate/tamper
-      cur.pass = pass
-      val gateLog = artifact(issue, s"-pass$pass.gate.log")
-      emit(cur, "FAST_GATE", "start", gateLog)
-      gates.run("FAST", cfg.gateCmd, cfg.gateTimeout, gateLog) match
-        case GateResult.Timeout =>
-          infraFault(
-            s"WARNING: FAST gate hit the ${cfg.gateTimeout}s timeout — infra fault, not a code failure"
-          )
-        case GateResult.Red =>
-          gateStatus = "RED"
-          failureKind = Some(FailureKind.GateRed)
-          emit(cur, "FAST_GATE", "red", gateLog)
-          logger.log(s"FAST gate RED (pass $pass, see $gateLog)")
-          spendOrExhaust(
-            FailureKind.GateRed,
-            s"## FAST gate RED (pass $pass)\n\n" +
-              s"The fast tier gate command is `${cfg.gateCmd}`. It ran at the repository root and " +
-              s"exited with a nonzero status.\n\n" +
-              s"Tail of the fast-gate log:\n\n```\n${fs.read(gateLog)}\n```\n"
-          )
-        case GateResult.Green =>
-          gateStatus = "GREEN"
-          emit(cur, "FAST_GATE", "ok", gateLog)
-          logger.log(s"FAST gate GREEN (pass $pass) — running tamper check + cold reviewer")
-
-          // Tamper check feeds the reviewer (the harness surfaces, does not block).
-          val tamperFile = artifact(issue, "-tamper.md")
-          fs.write(tamperFile, tamperReport(currentPatch.map(git.applyNumstat).getOrElse("")))
-          val diffFile = artifact(issue, "-diff.patch")
-          fs.write(diffFile, git.diffCachedOriginMain())
-          val reviewPromptFile = artifact(issue, s"-pass$pass.review.prompt.txt")
-          fs.write(
-            reviewPromptFile,
-            renderTemplate(
-              fs.readTemplate(Template.Review),
-              "PROTECTED"   -> protectedList(cfg.protect),
-              "GATE"        -> cfg.gateCmd,
-              "CONVENTIONS" -> fs.conventions(),
-              "ISSUE"       -> fs.read(bodyFile),
-              "TAMPER"      -> fs.read(tamperFile),
-              "DIFF"        -> fs.read(diffFile)
-            )
-          )
-          emit(cur, "REVIEW", "start", reviewFile)
-          agents.review(fs.read(reviewPromptFile), reviewFile) match
-            case DispatchOutcome.TimedOut =>
-              emit(cur, "REVIEW", "red", reviewFile, "timeout")
-              infraFault("REVIEWER timed out — infra fault; exiting without spending budget")
-            case DispatchOutcome.Done => ()
-          reviewed = true
-
-          // An empty (or whitespace-only) review is a crashed reviewer, not a verdict.
-          if fs.read(reviewFile).isBlank then
-            emit(cur, "REVIEW", "red", reviewFile, "empty review")
-            infraFault("reviewer produced no output — infra fault (crashed or timed-out reviewer)")
-
-          // Grep, not parse. Missing sentinel -> REQUEST_CHANGES (fail safe, never auto-approve).
-          val verdict = parseVerdict(fs.read(reviewFile)) match
-            case Some(v) => v
-            case None    =>
-              logger.log("reviewer emitted no VERDICT sentinel — fail-safe REQUEST_CHANGES")
-              Verdict.RequestChanges
-          logger.log(s"reviewer verdict: ${verdictText(verdict)} (pass $pass)")
-          emit(cur, "REVIEW", "ok", reviewFile, s"verdict=${verdictText(verdict)}")
-          verdict match
-            case Verdict.Approve =>
-              outcome = Some(Outcome.Success)
-            case Verdict.RequestChanges =>
-              // REQUEST_CHANGES — spend from the same shared budget as gate-RED.
-              failureKind = Some(FailureKind.ReviewChanges)
-              spendOrExhaust(
-                FailureKind.ReviewChanges,
-                s"## The independent reviewer requested changes\n\n${fs.read(reviewFile)}\n\n${fs.read(tamperFile)}"
-              )
-    end while
+    val implemented = implementAndRepair(n, cur, issue, bodyFile, workerPromptFile) match
+      case ImplementAndRepair.StoppedEarly(exit) => return exit
+      case ready: ImplementAndRepair.Ready       => ready
+    import implemented.{pass, outcome, gateStatus, failureKind, reviewed, reviewFile}
 
     // --- terminal: commit, push, PR (SUCCESS -> needs-review, FAIL -> needs-human) --------
     // A fixer that produced no diff left the tree pristine (stagePatch reset to origin/main
@@ -338,15 +190,15 @@ object Machine:
       logger.log("nothing staged at terminal — unexpected; leaving in-progress")
       return LoopExit.NothingMade
 
-    val outcomeText = if outcome.contains(Outcome.Success) then "SUCCESS" else "FAIL"
+    val outcomeText = if outcome == Outcome.Success then "SUCCESS" else "FAIL"
     val kindText    = failureKind.map(_.text).getOrElse("?")
 
     // Terminal route decided ONCE, here. Every downstream site (label, notify, PR note,
     // auto-merge dispatch, exit code) threads this value instead of re-testing
     // outcome/isClass1 or comparing against a "needs-human" label string.
     val route =
-      if outcome.contains(Outcome.Success) && isClass1 then Route.AutoMergeCandidate
-      else if outcome.contains(Outcome.Success) then Route.NeedsReview
+      if outcome == Outcome.Success && isClass1 then Route.AutoMergeCandidate
+      else if outcome == Outcome.Success then Route.NeedsReview
       else Route.NeedsHuman
 
     val (label, commitTag, prNote) =
@@ -511,6 +363,196 @@ object Machine:
 
     PickAndSetup.Ready(issue, bodyFile, workerPromptFile, isClass1, branch)
 
+  /** The second of the phase extractions `iterate` is being split into (issue #30 / RFC #26
+    * decision 12); the same reasoning as `pickAndSetup` applies here: naming this phase and giving
+    * it a return type of its own is what makes the later node conversion a reshape instead of a
+    * rewrite. The locals that used to be this phase's real interface, declared before the initial
+    * dispatch and carried across the phases by capture, are now the fields of `Ready` below; see
+    * that case's scaladoc for which ones and why.
+    *
+    * `reviewFile` is computed here, not passed in as a parameter: this phase is the only writer
+    * (an empty seed before the first review, then each review's raw output), so it belongs with
+    * the values `Ready` produces, not with the caller-supplied `bodyFile`/`workerPromptFile`. It
+    * is returned as a field of `Ready` so the terminal phase of `iterate` can still read the
+    * reviewer transcript for the PR body.
+    *
+    * `(using Faulting)` still spans the whole function, for the same reason it spans
+    * `pickAndSetup`: a fault path that could return normally here would be a fault path that can
+    * spend repair budget, and the type system is what rules that out, not code review.
+    */
+  private def implementAndRepair(
+      n: Int,
+      cur: Cursor,
+      issue: Int,
+      bodyFile: String,
+      workerPromptFile: String
+  )(using
+      cfg: Config,
+      git: Git,
+      agents: AgentDispatch,
+      gates: GateRunner,
+      fs: HarnessFs,
+      log: StatusLog,
+      logger: Log,
+      notify: Notify
+  )(using Faulting): ImplementAndRepair =
+    // --- bounded self-repair state -------------------------------------------------------
+    // Declared BEFORE the initial dispatch: a patch-guard rejection on the very first worker
+    // patch sets outcome/failureKind and skips the repair loop entirely. This function still
+    // returns a `Ready`, with `gateStatus` left at "SKIPPED".
+    var budget                           = cfg.repairBudget
+    var pass                             = 0
+    var outcome: Option[Outcome]         = None
+    var gateStatus                       = ""
+    var failureKind: Option[FailureKind] = None
+    var currentPatch: Option[String]     = None
+    val reviewFile                       = artifact(issue, "-review.md")
+    fs.write(reviewFile, "") // empty until the first review
+    var reviewed = false
+
+    // Initial worker dispatch (fresh context), crossing the patch seam. The tree the worker
+    // edited is never committed directly.
+    val implLog   = artifact(issue, s"-iter$n.claude.log")
+    val implPatch = artifact(issue, s"-iter$n.impl.patch")
+    emit(cur, "IMPL", "start", implLog)
+    stagePatch(Role.IMPL, workerPromptFile, implPatch, implLog, currentPatch) match
+      case StageResult.Empty =>
+        emit(cur, "IMPL", "ok", implLog, "no diff")
+        logger.log("no changes produced by the iteration — leaving issue in-progress, not opening a PR")
+        return ImplementAndRepair.StoppedEarly(LoopExit.NothingMade)
+      case result =>
+        handleStageResult(cur, Role.IMPL, implLog, result) match
+          case StageVerdict.Applied(p)     => currentPatch = Some(p)
+          case StageVerdict.Rejected(kind) =>
+            outcome = Some(Outcome.Fail); failureKind = Some(kind); gateStatus = "SKIPPED"
+
+    // The fixer dispatch across the patch seam plus the mapping of its StageResult onto the
+    // repair loop's control flow (bash dispatch_fix + handle_fix_result). Infra faults raise;
+    // guard rejections and an empty fix become the terminal FAIL; Ok advances currentPatch.
+    def fixRound(pass: Int, failFile: String): Unit =
+      val fixPromptFile = artifact(issue, s"-pass$pass.fix.prompt.txt")
+      fs.write(
+        fixPromptFile,
+        renderTemplate(
+          fs.readTemplate(Template.Fix),
+          "PROTECTED"   -> protectedList(cfg.protect),
+          "GATE"        -> cfg.gateCmd,
+          "CONVENTIONS" -> fs.conventions(),
+          "ISSUE"       -> fs.read(bodyFile),
+          "FAILURE"     -> fs.read(failFile)
+        )
+      )
+      val fixLog   = artifact(issue, s"-pass$pass.fix.claude.log")
+      val fixPatch = artifact(issue, s"-pass$pass.fix.patch")
+      emit(cur, "FIX", "start", fixLog)
+      stagePatch(Role.FIX, fixPromptFile, fixPatch, fixLog, currentPatch) match
+        case StageResult.Empty =>
+          // The fixer reverted all prior work — route to needs-human, never re-gate an empty tree.
+          emit(cur, "FIX", "red", fixLog, "empty fix")
+          logger.log("FIX produced no diff (the fixer reverted all prior work); routing to needs-human")
+          outcome = Some(Outcome.Fail); failureKind = Some(FailureKind.EmptyFix)
+        case result =>
+          handleStageResult(cur, Role.FIX, fixLog, result) match
+            case StageVerdict.Applied(p)     => currentPatch = Some(p)
+            case StageVerdict.Rejected(kind) =>
+              outcome = Some(Outcome.Fail); failureKind = Some(kind)
+
+    // Shared shape of both repair triggers (gate-RED, REQUEST_CHANGES): out of budget fails the
+    // outcome, otherwise spend one unit, write the fail file with the stage-specific content, and
+    // dispatch a FIX round. failureKind/gateStatus are set by the caller before this runs.
+    def spendOrExhaust(trigger: FailureKind, failContent: String): Unit =
+      if budget == 0 then outcome = Some(Outcome.Fail)
+      else
+        budget -= 1; cur.budget = budget
+        logger.log(s"self-repair: budget now $budget — dispatching FIX for ${trigger.text}")
+        val failFile = artifact(issue, s"-pass$pass.failure.md")
+        fs.write(failFile, failContent)
+        fixRound(pass, failFile)
+
+    // --- bounded self-repair loop --------------------------------------------------------
+    // Skipped entirely if the initial patch was already rejected (outcome set above).
+    while outcome.isEmpty do
+      pass += 1
+      git.addAll() // stage so new files show in diff/gate/tamper
+      cur.pass = pass
+      val gateLog = artifact(issue, s"-pass$pass.gate.log")
+      emit(cur, "FAST_GATE", "start", gateLog)
+      gates.run("FAST", cfg.gateCmd, cfg.gateTimeout, gateLog) match
+        case GateResult.Timeout =>
+          infraFault(
+            s"WARNING: FAST gate hit the ${cfg.gateTimeout}s timeout — infra fault, not a code failure"
+          )
+        case GateResult.Red =>
+          gateStatus = "RED"
+          failureKind = Some(FailureKind.GateRed)
+          emit(cur, "FAST_GATE", "red", gateLog)
+          logger.log(s"FAST gate RED (pass $pass, see $gateLog)")
+          spendOrExhaust(
+            FailureKind.GateRed,
+            s"## FAST gate RED (pass $pass)\n\n" +
+              s"The fast tier gate command is `${cfg.gateCmd}`. It ran at the repository root and " +
+              s"exited with a nonzero status.\n\n" +
+              s"Tail of the fast-gate log:\n\n```\n${fs.read(gateLog)}\n```\n"
+          )
+        case GateResult.Green =>
+          gateStatus = "GREEN"
+          emit(cur, "FAST_GATE", "ok", gateLog)
+          logger.log(s"FAST gate GREEN (pass $pass) — running tamper check + cold reviewer")
+
+          // Tamper check feeds the reviewer (the harness surfaces, does not block).
+          val tamperFile = artifact(issue, "-tamper.md")
+          fs.write(tamperFile, tamperReport(currentPatch.map(git.applyNumstat).getOrElse("")))
+          val diffFile = artifact(issue, "-diff.patch")
+          fs.write(diffFile, git.diffCachedOriginMain())
+          val reviewPromptFile = artifact(issue, s"-pass$pass.review.prompt.txt")
+          fs.write(
+            reviewPromptFile,
+            renderTemplate(
+              fs.readTemplate(Template.Review),
+              "PROTECTED"   -> protectedList(cfg.protect),
+              "GATE"        -> cfg.gateCmd,
+              "CONVENTIONS" -> fs.conventions(),
+              "ISSUE"       -> fs.read(bodyFile),
+              "TAMPER"      -> fs.read(tamperFile),
+              "DIFF"        -> fs.read(diffFile)
+            )
+          )
+          emit(cur, "REVIEW", "start", reviewFile)
+          agents.review(fs.read(reviewPromptFile), reviewFile) match
+            case DispatchOutcome.TimedOut =>
+              emit(cur, "REVIEW", "red", reviewFile, "timeout")
+              infraFault("REVIEWER timed out — infra fault; exiting without spending budget")
+            case DispatchOutcome.Done => ()
+          reviewed = true
+
+          // An empty (or whitespace-only) review is a crashed reviewer, not a verdict.
+          if fs.read(reviewFile).isBlank then
+            emit(cur, "REVIEW", "red", reviewFile, "empty review")
+            infraFault("reviewer produced no output — infra fault (crashed or timed-out reviewer)")
+
+          // Grep, not parse. Missing sentinel -> REQUEST_CHANGES (fail safe, never auto-approve).
+          val verdict = parseVerdict(fs.read(reviewFile)) match
+            case Some(v) => v
+            case None    =>
+              logger.log("reviewer emitted no VERDICT sentinel — fail-safe REQUEST_CHANGES")
+              Verdict.RequestChanges
+          logger.log(s"reviewer verdict: ${verdictText(verdict)} (pass $pass)")
+          emit(cur, "REVIEW", "ok", reviewFile, s"verdict=${verdictText(verdict)}")
+          verdict match
+            case Verdict.Approve =>
+              outcome = Some(Outcome.Success)
+            case Verdict.RequestChanges =>
+              // REQUEST_CHANGES — spend from the same shared budget as gate-RED.
+              failureKind = Some(FailureKind.ReviewChanges)
+              spendOrExhaust(
+                FailureKind.ReviewChanges,
+                s"## The independent reviewer requested changes\n\n${fs.read(reviewFile)}\n\n${fs.read(tamperFile)}"
+              )
+    end while
+
+    // `outcome.getOrElse(Outcome.Fail)`: unreachable in practice; see `Ready`'s scaladoc.
+    ImplementAndRepair.Ready(pass, outcome.getOrElse(Outcome.Fail), gateStatus, failureKind, reviewed, reviewFile)
+
   /** v4 auto-merge (class-1 + APPROVE only): wait-appear -> watch -> merge -> VERIFY the PR state
     * is MERGED (unverified = infra fault) -> drop in-progress -> flip blocked -> fetch -> notify.
     * CI red after green local gates = needs-human WITHOUT self-repair: the loop never repairs
@@ -647,6 +689,51 @@ object Machine:
         workerPromptFile: String,
         isClass1: Boolean,
         branch: String
+    )
+
+  /** What `implementAndRepair` concluded: either the initial IMPL patch was empty and `iterate`
+    * stops immediately with the carried `LoopExit`, or the phase ran to completion (the initial
+    * dispatch, zero or more repair passes, and a final gate/review outcome) and everything the
+    * terminal phase of `iterate` reads is here.
+    *
+    * Same shape as `PickAndSetup` and for the same reason (issue #30 / RFC #26 decision 12): the
+    * two cases genuinely differ, so naming both lets `iterate` read as "call the phase, then
+    * branch" instead of re-deriving the early-exit condition at the call site.
+    */
+  private enum ImplementAndRepair:
+    /** The only early stop in this phase: an empty initial IMPL patch. `exit` is always
+      * `LoopExit.NothingMade` in practice; kept as `LoopExit` rather than hardcoded so this case
+      * has the same shape as `PickAndSetup.StoppedEarly`. Never `LoopExit.InfraFault`, for the
+      * same reason as `PickAndSetup.StoppedEarly`: a fault goes through `infraFault`'s `break`,
+      * which never returns here at all.
+      */
+    case StoppedEarly(exit: LoopExit)
+
+    /** The values that used to be mutable locals declared before the initial dispatch and read by
+      * `iterate` long after this phase returned, plus `reviewFile`. `budget` and `currentPatch`
+      * are not here. `currentPatch` is pure bookkeeping internal to the repair loop, never read
+      * once this function returns. `budget` leaves through the shared `cur.budget`, which `emit`
+      * copies into every `StatusEvent`; it does not leave through this return value, so there is
+      * no local copy to carry here either. Field names match what `iterate` imports them as, same
+      * convention as `PickAndSetup.Ready`.
+      *
+      * `outcome` is `Outcome`, not `Option[Outcome]`. The `while outcome.isEmpty` loop above can
+      * only exit with `Some`, and the only other way to reach this `Ready` is the initial-patch
+      * rejection path, which already set `Some(Outcome.Fail)`. So `None` was never reachable here;
+      * this is the one field where the explicit result type discharges that invariant for free
+      * instead of carrying a case nothing produces. The construction collapses it with
+      * `outcome.getOrElse(Outcome.Fail)`, which is exactly what the terminal used to do by reading
+      * `outcome.contains(Outcome.Success)`: a `None` there already meant `Fail`, so the collapse
+      * changes no observable behaviour. `failureKind` stays `Option[FailureKind]`: that one
+      * genuinely can be `None` (a clean gate GREEN plus a reviewer APPROVE never sets it).
+      */
+    case Ready(
+        pass: Int,
+        outcome: Outcome,
+        gateStatus: String,
+        failureKind: Option[FailureKind],
+        reviewed: Boolean,
+        reviewFile: String
     )
 
   private enum Outcome:
