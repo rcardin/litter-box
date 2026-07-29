@@ -212,9 +212,243 @@ object Machine:
       case ready: PickAndSetup.Ready       => ready
     import setup.{issue, bodyFile, workerPromptFile, isClass1, branch}
 
+    val implemented = implementAndRepair(n, cur, issue, bodyFile, workerPromptFile) match
+      case ImplementAndRepair.StoppedEarly(exit) => return exit
+      case ready: ImplementAndRepair.Ready       => ready
+    import implemented.{pass, outcome, gateStatus, failureKind, reviewed, reviewFile}
+
+    // --- terminal: commit, push, PR (SUCCESS -> needs-review, FAIL -> needs-human) --------
+    // A fixer that produced no diff left the tree pristine (stagePatch reset to origin/main
+    // before it saw the empty patch), so the "nothing staged" guard below would otherwise fire
+    // first and mask the routing. Stage a small tracked marker so the needs-human audit PR
+    // still opens. In the cumulative-patch model an empty fix reverts all prior work, so this
+    // branch legitimately holds only the marker.
+    if failureKind.contains(FailureKind.EmptyFix) then
+      fs.write(
+        "FIX-EMPTY.md",
+        s"""# Fixer produced no diff
+           |
+           |The self-repair fixer returned an empty patch. In the cumulative-patch model that
+           |reverts all prior work on this branch, so the loop routed the issue to human review
+           |instead of re-gating an empty tree. Opened for the audit trail ONLY; do NOT merge.
+           |""".stripMargin
+      )
+      git.add("FIX-EMPTY.md")
+    git.addAll()
+    if !git.anythingStaged() then
+      logger.log("nothing staged at terminal — unexpected; leaving in-progress")
+      return LoopExit.NothingMade
+
+    val outcomeText = if outcome == Outcome.Success then "SUCCESS" else "FAIL"
+    val kindText    = failureKind.map(_.text).getOrElse("?")
+
+    // Terminal route decided ONCE, here. Every downstream site (label, notify, PR note,
+    // auto-merge dispatch, exit code) threads this value instead of re-testing
+    // outcome/isClass1 or comparing against a "needs-human" label string.
+    val route =
+      if outcome == Outcome.Success && isClass1 then Route.AutoMergeCandidate
+      else if outcome == Outcome.Success then Route.NeedsReview
+      else Route.NeedsHuman
+
+    val (label, commitTag, prNote) =
+      route match
+        case Route.AutoMergeCandidate =>
+          // no flip: the auto-merge path owns the issue's fate
+          (
+            "",
+            s"reviewer APPROVE, gate $gateStatus",
+            s"**Reviewer: APPROVE** · gate $gateStatus · class-1 — v4 auto-merge candidate: the loop merges after the required CI check goes green."
+          )
+        case Route.NeedsReview =>
+          (
+            "needs-review",
+            s"reviewer APPROVE, gate $gateStatus",
+            s"**Reviewer: APPROVE** · gate $gateStatus (containerized in-memory FAST tier green; the real-PG IT tier is judged by CI on this PR). Not class-1, so not auto-merged: a human reviews and merges."
+          )
+        case Route.NeedsHuman =>
+          if failureKind.contains(FailureKind.ProtectedPath) || failureKind.contains(
+              FailureKind.OversizedPatch
+            )
+          then
+            (
+              "needs-human",
+              s"patch guard rejection ($kindText), gate $gateStatus",
+              s"**Needs human** — the patch guard rejected the agent's patch ($kindText: a CI workflow / harness / docs / control-or-constitution file, or a patch over the size cap). The rejected change was NOT applied; this branch holds only a rejection marker and must NOT be merged."
+            )
+          else if failureKind.contains(FailureKind.EmptyFix) then
+            (
+              "needs-human",
+              s"fixer produced no diff (empty-fix), gate $gateStatus",
+              s"**Needs human**: the self-repair fixer produced no diff. In the cumulative-patch model that reverts all prior work, so this branch holds only an audit marker (the prior implementation is NOT on it). Opened for the audit trail; do NOT merge."
+            )
+          else
+            (
+              "needs-human",
+              s"self-repair budget exhausted ($kindText), gate $gateStatus",
+              s"**Needs human** — self-repair budget of ${cfg.repairBudget} exhausted on $kindText (last gate $gateStatus). Opened for the audit trail; do NOT merge without review."
+            )
+
+    if route == Route.NeedsHuman then
+      notify.notify(s"harness: #$issue needs-human ($kindText, gate $gateStatus)")
+
+    git.commit(
+      s"""feat(US-$issue): autonomous iteration — $commitTag
+         |
+         |Refs #$issue. Loop iteration $n, $pass gate pass(es). Outcome: $outcomeText.
+         |This commit was produced by an unattended claude -p iteration (harness v2).
+         |
+         |Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>""".stripMargin
+    )
+    git.push(branch)
+
+    val prBody = StringBuilder()
+    prBody ++= s"Autonomous harness (v2) iteration $n for #$issue.\n\n"
+    prBody ++= s"$prNote\n\n"
+    if reviewed then
+      prBody ++= s"<details><summary>Independent reviewer output</summary>\n\n```\n${fs.read(reviewFile)}\n```\n\n</details>\n\n"
+    if route == Route.AutoMergeCandidate then
+      prBody ++= "v4 auto-merge: class-1 + reviewer APPROVE — the loop merges once the required CI check is green.\n\n"
+    else
+      prBody ++= "Not auto-merged (v4 merges class-1 + APPROVE only): a human reviews and merges.\n\n"
+    prBody ++= s"Closes #$issue\n"
+    fs.write(artifact(issue, ".pr-body.md"), prBody.toString)
+
+    val prUrl = gh.createPr(
+      branch,
+      s"US-$issue: autonomous iteration ($outcomeText, gate $gateStatus)",
+      prBody.toString
+    )
+    val prNum = prNumberOf(prUrl) match
+      case None =>
+        infraFault("could not determine PR number from gh pr create output — infra fault")
+      case Some(p) => p
+    logger.log(s"PR #$prNum opened for #$issue (outcome $outcomeText)")
+    emit(cur, "PR", "ok", detail = s"pr=$prNum outcome=$outcomeText")
+
+    route match
+      case Route.AutoMergeCandidate => autoMerge(issue, prNum, cur)
+      case Route.NeedsReview | Route.NeedsHuman =>
+        gh.editLabels(issue, add = List(label), remove = List(cfg.labels.active))
+        logger.log(s"issue #$issue -> $label")
+        if route == Route.NeedsReview then LoopExit.Success else LoopExit.NeedsHuman
+
+  /** This is the first of the phase extractions `iterate` is being split into (issue #29 / RFC #26
+    * decision 12); making that later split easy is why the pick-and-setup logic gets a name and a
+    * return type of its own before anything about its shape changes.
+    *
+    * Takes `(using Faulting)` even though nothing here calls `infraFault` today: threading the
+    * label keeps this phase inside `runOnce`'s boundary, so it cannot return a fault normally into
+    * the caller. A fault site added here later will additionally need `Notify` threaded through,
+    * since `infraFault` requires it and this function's using clause does not provide it yet.
+    */
+  private def pickAndSetup(n: Int, cur: Cursor)(using
+      cfg: Config,
+      gh: GitHub,
+      git: Git,
+      fs: HarnessFs,
+      log: StatusLog,
+      logger: Log
+  )(using Faulting): PickAndSetup =
+    // The stop file is a MANUAL kill-switch only: the loop never writes it itself.
+    if fs.stopRequested() then
+      logger.log(s"${cfg.stopFile} present (manual kill-switch) — exiting")
+      return PickAndSetup.StoppedEarly(LoopExit.ManualStop)
+
+    // Pick US (deterministic, no LLM): resume an in-progress one, else oldest ready.
+    // No issue = transient idle — nothing is written, nothing is labelled, so the very next
+    // tick resumes on its own when a US goes ready (the idle state must never latch).
+    val issue = gh.inProgressIssue().orElse(gh.oldestReadyIssue()) match
+      case None =>
+        logger.log("no in-progress or ready issue — idle, exiting (next tick resumes when one goes ready)")
+        return PickAndSetup.StoppedEarly(LoopExit.Idle)
+      case Some(i) => i
+    cur.iter = n; cur.issue = issue.toString; cur.pass = 0; cur.budget = cfg.repairBudget
+    emit(cur, "PICK", "ok", detail = s"issue=$issue")
+    logger.log(s"iteration $n -> issue #$issue")
+
+    // Render the worker prompt with the issue body injected (read-only).
+    val bodyFile = artifact(issue, ".body.md")
+    fs.write(bodyFile, gh.issueTitleAndBody(issue))
+    val workerPromptFile = artifact(issue, ".prompt.txt")
+    fs.write(
+      workerPromptFile,
+      renderTemplate(
+        fs.readTemplate(Template.Iterate),
+        // Config-derived slots FIRST, untrusted content last: belt and braces ordering, kept even
+        // though `renderTemplate`'s single pass (see its own scaladoc) already makes splice order
+        // immaterial to one splice's content being rescanned by another. Nothing here is secret
+        // from the agent, but a prompt reshaped by its own inputs is a prompt nobody reviewed.
+        "PROTECTED"   -> protectedList(cfg.protect),
+        "GATE"        -> cfg.gateCmd,
+        "CONVENTIONS" -> fs.conventions(),
+        "ISSUE"       -> fs.read(bodyFile)
+      )
+    )
+
+    // Auto-merge is earned by class-1 only. Detect the class once, at pick time.
+    val isClass1 = gh.issueLabels(issue).contains("class-1")
+
+    // Dry run stops here — before ANY git/label mutation, so it is truly read-only.
+    if cfg.dryRun then
+      logger.log(
+        s"DRY_RUN=1 — rendered worker prompt for #$issue -> $workerPromptFile; no mutation; stopping"
+      )
+      return PickAndSetup.StoppedEarly(LoopExit.DryRun)
+
+    // Require a clean tree on a fresh branch off main. Serial loop: one US at a time.
+    // These are die() paths in bash (exit 1): fatal misconfiguration, not part of the
+    // rc 0..50 state machine, so they surface as exceptions.
+    if !git.statusClean() then
+      throw IllegalStateException("working tree not clean — refusing to start")
+    // Stale-base guard: everything downstream is measured against origin/main; no fallback.
+    if !git.fetchOriginMain() then
+      throw IllegalStateException("cannot fetch origin/main — refusing to run against a stale base")
+    val branch = s"us-$issue"
+    if !git.checkoutBranch(branch) then throw IllegalStateException("cannot branch off origin/main")
+
+    // Mark active so a crashed run resumes the same US next tick.
+    gh.editLabels(issue, add = List(cfg.labels.active), remove = List(cfg.labels.ready))
+
+    PickAndSetup.Ready(issue, bodyFile, workerPromptFile, isClass1, branch)
+
+  /** The second of the phase extractions `iterate` is being split into (issue #30 / RFC #26
+    * decision 12); the same reasoning as `pickAndSetup` applies here: naming this phase and giving
+    * it a return type of its own is what makes the later node conversion a reshape instead of a
+    * rewrite. The locals that used to be this phase's real interface, declared before the initial
+    * dispatch and carried across the phases by capture, are now the fields of `Ready` below; see
+    * that case's scaladoc for which ones and why.
+    *
+    * `reviewFile` is computed here, not passed in as a parameter: this phase is the only writer
+    * (an empty seed before the first review, then each review's raw output), so it belongs with
+    * the values `Ready` produces, not with the caller-supplied `bodyFile`/`workerPromptFile`. It
+    * is returned as a field of `Ready` so the terminal phase of `iterate` can still read the
+    * reviewer transcript for the PR body.
+    *
+    * `(using Faulting)` still spans the whole function, for the same reason it spans
+    * `pickAndSetup`: a fault path that could return normally here would be a fault path that can
+    * spend repair budget, and the type system is what rules that out, not code review.
+    */
+  private def implementAndRepair(
+      n: Int,
+      cur: Cursor,
+      issue: Int,
+      bodyFile: String,
+      workerPromptFile: String
+  )(using
+      cfg: Config,
+      gh: GitHub,
+      git: Git,
+      agents: AgentDispatch,
+      gates: GateRunner,
+      fs: HarnessFs,
+      log: StatusLog,
+      logger: Log,
+      notify: Notify
+  )(using Faulting): ImplementAndRepair =
     // --- bounded self-repair state -------------------------------------------------------
     // Declared BEFORE the initial dispatch: a patch-guard rejection on the very first worker
-    // patch sets outcome/failureKind and skips the loop straight to the terminal.
+    // patch sets outcome/failureKind and skips the repair loop entirely. This function still
+    // returns a `Ready`, with `gateStatus` left at "SKIPPED".
     var budget                           = cfg.repairBudget
     var pass                             = 0
     var outcome: Option[Outcome]         = None
@@ -234,7 +468,7 @@ object Machine:
       case StageResult.Empty =>
         emit(cur, "IMPL", "ok", implLog, "no diff")
         logger.log("no changes produced by the iteration — leaving issue in-progress, not opening a PR")
-        return LoopExit.NothingMade
+        return ImplementAndRepair.StoppedEarly(LoopExit.NothingMade)
       case result =>
         handleStageResult(cur, Role.IMPL, implLog, result) match
           case StageVerdict.Applied(p)     => currentPatch = Some(p)
@@ -402,199 +636,8 @@ object Machine:
               )
     end while
 
-    // --- terminal: commit, push, PR (SUCCESS -> needs-review, FAIL -> needs-human) --------
-    // A fixer that produced no diff left the tree pristine (stagePatch reset to origin/main
-    // before it saw the empty patch), so the "nothing staged" guard below would otherwise fire
-    // first and mask the routing. Stage a small tracked marker so the needs-human audit PR
-    // still opens. In the cumulative-patch model an empty fix reverts all prior work, so this
-    // branch legitimately holds only the marker.
-    if failureKind.contains(FailureKind.EmptyFix) then
-      fs.write(
-        "FIX-EMPTY.md",
-        s"""# Fixer produced no diff
-           |
-           |The self-repair fixer returned an empty patch. In the cumulative-patch model that
-           |reverts all prior work on this branch, so the loop routed the issue to human review
-           |instead of re-gating an empty tree. Opened for the audit trail ONLY; do NOT merge.
-           |""".stripMargin
-      )
-      git.add("FIX-EMPTY.md")
-    git.addAll()
-    if !git.anythingStaged() then
-      logger.log("nothing staged at terminal — unexpected; leaving in-progress")
-      return LoopExit.NothingMade
-
-    val outcomeText = if outcome.contains(Outcome.Success) then "SUCCESS" else "FAIL"
-    val kindText    = failureKind.map(_.text).getOrElse("?")
-
-    // Terminal route decided ONCE, here. Every downstream site (label, notify, PR note,
-    // auto-merge dispatch, exit code) threads this value instead of re-testing
-    // outcome/isClass1 or comparing against a "needs-human" label string.
-    val route =
-      if outcome.contains(Outcome.Success) && isClass1 then Route.AutoMergeCandidate
-      else if outcome.contains(Outcome.Success) then Route.NeedsReview
-      else Route.NeedsHuman
-
-    val (label, commitTag, prNote) =
-      route match
-        case Route.AutoMergeCandidate =>
-          // no flip: the auto-merge path owns the issue's fate
-          (
-            "",
-            s"reviewer APPROVE, gate $gateStatus",
-            s"**Reviewer: APPROVE** · gate $gateStatus · class-1 — v4 auto-merge candidate: the loop merges after the required CI check goes green."
-          )
-        case Route.NeedsReview =>
-          (
-            "needs-review",
-            s"reviewer APPROVE, gate $gateStatus",
-            s"**Reviewer: APPROVE** · gate $gateStatus (containerized in-memory FAST tier green; the real-PG IT tier is judged by CI on this PR). Not class-1, so not auto-merged: a human reviews and merges."
-          )
-        case Route.NeedsHuman =>
-          if failureKind.contains(FailureKind.ProtectedPath) || failureKind.contains(
-              FailureKind.OversizedPatch
-            )
-          then
-            (
-              "needs-human",
-              s"patch guard rejection ($kindText), gate $gateStatus",
-              s"**Needs human** — the patch guard rejected the agent's patch ($kindText: a CI workflow / harness / docs / control-or-constitution file, or a patch over the size cap). The rejected change was NOT applied; this branch holds only a rejection marker and must NOT be merged."
-            )
-          else if failureKind.contains(FailureKind.EmptyFix) then
-            (
-              "needs-human",
-              s"fixer produced no diff (empty-fix), gate $gateStatus",
-              s"**Needs human**: the self-repair fixer produced no diff. In the cumulative-patch model that reverts all prior work, so this branch holds only an audit marker (the prior implementation is NOT on it). Opened for the audit trail; do NOT merge."
-            )
-          else
-            (
-              "needs-human",
-              s"self-repair budget exhausted ($kindText), gate $gateStatus",
-              s"**Needs human** — self-repair budget of ${cfg.repairBudget} exhausted on $kindText (last gate $gateStatus). Opened for the audit trail; do NOT merge without review."
-            )
-
-    if route == Route.NeedsHuman then
-      notify.notify(s"harness: #$issue needs-human ($kindText, gate $gateStatus)")
-
-    git.commit(
-      s"""feat(US-$issue): autonomous iteration — $commitTag
-         |
-         |Refs #$issue. Loop iteration $n, $pass gate pass(es). Outcome: $outcomeText.
-         |This commit was produced by an unattended claude -p iteration (harness v2).
-         |
-         |Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>""".stripMargin
-    )
-    git.push(branch)
-
-    val prBody = StringBuilder()
-    prBody ++= s"Autonomous harness (v2) iteration $n for #$issue.\n\n"
-    prBody ++= s"$prNote\n\n"
-    if reviewed then
-      prBody ++= s"<details><summary>Independent reviewer output</summary>\n\n```\n${fs.read(reviewFile)}\n```\n\n</details>\n\n"
-    if route == Route.AutoMergeCandidate then
-      prBody ++= "v4 auto-merge: class-1 + reviewer APPROVE — the loop merges once the required CI check is green.\n\n"
-    else
-      prBody ++= "Not auto-merged (v4 merges class-1 + APPROVE only): a human reviews and merges.\n\n"
-    prBody ++= s"Closes #$issue\n"
-    fs.write(artifact(issue, ".pr-body.md"), prBody.toString)
-
-    val prUrl = gh.createPr(
-      branch,
-      s"US-$issue: autonomous iteration ($outcomeText, gate $gateStatus)",
-      prBody.toString
-    )
-    val prNum = prNumberOf(prUrl) match
-      case None =>
-        infraFault("could not determine PR number from gh pr create output — infra fault")
-      case Some(p) => p
-    logger.log(s"PR #$prNum opened for #$issue (outcome $outcomeText)")
-    emit(cur, "PR", "ok", detail = s"pr=$prNum outcome=$outcomeText")
-
-    route match
-      case Route.AutoMergeCandidate => autoMerge(issue, prNum, cur)
-      case Route.NeedsReview | Route.NeedsHuman =>
-        gh.editLabels(issue, add = List(label), remove = List(cfg.labels.active))
-        logger.log(s"issue #$issue -> $label")
-        if route == Route.NeedsReview then LoopExit.Success else LoopExit.NeedsHuman
-
-  /** This is the first of the phase extractions `iterate` is being split into (issue #29 / RFC #26
-    * decision 12); making that later split easy is why the pick-and-setup logic gets a name and a
-    * return type of its own before anything about its shape changes.
-    *
-    * Takes `(using Faulting)` even though nothing here calls `infraFault` today: threading the
-    * label keeps this phase inside `runOnce`'s boundary, so it cannot return a fault normally into
-    * the caller. A fault site added here later will additionally need `Notify` threaded through,
-    * since `infraFault` requires it and this function's using clause does not provide it yet.
-    */
-  private def pickAndSetup(n: Int, cur: Cursor)(using
-      cfg: Config,
-      gh: GitHub,
-      git: Git,
-      fs: HarnessFs,
-      log: StatusLog,
-      logger: Log
-  )(using Faulting): PickAndSetup =
-    // The stop file is a MANUAL kill-switch only: the loop never writes it itself.
-    if fs.stopRequested() then
-      logger.log(s"${cfg.stopFile} present (manual kill-switch) — exiting")
-      return PickAndSetup.StoppedEarly(LoopExit.ManualStop)
-
-    // Pick US (deterministic, no LLM): resume an in-progress one, else oldest ready.
-    // No issue = transient idle — nothing is written, nothing is labelled, so the very next
-    // tick resumes on its own when a US goes ready (the idle state must never latch).
-    val issue = gh.inProgressIssue().orElse(gh.oldestReadyIssue()) match
-      case None =>
-        logger.log("no in-progress or ready issue — idle, exiting (next tick resumes when one goes ready)")
-        return PickAndSetup.StoppedEarly(LoopExit.Idle)
-      case Some(i) => i
-    cur.iter = n; cur.issue = issue.toString; cur.pass = 0; cur.budget = cfg.repairBudget
-    emit(cur, "PICK", "ok", detail = s"issue=$issue")
-    logger.log(s"iteration $n -> issue #$issue")
-
-    // Render the worker prompt with the issue body injected (read-only).
-    val bodyFile = artifact(issue, ".body.md")
-    fs.write(bodyFile, gh.issueTitleAndBody(issue))
-    val workerPromptFile = artifact(issue, ".prompt.txt")
-    fs.write(
-      workerPromptFile,
-      renderTemplate(
-        fs.readTemplate(Template.Iterate),
-        // Config-derived slots FIRST, untrusted content last: belt and braces ordering, kept even
-        // though `renderTemplate`'s single pass (see its own scaladoc) already makes splice order
-        // immaterial to one splice's content being rescanned by another. Nothing here is secret
-        // from the agent, but a prompt reshaped by its own inputs is a prompt nobody reviewed.
-        "PROTECTED"   -> protectedList(cfg.protect),
-        "GATE"        -> cfg.gateCmd,
-        "CONVENTIONS" -> fs.conventions(),
-        "ISSUE"       -> fs.read(bodyFile)
-      )
-    )
-
-    // Auto-merge is earned by class-1 only. Detect the class once, at pick time.
-    val isClass1 = gh.issueLabels(issue).contains("class-1")
-
-    // Dry run stops here — before ANY git/label mutation, so it is truly read-only.
-    if cfg.dryRun then
-      logger.log(
-        s"DRY_RUN=1 — rendered worker prompt for #$issue -> $workerPromptFile; no mutation; stopping"
-      )
-      return PickAndSetup.StoppedEarly(LoopExit.DryRun)
-
-    // Require a clean tree on a fresh branch off main. Serial loop: one US at a time.
-    // These are die() paths in bash (exit 1): fatal misconfiguration, not part of the
-    // rc 0..50 state machine, so they surface as exceptions.
-    if !git.statusClean() then
-      throw IllegalStateException("working tree not clean — refusing to start")
-    // Stale-base guard: everything downstream is measured against origin/main; no fallback.
-    if !git.fetchOriginMain() then
-      throw IllegalStateException("cannot fetch origin/main — refusing to run against a stale base")
-    val branch = s"us-$issue"
-    if !git.checkoutBranch(branch) then throw IllegalStateException("cannot branch off origin/main")
-
-    // Mark active so a crashed run resumes the same US next tick.
-    gh.editLabels(issue, add = List(cfg.labels.active), remove = List(cfg.labels.ready))
-
-    PickAndSetup.Ready(issue, bodyFile, workerPromptFile, isClass1, branch)
+    // `outcome.getOrElse(Outcome.Fail)`: unreachable in practice; see `Ready`'s scaladoc.
+    ImplementAndRepair.Ready(pass, outcome.getOrElse(Outcome.Fail), gateStatus, failureKind, reviewed, reviewFile)
 
   /** v4 auto-merge (class-1 + APPROVE only): wait-appear -> watch -> merge -> VERIFY the PR state
     * is MERGED (unverified = infra fault) -> drop in-progress -> flip blocked -> fetch -> notify.
@@ -732,6 +775,51 @@ object Machine:
         workerPromptFile: String,
         isClass1: Boolean,
         branch: String
+    )
+
+  /** What `implementAndRepair` concluded: either the initial IMPL patch was empty and `iterate`
+    * stops immediately with the carried `LoopExit`, or the phase ran to completion (the initial
+    * dispatch, zero or more repair passes, and a final gate/review outcome) and everything the
+    * terminal phase of `iterate` reads is here.
+    *
+    * Same shape as `PickAndSetup` and for the same reason (issue #30 / RFC #26 decision 12): the
+    * two cases genuinely differ, so naming both lets `iterate` read as "call the phase, then
+    * branch" instead of re-deriving the early-exit condition at the call site.
+    */
+  private enum ImplementAndRepair:
+    /** The only early stop in this phase: an empty initial IMPL patch. `exit` is always
+      * `LoopExit.NothingMade` in practice; kept as `LoopExit` rather than hardcoded so this case
+      * has the same shape as `PickAndSetup.StoppedEarly`. Never `LoopExit.InfraFault`, for the
+      * same reason as `PickAndSetup.StoppedEarly`: a fault goes through `infraFault`'s `break`,
+      * which never returns here at all.
+      */
+    case StoppedEarly(exit: LoopExit)
+
+    /** The values that used to be mutable locals declared before the initial dispatch and read by
+      * `iterate` long after this phase returned, plus `reviewFile`. `budget` and `currentPatch`
+      * are not here. `currentPatch` is pure bookkeeping internal to the repair loop, never read
+      * once this function returns. `budget` leaves through the shared `cur.budget`, which `emit`
+      * copies into every `StatusEvent`; it does not leave through this return value, so there is
+      * no local copy to carry here either. Field names match what `iterate` imports them as, same
+      * convention as `PickAndSetup.Ready`.
+      *
+      * `outcome` is `Outcome`, not `Option[Outcome]`. The `while outcome.isEmpty` loop above can
+      * only exit with `Some`, and the only other way to reach this `Ready` is the initial-patch
+      * rejection path, which already set `Some(Outcome.Fail)`. So `None` was never reachable here;
+      * this is the one field where the explicit result type discharges that invariant for free
+      * instead of carrying a case nothing produces. The construction collapses it with
+      * `outcome.getOrElse(Outcome.Fail)`, which is exactly what the terminal used to do by reading
+      * `outcome.contains(Outcome.Success)`: a `None` there already meant `Fail`, so the collapse
+      * changes no observable behaviour. `failureKind` stays `Option[FailureKind]`: that one
+      * genuinely can be `None` (a clean gate GREEN plus a reviewer APPROVE never sets it).
+      */
+    case Ready(
+        pass: Int,
+        outcome: Outcome,
+        gateStatus: String,
+        failureKind: Option[FailureKind],
+        reviewed: Boolean,
+        reviewFile: String
     )
 
   private enum Outcome:

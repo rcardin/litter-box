@@ -299,6 +299,15 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     w.calls.find(_.startsWith("dispatch FIX")).get should include(
       s"currentPatch=$logDir/issue-999-iter1.impl.patch"
     )
+    // two gate passes were made (the initial pass, whose review came back REQUEST_CHANGES, then
+    // the re-gate after the fix) and the commit message body carries that count, not a stale or
+    // hardcoded one
+    w.commitMessages.head should include("Loop iteration 1, 2 gate pass(es)")
+    // a review actually ran, so the PR body embeds the reviewer's transcript, not an empty block:
+    // the content pins reviewFile itself, since an unknown path would read back as "" in-memory
+    // (Recorder.read) but throws in production (LiveHarnessFs.read, no missing-file fallback)
+    w.prBodies.head should include("<details><summary>Independent reviewer output</summary>")
+    w.prBodies.head should include("VERDICT: APPROVE")
   }
 
   // ---- issue #27: a third party's issue comment reaches the FIX prompt ---------------------
@@ -784,6 +793,12 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     w.commitMessages.head should include("patch guard rejection (protected-path), gate SKIPPED")
     w.notifications shouldBe List("harness: #999 needs-human (protected-path, gate SKIPPED)")
     w.prBodies.head should include("must NOT be merged")
+    // the repair loop never ran (guard rejection short-circuits it), so zero gate passes were
+    // made and the commit message body reflects that, not a leftover count from some other path
+    w.commitMessages.head should include("Loop iteration 1, 0 gate pass(es)")
+    // no review ever ran (asserted above via dispatch REVIEW count 0), so the PR body must not
+    // embed a reviewer transcript block
+    w.prBodies.head should not include "<details><summary>Independent reviewer output</summary>"
   }
 
   it should "guard every protected path class and let ordinary source paths through" in {
