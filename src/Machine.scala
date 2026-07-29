@@ -158,66 +158,10 @@ object Machine:
       clock: Clock,
       logger: Log
   )(using Faulting): LoopExit =
-    // The stop file is a MANUAL kill-switch only: the loop never writes it itself.
-    if fs.stopRequested() then
-      logger.log(s"${cfg.stopFile} present (manual kill-switch) — exiting")
-      return LoopExit.ManualStop
-
-    // Pick US (deterministic, no LLM): resume an in-progress one, else oldest ready.
-    // No issue = transient idle — nothing is written, nothing is labelled, so the very next
-    // tick resumes on its own when a US goes ready (the idle state must never latch).
-    val issue = gh.inProgressIssue().orElse(gh.oldestReadyIssue()) match
-      case None =>
-        logger.log("no in-progress or ready issue — idle, exiting (next tick resumes when one goes ready)")
-        return LoopExit.Idle
-      case Some(i) => i
-    cur.iter = n; cur.issue = issue.toString; cur.pass = 0; cur.budget = cfg.repairBudget
-    emit(cur, "PICK", "ok", detail = s"issue=$issue")
-    logger.log(s"iteration $n -> issue #$issue")
-
-    // Render the worker prompt with the issue body injected (read-only).
-    val bodyFile = artifact(issue, ".body.md")
-    fs.write(bodyFile, gh.issueTitleAndBody(issue))
-    val workerPromptFile = artifact(issue, ".prompt.txt")
-    fs.write(
-      workerPromptFile,
-      renderTemplate(
-        fs.readTemplate(Template.Iterate),
-        // Config-derived slots FIRST, untrusted content last: `renderTemplate` folds left, so a
-        // slot spliced early has its injected text scanned by every later pass. With ISSUE first,
-        // an issue body containing the literal {{GATE}} would have that line rewritten by the
-        // harness. Nothing here is secret from the agent, but a prompt reshaped by its own inputs
-        // is a prompt nobody reviewed.
-        "PROTECTED"   -> protectedList(cfg.protect),
-        "GATE"        -> cfg.gateCmd,
-        "CONVENTIONS" -> fs.conventions(),
-        "ISSUE"       -> fs.read(bodyFile)
-      )
-    )
-
-    // Auto-merge is earned by class-1 only. Detect the class once, at pick time.
-    val isClass1 = gh.issueLabels(issue).contains("class-1")
-
-    // Dry run stops here — before ANY git/label mutation, so it is truly read-only.
-    if cfg.dryRun then
-      logger.log(
-        s"DRY_RUN=1 — rendered worker prompt for #$issue -> $workerPromptFile; no mutation; stopping"
-      )
-      return LoopExit.DryRun
-
-    // Require a clean tree on a fresh branch off main. Serial loop: one US at a time.
-    // These are die() paths in bash (exit 1): fatal misconfiguration, not part of the
-    // rc 0..50 state machine, so they surface as exceptions.
-    if !git.statusClean() then
-      throw IllegalStateException("working tree not clean — refusing to start")
-    // Stale-base guard: everything downstream is measured against origin/main; no fallback.
-    if !git.fetchOriginMain() then
-      throw IllegalStateException("cannot fetch origin/main — refusing to run against a stale base")
-    val branch = s"us-$issue"
-    if !git.checkoutBranch(branch) then throw IllegalStateException("cannot branch off origin/main")
-
-    // Mark active so a crashed run resumes the same US next tick.
-    gh.editLabels(issue, add = List(cfg.labels.active), remove = List(cfg.labels.ready))
+    val setup = pickAndSetup(n, cur) match
+      case PickAndSetup.StoppedEarly(exit) => return exit
+      case ready: PickAndSetup.Ready       => ready
+    import setup.{issue, bodyFile, workerPromptFile, isClass1, branch}
 
     // --- bounded self-repair state -------------------------------------------------------
     // Declared BEFORE the initial dispatch: a patch-guard rejection on the very first worker
@@ -487,6 +431,86 @@ object Machine:
         logger.log(s"issue #$issue -> $label")
         if route == Route.NeedsReview then LoopExit.Success else LoopExit.NeedsHuman
 
+  /** This is the first of the phase extractions `iterate` is being split into (issue #29 / RFC #26
+    * decision 12); making that later split easy is why the pick-and-setup logic gets a name and a
+    * return type of its own before anything about its shape changes.
+    *
+    * Takes `(using Faulting)` even though nothing here calls `infraFault` today: threading the
+    * label keeps this phase inside `runOnce`'s boundary, so it cannot return a fault normally into
+    * the caller. A fault site added here later will additionally need `Notify` threaded through,
+    * since `infraFault` requires it and this function's using clause does not provide it yet.
+    */
+  private def pickAndSetup(n: Int, cur: Cursor)(using
+      cfg: Config,
+      gh: GitHub,
+      git: Git,
+      fs: HarnessFs,
+      log: StatusLog,
+      logger: Log
+  )(using Faulting): PickAndSetup =
+    // The stop file is a MANUAL kill-switch only: the loop never writes it itself.
+    if fs.stopRequested() then
+      logger.log(s"${cfg.stopFile} present (manual kill-switch) — exiting")
+      return PickAndSetup.StoppedEarly(LoopExit.ManualStop)
+
+    // Pick US (deterministic, no LLM): resume an in-progress one, else oldest ready.
+    // No issue = transient idle — nothing is written, nothing is labelled, so the very next
+    // tick resumes on its own when a US goes ready (the idle state must never latch).
+    val issue = gh.inProgressIssue().orElse(gh.oldestReadyIssue()) match
+      case None =>
+        logger.log("no in-progress or ready issue — idle, exiting (next tick resumes when one goes ready)")
+        return PickAndSetup.StoppedEarly(LoopExit.Idle)
+      case Some(i) => i
+    cur.iter = n; cur.issue = issue.toString; cur.pass = 0; cur.budget = cfg.repairBudget
+    emit(cur, "PICK", "ok", detail = s"issue=$issue")
+    logger.log(s"iteration $n -> issue #$issue")
+
+    // Render the worker prompt with the issue body injected (read-only).
+    val bodyFile = artifact(issue, ".body.md")
+    fs.write(bodyFile, gh.issueTitleAndBody(issue))
+    val workerPromptFile = artifact(issue, ".prompt.txt")
+    fs.write(
+      workerPromptFile,
+      renderTemplate(
+        fs.readTemplate(Template.Iterate),
+        // Config-derived slots FIRST, untrusted content last: `renderTemplate` folds left, so a
+        // slot spliced early has its injected text scanned by every later pass. With ISSUE first,
+        // an issue body containing the literal {{GATE}} would have that line rewritten by the
+        // harness. Nothing here is secret from the agent, but a prompt reshaped by its own inputs
+        // is a prompt nobody reviewed.
+        "PROTECTED"   -> protectedList(cfg.protect),
+        "GATE"        -> cfg.gateCmd,
+        "CONVENTIONS" -> fs.conventions(),
+        "ISSUE"       -> fs.read(bodyFile)
+      )
+    )
+
+    // Auto-merge is earned by class-1 only. Detect the class once, at pick time.
+    val isClass1 = gh.issueLabels(issue).contains("class-1")
+
+    // Dry run stops here — before ANY git/label mutation, so it is truly read-only.
+    if cfg.dryRun then
+      logger.log(
+        s"DRY_RUN=1 — rendered worker prompt for #$issue -> $workerPromptFile; no mutation; stopping"
+      )
+      return PickAndSetup.StoppedEarly(LoopExit.DryRun)
+
+    // Require a clean tree on a fresh branch off main. Serial loop: one US at a time.
+    // These are die() paths in bash (exit 1): fatal misconfiguration, not part of the
+    // rc 0..50 state machine, so they surface as exceptions.
+    if !git.statusClean() then
+      throw IllegalStateException("working tree not clean — refusing to start")
+    // Stale-base guard: everything downstream is measured against origin/main; no fallback.
+    if !git.fetchOriginMain() then
+      throw IllegalStateException("cannot fetch origin/main — refusing to run against a stale base")
+    val branch = s"us-$issue"
+    if !git.checkoutBranch(branch) then throw IllegalStateException("cannot branch off origin/main")
+
+    // Mark active so a crashed run resumes the same US next tick.
+    gh.editLabels(issue, add = List(cfg.labels.active), remove = List(cfg.labels.ready))
+
+    PickAndSetup.Ready(issue, bodyFile, workerPromptFile, isClass1, branch)
+
   /** v4 auto-merge (class-1 + APPROVE only): wait-appear -> watch -> merge -> VERIFY the PR state
     * is MERGED (unverified = infra fault) -> drop in-progress -> flip blocked -> fetch -> notify.
     * CI red after green local gates = needs-human WITHOUT self-repair: the loop never repairs
@@ -596,6 +620,34 @@ object Machine:
           if !gh.editLabels(b, add = List(ready), remove = List(blocked)) then
             logger.log(s"WARNING: could not flip #$b $blocked -> $ready (flip by hand)")
     }
+
+  /** What `pickAndSetup` concluded: either `iterate` stops immediately with the carried `LoopExit`
+    * (manual stop, idle, dry run — none of them mutate git or labels), or the phase ran to
+    * completion and everything the rest of `iterate` needs is here.
+    *
+    * A sum type rather than, say, an `Option` of a result tuple plus a separate exit code: the two
+    * cases really do have different shapes, and naming both is what lets `iterate` read as "call the
+    * phase, then branch" instead of re-deriving the early-exit condition at the call site (issue #29
+    * / RFC #26 decision 12 — extract the phase first, so the later node conversion is a reshape).
+    */
+  private enum PickAndSetup:
+    /** The phase stopped on its own before touching git or labels; `exit` is what `iterate` must
+      * return unchanged. `exit` is never `LoopExit.InfraFault`: an infra fault goes through
+      * `infraFault`, not through this case, because routing it here would skip the fault log line
+      * and the notify that `infraFault` is responsible for.
+      */
+    case StoppedEarly(exit: LoopExit)
+
+    /** So the call site reads as plain names instead of `setup.foo` accessors, the field names are
+      * the ones `iterate` imports them as.
+      */
+    case Ready(
+        issue: Int,
+        bodyFile: String,
+        workerPromptFile: String,
+        isClass1: Boolean,
+        branch: String
+    )
 
   private enum Outcome:
     case Success, Fail

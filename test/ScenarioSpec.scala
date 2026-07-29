@@ -97,7 +97,53 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     w.called("gh pr create") shouldBe false
     w.called("git checkout") shouldBe false
     w.called("git fetch") shouldBe false
+    // class detection reads labels before the dry run check, not after: pins that ordering
+    w.called("gh issue view 999 --json labels") shouldBe true
     w.phaseSeq shouldBe List("PICK", "DONE")
+  }
+
+  // ---- issue #29: pick-and-setup guards for dirty tree, stale base, branch failure ---------
+  // `pickAndSetup`'s clean-tree, stale-base and branch guards are the only paths in the pick and
+  // setup phase with no other coverage: no golden exercises them, and every fake defaults to the
+  // happy path, so without tests here a regression in any of the three would pass silently.
+
+  it should "refuse to start on a dirty working tree, before any label mutation" in {
+    val w = TestWorld()
+    w.cleanTree = false
+
+    val ex = intercept[IllegalStateException] { w.runLoop() }
+
+    ex.getMessage shouldBe "working tree not clean — refusing to start"
+    w.called("git status --porcelain") shouldBe true // the guard that fired
+    w.called("git fetch origin main") shouldBe false // stale-base guard never reached
+    w.called("git checkout") shouldBe false
+    w.called("gh issue edit") shouldBe false         // active label never flipped
+  }
+
+  it should "refuse to run against a stale base when fetching origin/main fails" in {
+    val w = TestWorld()
+    w.fetchSucceeds = false
+
+    val ex = intercept[IllegalStateException] { w.runLoop() }
+
+    ex.getMessage shouldBe "cannot fetch origin/main — refusing to run against a stale base"
+    w.called("git status --porcelain") shouldBe true // clean-tree guard passed first
+    w.called("git fetch origin main") shouldBe true  // the guard that fired
+    w.called("git checkout") shouldBe false
+    w.called("gh issue edit") shouldBe false         // active label never flipped
+  }
+
+  it should "refuse to proceed when checking out the branch off origin/main fails" in {
+    val w = TestWorld()
+    w.checkoutSucceeds = false
+
+    val ex = intercept[IllegalStateException] { w.runLoop() }
+
+    ex.getMessage shouldBe "cannot branch off origin/main"
+    w.called("git status --porcelain") shouldBe true // clean-tree guard passed first
+    w.called("git fetch origin main") shouldBe true  // stale-base guard passed too
+    w.called("git checkout us-999") shouldBe true    // the attempt that failed
+    w.called("gh issue edit") shouldBe false         // active label never flipped
   }
 
   // ---- Scenario A: APPROVE happy path -> needs-review, exit 0 ------------------------------

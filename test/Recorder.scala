@@ -87,6 +87,7 @@ final class TestWorld:
   var applySucceeds: Boolean            = true
   var cleanTree: Boolean                = true
   var fetchSucceeds: Boolean            = true
+  var checkoutSucceeds: Boolean         = true
   var labelEditSucceeds: Boolean        = true
   var blockedIssues: List[Int]          = Nil
   var issueBodies: Map[Int, String]     = Map.empty
@@ -150,7 +151,7 @@ final class TestWorld:
   val git: Git = new Git:
     def statusClean(): Boolean                  = { record("git status --porcelain"); cleanTree }
     def fetchOriginMain(): Boolean              = { record("git fetch origin main"); fetchSucceeds }
-    def checkoutBranch(branch: String): Boolean = { record(s"git checkout $branch"); true }
+    def checkoutBranch(branch: String): Boolean = { record(s"git checkout $branch"); checkoutSucceeds }
     def resetHardCleanToOriginMain(): Unit      =
       record("git reset --hard origin/main && git clean -fd"); staged = false
     def applyNumstat(patch: String): String =
