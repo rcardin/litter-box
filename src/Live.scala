@@ -775,6 +775,59 @@ final class LiveGitHub(
   private def gh(args: String*): LiveProc.Result =
     LiveProc.run(root, "gh" +: args, pathPrepend = extraPath)
 
+  /** The jq program shared by `issueComments` and `prComments`, one argv element: both read the same
+    * `comments` JSON shape, off `gh issue view` and `gh pr view` respectively, so the program itself
+    * does not need to differ. Emits one `@json`-encoded string PER comment rather than joining the
+    * array into one preformatted string (see `Caps.GitHub.issueComments` for why joining is unsafe).
+    * `@json` escapes any newline inside a comment to a literal `\n`, so `gh`'s `--jq` output is one
+    * physical line per comment, and `commentsOf` below splits on that.
+    */
+  private val commentsJqProgram =
+    ".comments[] | (\"@\" + .author.login + \" (\" + .authorAssociation + \"):\\n\" + .body) | @json"
+
+  /** Runs `gh <kind> view <id> --json comments --jq commentsJqProgram` and decodes the result back
+    * to one plain-text entry per comment. `kind` is `"issue"` or `"pr"`, the only two argv words
+    * `issueComments`/`prComments` differ by.
+    */
+  private def commentsOf(kind: String, id: Int): Option[List[String]] =
+    val r = gh(kind, "view", id.toString, "--json", "comments", "--jq", commentsJqProgram)
+    // `None` on a nonzero exit rather than folding it into `Some(Nil)`: auth expiry, rate limiting,
+    // and a broken jq program all fail this way, and the two must stay distinguishable (see
+    // `Caps.GitHub.issueComments`). `Machine.fixRound` turns this back into prompt text with a
+    // different sentinel for each case.
+    if r.rc == 0 then
+      Some(r.stdoutTrimmedTrailingNewlines.linesIterator.filter(_.nonEmpty).map(decodeJsonString).toList)
+    else None
+
+  /** Reverses `@json`'s escaping of ONE line of `commentsOf`'s output. Not a general JSON parser:
+    * this repo has no JSON library (`CONVENTIONS.md`), and `commentsJqProgram` only ever hands this
+    * a single double-quoted string, so undoing the handful of escapes `@json` can produce (quote,
+    * backslash, the control-character shorthands, and `\u` for anything else under 0x20) is enough.
+    */
+  private def decodeJsonString(line: String): String =
+    val inner = line.substring(1, line.length - 1) // strip the surrounding quotes @json always adds
+    val sb    = new StringBuilder(inner.length)
+    var i     = 0
+    while i < inner.length do
+      val c = inner.charAt(i)
+      if c == '\\' && i + 1 < inner.length then
+        inner.charAt(i + 1) match
+          case '"'   => sb += '"'; i += 2
+          case '\\'  => sb += '\\'; i += 2
+          case '/'   => sb += '/'; i += 2
+          case 'b'   => sb += '\b'; i += 2
+          case 'f'   => sb += '\f'; i += 2
+          case 'n'   => sb += '\n'; i += 2
+          case 'r'   => sb += '\r'; i += 2
+          case 't'   => sb += '\t'; i += 2
+          case 'u'   =>
+            sb += Integer.parseInt(inner.substring(i + 2, i + 6), 16).toChar
+            i += 6
+          case other => sb += other; i += 2
+      else
+        sb += c; i += 1
+    sb.toString
+
   /** loop.sh:627: `gh issue list --state open --label <active> --json number --jq .[0].number`.
     * Crash-resume asks for the CONFIGURED active label, never the literal `in-progress`.
     */
@@ -822,6 +875,12 @@ final class LiveGitHub(
   /** loop.sh:395 (flip_blocked's dependency-body scan). */
   def issueBody(issue: Int): String =
     gh("issue", "view", issue.toString, "--json", "body", "--jq", ".body").stdout
+
+  /** Added for #27: `gh issue view` already returns `comments`, this repo just never read it. See
+    * the trait docstring in `Caps.scala` for why this is a `List` of prefixed entries rather than a
+    * joined string, and why the `Option` keeps a failed read distinct from a comment-free issue.
+    */
+  def issueComments(issue: Int): Option[List[String]] = commentsOf("issue", issue)
 
   /** loop.sh:650, minus the join/split round-trip (a bash string-matching artifact only, Machine
     * does `.contains("class-1")` on the `List` form directly, Machine.scala:108).
@@ -900,6 +959,9 @@ final class LiveGitHub(
   def prComment(pr: Int, body: String): Unit =
     gh("pr", "comment", pr.toString, "--body", body)
     ()
+
+  /** Mirrors `issueComments` over the PR thread instead of the issue thread. */
+  def prComments(pr: Int): Option[List[String]] = commentsOf("pr", pr)
 
   /** loop.sh:479: stderr discarded, trimmed; any nonzero exit -> empty string (bash: `|| true` with
     * `2>/dev/null`).

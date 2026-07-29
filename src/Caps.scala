@@ -24,6 +24,26 @@ trait GitHub:
 
   /** Raw body only (flip_blocked scans it for `Blocked-by: #N`). */
   def issueBody(issue: Int): String
+
+  /** Comments left on the issue, oldest first, one entry per comment, added for #27 (a third party
+    * steering a run mid-flight was invisible until something read this back).
+    *
+    * A `List`, not one joined string: any separator this trait could pick is text a commenter can
+    * type into their own comment body, so joining would let a drive by comment forge a fake second
+    * entry (for example one impersonating the maintainer) inside its own text. The boundary between
+    * entries is `List` structure this trait draws from `gh`'s own comment array, never a substring
+    * scanned out of a blob afterward, so no comment body can merge into, or split off from, its
+    * neighbour.
+    *
+    * Each entry is also prefixed with its author's `@login (association):`. That names who `gh`
+    * recorded as the author of THIS entry; it is provenance, not a guarantee, since nothing here
+    * stops an entry's own body from containing a line that looks like another author prefix.
+    *
+    * `None` when the `gh` read itself failed (auth expiry, rate limit, a broken jq program);
+    * `Some(Nil)` when it succeeded and there simply were no comments (same shape as
+    * `checksRollupCount` below). Collapsing the two would tell the fixer something untrue.
+    */
+  def issueComments(issue: Int): Option[List[String]]
   def issueLabels(issue: Int): List[String]
   def issueState(issue: Int): String
 
@@ -36,6 +56,13 @@ trait GitHub:
   /** Returns the PR URL (empty/garbage URL is the caller's infra fault to raise). */
   def createPr(branch: String, title: String, body: String): String
   def prComment(pr: Int, body: String): Unit
+
+  /** Comments on the PR opened for this issue: same shape and reasoning as `issueComments` above.
+    * Nothing splices this into a prompt yet (only the issue's own comments feed the FIX prompt; #28
+    * owns wiring this one in), but the read exists in full because a third party is just as likely
+    * to steer from the PR thread.
+    */
+  def prComments(pr: Int): Option[List[String]]
   def prState(pr: Int): String
 
   /** `statusCheckRollup | length`; None when the query itself failed. */

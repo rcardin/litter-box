@@ -119,6 +119,54 @@ class LogParitySpec extends AnyFlatSpec with Matchers:
     w.logShouldMatchGolden("gate-red-repair")
   }
 
+  /** The "third-party comments were spliced" log line was previously asserted only by a substring
+    * check (`ScenarioSpec`), which a reword or reorder could pass right through. Pinning it here,
+    * whole stream and all, gives it the same protection every other operator-facing line in this
+    * file already has.
+    */
+  it should "match the golden for a gate-RED repair round with a third-party issue comment spliced in (issue #27)" in {
+    val w = TestWorld()
+    w.gateResults = List(GateResult.Red)
+    w.fixScripts = List(WorkerScript.Produces(newFilePatch))
+    w.issueCommentBodies = Map(999 -> List("please also handle the empty-list case"))
+
+    w.runLoop() shouldBe LoopExit.Success
+
+    w.logShouldMatchGolden("gate-red-repair-comment")
+  }
+
+  /** The other two operator log lines this feature added, the failed-read line and the
+    * missing-`{{COMMENTS}}`-marker warning, were asserted only by substring checks in
+    * `ScenarioSpec`, which a reword sails through. These two pin them the same way as
+    * `gate-red-repair-comment` above.
+    */
+  it should "match the golden for a gate-RED repair round whose issue comments read failed (issue #27)" in {
+    val w = TestWorld()
+    w.gateResults = List(GateResult.Red)
+    w.fixScripts = List(WorkerScript.Produces(newFilePatch))
+    w.issueCommentsFail = Set(999)
+
+    w.runLoop() shouldBe LoopExit.Success
+
+    w.logShouldMatchGolden("gate-red-repair-comments-read-failed")
+  }
+
+  it should "match the golden for a gate-RED repair round warning about a missing {{COMMENTS}} marker (issue #27)" in {
+    val w = TestWorld()
+    // An ejected fix-prompt.md that predates issue #27 has no {{COMMENTS}} line at all.
+    w.templates = w.templates.updated(
+      Template.Fix,
+      "You are the fixer.\n{{ISSUE}}\n{{FAILURE}}\nProduce a patch."
+    )
+    w.gateResults = List(GateResult.Red)
+    w.fixScripts = List(WorkerScript.Produces(newFilePatch))
+    w.issueCommentBodies = Map(999 -> List("please also handle the empty-list case"))
+
+    w.runLoop() shouldBe LoopExit.Success
+
+    w.logShouldMatchGolden("gate-red-repair-missing-comments-marker")
+  }
+
   it should "match the golden for a REQUEST_CHANGES repair round" in {
     val w = TestWorld()
     w.reviewScripts = List(

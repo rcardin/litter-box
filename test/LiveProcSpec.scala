@@ -844,12 +844,15 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
          |    fi ;;
          |  "issue view")
          |    id="$$3"
-         |    if [[ "$$*" == *"--json title,body"* ]]; then
+         |    if [[ "$$id" == "666" ]]; then echo "gh: could not resolve to an Issue"; exit 1
+         |    elif [[ "$$*" == *"--json title,body"* ]]; then
          |      printf '# US-%s sample\\n\\nAC1: implement.\\n' "$$id"
          |    elif [[ "$$*" == *"--json labels"* ]]; then
          |      echo "ready class-1"
          |    elif [[ "$$*" == *"--json body"* ]]; then
          |      echo "Blocked-by: #999"
+         |    elif [[ "$$*" == *"--json comments"* ]]; then
+         |      printf '%s\\n' '"@alice (MEMBER):\\nhuman note one"' '"@bob (NONE):\\nhuman note two"'
          |    elif [[ "$$*" == *"--json state"* ]]; then
          |      echo "CLOSED"
          |    fi ;;
@@ -866,7 +869,9 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
          |  "pr view")
          |    pr="$$3"
          |    if [[ "$$*" == *statusCheckRollup* ]]; then echo "1"
-         |    elif [[ "$$pr" == "666" ]]; then exit 1
+         |    elif [[ "$$pr" == "666" ]]; then echo "gh: could not resolve to a PullRequest"; exit 1
+         |    elif [[ "$$*" == *"--json comments"* ]]; then
+         |      printf '%s\\n' '"@carol (COLLABORATOR):\\npr note one"' '"@dave (NONE):\\npr note two"'
          |    else echo "MERGED"
          |    fi ;;
          |  *) : ;;
@@ -1124,6 +1129,66 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
     gh.prState(666) shouldBe "" // the fake exits 1 for pr 666
 
     readString(callsFile) should include("gh pr view 42 --json state --jq .state")
+  }
+
+  // A third party commenting mid-run is invisible to the loop unless something reads it back
+  // (#27); see `Caps.GitHub.issueComments` for why the result is a List of prefixed entries rather
+  // than one joined string.
+  "LiveGitHub.issueComments" should "pass the exact jq program as one argv element and decode one entry per comment" in {
+    val root                   = tempRoot()
+    val (binDir, callsFile, _) = setupFakeGh()
+    val gh                     =
+      LiveGitHub(root, ciAppearCmd = None, mergeCmd = None, extraPath = Some(binDir.toString))
+
+    val comments = gh.issueComments(999)
+
+    comments shouldBe defined
+    comments.get should have size 2
+    // The decoded entry is exactly the fake's payload with the JSON @json escaping reversed: the
+    // surrounding quotes stripped and the escaped \n turned back into a real newline.
+    comments.get.head shouldBe "@alice (MEMBER):\nhuman note one"
+    comments.get(1) shouldBe "@bob (NONE):\nhuman note two"
+    readString(callsFile) should include(
+      """gh issue view 999 --json comments --jq .comments[] | ("@" + .author.login + " (" + .authorAssociation + "):\n" + .body) | @json"""
+    )
+  }
+
+  it should "return None when gh exits nonzero, even though the fake also prints to stdout" in {
+    val root                   = tempRoot()
+    val (binDir, _, _)         = setupFakeGh()
+    val gh                     =
+      LiveGitHub(root, ciAppearCmd = None, mergeCmd = None, extraPath = Some(binDir.toString))
+
+    // The fake prints a message before exiting 1: without the rc guard this would return
+    // Some(that message) instead of None, so this test only proves the guard is load bearing
+    // because the fake has something on stdout to leak if the guard were missing.
+    gh.issueComments(666) shouldBe None
+  }
+
+  "LiveGitHub.prComments" should "pass the exact jq program as one argv element and decode one entry per comment" in {
+    val root                   = tempRoot()
+    val (binDir, callsFile, _) = setupFakeGh()
+    val gh                     =
+      LiveGitHub(root, ciAppearCmd = None, mergeCmd = None, extraPath = Some(binDir.toString))
+
+    val comments = gh.prComments(42)
+
+    comments shouldBe defined
+    comments.get should have size 2
+    comments.get.head shouldBe "@carol (COLLABORATOR):\npr note one"
+    comments.get(1) shouldBe "@dave (NONE):\npr note two"
+    readString(callsFile) should include(
+      """gh pr view 42 --json comments --jq .comments[] | ("@" + .author.login + " (" + .authorAssociation + "):\n" + .body) | @json"""
+    )
+  }
+
+  it should "return None when gh exits nonzero, even though the fake also prints to stdout" in {
+    val root           = tempRoot()
+    val (binDir, _, _) = setupFakeGh()
+    val gh             =
+      LiveGitHub(root, ciAppearCmd = None, mergeCmd = None, extraPath = Some(binDir.toString))
+
+    gh.prComments(666) shouldBe None
   }
 
   // =============================================================================================

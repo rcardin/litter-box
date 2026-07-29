@@ -81,16 +81,28 @@ object Machine:
     )
 
   /** render_template: each line containing the literal `{{KEY}}` is replaced by the spliced content
-    * (whole-line replacement, embedded newlines preserved), one key per pass.
+    * (whole-line replacement, embedded newlines preserved). Every splice key is looked up against
+    * the ORIGINAL template text, so the match for each line of `template` is decided once, and the
+    * chosen replacement's own lines go straight into the output without ever being fed back into the
+    * scan. This single pass (rather than folding the splices one at a time over an accumulator) is
+    * what makes the guarantee "no splice's content is rescanned for another splice's marker" hold
+    * regardless of splice order; call sites still splice untrusted content last anyway, as defence
+    * in depth.
+    *
+    * The lookup is `splices.collectFirst`, a linear scan of the argument SEQUENCE, never a `Map`
+    * built from it: a `Map` loses argument order, so a template line naming two markers would
+    * resolve by hash order instead of by which splice the caller listed first. Consumers own ejected
+    * skeletons and can legitimately put two markers on one line, so which one wins has to be a
+    * decision this function makes on purpose, not an artefact of `Map`'s iteration order.
     */
   private[litterbox] def renderTemplate(template: String, splices: (String, String)*): String =
-    splices.foldLeft(template) { case (acc, (key, content)) =>
-      acc.linesIterator
-        .flatMap { line =>
-          if line.contains(s"{{$key}}") then content.linesIterator else Iterator(line)
-        }
-        .mkString("\n")
-    }
+    template.linesIterator
+      .flatMap { line =>
+        splices.collectFirst { case (key, content) if line.contains(s"{{$key}}") => content } match
+          case Some(content) => content.linesIterator
+          case None          => Iterator(line)
+      }
+      .mkString("\n")
 
   /** `{{PROTECTED}}`: the patch guard's list, as markdown bullets for the prompt.
     *
@@ -101,6 +113,43 @@ object Machine:
     */
   private[litterbox] def protectedList(protect: List[String]): String =
     protect.map(p => s"- `$p`").mkString("\n")
+
+  /** The `<untrusted-comments>` fence in fix-prompt.md is plain text, not a markup the model parses
+    * structurally. A comment body starting with the literal `</untrusted-comments>` string reads as
+    * the END of the untrusted section, landing whatever the commenter wrote after it as unmarked,
+    * seemingly-authoritative text at top level; a comment body containing the literal
+    * `<untrusted-comments>` OPENING string forges a second fence boundary inside the data. Encoding
+    * either tag's angle brackets as HTML entities keeps the forgery readable as data while making it
+    * impossible for spliced text to reproduce either of the fence's own strings. The genuine fence
+    * that ships in the skeleton is untouched: it never passes through this function, only the
+    * comment DATA does.
+    *
+    * `[\s\p{Z}]*` widens the whitespace class to every Unicode separator, not just the ASCII ones
+    * Java's `\s` matches (a non breaking space is a real-world bypass otherwise), and `[^>]*` after
+    * the tag name tolerates any junk up to the closing `>` rather than requiring the tag to be
+    * exactly whitespace-padded. The capturing group around the optional `/` is what tells the
+    * replacement which of the two strings to emit, so one pattern defuses both tags without
+    * duplicating the whitespace/junk tolerance twice.
+    */
+  private[litterbox] def defuseFenceCloser(s: String): String =
+    "(?i)<[\\s\\p{Z}]*(/?)[\\s\\p{Z}]*untrusted-comments[^>]*>".r.replaceAllIn(
+      s,
+      m => if m.group(1) == "/" then "&lt;/untrusted-comments&gt;" else "&lt;untrusted-comments&gt;"
+    )
+
+  /** Comment text is free form and, unlike the patch path (`cfg.maxPatchBytes`), unbounded. A
+    * constant here rather than a config key, same as every other cap in this file: this is the
+    * harness defending itself, not a knob a consumer tunes. The truncation marker is appended AFTER
+    * the cap is reached, so the fixer can tell a long comment thread was cut short rather than
+    * reading a silently shortened one as complete.
+    */
+  private[litterbox] val MaxCommentsChars = 20000
+
+  private[litterbox] def truncateComments(s: String): String =
+    if s.length <= MaxCommentsChars then s
+    else
+      s.take(MaxCommentsChars) +
+        s"\n\n[comments truncated by the harness at $MaxCommentsChars characters]"
 
   /** Logs an infra fault the way bash does — the message on the operator's log stream at the point
     * of the fault — fires the rc-50 notify seam, and abandons the iteration. Single helper rather
@@ -325,11 +374,10 @@ object Machine:
       workerPromptFile,
       renderTemplate(
         fs.readTemplate(Template.Iterate),
-        // Config-derived slots FIRST, untrusted content last: `renderTemplate` folds left, so a
-        // slot spliced early has its injected text scanned by every later pass. With ISSUE first,
-        // an issue body containing the literal {{GATE}} would have that line rewritten by the
-        // harness. Nothing here is secret from the agent, but a prompt reshaped by its own inputs
-        // is a prompt nobody reviewed.
+        // Config-derived slots FIRST, untrusted content last: belt and braces ordering, kept even
+        // though `renderTemplate`'s single pass (see its own scaladoc) already makes splice order
+        // immaterial to one splice's content being rescanned by another. Nothing here is secret
+        // from the agent, but a prompt reshaped by its own inputs is a prompt nobody reviewed.
         "PROTECTED"   -> protectedList(cfg.protect),
         "GATE"        -> cfg.gateCmd,
         "CONVENTIONS" -> fs.conventions(),
@@ -388,6 +436,7 @@ object Machine:
       workerPromptFile: String
   )(using
       cfg: Config,
+      gh: GitHub,
       git: Git,
       agents: AgentDispatch,
       gates: GateRunner,
@@ -431,15 +480,52 @@ object Machine:
     // guard rejections and an empty fix become the terminal FAIL; Ok advances currentPatch.
     def fixRound(pass: Int, failFile: String): Unit =
       val fixPromptFile = artifact(issue, s"-pass$pass.fix.prompt.txt")
+      // Third-party comments are untrusted content, same as the issue body; see
+      // `Caps.GitHub.issueComments` for why they arrive as a List of prefixed entries rather than a
+      // joined string, and why `Option` keeps a failed read distinct from "no comments". COMMENTS is
+      // still spliced last here as defence in depth, though `renderTemplate`'s single pass (see its
+      // own scaladoc) already makes splice order immaterial to the rescan guarantee.
+      //
+      // commentsData and commentsLogLine come out of the SAME match on commentsRead, not two
+      // independent matches, so the prompt text and the log line can never drift out of sync with
+      // each other one arm at a time.
+      val commentsRead                    = gh.issueComments(issue)
+      val (commentsData, commentsLogLine) = commentsRead match
+        case None =>
+          (
+            "[harness: comments could not be read]",
+            Some(
+              s"issue #$issue: could not read comments for the FIX prompt (gh failed); proceeding without them"
+            )
+          )
+        case Some(Nil) =>
+          ("[harness: no comments]", None)
+        case Some(entries) =>
+          (
+            truncateComments(entries.map(defuseFenceCloser).mkString("\n\n---\n\n")),
+            Some(s"issue #$issue: third-party comments were spliced into the FIX prompt")
+          )
+      commentsLogLine.foreach(logger.log)
+      val fixTemplate = fs.readTemplate(Template.Fix)
+      // An ejected fix-prompt.md that predates #27 has no {{COMMENTS}} line, so the marker never
+      // matches and whatever was read above is silently dropped. Only warn when there was something
+      // real to lose: no comments or a failed read leaves nothing for the missing marker to hide,
+      // and warning on every ordinary comment-free iteration would just be noise the log-parity
+      // goldens would then have to carry for every scenario.
+      if !fixTemplate.contains("{{COMMENTS}}") && commentsRead.exists(_.nonEmpty) then
+        logger.log(
+          s"WARNING: issue #$issue has comments but the resolved FIX skeleton has no {{COMMENTS}} marker to hold them (ejected before issue #27; add {{COMMENTS}} or re-eject fix-prompt.md)"
+        )
       fs.write(
         fixPromptFile,
         renderTemplate(
-          fs.readTemplate(Template.Fix),
+          fixTemplate,
           "PROTECTED"   -> protectedList(cfg.protect),
           "GATE"        -> cfg.gateCmd,
           "CONVENTIONS" -> fs.conventions(),
           "ISSUE"       -> fs.read(bodyFile),
-          "FAILURE"     -> fs.read(failFile)
+          "FAILURE"     -> fs.read(failFile),
+          "COMMENTS"    -> commentsData
         )
       )
       val fixLog   = artifact(issue, s"-pass$pass.fix.claude.log")

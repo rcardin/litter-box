@@ -1,0 +1,9 @@
+iteration 1 -> issue #999
+FAST gate RED (pass 1, see .litter-box/logs/issue-999-pass1.gate.log)
+self-repair: budget now 1 — dispatching FIX for gate-RED
+issue #999: third-party comments were spliced into the FIX prompt
+WARNING: issue #999 has comments but the resolved FIX skeleton has no {{COMMENTS}} marker to hold them (ejected before issue #27; add {{COMMENTS}} or re-eject fix-prompt.md)
+FAST gate GREEN (pass 2) — running tamper check + cold reviewer
+reviewer verdict: APPROVE (pass 2)
+PR #123 opened for #999 (outcome SUCCESS)
+issue #999 -> needs-review
