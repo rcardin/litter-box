@@ -88,7 +88,10 @@ java -jar /path/to/lb eject iterate-prompt.md
 This copies the built-in skeleton to `.litter-box/prompts/iterate-prompt.md`, which then wins over
 the built-in for every later run. `.litter-box/prompts/**` sits inside `.litter-box/**`, which the
 protected-path floor always covers, so a worker under harness cannot rewrite the prompt that
-constrains it. Pass `--force` to overwrite one you already ejected.
+constrains it. Pass `--force` to overwrite one you already ejected. `fix-prompt.md` now splices in
+third-party comments left on the issue while a run is in flight, so the fixer can act on steering it
+would otherwise never see; a `fix-prompt.md` ejected before this change has no slot for them and
+silently drops them until you re-eject it.
 
 ### The sandbox image
 

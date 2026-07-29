@@ -91,10 +91,26 @@ final class TestWorld:
   var labelEditSucceeds: Boolean        = true
   var blockedIssues: List[Int]          = Nil
   var issueBodies: Map[Int, String]     = Map.empty
+
+  /** Named plural, like `issueBodies`, never `issueComments`/`prComments`: a field with the exact
+    * method name would shadow it inside the `new GitHub { ... }` block below and not compile
+    * cleanly. One entry per comment, oldest first (see `Caps.GitHub.issueComments` for why a
+    * `List` rather than a joined string).
+    */
+  var issueCommentBodies: Map[Int, List[String]] = Map.empty
+  var prCommentBodies: Map[Int, List[String]]    = Map.empty // #28 wires this in; no consumer yet
+
+  /** Issues whose scripted `gh` comments read should fail (`None`), distinct from an issue with no
+    * entry in `issueCommentBodies`, which is a SUCCESSFUL read of `Nil` (see `Caps.GitHub.issueComments`
+    * for why the fake must be able to tell the two apart).
+    */
+  var issueCommentsFail: Set[Int] = Set.empty
+
   var issueStates: Map[Int, String]     = Map.empty // default CLOSED
   var templates: Map[Template, String]  = Map(
     Template.Iterate -> "You are the worker. Fresh context.\n{{ISSUE}}\nProduce a patch.",
-    Template.Fix     -> "You are the fixer.\n{{ISSUE}}\n{{FAILURE}}\nProduce a patch.",
+    Template.Fix ->
+      "You are the fixer.\n{{PROTECTED}}\n{{GATE}}\n{{CONVENTIONS}}\n{{ISSUE}}\n{{FAILURE}}\n{{COMMENTS}}\nProduce a patch.",
     Template.Review -> "Cold review.\n{{ISSUE}}\n{{CONVENTIONS}}\n{{TAMPER}}\n{{DIFF}}\nEmit a VERDICT."
   )
   var conventionsText: String = "# CONTEXT\nConventions: onion layout, use-case error enum."
@@ -123,6 +139,9 @@ final class TestWorld:
       record(s"gh issue view $issue --json title,body"); titleBody
     def issueBody(issue: Int): String =
       record(s"gh issue view $issue --json body"); issueBodies.getOrElse(issue, "")
+    def issueComments(issue: Int): Option[List[String]] =
+      record(s"gh issue view $issue --json comments")
+      if issueCommentsFail(issue) then None else Some(issueCommentBodies.getOrElse(issue, Nil))
     def issueLabels(issue: Int): List[String] =
       record(s"gh issue view $issue --json labels"); labels
     def issueState(issue: Int): String =
@@ -137,6 +156,9 @@ final class TestWorld:
       record(s"gh pr create --head $branch --title $title"); prBodies = prBodies :+ body; prUrl
     def prComment(pr: Int, body: String): Unit =
       record(s"gh pr comment $pr")
+    def prComments(pr: Int): Option[List[String]] =
+      record(s"gh pr view $pr --json comments")
+      Some(prCommentBodies.getOrElse(pr, Nil))
     def prState(pr: Int): String =
       record(s"gh pr view $pr --json state"); prStateAnswer
     def checksRollupCount(pr: Int): Option[Int] =
