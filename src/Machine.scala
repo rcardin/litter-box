@@ -217,120 +217,19 @@ object Machine:
       case ready: ImplementAndRepair.Ready       => ready
     import implemented.{pass, outcome, gateStatus, failureKind, reviewed, reviewFile}
 
-    // --- terminal: commit, push, PR (SUCCESS -> needs-review, FAIL -> needs-human) --------
-    // A fixer that produced no diff left the tree pristine (stagePatch reset to origin/main
-    // before it saw the empty patch), so the "nothing staged" guard below would otherwise fire
-    // first and mask the routing. Stage a small tracked marker so the needs-human audit PR
-    // still opens. In the cumulative-patch model an empty fix reverts all prior work, so this
-    // branch legitimately holds only the marker.
-    if failureKind.contains(FailureKind.EmptyFix) then
-      fs.write(
-        "FIX-EMPTY.md",
-        s"""# Fixer produced no diff
-           |
-           |The self-repair fixer returned an empty patch. In the cumulative-patch model that
-           |reverts all prior work on this branch, so the loop routed the issue to human review
-           |instead of re-gating an empty tree. Opened for the audit trail ONLY; do NOT merge.
-           |""".stripMargin
-      )
-      git.add("FIX-EMPTY.md")
-    git.addAll()
-    if !git.anythingStaged() then
-      logger.log("nothing staged at terminal — unexpected; leaving in-progress")
-      return LoopExit.NothingMade
-
-    val outcomeText = if outcome == Outcome.Success then "SUCCESS" else "FAIL"
-    val kindText    = failureKind.map(_.text).getOrElse("?")
-
-    // Terminal route decided ONCE, here. Every downstream site (label, notify, PR note,
-    // auto-merge dispatch, exit code) threads this value instead of re-testing
-    // outcome/isClass1 or comparing against a "needs-human" label string.
-    val route =
-      if outcome == Outcome.Success && isClass1 then Route.AutoMergeCandidate
-      else if outcome == Outcome.Success then Route.NeedsReview
-      else Route.NeedsHuman
-
-    val (label, commitTag, prNote) =
-      route match
-        case Route.AutoMergeCandidate =>
-          // no flip: the auto-merge path owns the issue's fate
-          (
-            "",
-            s"reviewer APPROVE, gate $gateStatus",
-            s"**Reviewer: APPROVE** · gate $gateStatus · class-1 — v4 auto-merge candidate: the loop merges after the required CI check goes green."
-          )
-        case Route.NeedsReview =>
-          (
-            "needs-review",
-            s"reviewer APPROVE, gate $gateStatus",
-            s"**Reviewer: APPROVE** · gate $gateStatus (containerized in-memory FAST tier green; the real-PG IT tier is judged by CI on this PR). Not class-1, so not auto-merged: a human reviews and merges."
-          )
-        case Route.NeedsHuman =>
-          if failureKind.contains(FailureKind.ProtectedPath) || failureKind.contains(
-              FailureKind.OversizedPatch
-            )
-          then
-            (
-              "needs-human",
-              s"patch guard rejection ($kindText), gate $gateStatus",
-              s"**Needs human** — the patch guard rejected the agent's patch ($kindText: a CI workflow / harness / docs / control-or-constitution file, or a patch over the size cap). The rejected change was NOT applied; this branch holds only a rejection marker and must NOT be merged."
-            )
-          else if failureKind.contains(FailureKind.EmptyFix) then
-            (
-              "needs-human",
-              s"fixer produced no diff (empty-fix), gate $gateStatus",
-              s"**Needs human**: the self-repair fixer produced no diff. In the cumulative-patch model that reverts all prior work, so this branch holds only an audit marker (the prior implementation is NOT on it). Opened for the audit trail; do NOT merge."
-            )
-          else
-            (
-              "needs-human",
-              s"self-repair budget exhausted ($kindText), gate $gateStatus",
-              s"**Needs human** — self-repair budget of ${cfg.repairBudget} exhausted on $kindText (last gate $gateStatus). Opened for the audit trail; do NOT merge without review."
-            )
-
-    if route == Route.NeedsHuman then
-      notify.notify(s"harness: #$issue needs-human ($kindText, gate $gateStatus)")
-
-    git.commit(
-      s"""feat(US-$issue): autonomous iteration — $commitTag
-         |
-         |Refs #$issue. Loop iteration $n, $pass gate pass(es). Outcome: $outcomeText.
-         |This commit was produced by an unattended claude -p iteration (harness v2).
-         |
-         |Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>""".stripMargin
+    terminal(
+      n = n,
+      cur = cur,
+      issue = issue,
+      isClass1 = isClass1,
+      branch = branch,
+      pass = pass,
+      outcome = outcome,
+      gateStatus = gateStatus,
+      failureKind = failureKind,
+      reviewed = reviewed,
+      reviewFile = reviewFile
     )
-    git.push(branch)
-
-    val prBody = StringBuilder()
-    prBody ++= s"Autonomous harness (v2) iteration $n for #$issue.\n\n"
-    prBody ++= s"$prNote\n\n"
-    if reviewed then
-      prBody ++= s"<details><summary>Independent reviewer output</summary>\n\n```\n${fs.read(reviewFile)}\n```\n\n</details>\n\n"
-    if route == Route.AutoMergeCandidate then
-      prBody ++= "v4 auto-merge: class-1 + reviewer APPROVE — the loop merges once the required CI check is green.\n\n"
-    else
-      prBody ++= "Not auto-merged (v4 merges class-1 + APPROVE only): a human reviews and merges.\n\n"
-    prBody ++= s"Closes #$issue\n"
-    fs.write(artifact(issue, ".pr-body.md"), prBody.toString)
-
-    val prUrl = gh.createPr(
-      branch,
-      s"US-$issue: autonomous iteration ($outcomeText, gate $gateStatus)",
-      prBody.toString
-    )
-    val prNum = prNumberOf(prUrl) match
-      case None =>
-        infraFault("could not determine PR number from gh pr create output — infra fault")
-      case Some(p) => p
-    logger.log(s"PR #$prNum opened for #$issue (outcome $outcomeText)")
-    emit(cur, "PR", "ok", detail = s"pr=$prNum outcome=$outcomeText")
-
-    route match
-      case Route.AutoMergeCandidate => autoMerge(issue, prNum, cur)
-      case Route.NeedsReview | Route.NeedsHuman =>
-        gh.editLabels(issue, add = List(label), remove = List(cfg.labels.active))
-        logger.log(s"issue #$issue -> $label")
-        if route == Route.NeedsReview then LoopExit.Success else LoopExit.NeedsHuman
 
   /** This is the first of the phase extractions `iterate` is being split into (issue #29 / RFC #26
     * decision 12); making that later split easy is why the pick-and-setup logic gets a name and a
@@ -421,8 +320,8 @@ object Machine:
     * `reviewFile` is computed here, not passed in as a parameter: this phase is the only writer
     * (an empty seed before the first review, then each review's raw output), so it belongs with
     * the values `Ready` produces, not with the caller-supplied `bodyFile`/`workerPromptFile`. It
-    * is returned as a field of `Ready` so the terminal phase of `iterate` can still read the
-    * reviewer transcript for the PR body.
+    * is returned as a field of `Ready` so `terminal` can still read the reviewer transcript for
+    * the PR body.
     *
     * `(using Faulting)` still spans the whole function, for the same reason it spans
     * `pickAndSetup`: a fault path that could return normally here would be a fault path that can
@@ -639,6 +538,154 @@ object Machine:
     // `outcome.getOrElse(Outcome.Fail)`: unreachable in practice; see `Ready`'s scaladoc.
     ImplementAndRepair.Ready(pass, outcome.getOrElse(Outcome.Fail), gateStatus, failureKind, reviewed, reviewFile)
 
+  /** The third and last of the phase extractions `iterate` is being split into (issue #31 / RFC #26
+    * decision 12). Unlike `pickAndSetup` and `implementAndRepair`, there is nothing left in `iterate`
+    * after this phase runs, so its result IS `iterate`'s result: a plain `LoopExit`, not a
+    * `StoppedEarly`/`Ready` sum type invented for symmetry with the other two. A sum type here would
+    * have no second case to distinguish.
+    *
+    * Takes `hostGates` and `clock` only because `autoMerge` needs them; this function itself never
+    * touches either directly. Carrying them is the price of naming the phase as one function rather
+    * than inlining `autoMerge`'s dispatch back into `iterate`.
+    *
+    * The terminal route is decided ONCE, here, and threaded to every downstream site instead of
+    * being re-tested: see `Route`'s own scaladoc for why that property matters.
+    */
+  private def terminal(
+      n: Int,
+      cur: Cursor,
+      issue: Int,
+      isClass1: Boolean,
+      branch: String,
+      pass: Int,
+      outcome: Outcome,
+      gateStatus: String,
+      failureKind: Option[FailureKind],
+      reviewed: Boolean,
+      reviewFile: String
+  )(using
+      cfg: Config,
+      gh: GitHub,
+      git: Git,
+      fs: HarnessFs,
+      log: StatusLog,
+      notify: Notify,
+      logger: Log,
+      hostGates: HostGateRunner,
+      clock: Clock
+  )(using Faulting): LoopExit =
+    // A fixer that produced no diff left the tree pristine (stagePatch reset to origin/main
+    // before it saw the empty patch), so the "nothing staged" guard below would otherwise fire
+    // first and mask the routing. Stage a small tracked marker so the needs-human audit PR
+    // still opens. In the cumulative-patch model an empty fix reverts all prior work, so this
+    // branch legitimately holds only the marker.
+    if failureKind.contains(FailureKind.EmptyFix) then
+      fs.write(
+        "FIX-EMPTY.md",
+        s"""# Fixer produced no diff
+           |
+           |The self-repair fixer returned an empty patch. In the cumulative-patch model that
+           |reverts all prior work on this branch, so the loop routed the issue to human review
+           |instead of re-gating an empty tree. Opened for the audit trail ONLY; do NOT merge.
+           |""".stripMargin
+      )
+      git.add("FIX-EMPTY.md")
+    git.addAll()
+    if !git.anythingStaged() then
+      logger.log("nothing staged at terminal — unexpected; leaving in-progress")
+      return LoopExit.NothingMade
+
+    val outcomeText = if outcome == Outcome.Success then "SUCCESS" else "FAIL"
+    val kindText    = failureKind.map(_.text).getOrElse("?")
+
+    // THE decision site for the terminal route; see `Route`'s scaladoc for why it is decided once.
+    val route =
+      if outcome == Outcome.Success && isClass1 then Route.AutoMergeCandidate
+      else if outcome == Outcome.Success then Route.NeedsReview
+      else Route.NeedsHuman
+
+    val (label, commitTag, prNote) =
+      route match
+        case Route.AutoMergeCandidate =>
+          // no flip: the auto-merge path owns the issue's fate
+          (
+            "",
+            s"reviewer APPROVE, gate $gateStatus",
+            s"**Reviewer: APPROVE** · gate $gateStatus · class-1 — v4 auto-merge candidate: the loop merges after the required CI check goes green."
+          )
+        case Route.NeedsReview =>
+          (
+            "needs-review",
+            s"reviewer APPROVE, gate $gateStatus",
+            s"**Reviewer: APPROVE** · gate $gateStatus (containerized in-memory FAST tier green; the real-PG IT tier is judged by CI on this PR). Not class-1, so not auto-merged: a human reviews and merges."
+          )
+        case Route.NeedsHuman =>
+          if failureKind.contains(FailureKind.ProtectedPath) || failureKind.contains(
+              FailureKind.OversizedPatch
+            )
+          then
+            (
+              "needs-human",
+              s"patch guard rejection ($kindText), gate $gateStatus",
+              s"**Needs human** — the patch guard rejected the agent's patch ($kindText: a CI workflow / harness / docs / control-or-constitution file, or a patch over the size cap). The rejected change was NOT applied; this branch holds only a rejection marker and must NOT be merged."
+            )
+          else if failureKind.contains(FailureKind.EmptyFix) then
+            (
+              "needs-human",
+              s"fixer produced no diff (empty-fix), gate $gateStatus",
+              s"**Needs human**: the self-repair fixer produced no diff. In the cumulative-patch model that reverts all prior work, so this branch holds only an audit marker (the prior implementation is NOT on it). Opened for the audit trail; do NOT merge."
+            )
+          else
+            (
+              "needs-human",
+              s"self-repair budget exhausted ($kindText), gate $gateStatus",
+              s"**Needs human** — self-repair budget of ${cfg.repairBudget} exhausted on $kindText (last gate $gateStatus). Opened for the audit trail; do NOT merge without review."
+            )
+
+    if route == Route.NeedsHuman then
+      notify.notify(s"harness: #$issue needs-human ($kindText, gate $gateStatus)")
+
+    git.commit(
+      s"""feat(US-$issue): autonomous iteration — $commitTag
+         |
+         |Refs #$issue. Loop iteration $n, $pass gate pass(es). Outcome: $outcomeText.
+         |This commit was produced by an unattended claude -p iteration (harness v2).
+         |
+         |Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>""".stripMargin
+    )
+    git.push(branch)
+
+    val prBody = StringBuilder()
+    prBody ++= s"Autonomous harness (v2) iteration $n for #$issue.\n\n"
+    prBody ++= s"$prNote\n\n"
+    if reviewed then
+      prBody ++= s"<details><summary>Independent reviewer output</summary>\n\n```\n${fs.read(reviewFile)}\n```\n\n</details>\n\n"
+    if route == Route.AutoMergeCandidate then
+      prBody ++= "v4 auto-merge: class-1 + reviewer APPROVE — the loop merges once the required CI check is green.\n\n"
+    else
+      prBody ++= "Not auto-merged (v4 merges class-1 + APPROVE only): a human reviews and merges.\n\n"
+    prBody ++= s"Closes #$issue\n"
+    fs.write(artifact(issue, ".pr-body.md"), prBody.toString)
+
+    val prUrl = gh.createPr(
+      branch,
+      s"US-$issue: autonomous iteration ($outcomeText, gate $gateStatus)",
+      prBody.toString
+    )
+    val prNum = prNumberOf(prUrl) match
+      case None =>
+        infraFault("could not determine PR number from gh pr create output — infra fault")
+      case Some(p) => p
+    logger.log(s"PR #$prNum opened for #$issue (outcome $outcomeText)")
+    emit(cur, "PR", "ok", detail = s"pr=$prNum outcome=$outcomeText")
+
+    route match
+      case Route.AutoMergeCandidate => autoMerge(issue, prNum, cur)
+      case Route.NeedsReview | Route.NeedsHuman =>
+        gh.editLabels(issue, add = List(label), remove = List(cfg.labels.active))
+        logger.log(s"issue #$issue -> $label")
+        if route == Route.NeedsReview then LoopExit.Success else LoopExit.NeedsHuman
+
   /** v4 auto-merge (class-1 + APPROVE only): wait-appear -> watch -> merge -> VERIFY the PR state
     * is MERGED (unverified = infra fault) -> drop in-progress -> flip blocked -> fetch -> notify.
     * CI red after green local gates = needs-human WITHOUT self-repair: the loop never repairs
@@ -779,8 +826,8 @@ object Machine:
 
   /** What `implementAndRepair` concluded: either the initial IMPL patch was empty and `iterate`
     * stops immediately with the carried `LoopExit`, or the phase ran to completion (the initial
-    * dispatch, zero or more repair passes, and a final gate/review outcome) and everything the
-    * terminal phase of `iterate` reads is here.
+    * dispatch, zero or more repair passes, and a final gate/review outcome) and everything
+    * `terminal` reads is here.
     *
     * Same shape as `PickAndSetup` and for the same reason (issue #30 / RFC #26 decision 12): the
     * two cases genuinely differ, so naming both lets `iterate` read as "call the phase, then
@@ -825,8 +872,10 @@ object Machine:
   private enum Outcome:
     case Success, Fail
 
-  /** The terminal route for a US, decided once in `iterate` and threaded to every downstream site
-    * (label, notify, PR note, auto-merge dispatch, exit code).
+  /** The terminal route for a US, decided once in `terminal` and threaded to every downstream site
+    * (label, notify, PR note, auto-merge dispatch, exit code) instead of re-tested at each one: a
+    * second decision site is where the label, the notify text, the PR note, the auto-merge
+    * dispatch, and the exit code could drift out of agreement with each other.
     */
   private enum Route:
     case AutoMergeCandidate, NeedsReview, NeedsHuman

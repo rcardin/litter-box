@@ -954,6 +954,26 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     w.notifications shouldBe List("harness: #999 needs-human (protected-path, gate RED)")
   }
 
+  // ---- issue #31: an unparseable gh pr create URL is an infra fault, not a crash -----------
+
+  it should "exit InfraFault when gh pr create's URL carries no numeric PR number, leaving in-progress on the issue" in {
+    val w = TestWorld()
+    w.prUrl = "https://github.com/test/test/pull/not-a-number"
+
+    val exit = w.runLoop()
+
+    exit shouldBe LoopExit.InfraFault
+    exit.rc shouldBe 50
+    w.called("gh pr create") shouldBe true // the PR was opened before the parse failure
+    w.called("gh issue edit 999 --add-label needs-review") shouldBe false // never reached
+    w.callCount("--remove-label in-progress") shouldBe 0                  // resumable next tick
+    w.phaseSeq shouldBe List("PICK", "IMPL", "FAST_GATE", "REVIEW", "DONE") // no PR event emitted
+    w.logged("could not determine PR number from gh pr create output — infra fault") shouldBe true
+    w.notifications shouldBe List(
+      "harness: infra fault — loop exited rc=50 for inspection (issue stays in-progress)"
+    )
+  }
+
   // ---- status-event hygiene ----------------------------------------------------------------
 
   it should "sanitize status-event details (strip backslash, double quote, newlines)" in {
