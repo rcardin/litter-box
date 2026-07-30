@@ -10,4 +10,5 @@ logs/
 # (`scala-cli --power package . -o lb --assembly`). ~10 MB of untracked binary otherwise, and the
 # loop itself runs `git add -A` before every gate pass, so untracked here means committed shortly.
 /lb
+/litter-box
 /litter-box.jar
