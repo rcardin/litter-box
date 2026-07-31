@@ -63,7 +63,8 @@ object Settings:
       |  sandboxed = true
       |  timeout   = 900
       |}
-      |issues.labels { ready = "ready", active = "in-progress", blocked = "blocked" }
+      |issues.labels { ready = "ready", active = "in-progress", blocked = "blocked", parked = "parked" }
+      |issues.park-on-exhaustion = true
       |protect  = [".litter-box/**", ".github/**", "CONTEXT.md"]
       |budgets  { repair = 2, max-patch-bytes = 1000000 }
       |timeouts { iter = 1800, ci-wait = 900, ci-appear = 300, ci-appear-interval = 10 }
@@ -320,8 +321,10 @@ object Settings:
       labels = Labels(
         ready = conf.getString("issues.labels.ready"),
         active = conf.getString("issues.labels.active"),
-        blocked = conf.getString("issues.labels.blocked")
+        blocked = conf.getString("issues.labels.blocked"),
+        parked = conf.getString("issues.labels.parked")
       ),
+      parkOnExhaustion = conf.getBoolean("issues.park-on-exhaustion"),
       protect = protectWithFloor(conf),
       repairBudget = conf.getInt("budgets.repair"),
       maxPatchBytes = conf.getLong("budgets.max-patch-bytes"),

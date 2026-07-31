@@ -860,6 +860,40 @@ final class LiveGitHub(
       "sort_by(.createdAt) | .[0].number"
     ).stdoutTrimmedTrailingNewlines.toIntOption
 
+  /** Added for #28, same shape as `oldestReadyIssue` above with the configured PARKED label,
+    * except every match is returned (oldest first) rather than only the first: `Machine`'s resume
+    * probe has to walk the whole list looking for the first one with an accepted human reply, so a
+    * newer parked issue with a reply is never starved behind an older one still waiting (review
+    * finding on issue #28's first pass).
+    *
+    * `None` on a nonzero `gh` exit rather than folding a failed read into `Some(Nil)`, same
+    * reasoning as `commentsOf` (issue #28 review finding 7, round 3): a rate limited or auth
+    * expired read must read as "the loop does not know", not as "the queue is empty".
+    */
+  def parkedIssues(): Option[List[Int]] =
+    val r = gh(
+      "issue",
+      "list",
+      "--state",
+      "open",
+      "--label",
+      labels.parked,
+      "--json",
+      "number,createdAt",
+      "--jq",
+      "sort_by(.createdAt) | .[].number"
+    )
+    if r.rc == 0 then
+      Some(r.stdout.linesIterator.flatMap(_.strip().toIntOption).toList)
+    else None
+
+  /** `gh api user --jq .login`: the account `gh` is authenticated as, i.e. the one the harness's
+    * own `issueComment` calls post as. `None` on a nonzero exit.
+    */
+  def viewerLogin(): Option[String] =
+    val r = gh("api", "user", "--jq", ".login")
+    if r.rc == 0 then Option(r.stdoutTrimmedTrailingNewlines).filter(_.nonEmpty) else None
+
   /** loop.sh:643-644. */
   def issueTitleAndBody(issue: Int): String =
     gh(
@@ -959,6 +993,13 @@ final class LiveGitHub(
   def prComment(pr: Int, body: String): Unit =
     gh("pr", "comment", pr.toString, "--body", body)
     ()
+
+  /** Added for #28, same shape as `prComment` above, over the issue thread instead of the PR one,
+    * except the rc is reported rather than discarded: see `Caps.GitHub.issueComment` for why the
+    * marker post's success has to be observable to the caller here.
+    */
+  def issueComment(issue: Int, body: String): Boolean =
+    gh("issue", "comment", issue.toString, "--body", body).rc == 0
 
   /** Mirrors `issueComments` over the PR thread instead of the issue thread. */
   def prComments(pr: Int): Option[List[String]] = commentsOf("pr", pr)

@@ -272,3 +272,50 @@ class LogParitySpec extends AnyFlatSpec with Matchers:
     w.logShouldMatchGolden("empty-impl-patch")
     w.called("gh pr create") shouldBe false
   }
+
+  // ---- issue #28: parked terminal ------------------------------------------------------------
+
+  it should "match the golden for the repair budget exhausting into a parked issue, not a needs-human PR" in {
+    val w = TestWorld()
+    w.gateResults = List(GateResult.Red, GateResult.Red, GateResult.Red)
+    w.fixScripts = List(
+      WorkerScript.Produces("1\t0\tsrc/main/scala/Fix1.scala"),
+      WorkerScript.Produces("1\t0\tsrc/main/scala/Fix2.scala")
+    )
+
+    w.runLoop() shouldBe LoopExit.Parked
+
+    w.logShouldMatchGolden("parked-on-exhaustion")
+  }
+
+  it should "match the golden for a parked issue with no reply, exiting Parked again with nothing spent" in {
+    val w = TestWorld()
+    w.inProgress = None
+    w.ready = None
+    w.parked = List(777)
+    w.issueCommentBodies =
+      Map(777 -> List(s"@litter-box (OWNER):\n${Machine.ParkMarker}\nparked, awaiting a reply"))
+
+    w.runLoop() shouldBe LoopExit.Parked
+
+    w.logShouldMatchGolden("parked-no-reply")
+    w.files shouldBe empty
+  }
+
+  it should "match the golden for resuming a parked issue with a human reply, straight to a FIX" in {
+    val w = TestWorld()
+    w.inProgress = None
+    w.ready = None
+    w.parked = List(777)
+    w.fixScripts = List(WorkerScript.Produces(newFilePatch))
+    w.issueCommentBodies = Map(
+      777 -> List(
+        s"@litter-box (OWNER):\n${Machine.ParkMarker}\nparked, awaiting a reply",
+        "@alice (OWNER):\ntry using a HashMap instead"
+      )
+    )
+
+    w.runLoop() shouldBe LoopExit.Success
+
+    w.logShouldMatchGolden("parked-resume")
+  }

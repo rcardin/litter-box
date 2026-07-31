@@ -70,9 +70,9 @@ remote found, a JDK other than 21) and three next steps, none of which it can do
    what it finds to the sandboxed worker, fixer and reviewer. Exporting the variable instead works
    just as well; the file takes any other variable from [Running it](#running-it) too, and which one
    wins is the layering in [Configuration](#configuration).
-3. **Create the three labels** the state machine drives on:
+3. **Create the four labels** the state machine drives on:
    ```bash
-   gh label create ready && gh label create in-progress && gh label create blocked
+   gh label create ready && gh label create in-progress && gh label create blocked && gh label create parked
    ```
 
 ### Overriding a prompt skeleton
@@ -133,7 +133,8 @@ gate {
   sandboxed = true                          # false runs it on the host instead, with everything your shell has
   timeout   = 900
 }
-issues.labels { ready = "ready", active = "in-progress", blocked = "blocked" }
+issues.labels { ready = "ready", active = "in-progress", blocked = "blocked", parked = "parked" }
+issues.park-on-exhaustion = true          # false opens a needs-human PR instead, the earlier contract
 protect  = [".litter-box/**", ".github/**", "CONTEXT.md"]
 budgets  { repair = 2, max-patch-bytes = 1000000 }
 timeouts { iter = 1800, ci-wait = 900, ci-appear = 300, ci-appear-interval = 10 }
@@ -158,8 +159,9 @@ Fixed, not pluggable:
 PICK → IMPLEMENT → GATE → REPAIR → REVIEW → PR → CI → MERGE
 ```
 
-One issue per iteration. `PICK` resumes an `in-progress` issue if there is one, else takes the
-oldest `ready` one — deterministic, no LLM involved.
+One issue per iteration. `PICK` resumes an `in-progress` issue if there is one; else a `parked`
+issue with an accepted human reply, so a run a human already steered finishes before anything new
+starts; else takes the oldest `ready` one — deterministic, no LLM involved.
 
 ## The safety spine
 
@@ -178,7 +180,13 @@ This is the product. Everything else is plumbing.
   the diff, the acceptance criteria, the conventions and the tamper report, and must emit a
   `VERDICT:` sentinel. **No sentinel is treated as REQUEST_CHANGES**, never as approval.
 - **Bounded self-repair.** A shared budget (default 2) per issue, spent by a RED gate *or* a
-  `REQUEST_CHANGES`. A pathological issue terminates instead of looping.
+  `REQUEST_CHANGES`. Exhausting it on that generic failure parks the issue by default
+  (`issues.park-on-exhaustion`) rather than looping forever; a guard rejection or an empty fix
+  still terminates straight to `needs-human` regardless of the knob.
+- **Only vouched-for accounts can resume a parked issue.** The marker comment that bounds the
+  resume probe, and any reply that resumes it, must come from an `OWNER`, `MEMBER` or
+  `COLLABORATOR` association. A comment from any other account is logged and ignored, so a public
+  issue thread cannot be used to force unbounded park/resume dispatch cycles.
 - **Infra faults are not code failures.** A Docker outage, a timed-out worker or a failed merge
   exits `50` with the budget untouched and the issue left `in-progress`, so the next tick resumes it.
   A crashed sandbox can never burn repair budget or trigger a FIX.
@@ -187,17 +195,18 @@ This is the product. Everything else is plumbing.
 
 ## Exit codes
 
-Each iteration ends in one of seven states. The driver maps them to a process exit code:
+Each iteration ends in one of eight states. The driver maps them to a process exit code:
 
 | State | rc | Process | Meaning |
 |---|---|---|---|
 | Success | 0 | *continues* | Merged, or PR opened → `needs-review` |
 | ManualStop | 10 | 0 | `STOP.md` present |
-| Idle | 11 | 0 | No `ready` or `in-progress` issue |
+| Idle | 11 | 0 | No `ready`, `in-progress` or `parked` issue |
 | DryRun | 20 | 0 | `DRY_RUN=1` stop point, before any mutation |
 | NothingMade | 30 | 1 | Empty patch — nothing staged |
-| NeedsHuman | 40 | *continues* | Budget spent, guard rejection, or CI red. PR left open for audit |
+| NeedsHuman | 40 | *continues* | Guard rejection, empty fix, CI red, or budget spent with `issues.park-on-exhaustion` false. PR left open for audit |
 | InfraFault | 50 | 50 | Infra problem. Issue stays `in-progress` |
+| Parked | 60 | 60 | Budget spent on a generic gate/review failure with `issues.park-on-exhaustion` true (the default). No PR; issue labelled `parked` instead of `needs-human`. A later tick with an accepted human reply on the issue resumes it with a FIX |
 
 `Success` and `NeedsHuman` are the only two that let the driver advance to the next iteration;
 every other state exits the process immediately. The loop runs at most `MAX_ITERS` iterations.

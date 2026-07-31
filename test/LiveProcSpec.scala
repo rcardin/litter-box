@@ -841,6 +841,7 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
          |    if [[ "$$*" == *"--label in-progress"* ]]; then echo ""
          |    elif [[ "$$*" == *"--label ready"* ]]; then echo "999"
          |    elif [[ "$$*" == *"--label blocked"* ]]; then echo "555"
+         |    elif [[ "$$*" == *"--label parked"* ]]; then printf '700\\n777\\n'
          |    fi ;;
          |  "issue view")
          |    id="$$3"
@@ -857,6 +858,7 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
          |      echo "CLOSED"
          |    fi ;;
          |  "issue edit") : ;;
+         |  "issue comment") : ;;
          |  "pr create")
          |    for ((i=1;i<=$$#;i++)); do
          |      if [[ "$${!i}" == "--body-file" ]]; then
@@ -896,6 +898,110 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
     calls should include(
       "gh issue list --state open --label ready --json number,createdAt --jq sort_by(.createdAt) | .[0].number"
     )
+  }
+
+  /** Issue #28 review finding 6: `parkedIssues` returns EVERY match, oldest first, not just the
+    * oldest. `Machine`'s resume probe has to walk the whole list to avoid starving a newer parked
+    * issue with a reply behind an older one with none.
+    */
+  "LiveGitHub.parkedIssues" should "call the exact bash argv and return every match, sorted oldest first" in {
+    val root                   = tempRoot()
+    val (binDir, callsFile, _) = setupFakeGh()
+    val gh                     =
+      LiveGitHub(root, ciAppearCmd = None, mergeCmd = None, extraPath = Some(binDir.toString))
+
+    gh.parkedIssues() shouldBe Some(List(700, 777))
+
+    readString(callsFile) should include(
+      "gh issue list --state open --label parked --json number,createdAt --jq sort_by(.createdAt) | .[].number"
+    )
+  }
+
+  /** Issue #28 review finding 7, round 3: a failed read must answer `None`, distinct from a
+    * successful read reporting an empty queue (`Some(Nil)`), the same distinction `commentsOf`
+    * already draws. Folding the two together would let a rate-limited or auth-expired read report
+    * as a healthy, empty queue.
+    */
+  it should "return None, not an empty list, when the underlying gh call exits nonzero" in {
+    val root   = tempRoot()
+    val binDir = Files.createTempDirectory("fake-gh-fail-bin")
+    writeExecutable(
+      binDir,
+      "gh",
+      """#!/usr/bin/env bash
+        |exit 1
+        |""".stripMargin
+    )
+    val gh = LiveGitHub(root, ciAppearCmd = None, mergeCmd = None, extraPath = Some(binDir.toString))
+
+    gh.parkedIssues() shouldBe None
+  }
+
+  /** Issue #28 review finding 3, round 3: the resume probe identifies its own park marker by the
+    * login `gh` is authenticated as, not by association, since a bot or GitHub App token's
+    * association reads `NONE` even on the harness's own comment.
+    */
+  "LiveGitHub.viewerLogin" should "call gh api user --jq .login and return the trimmed answer" in {
+    val root   = tempRoot()
+    val binDir = Files.createTempDirectory("fake-gh-viewer-bin")
+    val callsFile = Files.createTempFile("gh-calls", ".log")
+    writeExecutable(
+      binDir,
+      "gh",
+      s"""#!/usr/bin/env bash
+         |echo "gh $$*" >> "$callsFile"
+         |echo "litter-box-bot"
+         |""".stripMargin
+    )
+    val gh = LiveGitHub(root, ciAppearCmd = None, mergeCmd = None, extraPath = Some(binDir.toString))
+
+    gh.viewerLogin() shouldBe Some("litter-box-bot")
+    readString(callsFile) should include("gh api user --jq .login")
+  }
+
+  it should "return None when the underlying gh call exits nonzero" in {
+    val root   = tempRoot()
+    val binDir = Files.createTempDirectory("fake-gh-viewer-fail-bin")
+    writeExecutable(
+      binDir,
+      "gh",
+      """#!/usr/bin/env bash
+        |exit 1
+        |""".stripMargin
+    )
+    val gh = LiveGitHub(root, ciAppearCmd = None, mergeCmd = None, extraPath = Some(binDir.toString))
+
+    gh.viewerLogin() shouldBe None
+  }
+
+  /** Issue #28: `issueComment` mirrors `prComment`'s shape (argv `--body`, not `--body-file`), over
+    * the issue thread instead of the PR one, except the rc is reported back (issue #28 review
+    * finding 8: a failed marker post must never masquerade as a successful park).
+    */
+  "LiveGitHub.issueComment" should "post via gh issue comment ISSUE --body BODY and report success" in {
+    val root                   = tempRoot()
+    val (binDir, callsFile, _) = setupFakeGh()
+    val gh                     =
+      LiveGitHub(root, ciAppearCmd = None, mergeCmd = None, extraPath = Some(binDir.toString))
+
+    gh.issueComment(999, Machine.ParkBody) shouldBe true
+
+    readString(callsFile) should include(s"gh issue comment 999 --body ${Machine.ParkBody}")
+  }
+
+  it should "report failure when the underlying gh call exits nonzero" in {
+    val root      = tempRoot()
+    val binDir    = Files.createTempDirectory("fake-gh-fail-bin")
+    writeExecutable(
+      binDir,
+      "gh",
+      """#!/usr/bin/env bash
+        |exit 1
+        |""".stripMargin
+    )
+    val gh = LiveGitHub(root, ciAppearCmd = None, mergeCmd = None, extraPath = Some(binDir.toString))
+
+    gh.issueComment(999, "anything") shouldBe false
   }
 
   "LiveGitHub.issueTitleAndBody" should "pass the exact jq program as one argv element" in {

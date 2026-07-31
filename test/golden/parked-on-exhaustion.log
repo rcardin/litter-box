@@ -1,0 +1,7 @@
+iteration 1 -> issue #999
+FAST gate RED (pass 1, see .litter-box/logs/issue-999-pass1.gate.log)
+self-repair: budget now 1 — dispatching FIX for gate-RED
+FAST gate RED (pass 2, see .litter-box/logs/issue-999-pass2.gate.log)
+self-repair: budget now 0 — dispatching FIX for gate-RED
+FAST gate RED (pass 3, see .litter-box/logs/issue-999-pass3.gate.log)
+issue #999 -> parked (gate-RED, gate RED), waiting on a human reply

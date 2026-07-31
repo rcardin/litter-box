@@ -78,7 +78,10 @@ else
     ( [ "REVIEW", "PR", "CI_WAIT", "MERGE" ] | map(chip(.)) | join("  ") ),
 
     ( if $done != null then
-        "DONE " + (($done.detail // "") | gsub("[\r\n]+"; " "))
+        ("DONE " + (($done.detail // "") | gsub("[\r\n]+"; " "))) as $doneLine
+        # issue #28: rc=60 is the one detail worth a plain-English gloss; every other rc renders
+        # byte-identically to before, since sandbox/test/watch-test.sh pins them.
+        | if $done.detail == "rc=60" then $doneLine + " (parked, waiting on a human)" else $doneLine end
       elif $alive == 0 then
         "STALE (loop died in " + chip_name((($cur // $last).phase)) + ")"
       else

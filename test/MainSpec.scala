@@ -182,6 +182,10 @@ class MainSpec extends AnyFlatSpec with Matchers:
     Main.driverAction(LoopExit.InfraFault) shouldBe Main.DriverAction.Exit(50)
   }
 
+  it should "Exit(60) on Parked (issue #28)" in {
+    Main.driverAction(LoopExit.Parked) shouldBe Main.DriverAction.Exit(60)
+  }
+
   "driverLog" should "copy loop.sh's exact log lines, including the em-dash separator" in {
     Main.driverLog(
       3,
@@ -206,6 +210,11 @@ class MainSpec extends AnyFlatSpec with Matchers:
       LoopExit.InfraFault,
       "STOP.md"
     ) shouldBe "infra fault — exiting for inspection (issue stays in-progress)"
+    Main.driverLog(
+      3,
+      LoopExit.Parked,
+      "STOP.md"
+    ) shouldBe "iteration 3 parked, waiting on a human reply, exiting (next tick re-checks)"
   }
 
   /** The stop file is `stop-file` in the config now, not a constant, so the ManualStop line has to
