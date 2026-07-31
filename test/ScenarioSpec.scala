@@ -654,7 +654,7 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     w.called("gh issue list --label parked") shouldBe true
   }
 
-  it should "resume a parked issue with a human reply: FIX only (no IMPL), labels flip parked -> active" in {
+  it should "resume a parked issue with a human reply: FIX only (no IMPL), parked survives the whole tick (issue #50)" in {
     val w = TestWorld()
     w.inProgress = None
     w.ready = None
@@ -668,7 +668,13 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     exit shouldBe LoopExit.Success
     w.callCount("dispatch IMPL") shouldBe 0 // the initial worker dispatch is skipped entirely
     w.callCount("dispatch FIX") shouldBe 1
-    w.called("gh issue edit 777 --add-label in-progress --remove-label parked") shouldBe true
+    // issue #50: the pick-time flip ADDS in-progress and does NOT remove parked, so the label
+    // survives for the whole tick; only the terminal route (below) removes it.
+    w.called("gh issue edit 777 --add-label in-progress") shouldBe true
+    w.called("gh issue edit 777 --add-label in-progress --remove-label parked") shouldBe false
+    // The terminal route (NeedsReview, not class-1) is what removes both labels, and only because
+    // this tick resumed a parked issue (issue #50).
+    w.called("gh issue edit 777 --add-label needs-review --remove-label in-progress --remove-label parked") shouldBe true
     // The failFile is HARNESS-AUTHORED ONLY (issue #28 review finding 2): the human's actual words
     // must never land in {{FAILURE}}, which the fix-prompt skeleton frames with no untrusted-data
     // warning at all, unlike {{COMMENTS}}'s fence. The words still reach the worker, correctly
@@ -708,6 +714,20 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     exit shouldBe LoopExit.NeedsHuman
     w.commitMessages.head should include("patch guard rejection (protected-path), gate SKIPPED")
     w.commitMessages.head should not include "gate \n"
+    // issue #50: this tick resumed a parked issue, so the NeedsHuman terminal removes BOTH labels;
+    // parked would otherwise survive this fault-free but still-Fail terminal forever.
+    w.called("gh issue edit 777 --add-label needs-human --remove-label in-progress --remove-label parked") shouldBe true
+  }
+
+  it should "not mention parked at all on a NeedsHuman terminal for an issue that was never parked (issue #50)" in {
+    val w = TestWorld()
+    w.implScript = WorkerScript.Produces("1\t0\t.github/workflows/evil.yml")
+
+    val exit = w.runLoop()
+
+    exit shouldBe LoopExit.NeedsHuman
+    w.called("gh issue edit 999 --add-label needs-human --remove-label in-progress") shouldBe true
+    w.calls.exists(c => c.contains("issue edit 999") && c.contains("parked")) shouldBe false
   }
 
   it should "treat every comment as the reply when a parked issue carries no marker comment at all (label applied by hand)" in {
@@ -817,7 +837,11 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     val exit = w.runLoop()
 
     exit shouldBe LoopExit.Success
-    w.called("gh issue edit 777 --add-label in-progress --remove-label parked") shouldBe true
+    w.called("gh issue edit 777 --add-label in-progress") shouldBe true
+    // Pins the pick-time flip, not just a prefix of it (issue #50 review finding 5): `called` is a
+    // substring match, so without this negative the assertion above would still pass had the
+    // pick-time flip reverted to removing `parked` immediately.
+    w.called("gh issue edit 777 --add-label in-progress --remove-label parked") shouldBe false
     w.called("gh issue edit 999") shouldBe false
   }
 
@@ -979,7 +1003,10 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
 
     exit shouldBe LoopExit.Success
     w.callCount("dispatch FIX") shouldBe 1
-    w.called("gh issue edit 777 --add-label in-progress --remove-label parked") shouldBe true
+    w.called("gh issue edit 777 --add-label in-progress") shouldBe true
+    // Substring-match negative (issue #50 review finding 5): pins that `parked` survives the
+    // pick-time flip rather than merely being consistent with it having survived.
+    w.called("gh issue edit 777 --add-label in-progress --remove-label parked") shouldBe false
   }
 
   it should "resume for an accepted association (MEMBER), same as OWNER/COLLABORATOR elsewhere in this file (review finding 5)" in {
@@ -1038,7 +1065,9 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     val exit = w.runLoop()
 
     exit shouldBe LoopExit.Success
-    w.called("gh issue edit 800 --add-label in-progress --remove-label parked") shouldBe true
+    w.called("gh issue edit 800 --add-label in-progress") shouldBe true
+    // Substring-match negative (issue #50 review finding 5): see the equivalent note above.
+    w.called("gh issue edit 800 --add-label in-progress --remove-label parked") shouldBe false
     w.called("gh issue edit 700") shouldBe false
   }
 
@@ -1056,7 +1085,9 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     val exit = w.runLoop()
 
     exit shouldBe LoopExit.Success
-    w.called("gh issue edit 700 --add-label in-progress --remove-label parked") shouldBe true
+    w.called("gh issue edit 700 --add-label in-progress") shouldBe true
+    // Substring-match negative (issue #50 review finding 5): see the equivalent note above.
+    w.called("gh issue edit 700 --add-label in-progress --remove-label parked") shouldBe false
     w.called("gh issue edit 800") shouldBe false
   }
 
@@ -1163,7 +1194,510 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
 
     exit shouldBe LoopExit.Success
     w.callCount("dispatch FIX") shouldBe 1
-    w.called("gh issue edit 777 --add-label in-progress --remove-label parked") shouldBe true
+    w.called("gh issue edit 777 --add-label in-progress") shouldBe true
+    // Substring-match negative (issue #50 review finding 5): see the equivalent note above.
+    w.called("gh issue edit 777 --add-label in-progress --remove-label parked") shouldBe false
+  }
+
+  // ---- issue #50: parked survives an infra fault for the whole tick ------------------------
+
+  it should "keep parked through an infra fault mid-resume, so the next tick resumes the SAME reply rather than an ordinary IMPL (issue #50)" in {
+    val w = TestWorld()
+    w.inProgress = None
+    w.ready = None
+    w.parked = List(777)
+    w.fixScripts = List(WorkerScript.TimedOut) // infra-faults the resumed FIX round
+    w.issueCommentBodies =
+      Map(777 -> List(markerEntry, "@alice (OWNER):\ntry using a HashMap instead"))
+
+    val first = w.runLoop()
+
+    first shouldBe LoopExit.InfraFault
+    first.rc shouldBe 50
+    // The pick-time flip only ADDS in-progress; parked is never removed on this path, so the
+    // world after the fault genuinely carries both labels on #777, same as `gh` would report it.
+    w.called("gh issue edit 777 --add-label in-progress") shouldBe true
+    w.calls.exists(c => c.startsWith("gh issue edit 777") && c.contains("remove-label parked")) shouldBe false
+
+    // Model what `gh` now reports on the next tick: the pick-time flip already ran, so #777 is
+    // in-progress AND still parked (issue #50 review finding: a hand set world has to carry the
+    // same labels a real `gh issue list` would report, not just the ones this particular test
+    // happens to read); the comment thread is untouched by the fault.
+    w.inProgress = Some(777)
+    w.labels = List("parked", "in-progress")
+    w.fixScripts = List(WorkerScript.Produces(newFilePatch))
+
+    val second = w.runLoop()
+
+    second shouldBe LoopExit.Success
+    // The merged probe (issue #50) must recognise #777 as a parked resume again, not an ordinary
+    // in-progress crash-resume: FIX only on both ticks, never an IMPL, and the SAME accepted
+    // reply reaches the FIX prompt on the second tick. (The prompt file itself is not re-asserted
+    // here: both ticks' FIX rounds write the same `pass0` path, since `w.files` persists across
+    // `runLoop` calls, so a content check there cannot tell the two ticks apart; the dispatch
+    // counts below are what actually pin two FIX rounds having run.)
+    w.callCount("dispatch IMPL") shouldBe 0
+    w.callCount("dispatch FIX") shouldBe 2 // one per tick
+    // The second tick's successful terminal (NeedsReview) is what finally removes parked.
+    w.called(
+      "gh issue edit 777 --add-label needs-review --remove-label in-progress --remove-label parked"
+    ) shouldBe true
+  }
+
+  // The fake cannot model `gh`'s real response to re-adding a label the issue already carries
+  // (`--add-label parked` on an issue already `parked`): `test/` is credential free by design
+  // (CONVENTIONS.md), so this scenario asserts only that the loop ATTEMPTS the same re-add, never
+  // that a real `gh` accepts it as a no-op.
+  it should "re-park an already-resumed parked issue correctly, without fault (issue #50)" in {
+    val w = TestWorld()
+    w.inProgress = None
+    w.ready = None
+    w.parked = List(777)
+    w.fixScripts = List(WorkerScript.Produces(newFilePatch))
+    w.gateResults = List(GateResult.Red)
+    w.issueCommentBodies =
+      Map(777 -> List(markerEntry, "@alice (OWNER):\ntry using a HashMap instead"))
+
+    val exit = w.runLoop(Config(repairBudget = 1))
+
+    exit shouldBe LoopExit.Parked
+    exit.rc shouldBe 60
+    w.postedIssueComments.last shouldBe (777 -> Machine.ParkBody)
+    // Route.Parked always re-adds `parked` and removes only `active`: `parked` is being ADDED
+    // here, not removed, so `carriesParked` never doubles up a removal on this route (issue #50
+    // requirement 4).
+    w.called("gh issue edit 777 --add-label parked --remove-label in-progress") shouldBe true
+  }
+
+  // ---- issue #50 review: findings 1-4 -------------------------------------------------------
+
+  it should "remove parked from an in-progress issue that carries it with no reply once its ordinary IMPL completes (review finding 1)" in {
+    // The terminal used to condition removal on `resumeAuthors.isDefined` (whether THIS tick
+    // resumed with a freshly accepted reply), not on whether `issue` actually carries `parked`.
+    // Those two facts disagree exactly here: #777 is in-progress AND parked, but nobody has
+    // replied since the last marker, so the merge check correctly treats this as a plain crash
+    // resume (`resumeAuthors = None`) and dispatches an ordinary IMPL. The old predicate then read
+    // that `None` as "never remove parked", stranding the label forever on an issue that just
+    // finished cleanly.
+    val w = TestWorld()
+    w.inProgress = Some(777)
+    w.parked = List(777)
+    w.labels = List("parked", "in-progress")
+    w.issueCommentBodies = Map(777 -> List(markerEntry)) // marker present, nothing after it
+
+    val exit = w.runLoop()
+
+    exit shouldBe LoopExit.Success
+    w.callCount("dispatch IMPL") shouldBe 1 // ordinary crash resume, never a FIX
+    w.callCount("dispatch FIX") shouldBe 0
+    w.called(
+      "gh issue edit 777 --add-label needs-review --remove-label in-progress --remove-label parked"
+    ) shouldBe true
+  }
+
+  it should "never re-pick an issue that finished a terminal while carrying parked: the livelock the review traced (issue #50 review finding 1)" in {
+    // Three ticks. Tick 1 resumes #777 off the parked queue with an accepted reply, fails again,
+    // and re-parks; the marker post succeeds but ONLY the re-park's own label flip fails, so the
+    // tick infra-faults with the NEW marker already the newest comment (the exact no-gh-failure gap
+    // the review traced at `terminal`'s `Route.Parked`). Tick 2 crash-resumes #777: no reply follows
+    // the new marker, so this is an ordinary IMPL, not a FIX, and it succeeds. The fixed predicate
+    // must still strip `parked` at that terminal even though tick 2 itself never saw a fresh reply.
+    // Tick 3 models what a real `gh` now reports (#777 neither in-progress nor parked) to show the
+    // issue genuinely never comes back, rather than merely asserting the removal call fired.
+    //
+    // The pick-time flip and the re-park flip are scripted to succeed and fail RESPECTIVELY, via
+    // `labelEditResults` rather than the single `labelEditSucceeds` flag (issue #50 review finding
+    // 3): a single flag would fail BOTH of tick 1's `editLabels` calls, including the pick-time
+    // flip, so a real `gh` would never have added `in-progress` to #777 at all, making the tick 2
+    // world this test used to hand-set (`#777` in-progress) unreachable from what tick 1 actually
+    // did. Scripting the two calls independently keeps the scenario this test is actually named
+    // for: a re-park attempt whose OWN flip fails, not a pick that never took effect.
+    val w = TestWorld()
+    w.inProgress = None
+    w.ready = None
+    w.parked = List(777)
+    w.fixScripts = List(WorkerScript.Produces(newFilePatch))
+    w.gateResults = List(GateResult.Red)
+    w.issueCommentBodies =
+      Map(777 -> List(markerEntry, "@alice (OWNER):\ntry using a HashMap instead"))
+    w.labelEditResults = List(true, false) // call 1: pick-time flip OK; call 2: re-park flip fails
+
+    val first = w.runLoop(Config(repairBudget = 1))
+
+    first shouldBe LoopExit.InfraFault
+    w.postedIssueComments.last shouldBe (777 -> Machine.ParkBody) // the new marker WAS posted
+    w.called("gh issue edit 777 --add-label in-progress") shouldBe true // pick-time flip: attempted, OK
+    w.called("gh issue edit 777 --add-label parked --remove-label in-progress") shouldBe true // re-park: attempted, failed
+
+    // Tick 2: `gh` now reports #777 in-progress (the pick-time flip DID succeed) AND still parked
+    // (the re-park flip failed, so it changed nothing), with the freshly posted marker as the
+    // newest comment and nothing after it, exactly what tick 1's two recorded `editLabels`
+    // outcomes imply, not a hand-picked state disconnected from them.
+    w.inProgress = Some(777)
+    w.labels = List("parked", "in-progress")
+    w.labelEditResults = Nil // tick 2's own edits (the terminal removal) should succeed normally
+    w.implScript = WorkerScript.Produces(newFilePatch)
+    w.issueCommentBodies = Map(
+      777 -> List(markerEntry, "@alice (OWNER):\ntry using a HashMap instead", markerEntry)
+    )
+
+    val second = w.runLoop()
+
+    second shouldBe LoopExit.Success
+    w.callCount("dispatch IMPL") shouldBe 1 // ordinary crash resume: no reply follows the new marker
+    w.callCount("dispatch FIX") shouldBe 1  // the one from tick 1 only
+    w.called(
+      "gh issue edit 777 --add-label needs-review --remove-label in-progress --remove-label parked"
+    ) shouldBe true
+
+    // Tick 3: a real `gh` would now report neither label on #777. Idle, not a re-pick of #777.
+    w.inProgress = None
+    w.parked = Nil
+
+    val third = w.runLoop()
+
+    third shouldBe LoopExit.Idle
+  }
+
+  // ---- issue #50 review, round 3: resolution (a) reversed, resolution (b) adopted -----------
+  //
+  // Round 2 answered an unreadable `parkedIssues()` read with an issue already in flight by
+  // degrading to "treat the in-flight issue as possibly parked" (`ParkedRead.Uncertain`) rather
+  // than faulting. Round 3's review found that unsound in the exact case it targeted (see the
+  // scaladoc on the fault site in `Machine.pickAndSetup`, right above `val parkedCandidates`, for
+  // the three-part argument in full) and reversed it: a failed `parkedIssues()` read now ALWAYS
+  // infra-faults, whether or not an issue is in flight. The three tests immediately below reproduce
+  // the three scenarios (findings A, B and C) the review actually executed against the degrade to
+  // prove it wrong; all three must now infra-fault instead.
+
+  it should "infra fault rather than fabricate a resume: a never-parked in-flight issue plus a failed parked read plus an ordinary owner comment must not dispatch FIX or log a parked resume (review finding A)" in {
+    // The reviewer's traced scenario: #999 is in-progress but has NEVER been parked (no marker, no
+    // `parked` label, ordinary mid-work issue) and carries one perfectly ordinary owner comment. If
+    // the old degrade answered `mightBeParked(999) = true` here, `replySince`'s own "no marker
+    // anywhere means every comment counts" rule would read the owner's comment as an accepted
+    // resume reply and dispatch a FIX with a harness-authored `{{FAILURE}}` claiming a previous
+    // attempt failed its gates and was discarded, none of which happened, and no IMPL would ever
+    // run. A single transient `gh issue list --label parked` failure must never be able to fabricate
+    // that story.
+    val w = TestWorld()
+    w.inProgress = Some(999)
+    w.parked = Nil // real gh state: #999 was never parked
+    w.parkedIssuesFail = true
+    w.issueCommentBodies = Map(999 -> List("@alice (OWNER):\nlooks good, ship it"))
+
+    val exit = w.runLoop()
+
+    exit shouldBe LoopExit.InfraFault
+    exit.rc shouldBe 50
+    w.calls.exists(_.startsWith("dispatch")) shouldBe false // neither IMPL nor FIX
+    w.called("gh issue edit") shouldBe false                // no mutation at all
+    w.logged("resuming from parked") shouldBe false
+  }
+
+  it should "infra fault rather than strand a genuinely parked issue's reply behind a degrade (review finding B)" in {
+    // A second traced scenario: #777 genuinely IS in-progress and parked, with the marker plus an
+    // accepted reply already sitting on GitHub, and this tick's own `gh issue list --label parked`
+    // fails. The old degrade tried to answer this case by treating #777 as possibly parked and
+    // checking its reply anyway, which sounds safe here, but `activeAndParked`'s conditional
+    // removal of `parked` exists PRECISELY because the label can be entirely missing from a
+    // consumer repo, which is one of the reasons this very read can fail; the degrade set
+    // `carriesParked = true` unconditionally on the read failure, defeating that guard in its own
+    // motivating case. There is no way, from inside this one failed read, to tell "the label is
+    // missing" apart from "the label exists and this call merely failed", so this now faults
+    // instead of guessing either way: mutate nothing, dispatch nothing, let the next tick's
+    // (hopefully successful) read decide for real.
+    val w = TestWorld()
+    w.inProgress = Some(777)
+    w.parked = List(777) // real gh state: genuinely parked
+    w.parkedIssuesFail = true
+    w.ready = None
+    w.issueCommentBodies =
+      Map(777 -> List(markerEntry, "@alice (OWNER):\ntry using a HashMap instead"))
+
+    val exit = w.runLoop()
+
+    exit shouldBe LoopExit.InfraFault
+    exit.rc shouldBe 50
+    w.calls.exists(_.startsWith("dispatch")) shouldBe false
+    w.called("gh issue edit") shouldBe false
+    w.logged("resuming from parked") shouldBe false
+  }
+
+  it should "infra fault, never Idle, when an unreadable parked list leaves an exhausted-budget resume and an empty ready queue both undecidable (review finding C)" in {
+    // The third traced scenario: #999 in-progress with an owner comment, the parked-list read
+    // fails, REPAIR_BUDGET=0, and the ready queue is empty. Before this fix, a degraded read forced
+    // `parkedCandidates = Nil`, and `pickFromQueue`'s own tail matched that raw (now definitely
+    // wrong) empty list once the ready queue also came up empty, settling into `Idle` (rc 11), the
+    // loop reporting the queue empty on a tick whose parked read outright failed. The fault now
+    // happens before `pickFromQueue` (or even the in-progress/parked merge check) is ever reached,
+    // so this can no longer happen by construction: there is no path left from an unreadable
+    // parked-list read to `Idle`.
+    val w = TestWorld()
+    w.inProgress = Some(999)
+    w.ready = None
+    w.parkedIssuesFail = true
+    w.issueCommentBodies = Map(999 -> List("@alice (OWNER):\nlooks good, ship it"))
+
+    val exit = w.runLoop(Config(repairBudget = 0))
+
+    exit shouldBe LoopExit.InfraFault
+    exit.rc shouldBe 50
+    w.calls.exists(_.startsWith("dispatch")) shouldBe false
+    w.called("gh issue edit") shouldBe false
+  }
+
+  it should "release the in-flight slot and let the ready queue proceed when an accepted reply on an in-progress-and-parked issue hits an exhausted repair budget (review finding 2, round 2)" in {
+    // Round 2 finding: the merged path used to return `StoppedEarly(Parked)` unconditionally for
+    // EVERY unresolved reply check on #i, including this one. `cfg.repairBudget` is a config value
+    // fixed for the whole run, not a transient read, so that wedged #777, and starved every other
+    // issue behind it (see the dedicated multi-issue regression test below), forever. The fix
+    // releases #777's in-progress slot instead and lets the pick continue this same tick: #777 is
+    // skipped again by the walk (same exhausted budget, same verdict), so #999 on the default
+    // ready queue is what actually runs.
+    val w = TestWorld()
+    w.inProgress = Some(777)
+    w.parked = List(777)
+    w.issueCommentBodies =
+      Map(777 -> List(markerEntry, "@alice (OWNER):\ntry using a HashMap instead"))
+
+    val exit = w.runLoop(Config(repairBudget = 0))
+
+    exit shouldBe LoopExit.Success
+    w.callCount("dispatch IMPL") shouldBe 1 // #999 off the ready queue, never #777
+    w.called("gh issue edit 777 --remove-label in-progress") shouldBe true // released, parked kept
+    // `parked` is kept, never removed by the release itself: the reply really is still waiting.
+    w.called(
+      "gh issue edit 777 --remove-label in-progress --remove-label parked"
+    ) shouldBe false
+    w.logged(
+      "issue #777: a human reply is waiting but the repair budget is exhausted (REPAIR_BUDGET=0), cannot resume yet; staying parked"
+    ) shouldBe true
+    w.logged(
+      "issue #777: released from in-progress while parked (repair budget exhausted), trying the rest of the queue"
+    ) shouldBe true
+  }
+
+  it should "mutate nothing under DRY_RUN=1 when the budget-exhausted release would otherwise fire (review finding D)" in {
+    // Executed by the reviewer: `Config(repairBudget = 0, dryRun = true)` with #777 in-progress and
+    // parked with an accepted reply. Before this fix, the release at the `BudgetExhausted` arm ran
+    // unconditionally, well before `pickAndSetup`'s own `cfg.dryRun` stop point further down (that
+    // stop point only guards the PICK-TIME flip, a later line in the same function), so a dry run
+    // still emitted `gh issue edit 777 --remove-label in-progress`, a real GitHub mutation, before
+    // ever reaching the "no mutation" stop the README and `Main.applyDryRunFlag` both promise.
+    val w = TestWorld()
+    w.inProgress = Some(777)
+    w.parked = List(777)
+    w.issueCommentBodies =
+      Map(777 -> List(markerEntry, "@alice (OWNER):\ntry using a HashMap instead"))
+
+    val exit = w.runLoop(Config(repairBudget = 0, dryRun = true))
+
+    exit shouldBe LoopExit.DryRun
+    exit.rc shouldBe 20
+    w.called("gh issue edit") shouldBe false // no mutation at all, not even the release
+    w.logged(
+      "issue #777: a human reply is waiting but the repair budget is exhausted; DRY_RUN=1, not releasing #777 from in-progress"
+    ) shouldBe true
+  }
+
+  it should "end the tick rather than pick a second issue when the budget-exhausted release itself fails (review finding E)" in {
+    // Before this fix, a failed release logged its WARNING and fell straight through to
+    // `pickFromQueue()` regardless, so a failure on `#777`'s release could still let `#999` be
+    // picked and flipped to `in-progress` THE SAME TICK, two issues in flight at once, breaking
+    // the "one US at a time" invariant `pickAndSetup`'s own header comment states. If `#999`'s own
+    // tick later infra-faults, both issues are left in-progress and whichever `gh issue list
+    // --label in-progress | .[0]` does not name is stranded indefinitely.
+    val w = TestWorld()
+    w.inProgress = Some(777)
+    w.parked = List(777)
+    w.ready = Some(999)
+    w.issueCommentBodies =
+      Map(777 -> List(markerEntry, "@alice (OWNER):\ntry using a HashMap instead"))
+    w.labelEditResults = List(false) // the one editLabels call this tick makes: the release, fails
+
+    val exit = w.runLoop(Config(repairBudget = 0))
+
+    exit shouldBe LoopExit.Parked
+    w.calls.exists(_.startsWith("dispatch")) shouldBe false
+    w.called("gh issue list --label ready") shouldBe false // never even reached the ready queue
+    w.called("gh issue edit 999") shouldBe false            // #999 was never picked, let alone flipped
+    w.callCount("gh issue edit 777") shouldBe 1              // the one failed release, nothing more
+    w.logged(
+      "WARNING: could not release #777 from in-progress while parked (flip by hand); ending the tick rather than picking a second issue"
+    ) shouldBe true
+  }
+
+  it should "wedge on NEITHER a ready issue NOR a second parked issue when REPAIR_BUDGET=0: the reviewer's full traced scenario (review finding 2, round 2)" in {
+    // The exact multi-issue scenario the review executed: #700 in-progress AND parked with an
+    // accepted reply, #800 parked with its own accepted reply, #999 ready, REPAIR_BUDGET=0. Before
+    // this fix, EVERY tick returned `LoopExit.Parked` (rc 60) with zero dispatches and zero label
+    // edits, and `gh issue list --label ready` was never even called: #800 and #999 never ran, and
+    // only raising REPAIR_BUDGET or hand-editing labels could ever unblock it, even though the
+    // human has already done the only thing the log tells them to do. The fix makes progress:
+    // #700's slot is released (parked kept), #800 is skipped by the walk for the same exhausted
+    // budget, and #999 is what actually completes this tick.
+    val w = TestWorld()
+    w.inProgress = Some(700)
+    w.parked = List(700, 800)
+    w.ready = Some(999)
+    w.issueCommentBodies = Map(
+      700 -> List(markerEntry, "@alice (OWNER):\ntry using a HashMap instead"),
+      800 -> List(markerEntry, "@bob (OWNER):\nsplit the file first")
+    )
+
+    val exit = w.runLoop(Config(repairBudget = 0))
+
+    exit shouldBe LoopExit.Success
+    w.callCount("dispatch IMPL") shouldBe 1 // #999, never #700 or #800
+    w.callCount("dispatch FIX") shouldBe 0
+    w.called("gh issue list --label ready") shouldBe true // the queue WAS consulted, unlike the wedge
+    w.called("gh issue edit 700 --remove-label in-progress") shouldBe true // released
+    w.called("gh issue edit 800") shouldBe false // #800 was only ever read, never mutated
+    w.called("gh issue edit 999 --add-label needs-review --remove-label in-progress") shouldBe true
+    // Substring-match negative (issue #50 review, round 3, finding J): `called` above is a
+    // substring search, so it would still pass had a spurious `--remove-label parked` been
+    // appended to #999's terminal flip. #999 came off the plain ready queue and was never parked,
+    // so `carriesParked` must be false for it and this exact longer string must never appear.
+    w.called(
+      "gh issue edit 999 --add-label needs-review --remove-label in-progress --remove-label parked"
+    ) shouldBe false
+  }
+
+  it should "stay Parked with zero mutation when the comments read fails on an in-progress-and-parked issue (review finding 2)" in {
+    val w = TestWorld()
+    w.inProgress = Some(777)
+    w.parked = List(777)
+    w.issueCommentsFail = Set(777)
+
+    val exit = w.runLoop()
+
+    exit shouldBe LoopExit.Parked
+    w.calls.exists(_.startsWith("dispatch")) shouldBe false
+    w.called("gh issue edit") shouldBe false
+    // review finding 3: true of the shipped path, the tick genuinely stays parked.
+    w.logged(
+      "issue #777: could not read comments to check for a human reply (gh failed); staying parked"
+    ) shouldBe true
+  }
+
+  it should "stay Parked with zero mutation when the viewer login read fails on an in-progress-and-parked issue (review finding 2)" in {
+    val w = TestWorld()
+    w.inProgress = Some(777)
+    w.parked = List(777)
+    w.viewerLoginAnswer = None
+
+    val exit = w.runLoop()
+
+    exit shouldBe LoopExit.Parked
+    w.calls.exists(_.startsWith("dispatch")) shouldBe false
+    w.called("gh issue edit") shouldBe false
+    // review finding 3: true of the shipped path, the tick genuinely stays parked.
+    w.logged("could not read the harness's own GitHub login") shouldBe true
+  }
+
+  it should "infra fault on an in-progress issue whose parked-list read fails, even with no comments at all to look at (review finding 4, reversed in round 3)" in {
+    // Round 2 answered this exact shape (an issue already in flight, an unreadable parked-list
+    // read) by degrading to "possibly parked" and letting an ordinary crash resume run, on the
+    // theory that an issue already in flight makes the pick decidable regardless of whether it is
+    // ALSO parked. Round 3's review rejected that theory (see the fault site's own scaladoc in
+    // `Machine.pickAndSetup`): the degrade cannot tell "genuinely not parked" apart from "genuinely
+    // parked but the read that would prove it just failed", and guessing either way has been shown
+    // unsound. This is the plainest version of that scenario, no comments, no reply, nothing for
+    // the old degrade's reply check to even find, and it still must not complete as an ordinary
+    // resume: the whole point is that NEITHER path is knowable from inside this one failed read.
+    val w = TestWorld()
+    w.inProgress = Some(999)
+    w.parkedIssuesFail = true
+
+    val exit = w.runLoop()
+
+    exit shouldBe LoopExit.InfraFault
+    exit.rc shouldBe 50
+    w.calls.exists(_.startsWith("dispatch")) shouldBe false
+    w.called("gh issue edit") shouldBe false
+    w.logged(
+      "could not list parked issues (gh issue list failed) while #999 is in flight, infra fault, the loop cannot tell whether #999 (or anything else) is parked"
+    ) shouldBe true
+  }
+
+  it should "remove parked on a resumed class-1 issue's verified auto-merge (issue #50)" in {
+    val w = TestWorld()
+    w.inProgress = None
+    w.ready = None
+    w.parked = List(777)
+    w.labels = List("class-1")
+    w.fixScripts = List(WorkerScript.Produces(newFilePatch))
+    w.issueCommentBodies =
+      Map(777 -> List(markerEntry, "@alice (OWNER):\ntry using a HashMap instead"))
+
+    val exit = w.runLoop()
+
+    exit shouldBe LoopExit.Success
+    w.called("gh issue edit 777 --remove-label in-progress --remove-label parked") shouldBe true
+  }
+
+  it should "remove parked on a resumed class-1 issue's CI-RED needs-human flip (issue #50)" in {
+    val w = TestWorld()
+    w.inProgress = None
+    w.ready = None
+    w.parked = List(777)
+    w.labels = List("class-1")
+    w.fixScripts = List(WorkerScript.Produces(newFilePatch))
+    w.ciWaitResult = GateResult.Red
+    w.issueCommentBodies =
+      Map(777 -> List(markerEntry, "@alice (OWNER):\ntry using a HashMap instead"))
+
+    val exit = w.runLoop()
+
+    exit shouldBe LoopExit.NeedsHuman
+    w.called(
+      "gh issue edit 777 --add-label needs-human --remove-label in-progress --remove-label parked"
+    ) shouldBe true
+  }
+
+  // ---- issue #50 review, round 3, finding B: no editLabels return is ever silently discarded --
+  // `editLabels` returns `Boolean` specifically so a failed flip is visible. Three call sites
+  // discarded it with no warning at all (the pick-time flip, the NeedsReview/NeedsHuman terminal
+  // flip, and the post-merge drop); a fourth (the CI-RED needs-human flip) already warned and is
+  // pinned separately by `LogParitySpec`'s "ci-red-label-flip-failed" golden. Each test below
+  // scripts ONLY the one relevant `editLabels` call to fail, via `labelEditResults`, so a false
+  // positive from an unrelated call failing cannot masquerade as this one having been reached.
+
+  it should "warn, not silently continue, when the pick-time in-progress flip itself fails (review finding B)" in {
+    val w = TestWorld()
+    // call 1: the pick-time flip, fails; call 2 onward (the terminal flip): succeeds, so only the
+    // pick-time warning is the one under test here.
+    w.labelEditResults = List(false, true)
+
+    val exit = w.runLoop()
+
+    exit shouldBe LoopExit.Success // the tick still completes: a flip failure is a warning, not a fault
+    w.logged("WARNING: could not flip #999 to in-progress (flip by hand)") shouldBe true
+  }
+
+  it should "warn, not silently continue, when the NeedsReview terminal flip itself fails (review finding B)" in {
+    val w = TestWorld()
+    // call 1: pick-time flip OK; call 2: the NeedsReview terminal flip fails
+    w.labelEditResults = List(true, false)
+
+    val exit = w.runLoop()
+
+    exit shouldBe LoopExit.Success // reviewer APPROVE already decided the outcome; the flip is cosmetic
+    w.logged("WARNING: could not flip #999 to needs-review (flip by hand)") shouldBe true
+  }
+
+  it should "warn, not silently continue, when the post-merge label drop itself fails (review finding B)" in {
+    val w = TestWorld()
+    w.labels = List("class-1")
+    // call 1: pick-time flip OK; call 2: the post-merge drop fails
+    w.labelEditResults = List(true, false)
+
+    val exit = w.runLoop()
+
+    exit shouldBe LoopExit.Success // the merge itself is already verified by this point
+    w.logged(
+      "WARNING: could not drop in-progress/parked from #999 after merge (flip by hand)"
+    ) shouldBe true
   }
 
   // ---- Scenario D: IMPL dispatch timeout -> rc 50, budget untouched, nothing dispatched ----

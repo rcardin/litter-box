@@ -896,7 +896,7 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
       "gh issue list --state open --label in-progress --json number --jq .[0].number"
     )
     calls should include(
-      "gh issue list --state open --label ready --json number,createdAt --jq sort_by(.createdAt) | .[0].number"
+      "gh issue list --state open --label ready --limit 1000 --json number,createdAt --jq sort_by(.createdAt) | .[0].number"
     )
   }
 
@@ -912,8 +912,12 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
 
     gh.parkedIssues() shouldBe Some(List(700, 777))
 
+    // `--limit` pinned explicitly (issue #50 review finding 4): `gh`'s own default page size (30)
+    // would silently truncate a repo with more open parked issues than that, and truncation now
+    // decides whether `parked` is removed at the terminal (`Machine.pickAndSetup`'s
+    // `carriesParked`), not just which issue gets picked.
     readString(callsFile) should include(
-      "gh issue list --state open --label parked --json number,createdAt --jq sort_by(.createdAt) | .[].number"
+      "gh issue list --state open --label parked --limit 1000 --json number,createdAt --jq sort_by(.createdAt) | .[].number"
     )
   }
 
@@ -935,6 +939,23 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
     val gh = LiveGitHub(root, ciAppearCmd = None, mergeCmd = None, extraPath = Some(binDir.toString))
 
     gh.parkedIssues() shouldBe None
+  }
+
+  /** Issue #50 review, round 3, finding I: `openBlockedIssues` had no `--limit` at all, the same gap
+    * `parkedIssues` closed for finding 4. Without it a repo with more than `gh`'s default page size
+    * (30) of open `blocked` issues would silently never dependency-flip the rest to `ready`.
+    */
+  "LiveGitHub.openBlockedIssues" should "call the exact bash argv, pinning --limit" in {
+    val root                   = tempRoot()
+    val (binDir, callsFile, _) = setupFakeGh()
+    val gh                     =
+      LiveGitHub(root, ciAppearCmd = None, mergeCmd = None, extraPath = Some(binDir.toString))
+
+    gh.openBlockedIssues() shouldBe List(555)
+
+    readString(callsFile) should include(
+      "gh issue list --state open --label blocked --limit 1000 --json number --jq .[].number"
+    )
   }
 
   /** Issue #28 review finding 3, round 3: the resume probe identifies its own park marker by the

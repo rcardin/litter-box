@@ -319,3 +319,32 @@ class LogParitySpec extends AnyFlatSpec with Matchers:
 
     w.logShouldMatchGolden("parked-resume")
   }
+
+  // ---- issue #50: parked survives an infra fault for the whole tick -------------------------
+
+  it should "match the golden for an infra fault during a resumed FIX, then resuming with the same reply next tick" in {
+    val w = TestWorld()
+    w.inProgress = None
+    w.ready = None
+    w.parked = List(777)
+    w.fixScripts = List(WorkerScript.TimedOut) // infra-faults the resumed FIX round
+    w.issueCommentBodies = Map(
+      777 -> List(
+        s"@litter-box (OWNER):\n${Machine.ParkMarker}\nparked, awaiting a reply",
+        "@alice (OWNER):\ntry using a HashMap instead"
+      )
+    )
+
+    w.runLoop() shouldBe LoopExit.InfraFault
+
+    // Model what `gh` now reports on the next tick: the pick-time flip in the first tick already
+    // added in-progress and left parked untouched (issue #50), so both labels are on #777, and the
+    // comment thread is unchanged by the fault.
+    w.inProgress = Some(777)
+    w.labels = List("parked", "in-progress")
+    w.fixScripts = List(WorkerScript.Produces(newFilePatch))
+
+    w.runLoop() shouldBe LoopExit.Success
+
+    w.logShouldMatchGolden("fault-then-parked-resume")
+  }

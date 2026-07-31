@@ -108,6 +108,15 @@ final class TestWorld:
   var checkoutSucceeds: Boolean         = true
   var labelEditSucceeds: Boolean        = true
 
+  /** Per-call override for `editLabels`, consumed in call order, one entry per call, the last entry
+    * repeating once the list is exhausted (same shape as `rollupCounts` below); falls back to
+    * `labelEditSucceeds` for every call while this stays `Nil` (issue #50 review finding 3: a single
+    * flag cannot express a tick where the pick-time flip succeeds and a LATER `editLabels` call in
+    * the same tick fails, which is the scenario the livelock regression test actually needs to pin,
+    * a marker posted and a re-park attempted but only the re-park's OWN label flip failing).
+    */
+  var labelEditResults: List[Boolean] = Nil
+
   /** Scripts `GitHub.issueComment`'s return value (issue #28 review finding 8: the marker post's
     * success has to be observable, not swallowed like `prComment`'s).
     */
@@ -183,7 +192,11 @@ final class TestWorld:
     def editLabels(issue: Int, add: List[String], remove: List[String]): Boolean =
       val a = add.map(l => s" --add-label $l").mkString
       val r = remove.map(l => s" --remove-label $l").mkString
-      record(s"gh issue edit $issue$a$r"); labelEditSucceeds
+      record(s"gh issue edit $issue$a$r")
+      labelEditResults match
+        case Nil      => labelEditSucceeds
+        case h :: Nil => h
+        case h :: t   => labelEditResults = t; h
     def openBlockedIssues(): List[Int] =
       record("gh issue list --label blocked"); blockedIssues
     def createPr(branch: String, title: String, body: String): String =

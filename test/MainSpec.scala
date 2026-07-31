@@ -214,7 +214,7 @@ class MainSpec extends AnyFlatSpec with Matchers:
       3,
       LoopExit.Parked,
       "STOP.md"
-    ) shouldBe "iteration 3 parked, waiting on a human reply, exiting (next tick re-checks)"
+    ) shouldBe "iteration 3 parked, exiting (next tick re-checks)"
   }
 
   /** The stop file is `stop-file` in the config now, not a constant, so the ManualStop line has to

@@ -159,9 +159,50 @@ Fixed, not pluggable:
 PICK → IMPLEMENT → GATE → REPAIR → REVIEW → PR → CI → MERGE
 ```
 
-One issue per iteration. `PICK` resumes an `in-progress` issue if there is one; else a `parked`
-issue with an accepted human reply, so a run a human already steered finishes before anything new
-starts; else takes the oldest `ready` one — deterministic, no LLM involved.
+One issue per iteration. `PICK` resumes an `in-progress` issue if there is one, and if that issue
+is ALSO `parked` with an accepted human reply it resumes straight into a FIX round rather than an
+ordinary IMPL. With no issue in progress it resumes the oldest `parked` issue with an accepted
+human reply instead, so a run a human already steered finishes before anything new starts; else it
+takes the oldest `ready` one. Deterministic, no LLM involved.
+
+`parked` now survives a whole iteration rather than flipping to `active` at pick time: an infra
+fault partway through a resumed iteration leaves the issue both `in-progress` and `parked`, exactly
+the state the next tick's pick already knows how to read, so a genuinely accepted reply is never
+silently dropped by a fault the loop could not have prevented. Several situations follow directly
+from that:
+
+- If `gh issue list --label parked` itself fails to read, the whole tick ends `InfraFault` (rc 50):
+  nothing is mutated, nothing is dispatched, and the next tick re-decides from scratch once the read
+  (hopefully) succeeds. This holds whether or not an issue is already in flight; an earlier version
+  of this rule tried to treat an in-flight issue as decidable regardless and degrade instead of
+  faulting, which turned out to be unsound (it could fabricate a parked-resume narrative over an
+  issue that was never parked at all, or strand the very label it was trying to protect on a repo
+  that has not created it yet). The known cost is that a repo which has never created the `parked`
+  label faults every crash-resume tick that reaches this read; the fix for that is to create the
+  label (or, longer term, to tell "label missing" apart from "read failed" at this call site, which
+  `gh` does not do today).
+- If the pick cannot tell whether an in-progress issue's own reply is usable (an unreadable
+  comments list, or the harness's own GitHub identity cannot be verified), the iteration ends
+  `Parked` (rc 60) having mutated nothing at all, exactly like an ordinary parked issue with no
+  reply yet. This is expected to be transient: the next tick re-reads the same `gh` calls, and a
+  persistently failing read shows up as a repeated log line rather than a silent hang, with the
+  same credential/access fix that the rest of the loop already depends on. Because this return
+  happens before the ready queue (and every other parked issue) is ever read, a PERSISTENTLY
+  failing read on this one issue starves the whole queue behind it; an operator who sees the same
+  log line repeat tick after tick can escape it without a code change by removing `in-progress` from
+  that one issue by hand (`gh issue edit <#> --remove-label in-progress`), which lets the pick fall
+  through to everything else while that issue keeps `parked` and waits for its own read to be fixed
+  separately.
+- If an in-progress issue's reply IS accepted but the self-repair budget is exhausted
+  (`REPAIR_BUDGET=0`, or already spent for that issue), the loop does not sit on the issue forever:
+  it drops `in-progress` (keeping `parked`, since the reply really is still waiting) and tries the
+  rest of the queue the same tick, UNLESS `DRY_RUN=1`, in which case it does not mutate that label
+  either and only reports what it would have picked. If nothing else is available the tick ends
+  `Parked` having made that one label edit; if the release edit itself fails, the tick ends `Parked`
+  immediately instead of picking a second issue, so the loop never runs two issues in flight at
+  once. An operator seeing repeated `Parked` exits with a human reply already posted should read
+  that as "raise `REPAIR_BUDGET`", not as "the loop is still waiting on a reply"; the per-tick log
+  line names which of the two is actually true.
 
 ## The safety spine
 

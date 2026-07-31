@@ -396,13 +396,13 @@ class SettingsSpec extends AnyFlatSpec with Matchers:
       "gh issue list --state open --label lbox-active --json number --jq .[0].number"
     )
     calls should include(
-      "gh issue list --state open --label lbox-ready --json number,createdAt --jq sort_by(.createdAt) | .[0].number"
+      "gh issue list --state open --label lbox-ready --limit 1000 --json number,createdAt --jq sort_by(.createdAt) | .[0].number"
     )
     calls should include(
-      "gh issue list --state open --label lbox-blocked --json number --jq .[].number"
+      "gh issue list --state open --label lbox-blocked --limit 1000 --json number --jq .[].number"
     )
     calls should include(
-      "gh issue list --state open --label lbox-parked --json number,createdAt --jq sort_by(.createdAt) | .[].number"
+      "gh issue list --state open --label lbox-parked --limit 1000 --json number,createdAt --jq sort_by(.createdAt) | .[].number"
     )
 
     // And the literals the slice was meant to remove never appear on the wire at all.

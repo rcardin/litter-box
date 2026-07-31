@@ -370,7 +370,7 @@ object Machine:
     val setup = pickAndSetup(n, cur) match
       case PickAndSetup.StoppedEarly(exit) => return exit
       case ready: PickAndSetup.Ready       => ready
-    import setup.{issue, bodyFile, workerPromptFile, isClass1, branch, resumeAuthors}
+    import setup.{issue, bodyFile, workerPromptFile, isClass1, branch, resumeAuthors, carriesParked}
 
     val implemented =
       implementAndRepair(n, cur, issue, bodyFile, workerPromptFile, resumeAuthors) match
@@ -389,16 +389,37 @@ object Machine:
       gateStatus = gateStatus,
       failureKind = failureKind,
       reviewed = reviewed,
-      reviewFile = reviewFile
+      reviewFile = reviewFile,
+      carriesParked = carriesParked
     )
+
+  /** The four outcomes `pickAndSetup`'s reply check can reach for one candidate parked issue, named
+    * rather than left as an `Option[List[String]]` because its `None`-shaped cases are three
+    * different facts, not one (issue #50 review findings 2 and 2-round-2): `NotYet` is the loop
+    * positively concluding there is nothing to resume on yet; `UnreadableComments` and
+    * `BudgetExhausted` are both "the loop could not act on it this tick", but for opposite reasons.
+    * Conflating any of these let a budget-exhausted or unreadable reply on an in-progress-and-parked
+    * issue fall through into an ordinary IMPL dispatch, silently losing the parked state and the
+    * reply it was waiting on (round 1 of this fix); conflating the latter two INTO EACH OTHER then
+    * wedged the merge check into `StoppedEarly(Parked)` forever for `BudgetExhausted`, a permanent
+    * config value, not a transient read, starving every other issue behind it (round 2, review
+    * finding 2). `acceptedReplyAuthors` below is the only place any of these is constructed; every
+    * other function in this phase only pattern-matches the result.
+    */
+  private enum ReplyCheck:
+    case Accepted(authors: List[String])
+    case NotYet
+    case UnreadableComments
+    case BudgetExhausted
 
   /** This is the first of the phase extractions `iterate` is being split into (issue #29 / RFC #26
     * decision 12); making that later split easy is why the pick-and-setup logic gets a name and a
     * return type of its own before anything about its shape changes.
     *
     * Takes `(using Faulting, Notify)`: a failed `gh.parkedIssues()` read (issue #28 review finding
-    * 7, round 3) is a fault site inside this phase, and `infraFault` requires both to log the fault
-    * line, fire the rc-50 notify seam, and abandon the iteration.
+    * 7, round 3) is a fault site inside this phase when no issue is already in flight to fall back
+    * on (issue #50 review finding 4); `infraFault` requires both to log the fault line, fire the
+    * rc-50 notify seam, and abandon the iteration.
     */
   private def pickAndSetup(n: Int, cur: Cursor)(using
       cfg: Config,
@@ -416,96 +437,293 @@ object Machine:
 
     // Pick US (deterministic, no LLM), in priority order: resume an in-progress one; else a parked
     // issue that has an accepted human reply (finish what a human already steered before starting
-    // something new); else oldest ready. `parkedProbe` reads `gh.parkedIssues()` (oldest first) and
-    // walks it looking for the first one with a reply, so a newer parked issue with a reply is
-    // never starved behind an older one still waiting (issue #28 review finding 6). Read once and
-    // reused below: re-deriving the answer a second time inside the same tick could disagree with
-    // the first read even though both are "the same" scripted world.
-    def parkedProbe(): (List[Int], Option[(Int, List[String])]) =
-      val candidates = gh.parkedIssues() match
-        case None     =>
-          // A failed list read must read as "the loop does not know", never as "the queue is
-          // empty" (issue #28 review finding 7, round 3): folding it into Nil would let the loop
-          // settle into Idle (rc 11) while a parked issue could be sitting there waiting.
-          infraFault(
+    // something new); else oldest ready. `inProgressIssue()` is read first because its answer names
+    // the issue the fault message below talks about; it no longer decides whether the parked-list
+    // read's own failure is survivable (see the fault below for why not).
+    val inProgress: Option[Int] = gh.inProgressIssue()
+
+    // The parked-candidate read, taken once and reused below (issue #50): now that `parked`
+    // survives a whole tick (see the pick-time flip further down), an in-progress issue and a
+    // parked-with-reply issue can be the very SAME issue, so this probe has to run whether or not
+    // `inProgress` is defined, not only in its absence.
+    //
+    // A failed read always infra-faults now, whether or not an issue is in flight. This is a
+    // reversal: an earlier round of this fix (issue #50 review finding 4) tried to make an
+    // in-flight issue's read failure survivable by degrading to "treat the in-flight issue as
+    // POSSIBLY parked" instead of faulting, precisely so a crash-resume tick on a repo that has
+    // never created the `parked` label would not fault on every single tick. The review that
+    // followed (round 3 of this fix) found that degrade unsound in exactly the case it targeted, on
+    // three counts that each reopen when the other two are fixed, so no combination of them holds
+    // at once:
+    //   - the in-flight issue is almost certainly NOT parked (a freshly picked issue, or one still
+    //     mid-IMPL) and so carries no park marker; `replySince`'s documented "no marker anywhere
+    //     means every comment counts as the reply" rule then hands the reply check the issue's
+    //     ENTIRE comment history, so one ordinary OWNER/MEMBER/COLLABORATOR comment reads as an
+    //     accepted resume reply and dispatches a FIX, with a harness-authored `{{FAILURE}}` claiming
+    //     a previous attempt failed its gates and was discarded, none of which happened;
+    //   - `activeAndParked`'s conditional removal of `parked` exists PRECISELY because the label may
+    //     not exist at all in a consumer repo, where a nonexistent label fails `gh issue edit` as a
+    //     unit, and a missing `parked` label is exactly one reason `parkedIssues()` can return
+    //     `None` in the first place, so treating the in-flight issue as parked sets `carriesParked
+    //     = true` on the one repo shape the conditional exists to protect, defeating the guard in
+    //     its own motivating case;
+    //   - `pickFromQueue`'s own tail (a few screens down) matches the raw candidate list, which the
+    //     degrade forces to `Nil`, so a degraded tick with nothing else ready falls all the way
+    //     through to reporting `Idle`, the loop claiming the queue is empty on a tick whose parked
+    //     read outright failed.
+    // Log honestly, mutate nothing, dispatch nothing, and end the tick: `LoopExit.InfraFault`, not
+    // `LoopExit.Idle`, is what keeps this from reading as "queue empty". The issue (if any is in
+    // flight) stays in-progress and the run exits for inspection with no budget spent and no
+    // mutation, exactly `InfraFault`'s own contract, and the next tick re-decides from scratch with
+    // whatever `gh` answers then. Round one's objection, that a failed parked read should not kill
+    // a tick that would otherwise have completed cleanly, is real, but every alternative tried
+    // since is worse than the cost of a fault the next tick simply retries.
+    //
+    // The underlying operability problem is real and is left as deliberate follow-up rather than
+    // guessed at here: a consumer repo that never created the `parked` label faults every
+    // crash-resume tick that reaches this read. That is better fixed at the source, either by
+    // distinguishing "the label does not exist" from "the read failed" (today `gh` reports both as
+    // one nonzero exit) or by validating the label exists at startup preflight.
+    val parkedCandidates: List[Int] = gh.parkedIssues() match
+      case Some(cs) => cs
+      case None     =>
+        val reason = inProgress match
+          case Some(i) =>
+            s"could not list parked issues (gh issue list failed) while #$i is in flight, infra fault, the loop cannot tell whether #$i (or anything else) is parked"
+          case None    =>
             "could not list parked issues (gh issue list failed), infra fault, the loop cannot tell whether any issue is waiting on a human"
+        infraFault(reason)
+
+    // Four outcomes for one candidate parked issue `p`, not two (issue #50 review finding 2; see
+    // `ReplyCheck`'s own scaladoc for why `UnreadableComments` and `BudgetExhausted` are not the
+    // same case either). `Accepted` names a reply the loop can resume on. `NotYet` means the loop
+    // positively knows there is nothing to resume yet (no reply, an unaccepted association, or a
+    // blank body). `UnreadableComments` and `BudgetExhausted` both mean the loop could not act on an
+    // accepted reply THIS tick, for different reasons a caller may need to tell apart. All three
+    // non-`Accepted` cases collapse to the same thing on the walk path below, `firstAcceptedReply`:
+    // either way that candidate stays parked and the walk moves to the next one. They must NOT
+    // collapse on the merge check further down, where an in-progress issue that is ALSO parked
+    // falls through past `NotYet` into an ordinary crash resume by design. Falling through past
+    // `UnreadableComments` or `BudgetExhausted` the same way would silently dispatch a full IMPL
+    // over a reply the loop never actually ruled out, which is the bug finding 2 traced: a
+    // REPAIR_BUDGET=0 resume burning a dispatch instead of staying parked.
+    def acceptedReplyAuthors(p: Int, viewer: String): ReplyCheck =
+      gh.issueComments(p) match
+        case None =>
+          // A failed gh read must never be mistaken for "no reply": a distinct case, so the merge
+          // check below can tell it apart both from `NotYet` and from `BudgetExhausted`.
+          logger.log(
+            s"issue #$p: could not read comments to check for a human reply (gh failed); staying parked"
           )
-        case Some(cs) => cs
-      val resume = gh.viewerLogin() match
-        case None       =>
-          // The harness cannot tell its own marker from a forgery without knowing its own login
-          // (issue #28 review finding 3, round 3), so no candidate can be resumed off this read.
-          if candidates.nonEmpty then
+          ReplyCheck.UnreadableComments
+        case Some(comments) =>
+          val reply                  = replySince(ParkMarker, viewer, comments)
+          val (accepted, notCounted) = reply.partition(entryCountsAsReply)
+          if accepted.isEmpty && notCounted.nonEmpty then
+            // A reply was posted but does not count (association not accepted, or blank once the
+            // author prefix is stripped). Say so, so an operator watching the log is not left
+            // wondering why the issue is still parked (issue #28 review finding 5).
+            logger.log(
+              s"issue #$p: a reply was posted but is not from an accepted association (${AcceptedReplyAssociations.mkString(", ")}) or is blank, ignored, staying parked"
+            )
+          if accepted.isEmpty then ReplyCheck.NotYet
+          else if cfg.repairBudget <= 0 then
+            // Decided HERE, before any label mutation (issue #28 review finding 7, round 2): the
+            // old code let pickAndSetup flip parked to active first and only discovered the
+            // exhausted budget once inside implementAndRepair, so a REPAIR_BUDGET=0 resume lost
+            // the parked state, and the human's reply, for nothing. `BudgetExhausted`, not
+            // `NotYet`: an accepted reply genuinely IS waiting, the loop just cannot act on it yet
+            // (issue #50 review finding 2).
+            logger.log(
+              s"issue #$p: a human reply is waiting but the repair budget is exhausted (REPAIR_BUDGET=${cfg.repairBudget}), cannot resume yet; staying parked"
+            )
+            ReplyCheck.BudgetExhausted
+          else
+            ReplyCheck.Accepted(accepted.flatMap(authorLogin).distinct)
+
+    // `gh.viewerLogin()`, warning only when there was a candidate the harness might otherwise have
+    // resumed (issue #28 review finding 3, round 3: without its own login the harness cannot tell
+    // its own marker from a forgery, so no candidate can be resumed off this read either way).
+    // `hadCandidate` is passed explicitly rather than read off `parkedCandidates` (issue #50 review
+    // finding 1, round 2): the merge branch already knows `issue` is a real candidate (it only calls
+    // this after confirming membership in `parkedCandidates` itself), so it always passes `true`
+    // rather than re-deriving the same fact from the list a second time.
+    def verifiedViewer(hadCandidate: Boolean): Option[String] =
+      gh.viewerLogin() match
+        case None =>
+          if hadCandidate then
             logger.log(
               "could not read the harness's own GitHub login (gh api user failed), cannot verify the park marker on any parked issue, staying parked"
             )
           None
-        case Some(viewer) =>
-          candidates.iterator
-            .flatMap { p =>
-              gh.issueComments(p) match
-                case None =>
-                  // A failed gh read must never be mistaken for a reply: stay parked, log it, and
-                  // move on to the next candidate (still oldest-to-newest).
+        case some => some
+
+    // Walk `parkedCandidates` oldest-first for the first with an accepted reply (issue #28 review
+    // finding 6: an older parked issue with no reply must never starve a newer one a human already
+    // steered). `NotYet`, `UnreadableComments` and `BudgetExhausted` are all equivalent here: either
+    // way this candidate is skipped and the walk moves on, still oldest-to-newest.
+    def firstAcceptedReply(): Option[(Int, List[String])] =
+      verifiedViewer(parkedCandidates.nonEmpty).flatMap { viewer =>
+        parkedCandidates.iterator
+          .flatMap { p =>
+            acceptedReplyAuthors(p, viewer) match
+              case ReplyCheck.Accepted(authors) => Some(p -> authors)
+              case ReplyCheck.NotYet | ReplyCheck.UnreadableComments | ReplyCheck.BudgetExhausted =>
+                None
+          }
+          .nextOption()
+      }
+
+    // The rest of the pick once #i (if any) is confirmed out of the running: the parked queue, then
+    // the ready queue, then whichever `Parked`/`Idle` exit fits. Its own type rather than a `return`
+    // inside it (issue #50 review finding 2): a `return` inside a nested `def` only unwinds THAT
+    // `def`, not `pickAndSetup`, so the early-exit cases have to travel back out as data and be
+    // turned into a real `return` at a call site that is lexically inside `pickAndSetup` itself,
+    // exactly like every other early exit in this phase.
+    def pickFromQueue(): Either[LoopExit, (Int, Option[List[String]])] =
+      firstAcceptedReply() match
+        case Some((p, authors)) => Right(p -> Some(authors))
+        case None                =>
+          gh.oldestReadyIssue() match
+            case Some(i) => Right(i -> None)
+            case None    =>
+              parkedCandidates match
+                case p :: _ =>
+                  // `p` is only the OLDEST remaining candidate, not necessarily the one whose reply
+                  // check the walk actually failed on, and "no human reply yet" is only one of the
+                  // three reasons a candidate can fail to resolve here (issue #50 review, minor):
+                  // it may instead be waiting behind an exhausted repair budget, or its own
+                  // comments read may itself be unreadable. Worded to be true of all three rather
+                  // than naming the one that happens to be the most common case.
                   logger.log(
-                    s"issue #$p: could not read comments to check for a human reply (gh failed); staying parked"
+                    s"issue #$p remains parked, no accepted reply resolved yet, exiting (next tick re-checks)"
                   )
-                  None
-                case Some(comments) =>
-                  val reply                   = replySince(ParkMarker, viewer, comments)
-                  val (accepted, notCounted) = reply.partition(entryCountsAsReply)
-                  if accepted.isEmpty && notCounted.nonEmpty then
-                    // A reply was posted but does not count (association not accepted, or blank
-                    // once the author prefix is stripped). Say so, so an operator watching the log
-                    // is not left wondering why the issue is still parked (issue #28 review
-                    // finding 5).
-                    logger.log(
-                      s"issue #$p: a reply was posted but is not from an accepted association (${AcceptedReplyAssociations.mkString(", ")}) or is blank, ignored, staying parked"
-                    )
-                  if accepted.nonEmpty && cfg.repairBudget <= 0 then
-                    // Decided HERE, before any label mutation (issue #28 review finding 7, round
-                    // 2): the old code let pickAndSetup flip parked to active first and only
-                    // discovered the exhausted budget once inside implementAndRepair, so a
-                    // REPAIR_BUDGET=0 resume lost the parked state, and the human's reply, for
-                    // nothing. Skipping the candidate here instead falls through to the next
-                    // parked issue, then to the ready queue, then to StoppedEarly(Parked), exactly
-                    // as if this issue had no accepted reply at all.
-                    logger.log(
-                      s"issue #$p: a human reply is waiting but the repair budget is exhausted (REPAIR_BUDGET=${cfg.repairBudget}), cannot resume yet; staying parked"
-                    )
-                    None
-                  else
-                    Option.when(accepted.nonEmpty)(p -> accepted.flatMap(authorLogin).distinct)
-            }
-            .nextOption()
-      (candidates, resume)
+                  Left(LoopExit.Parked)
+                case Nil    =>
+                  logger.log(
+                    "no in-progress or ready issue — idle, exiting (next tick resumes when one goes ready)"
+                  )
+                  Left(LoopExit.Idle)
 
     // No issue anywhere = transient idle. Nothing is written, nothing is labelled, so the very next
     // tick resumes on its own when a US goes ready (the idle state must never latch, PR #17). A
     // parked issue with NO accepted reply is the one exception: it is not idle, and the next tick
     // must keep re-checking it rather than reporting the queue empty.
     val (issue, resumeAuthors): (Int, Option[List[String]]) =
-      gh.inProgressIssue() match
-        case Some(i) => (i, None)
-        case None    =>
-          val (parkedCandidates, resume) = parkedProbe()
-          resume match
-            case Some((p, authors)) => (p, Some(authors))
-            case None                =>
-              gh.oldestReadyIssue() match
-                case Some(i) => (i, None)
-                case None    =>
-                  parkedCandidates match
-                    case p :: _ =>
+      inProgress match
+        case Some(i) =>
+          // issue #50: `i` may ALSO be a parked issue, if a previous tick resumed it and then hit
+          // an infra fault before its terminal could remove `parked` (parked now survives the
+          // whole tick, precisely so this merge can happen). The reply check below only runs when
+          // `i` is a member of `parkedCandidates`, i.e. a SUCCESSFUL read reports it parked (a
+          // failed read never reaches here at all, see the fault above).
+          if parkedCandidates.contains(i) then
+            verifiedViewer(hadCandidate = true) match
+              case None =>
+                // The viewer identity could not be read, so no reply on #i can be verified either
+                // way. Unlike the walk path there is no next candidate to fall back to: the whole
+                // tick has to stay parked rather than silently treating the unverifiable state as
+                // "no reply, ordinary resume" (issue #50 review finding 2).
+                //
+                // Same starvation shape, and same operator escape, as `UnreadableComments` below
+                // (issue #50 review, round 3, finding H, PLAUSIBLE): see that case's scaladoc.
+                return PickAndSetup.StoppedEarly(LoopExit.Parked)
+              case Some(viewer) =>
+                acceptedReplyAuthors(i, viewer) match
+                  case ReplyCheck.Accepted(authors) =>
+                    (i, Some(authors))
+                  case ReplyCheck.NotYet            =>
+                    // No reply is waiting at all: a plain in-progress crash resume, exactly as
+                    // before issue #50 introduced the merge.
+                    (i, None)
+                  case ReplyCheck.UnreadableComments =>
+                    // Transient by construction (issue #50 review finding 2, round 2): the comments
+                    // read is an ordinary `gh` call, expected to succeed again on a later tick, and
+                    // the operator-facing signal is the log line `acceptedReplyAuthors` already
+                    // emitted above, the same signal every other `gh` read failure in this loop
+                    // already relies on (a broken token or a repo the loop lost access to shows up
+                    // as a repeated run of this exact line, not as a silent hang, and the fix is
+                    // the same credential/access fix the rest of the loop already needs to make any
+                    // progress at all). Staying `Parked` here is therefore recoverable without any
+                    // action specific to this code path, unlike `BudgetExhausted` just below.
+                    //
+                    // This return happens before the ready queue, and every other parked issue, is
+                    // ever read (issue #50 review, round 3, finding H, PLAUSIBLE): a PERSISTENTLY
+                    // failing `gh issue view #i --json comments` (a token that lost a scope, or an
+                    // issue that got transferred to another repo) starves the whole queue behind #i
+                    // on every tick, not just a rate-limited blip. This is deliberately not given
+                    // the `BudgetExhausted` treatment (release #i's slot and try the rest of the
+                    // queue the same tick): unlike an exhausted budget, which this loop can prove is
+                    // config, not transient, there is no way to tell a rate limit apart from a
+                    // permanently broken read from inside this function, and releasing on a merely
+                    // slow read would needlessly abandon a resume that was about to succeed. An
+                    // operator who sees this exact log line repeat tick after tick has one escape
+                    // that needs no code change: `gh issue edit <#i> --remove-label in-progress` by
+                    // hand. That makes `inProgressIssue()` answer `None` on the next tick, so the
+                    // pick falls through to the ready and parked queues normally (un-starving every
+                    // other issue) while #i keeps `parked` and waits, untouched, for whatever is
+                    // actually breaking its own comments read to be fixed separately.
+                    return PickAndSetup.StoppedEarly(LoopExit.Parked)
+                  case ReplyCheck.BudgetExhausted    =>
+                    // NOT transient (issue #50 review finding 2, round 2): `cfg.repairBudget` is a
+                    // config value fixed for this whole run, so returning `StoppedEarly(Parked)`
+                    // here would never resolve itself. Traced scenario: `REPAIR_BUDGET=0` wedges
+                    // this ONE issue's `StoppedEarly(Parked)` forever, and because that return
+                    // happens before the ready queue is even read, it starves every ready issue and
+                    // every OTHER parked issue behind it too, on every tick, permanently, worse than
+                    // the starvation issue #28 review finding 6 fixed for the walk path, and on the
+                    // merge path besides. The fix is to give up the in-flight slot instead:
+                    // `parked` stays (the reply really is still waiting), `in-progress` is dropped
+                    // so #i no longer blocks the pick, and the pick falls through to the rest of
+                    // the queue THIS SAME TICK, exactly as if #i had never been in flight.
+                    //
+                    // Two more constraints on the release itself (issue #50 review, round 3,
+                    // findings D and E). First, `DRY_RUN=1` must not mutate this label either: the
+                    // `cfg.dryRun` stop point further down in this function only guards the
+                    // PICK-TIME flip, because this release runs earlier in the same tick, before
+                    // that check is ever reached, so it needs its own guard rather than inheriting
+                    // one meant for a later line. Second, a release that genuinely fails on a live
+                    // run must END the tick rather than press on into `pickFromQueue()` and pick a
+                    // SECOND issue while #i is, in fact, still in-progress (the edit failed): that
+                    // breaks the "one US at a time" invariant this function's own header comment
+                    // states, and strands whichever of the two issues a later `gh issue list
+                    // --label in-progress | .[0]` does not happen to name.
+                    if cfg.dryRun then
                       logger.log(
-                        s"issue #$p remains parked, no human reply yet, exiting (next tick re-checks)"
+                        s"issue #$i: a human reply is waiting but the repair budget is exhausted; DRY_RUN=1, not releasing #$i from in-progress"
+                      )
+                      pickFromQueue() match
+                        case Left(exit)    => return PickAndSetup.StoppedEarly(exit)
+                        case Right(picked) => picked
+                    else if !gh.editLabels(i, add = Nil, remove = List(cfg.labels.active)) then
+                      logger.log(
+                        s"WARNING: could not release #$i from in-progress while parked (flip by hand); ending the tick rather than picking a second issue"
                       )
                       return PickAndSetup.StoppedEarly(LoopExit.Parked)
-                    case Nil    =>
+                    else
                       logger.log(
-                        "no in-progress or ready issue — idle, exiting (next tick resumes when one goes ready)"
+                        s"issue #$i: released from in-progress while parked (repair budget exhausted), trying the rest of the queue"
                       )
-                      return PickAndSetup.StoppedEarly(LoopExit.Idle)
+                      pickFromQueue() match
+                        case Left(exit)    => return PickAndSetup.StoppedEarly(exit)
+                        case Right(picked) => picked
+          else (i, None)
+        case None    =>
+          pickFromQueue() match
+            case Left(exit)   => return PickAndSetup.StoppedEarly(exit)
+            case Right(picked) => picked
+
+    // Whether #issue currently carries the `parked` label, independent of why it was picked (issue
+    // #50 review finding 1). This is the fact `terminal` actually needs: `resumeAuthors.isDefined`
+    // only says THIS tick ran a parked resume with a freshly accepted reply, which is strictly
+    // narrower and stays `false` through every gap case above (an unreadable comments list, an
+    // unreadable viewer login, an exhausted budget, or a fault between `Route.Parked`'s marker post
+    // and its own label flip on an earlier tick) even though the issue genuinely still carries
+    // `parked` in every one of them. Computed only from a SUCCESSFUL `parkedCandidates` read (issue
+    // #50 review, round 3): a failed read never reaches this line at all, it infra-faults the whole
+    // tick above instead, so there is no degraded case left for this membership test to answer for.
+    val carriesParked = parkedCandidates.contains(issue)
+
     cur.iter = n; cur.issue = issue.toString; cur.pass = 0; cur.budget = cfg.repairBudget
     emit(cur, "PICK", "ok", detail = s"issue=$issue")
     logger.log(s"iteration $n -> issue #$issue")
@@ -552,12 +770,22 @@ object Machine:
     val branch = s"us-$issue"
     if !git.checkoutBranch(branch) then throw IllegalStateException("cannot branch off origin/main")
 
-    // Mark active so a crashed run resumes the same US next tick. A resumed parked issue flips
-    // from `parked`, never from `ready`: it was never in the ready queue this time around.
-    val removeLabel = if resumeAuthors.isDefined then cfg.labels.parked else cfg.labels.ready
-    gh.editLabels(issue, add = List(cfg.labels.active), remove = List(removeLabel))
+    // Mark active so a crashed run resumes the same US next tick. A resumed parked issue ADDS
+    // in-progress but does NOT remove parked (issue #50): parked must survive the whole tick, so
+    // that a fault later in this same tick (reviewer timeout, gate timeout, unverified merge...)
+    // leaves the world exactly as the next tick's merged probe above already knows how to read,
+    // both `in-progress` and `parked` on the same issue. Only a genuine ready-queue pick removes
+    // its own queue label, `ready`, exactly as before; `parked` is removed later, by whichever
+    // terminal route completes, and only when `carriesParked` (computed above, a pick-time
+    // snapshot, never re-read) is true (see `activeAndParked`).
+    val remove = if resumeAuthors.isDefined then Nil else List(cfg.labels.ready)
+    // `editLabels` returns `Boolean` specifically so a failed flip is visible, not silently
+    // discarded (issue #50 review, round 3, finding B): warn like every other flip site in this
+    // file does, rather than letting the run continue believing `active` landed when it did not.
+    if !gh.editLabels(issue, add = List(cfg.labels.active), remove = remove) then
+      logger.log(s"WARNING: could not flip #$issue to in-progress (flip by hand)")
 
-    PickAndSetup.Ready(issue, bodyFile, workerPromptFile, isClass1, branch, resumeAuthors)
+    PickAndSetup.Ready(issue, bodyFile, workerPromptFile, isClass1, branch, resumeAuthors, carriesParked)
 
   /** The second of the phase extractions `iterate` is being split into (issue #30 / RFC #26
     * decision 12); the same reasoning as `pickAndSetup` applies here: naming this phase and giving
@@ -727,10 +955,11 @@ object Machine:
         // must never land in this file (issue #28 review finding 2).
         fs.write(failFile, resumeFailureBody(authors))
         // `pickAndSetup` only ever sets `resumeAuthors` when `cfg.repairBudget > 0` (issue #28
-        // review finding 7, round 2): deciding that BEFORE the parked -> active label flip, rather
-        // than discovering it here after the flip already ran, is what stops a REPAIR_BUDGET=0
-        // resume from silently losing the parked state and the human's reply for nothing. So
-        // `budget` (freshly `cfg.repairBudget`, set above) is guaranteed positive here.
+        // review finding 7, round 2): deciding that BEFORE the pick-time label flip (which only
+        // ever ADDS `active`, see that flip's own scaladoc), rather than discovering it here after
+        // the flip already ran, is what stops a REPAIR_BUDGET=0 resume from silently losing the
+        // parked state and the human's reply for nothing. So `budget` (freshly `cfg.repairBudget`,
+        // set above) is guaranteed positive here.
         budget -= 1; cur.budget = budget
         logger.log(
           s"issue #$issue: resuming from parked with a human reply, dispatching FIX (budget now $budget)"
@@ -844,6 +1073,25 @@ object Machine:
     // `outcome.getOrElse(Outcome.Fail)`: unreachable in practice; see `Ready`'s scaladoc.
     ImplementAndRepair.Ready(pass, outcome.getOrElse(Outcome.Fail), gateStatus, failureKind, reviewed, reviewFile)
 
+  /** The labels a terminal route removes when it flips an issue away from `in-progress`: always
+    * `active`, plus `parked` ONLY when `carriesParked`, i.e. only when `issue` currently carries
+    * the `parked` label (issue #50 review finding 1; see `PickAndSetup.Ready`'s scaladoc for why
+    * that is a strictly wider condition than "this tick resumed a parked issue").
+    *
+    * The removal of `parked` is conditional, never unconditional, by design, and the reason is not
+    * that `gh issue edit --remove-label` is unverified against an absent label in general: the
+    * crash-resume flip a few screens up already sends `--remove-label ready` on issues that
+    * provably lack `ready`, and the loop already depends on that succeeding as a no-op. The reason
+    * is narrower and specific to `parked`: the label may not exist AT ALL in a consumer repo, the
+    * same "every consumer repo's state on upgrade" gap `Route.Parked`'s own label flip below
+    * documents, where a nonexistent label fails the whole `gh issue edit` call as a unit. `ready`
+    * has shipped with every consumer repo's setup from the start; `parked` has not. An
+    * unconditional removal here would risk turning a healthy completion into an infra fault on
+    * exactly the repos that gap describes.
+    */
+  private def activeAndParked(carriesParked: Boolean)(using cfg: Config): List[String] =
+    cfg.labels.active :: (if carriesParked then List(cfg.labels.parked) else Nil)
+
   /** The third and last of the phase extractions `iterate` is being split into (issue #31 / RFC #26
     * decision 12). Unlike `pickAndSetup` and `implementAndRepair`, there is nothing left in `iterate`
     * after this phase runs, so its result IS `iterate`'s result: a plain `LoopExit`, not a
@@ -868,7 +1116,8 @@ object Machine:
       gateStatus: String,
       failureKind: Option[FailureKind],
       reviewed: Boolean,
-      reviewFile: String
+      reviewFile: String,
+      carriesParked: Boolean
   )(using
       cfg: Config,
       gh: GitHub,
@@ -1054,9 +1303,15 @@ object Machine:
     emit(cur, "PR", "ok", detail = s"pr=$prNum outcome=$outcomeText")
 
     route match
-      case Route.AutoMergeCandidate => autoMerge(issue, prNum, cur)
+      case Route.AutoMergeCandidate => autoMerge(issue, prNum, cur, carriesParked)
       case Route.NeedsReview | Route.NeedsHuman =>
-        gh.editLabels(issue, add = List(label), remove = List(cfg.labels.active))
+        // A failed flip here (issue #50 review, round 3, finding B) used to be silently discarded:
+        // the tick would still return `Success`/`NeedsHuman` with #issue left `in-progress` and no
+        // terminal label at all, and the driver would re-pick it next tick and burn a second full
+        // dispatch on work that already finished. Warn, like `editLabels`'s Boolean return exists
+        // to let every OTHER call site in this file do.
+        if !gh.editLabels(issue, add = List(label), remove = activeAndParked(carriesParked)) then
+          logger.log(s"WARNING: could not flip #$issue to $label (flip by hand)")
         logger.log(s"issue #$issue -> $label")
         if route == Route.NeedsReview then LoopExit.Success else LoopExit.NeedsHuman
       case Route.Parked =>
@@ -1070,7 +1325,7 @@ object Machine:
     * CI red after green local gates = needs-human WITHOUT self-repair: the loop never repairs
     * against the independent check.
     */
-  private def autoMerge(issue: Int, prNum: Int, cur: Cursor)(using
+  private def autoMerge(issue: Int, prNum: Int, cur: Cursor, carriesParked: Boolean)(using
       cfg: Config,
       gh: GitHub,
       git: Git,
@@ -1111,7 +1366,7 @@ object Machine:
           "CI red after local gates were green. The loop never self-repairs against the independent check (v3 hands-off rule) — a human must look."
         )
         // bash guards this flip (loop.sh:464): a failed flip is a warning, not a hard stop.
-        if !gh.editLabels(issue, add = List("needs-human"), remove = List(cfg.labels.active)) then
+        if !gh.editLabels(issue, add = List("needs-human"), remove = activeAndParked(carriesParked)) then
           logger.log(s"WARNING: could not flip #$issue to needs-human (flip by hand)")
         notify.notify(s"harness: #$issue CI RED -> needs-human (PR #$prNum)")
         LoopExit.NeedsHuman
@@ -1130,7 +1385,12 @@ object Machine:
           val shown = if state.isEmpty then "unknown" else state
           infraFault(s"merge NOT verified (PR state '$shown') — infra fault")
         emit(cur, "MERGE", "ok", detail = s"pr=$prNum")
-        gh.editLabels(issue, add = Nil, remove = List(cfg.labels.active))
+        // A failed drop here (issue #50 review, round 3, finding B) used to leave a genuinely
+        // MERGED issue silently `in-progress` forever, with the merge itself already verified above
+        // so nothing else about the tick would ever surface the problem. Warn, same as every other
+        // flip site in this file.
+        if !gh.editLabels(issue, add = Nil, remove = activeAndParked(carriesParked)) then
+          logger.log(s"WARNING: could not drop in-progress/parked from #$issue after merge (flip by hand)")
         flipBlocked(issue)
         // a post-merge fetch failure is tolerated: next tick re-fetches
         if !git.fetchOriginMain() then
@@ -1176,8 +1436,9 @@ object Machine:
     }
 
   /** What `pickAndSetup` concluded: either `iterate` stops immediately with the carried `LoopExit`
-    * (manual stop, idle, dry run — none of them mutate git or labels), or the phase ran to
-    * completion and everything the rest of `iterate` needs is here.
+    * (manual stop, idle, dry run, parked; issue #50 review adds three more `Parked` exit sites to
+    * the ones that already existed), or the phase ran to completion and everything the rest of
+    * `iterate` needs is here.
     *
     * A sum type rather than, say, an `Option` of a result tuple plus a separate exit code: the two
     * cases really do have different shapes, and naming both is what lets `iterate` read as "call the
@@ -1185,31 +1446,55 @@ object Machine:
     * / RFC #26 decision 12 — extract the phase first, so the later node conversion is a reshape).
     */
   private enum PickAndSetup:
-    /** The phase stopped on its own before touching git or labels; `exit` is what `iterate` must
-      * return unchanged. `exit` is never `LoopExit.InfraFault`: an infra fault goes through
-      * `infraFault`, not through this case, because routing it here would skip the fault log line
-      * and the notify that `infraFault` is responsible for.
+    /** The phase stopped on its own before dispatching any work or touching git; `exit` is what
+      * `iterate` must return unchanged. `exit` is never `LoopExit.InfraFault`: an infra fault goes
+      * through `infraFault`, not through this case, because routing it here would skip the fault
+      * log line and the notify that `infraFault` is responsible for.
+      *
+      * NOT label-mutation-free in every case (issue #50 review finding 2, round 2): a `Parked` exit
+      * reached after releasing a budget-exhausted issue's `in-progress` label (because there was
+      * nothing else left to pick this tick either) still carries that one `editLabels` call. That
+      * is intentional, not a leak of this case's contract: the release has to happen regardless of
+      * whether anything else was available to run this same tick, or the next tick would have to
+      * rediscover the exact same exhausted-budget verdict before it could make the same release.
       */
     case StoppedEarly(exit: LoopExit)
 
     /** So the call site reads as plain names instead of `setup.foo` accessors, the field names are
       * the ones `iterate` imports them as.
       *
-      * `resumeAuthors` is `Some` only when `issue` was picked off the parked queue with an accepted
-      * human reply waiting (issue #28): `implementAndRepair` reads it to skip the initial IMPL
-      * dispatch and go straight to a FIX round instead, and to name the reply's authors in the
-      * harness-authored failure body it writes (issue #28 review finding 3, round 2; the field
-      * used to carry the reply TEXT and nothing ever read it back, see finding 6).
+      * `resumeAuthors` is `Some` only when `issue` was picked off the parked queue, or off an
+      * in-progress issue that is ALSO parked, with a freshly ACCEPTED human reply THIS tick (issue
+      * #28): `implementAndRepair` reads it to skip the initial IMPL dispatch and go straight to a
+      * FIX round instead, and to name the reply's authors in the harness-authored failure body it
+      * writes (issue #28 review finding 3, round 2; the field used to carry the reply TEXT and
+      * nothing ever read it back, see finding 6).
       *
-      * KNOWN LIMITATION (issue #28 review finding 6, round 3): once a resumed issue's label is
-      * flipped from `parked` to `active` (this same function, below), an infra fault later in the
-      * same tick (a reviewer timeout, a gate timeout) leaves the issue `active`, not `parked`. The
-      * next tick then picks it up as an ordinary in-progress issue with `resumeAuthors = None`, and
-      * the human's reply reaches no prompt unless the gate later goes red on its own (at which
-      * point the ordinary FIX round's `{{COMMENTS}}` splice picks it up anyway). The issue stays
-      * actionable, and the guidance is still readable on GitHub, so this is accepted rather than
-      * plumbing the resumed-issue distinction through every infra-fault site in
-      * `implementAndRepair` to restore the label on each one.
+      * `carriesParked` is a different, wider fact (issue #50 review finding 1): whether `issue`
+      * currently carries the `parked` label at all, regardless of why it was picked or whether THIS
+      * tick established a fresh reply. `resumeAuthors.isDefined` used to stand in for this at the
+      * terminal and was wrong, because it is `false` in every gap case where the issue still
+      * carries `parked` from an earlier tick's fault, without THIS tick re-establishing the reply:
+      * an unreadable comments list, an unreadable viewer login, an exhausted repair budget, or a
+      * fault landing between `Route.Parked`'s marker post and its own label flip on an earlier
+      * tick. (THIS tick's own `gh.parkedIssues()` read failing is not one of these gap cases: that
+      * always infra-faults the whole tick above, before `Ready` is ever constructed, per review
+      * round 3's reversal of an earlier degrade, see the fault site's own scaladoc.) `terminal`
+      * (via `activeAndParked`) reads `carriesParked`, not `resumeAuthors.isDefined`, to decide
+      * whether to remove `parked` on completion, which is what actually clears the gap instead of
+      * stranding the label on a finished issue forever.
+      *
+      * The pick-time flip above ADDS `active` but does NOT remove `parked`, so `parked` survives
+      * the whole tick. An infra fault later in the same tick (a reviewer timeout, a gate timeout,
+      * an unverified merge) therefore leaves the issue both `in-progress` and still `parked`,
+      * exactly the state the next tick's merged probe in `pickAndSetup` already knows how to read:
+      * it checks whether the in-progress issue is ALSO parked and, if a reply is accepted, resumes
+      * it as a parked resume again with the same reply, rather than falling back to an ordinary
+      * IMPL. Every terminal route other than `Route.Parked` removes `parked` on completion when
+      * `carriesParked` is true (`activeAndParked`, reached on success, needs-review, needs-human, a
+      * verified auto-merge, or a CI-red needs-human flip). `Route.Parked` itself never removes
+      * `parked`, it ADDS it, whether as a fresh park or a re-park, and never calls
+      * `activeAndParked` at all.
       */
     case Ready(
         issue: Int,
@@ -1217,7 +1502,8 @@ object Machine:
         workerPromptFile: String,
         isClass1: Boolean,
         branch: String,
-        resumeAuthors: Option[List[String]]
+        resumeAuthors: Option[List[String]],
+        carriesParked: Boolean
     )
 
   /** What `implementAndRepair` concluded: either the initial IMPL patch was empty and `iterate`
