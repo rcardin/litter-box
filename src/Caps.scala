@@ -19,6 +19,35 @@ trait GitHub:
   /** Oldest open issue labelled ready, if any. */
   def oldestReadyIssue(): Option[Int]
 
+  /** Every open issue labelled parked, oldest first (issue #28). Queried back every tick rather
+    * than remembered anywhere: parking is the terminal state of ONE tick, never a stored
+    * position, so `Machine.pickAndSetup` re-derives "is there still a parked issue, and does it
+    * have a reply" from GitHub alone (RFC #26 decision 6).
+    *
+    * A `List`, not the single oldest issue: `Machine.pickAndSetup` has to walk every parked issue
+    * looking for the first one with an accepted human reply, so an older parked issue with no
+    * reply yet can never starve a newer one a human already steered (review finding on issue #28's
+    * first pass, where only the oldest was ever probed).
+    *
+    * `None` on a failed `gh` read (auth expiry, rate limit), same shape and reasoning as
+    * `issueComments` below: folding that into `Some(Nil)` would report the queue empty and let the
+    * loop settle into `Idle` (rc 11, a healthy looking exit) while it actually has no idea whether
+    * a parked issue is out there waiting on a human (issue #28 review finding 7, round 3).
+    */
+  def parkedIssues(): Option[List[Int]]
+
+  /** The login `gh` is authenticated as, i.e. the account whose comments the harness itself posts
+    * (`gh api user --jq .login`). This is how `Machine`'s resume probe tells its own park marker
+    * comment apart from a forged one: association (`OWNER`/`MEMBER`/`COLLABORATOR`) is not a safe
+    * test for the marker, because a bot or GitHub App token's `authorAssociation` reads `NONE` even
+    * though it IS the harness's own account, which would make the harness unable to recognise its
+    * own marker under such a token (issue #28 review finding 3, round 3).
+    *
+    * `None` on a failed read: the loop then cannot tell its own marker from a forgery, so it must
+    * not resume anything off that answer.
+    */
+  def viewerLogin(): Option[String]
+
   /** `"# " + title + "\n\n" + body` — the shape loop.sh writes to the body file. */
   def issueTitleAndBody(issue: Int): String
 
@@ -57,10 +86,21 @@ trait GitHub:
   def createPr(branch: String, title: String, body: String): String
   def prComment(pr: Int, body: String): Unit
 
+  /** Posts a comment on an issue. Mirrors `prComment`, except the return value is load-bearing:
+    * the marker comment IS the cross-tick boundary `Machine`'s resume probe reads back (see
+    * `Machine.ParkMarker`), so a caller that could not tell a failed post from a successful one
+    * would risk labelling an issue `parked` with no marker on it at all, after which every comment
+    * ever left on the issue reads as "the reply" on the next tick.
+    *
+    * `false` = the underlying post failed (rc != 0); `Machine.terminal` treats that as an infra
+    * fault rather than completing the park.
+    */
+  def issueComment(issue: Int, body: String): Boolean
+
   /** Comments on the PR opened for this issue: same shape and reasoning as `issueComments` above.
-    * Nothing splices this into a prompt yet (only the issue's own comments feed the FIX prompt; #28
-    * owns wiring this one in), but the read exists in full because a third party is just as likely
-    * to steer from the PR thread.
+    * Nothing splices this into a prompt (only the issue's own comments feed the FIX prompt); this
+    * read exists in full because a third party is just as likely to steer from the PR thread, but
+    * it stays unwired on purpose until something actually needs it.
     */
   def prComments(pr: Int): Option[List[String]]
   def prState(pr: Int): String

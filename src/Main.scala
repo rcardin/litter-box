@@ -263,14 +263,25 @@ object Main:
 
   /** loop.sh:931-943's `case` block: rc 0 (Success) and rc 40 (NeedsHuman) are the only two that do
     * NOT `exit`; the driver logs and lets the `for` loop advance to the next iteration. Every other
-    * rc exits the process immediately. `LoopExit` is closed to exactly these 7 cases, so there is
-    * no bash `*)` passthrough branch to reproduce here.
+    * rc exits the process immediately. `LoopExit` is closed to exactly these 8 cases (issue #28
+    * added `Parked`, rc 60), so there is no bash `*)` passthrough branch to reproduce here.
+    *
+    * `Parked` is deliberately `Exit`, not `Continue`, even though it shares a lot with
+    * `NeedsHuman` (a bounded self-repair budget running out). It belongs with `Idle` instead:
+    * "nothing actionable without a human, stop and let the next scheduled run re-check." Making it
+    * `Continue` would spin the driver through `MAX_ITERS` ticks that each re-probe GitHub and can
+    * do nothing until a human replies, exactly what `Idle`'s exit already exists to avoid. An
+    * operator who wants the old keep-going-past-exhaustion behaviour sets
+    * `issues.park-on-exhaustion = false`, which routes exhaustion to `NeedsHuman` instead, and
+    * that already `Continue`s. This was raised again in the issue #28 review and rejected on
+    * purpose: it is not an oversight, so do not "fix" it into `Continue`.
     */
   private[litterbox] def driverAction(exit: LoopExit): DriverAction = exit match
     case LoopExit.Success | LoopExit.NeedsHuman                => DriverAction.Continue
     case LoopExit.ManualStop | LoopExit.Idle | LoopExit.DryRun => DriverAction.Exit(0)
     case LoopExit.NothingMade                                  => DriverAction.Exit(1)
     case LoopExit.InfraFault                                   => DriverAction.Exit(50)
+    case LoopExit.Parked                                       => DriverAction.Exit(60)
 
   /** The repo the loop works on: the git work tree containing the process's CWD.
     *
@@ -321,6 +332,8 @@ object Main:
     case LoopExit.DryRun      => "dry run reached its stop point — exiting"
     case LoopExit.NothingMade => s"iteration $i produced nothing — exiting for inspection"
     case LoopExit.InfraFault  => "infra fault — exiting for inspection (issue stays in-progress)"
+    case LoopExit.Parked      =>
+      s"iteration $i parked, waiting on a human reply, exiting (next tick re-checks)"
 
   /** loop.sh:927-943: run up to `maxIters` ticks, applying the rc -> action map after each one.
     * Returns the process exit code the caller must `sys.exit` with; `sys.exit` itself stays out of

@@ -47,7 +47,8 @@ class SettingsSpec extends AnyFlatSpec with Matchers:
       |stop-file     = "HALT.md"
       |log-dir       = "custom/logs"
       |gate { fast = "mill __.compile", timeout = 111 }
-      |issues.labels { ready = "lbox-ready", active = "lbox-active", blocked = "lbox-blocked" }
+      |issues.labels { ready = "lbox-ready", active = "lbox-active", blocked = "lbox-blocked", parked = "lbox-parked" }
+      |issues.park-on-exhaustion = false
       |protect = ["secrets/**", "Makefile"]
       |budgets { repair = 7, max-patch-bytes = 4242 }
       |timeouts { iter = 60, ci-wait = 61, ci-appear = 62, ci-appear-interval = 63 }
@@ -111,7 +112,8 @@ class SettingsSpec extends AnyFlatSpec with Matchers:
     cfg.logDir shouldBe "custom/logs"
     cfg.gateCmd shouldBe "mill __.compile"
     cfg.gateTimeout shouldBe 111
-    cfg.labels shouldBe Labels("lbox-ready", "lbox-active", "lbox-blocked")
+    cfg.labels shouldBe Labels("lbox-ready", "lbox-active", "lbox-blocked", "lbox-parked")
+    cfg.parkOnExhaustion shouldBe false
     // The file's own entries first, then the reference floor unioned in (see the `protect` section
     // below for why the floor is not droppable).
     cfg.protect shouldBe List("secrets/**", "Makefile", ".litter-box/**", ".github/**", "CONTEXT.md")
@@ -193,7 +195,8 @@ class SettingsSpec extends AnyFlatSpec with Matchers:
     parsed.cfg.logDir shouldBe "custom/logs"
     parsed.cfg.stopFile shouldBe "HALT.md"
     parsed.cfg.conventions shouldBe "RULES.md"
-    parsed.cfg.labels shouldBe Labels("lbox-ready", "lbox-active", "lbox-blocked")
+    parsed.cfg.labels shouldBe Labels("lbox-ready", "lbox-active", "lbox-blocked", "lbox-parked")
+    parsed.cfg.parkOnExhaustion shouldBe false
 
     // GATE_CMD set by the operator is what "overridden" means, and it turns the sandbox preflight
     // off; a `gate.fast` in the file is the repo's normal gate and must never do that.
@@ -361,6 +364,7 @@ class SettingsSpec extends AnyFlatSpec with Matchers:
          |    if [[ "$$*" == *"--label lbox-active"* ]]; then echo "111"
          |    elif [[ "$$*" == *"--label lbox-ready"* ]]; then echo "222"
          |    elif [[ "$$*" == *"--label lbox-blocked"* ]]; then printf '333\\n444\\n'
+         |    elif [[ "$$*" == *"--label lbox-parked"* ]]; then echo "555"
          |    fi ;;
          |  *) : ;;
          |esac
@@ -370,10 +374,10 @@ class SettingsSpec extends AnyFlatSpec with Matchers:
 
   private def labelledGh(binDir: Path, root: Path): LiveGitHub =
     LiveGitHub(root, ciAppearCmd = None, mergeCmd = None, extraPath = Some(binDir.toString))(using
-      Config(labels = Labels("lbox-ready", "lbox-active", "lbox-blocked"))
+      Config(labels = Labels("lbox-ready", "lbox-active", "lbox-blocked", "lbox-parked"))
     )
 
-  "the configured labels" should "be the ones the three gh query methods put on the wire" in {
+  "the configured labels" should "be the ones the four gh query methods put on the wire" in {
     val root                = tempRoot()
     val (binDir, callsFile) = setupLabelRecordingGh()
     val gh                  = labelledGh(binDir, root)
@@ -384,6 +388,8 @@ class SettingsSpec extends AnyFlatSpec with Matchers:
     gh.oldestReadyIssue() shouldBe Some(222)
     // The blocked sweep asks for the configured BLOCKED label.
     gh.openBlockedIssues() shouldBe List(333, 444)
+    // The parked probe (issue #28) asks for the configured PARKED label.
+    gh.parkedIssues() shouldBe Some(List(555))
 
     val calls = readString(callsFile)
     calls should include(
@@ -395,11 +401,15 @@ class SettingsSpec extends AnyFlatSpec with Matchers:
     calls should include(
       "gh issue list --state open --label lbox-blocked --json number --jq .[].number"
     )
+    calls should include(
+      "gh issue list --state open --label lbox-parked --json number,createdAt --jq sort_by(.createdAt) | .[].number"
+    )
 
     // And the literals the slice was meant to remove never appear on the wire at all.
     calls should not include "--label ready"
     calls should not include "--label in-progress"
     calls should not include "--label blocked"
+    calls should not include "--label parked"
   }
 
   /** `Main` builds its `LiveGitHub` against the same `Config` it gives `Machine`, so the file value

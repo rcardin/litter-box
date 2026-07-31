@@ -73,6 +73,24 @@ final class TestWorld:
   var stopFile: Boolean       = false
   var inProgress: Option[Int] = None
   var ready: Option[Int]      = Some(999)
+
+  /** Every open parked issue, oldest first, `GitHub.parkedIssues`'s own contract (issue #28
+    * review finding 6: the probe has to walk the whole list, not just the oldest).
+    */
+  var parked: List[Int] = Nil
+
+  /** Scripts `GitHub.parkedIssues`'s failed-read case (`None`), distinct from `parked = Nil`,
+    * which is a SUCCESSFUL read reporting no parked issues at all (issue #28 review finding 7,
+    * round 3).
+    */
+  var parkedIssuesFail: Boolean = false
+
+  /** The login `GitHub.viewerLogin` answers, the account the harness's own marker comment is
+    * posted as. Defaults to the same login the scenarios' `markerEntry` helper writes, so a
+    * scenario that scripts a genuine marker without touching this field still recognises it
+    * (issue #28 review finding 3, round 3).
+    */
+  var viewerLoginAnswer: Option[String] = Some("litter-box")
   var titleBody: String = "# US-999 sample\n\nAC1: implement the slice.\nAC2: cover it with a test."
   var labels: List[String]              = List("ready")
   var implScript: WorkerScript          = WorkerScript.Produces(newFilePatch)
@@ -89,6 +107,12 @@ final class TestWorld:
   var fetchSucceeds: Boolean            = true
   var checkoutSucceeds: Boolean         = true
   var labelEditSucceeds: Boolean        = true
+
+  /** Scripts `GitHub.issueComment`'s return value (issue #28 review finding 8: the marker post's
+    * success has to be observable, not swallowed like `prComment`'s).
+    */
+  var issueCommentSucceeds: Boolean = true
+
   var blockedIssues: List[Int]          = Nil
   var issueBodies: Map[Int, String]     = Map.empty
 
@@ -98,7 +122,7 @@ final class TestWorld:
     * `List` rather than a joined string).
     */
   var issueCommentBodies: Map[Int, List[String]] = Map.empty
-  var prCommentBodies: Map[Int, List[String]]    = Map.empty // #28 wires this in; no consumer yet
+  var prCommentBodies: Map[Int, List[String]]    = Map.empty // stays unwired; no consumer yet
 
   /** Issues whose scripted `gh` comments read should fail (`None`), distinct from an issue with no
     * entry in `issueCommentBodies`, which is a SUCCESSFUL read of `Nil` (see `Caps.GitHub.issueComments`
@@ -123,6 +147,11 @@ final class TestWorld:
   var prBodies: List[String]       = Nil
   var sleeps: List[Int]            = Nil
 
+  /** `(issue, body)` for every `GitHub.issueComment` call, in order: the parking marker's content
+    * is asserted against this, the way `prBodies` pins `createPr`'s.
+    */
+  var postedIssueComments: List[(Int, String)] = Nil
+
   private def isNumstatLine(l: String): Boolean =
     NumstatRow.parse(l).exists { row =>
       (row.added
@@ -135,6 +164,11 @@ final class TestWorld:
       record("gh issue list --label in-progress"); inProgress
     def oldestReadyIssue(): Option[Int] =
       record("gh issue list --label ready"); ready
+    def parkedIssues(): Option[List[Int]] =
+      record("gh issue list --label parked")
+      if parkedIssuesFail then None else Some(parked)
+    def viewerLogin(): Option[String] =
+      record("gh api user"); viewerLoginAnswer
     def issueTitleAndBody(issue: Int): String =
       record(s"gh issue view $issue --json title,body"); titleBody
     def issueBody(issue: Int): String =
@@ -156,6 +190,11 @@ final class TestWorld:
       record(s"gh pr create --head $branch --title $title"); prBodies = prBodies :+ body; prUrl
     def prComment(pr: Int, body: String): Unit =
       record(s"gh pr comment $pr")
+    def issueComment(issue: Int, body: String): Boolean =
+      record(s"gh issue comment $issue")
+      if issueCommentSucceeds then
+        postedIssueComments = postedIssueComments :+ (issue -> body)
+      issueCommentSucceeds
     def prComments(pr: Int): Option[List[String]] =
       record(s"gh pr view $pr --json comments")
       Some(prCommentBodies.getOrElse(pr, Nil))

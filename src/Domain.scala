@@ -33,6 +33,15 @@ enum LoopExit(val rc: Int):
     */
   case InfraFault extends LoopExit(50)
 
+  /** Repair budget exhausted on the generic sub-case (gate-RED or REQUEST_CHANGES, never a guard
+    * rejection or an empty fix), with `issues.park-on-exhaustion` true: the issue is labelled
+    * `parked` and left there rather than opened as a needs-human PR. Parking is the terminal state
+    * of ONE tick, never a stored position. The next tick re-derives "is there a reply" from GitHub
+    * alone (RFC #26 decision 6), the same way `Idle` re-derives "is there a ready issue" rather than
+    * latching (see `Idle`'s own note, PR #17).
+    */
+  case Parked extends LoopExit(60)
+
 /** What the patch seam (dispatch -> reset -> inspect -> apply) concluded for one agent patch. */
 enum StageResult:
   /** Patch inspected, applied and staged; `patch` is the artifact tamper/reviewer read. */
@@ -127,17 +136,21 @@ final case class StatusEvent(
     detail: String
 )
 
-/** The three issue labels the loop drives its own state machine with (`issues.labels`). Named rather
+/** The four issue labels the loop drives its own state machine with (`issues.labels`). Named rather
   * than a bare `Map[String, String]` so a caller cannot ask for a key that does not exist, and so
   * "which label does crash-resume query" has one answer (`active`) instead of a string lookup.
   *
   * `class-1`, `needs-review` and `needs-human` are deliberately NOT here: those are the loop's own
-  * vocabulary for outcomes it produces, not the consumer repo's queue labels it consumes.
+  * vocabulary for outcomes it produces, not the consumer repo's queue labels it consumes. `parked`
+  * differs from those three the same way: it is QUERIED BACK the next tick (`GitHub.parkedIssues`)
+  * rather than only ever written, which is exactly why it lives here instead of being a literal
+  * next to them.
   */
 final case class Labels(
     ready: String = "ready",
     active: String = "in-progress",
-    blocked: String = "blocked"
+    blocked: String = "blocked",
+    parked: String = "parked"
 )
 
 /** The per-iteration knobs, read from `.litter-box/config.conf` and overlaid with the loop.sh env
@@ -167,6 +180,12 @@ final case class Config(
       */
     logDir: String = ".litter-box/logs",
     labels: Labels = Labels(),
+    /** `issues.park-on-exhaustion`: true routes generic repair-budget exhaustion (gate-RED or
+      * REQUEST_CHANGES, never a guard rejection or an empty fix) to `LoopExit.Parked` instead of
+      * the needs-human PR. Not env-overridable: unlike `repairBudget` or `gateCmd`, this is a
+      * per-repo policy about what "waiting on a human" means, not a per-run operator switch.
+      */
+    parkOnExhaustion: Boolean = true,
     /** `protect` — globs (JDK `glob:` syntax) the patch guard rejects any patch touching. */
     protect: List[String] = List(".litter-box/**", ".github/**", "CONTEXT.md"),
     /** `gate.fast`, overridable by GATE_CMD (loop.sh:133). The command itself, not a path to a

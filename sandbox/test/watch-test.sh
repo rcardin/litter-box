@@ -18,8 +18,12 @@ SB="$(mktemp -d)"
 trap 'rm -rf "$SB"' EXIT
 
 ev() { # ev TS PHASE STATE PASS BUDGET [LOGFILE] [DETAIL] [ISSUE] [RUN] [ITER]
+  # ISSUE uses `${8-5}` (no colon), UNSET-only, deliberately unlike the other defaults: a caller
+  # that wants to represent a real parked-no-reply tick (issue #28, Fixture M) has to be able to
+  # pass an explicit empty issue and have it stay empty, which `${8:-5}` (empty-or-unset) would
+  # silently override back to the default.
   printf '{"ts":%s,"pid":4711,"run":"%s","iter":%s,"issue":"%s","phase":"%s","state":"%s","pass":%s,"budget":%s,"logfile":"%s","detail":"%s"}\n' \
-    "$1" "${9:-100}" "${10:-1}" "${8:-5}" "$2" "$3" "$4" "$5" "${6:-}" "${7:-}"
+    "$1" "${9:-100}" "${10:-1}" "${8-5}" "$2" "$3" "$4" "$5" "${6:-}" "${7:-}"
 }
 
 # v6 slice 3 removed the local IT gate, so the banner's fixed chip row is PICK/IMPL/FAST_GATE
@@ -179,6 +183,48 @@ F="$SB/l.jsonl"
 out="$(render_banner "$F" 1 1000)"
 check "L status is DONE even though the pid is alive (terminal beats liveness, not just staleness)" \
   "DONE rc=0" "$(line "$out" 4)"
+
+echo "== Fixture M: terminal event rc=60, no reply on a parked issue -> parked banner, the shape a real parked-no-reply tick actually produces (issue #28) =="
+# `Machine.pickAndSetup`'s StoppedEarly(Parked) branch (the parked-with-no-reply path) returns
+# BEFORE cur.iter/cur.issue are ever set and before any PICK/IMPL/FAST_GATE event is emitted, so
+# the only event a real tick like this ever writes is the terminal DONE, with iter=0 and issue="".
+# The old fixture synthesized PICK/IMPL/FAST_GATE events this path never emits; this one matches
+# what actually lands in status.jsonl.
+F="$SB/m.jsonl"
+{ ev 900 DONE end 0 0 "" "rc=60" "" 100 0
+} > "$F"
+out="$(render_banner "$F" 0 1000)"
+check "M header"  "US- · iter 0 · pass 0 · budget 0"        "$(line "$out" 1)"
+check "M chips 1" "· pick  · impl  · fast"                  "$(line "$out" 2)"
+check "M status"  "DONE rc=60 (parked, waiting on a human)" "$(line "$out" 4)"
+
+echo "== Fixture N: budget-exhaustion park -> the real PICK/IMPL/FAST_GATE/PARK/DONE sequence, PARK renders like any unmapped phase =="
+# Unlike Fixture M, a tick that PARKS after exhausting the repair budget runs the ordinary
+# PICK/IMPL/FAST_GATE phases first (see the parked-on-exhaustion golden in LogParitySpec) and, since
+# issue #28's review, emits one more event when the issue is actually parked: PARK "ok". PARK is not
+# one of the seven phases the two fixed chip rows enumerate (PICK/IMPL/FAST_GATE and
+# REVIEW/PR/CI_WAIT/MERGE), so it never grows an eighth chip; it just has to not break the banner,
+# which this fixture is the regression test for.
+F="$SB/n.jsonl"
+{ ev 100 PICK      ok    0 2
+  ev 101 IMPL      ok    0 2 harness/logs/issue-5-iter1.claude.log
+  ev 500 FAST_GATE red   3 0 harness/logs/issue-5-pass3.gate.log
+  ev 890 PARK       ok    3 0 "" "issue=5"
+  ev 900 DONE      end   3 0 "" "rc=60"
+} > "$F"
+out="$(render_banner "$F" 0 1000)"
+check "N status"  "DONE rc=60 (parked, waiting on a human)" "$(line "$out" 4)"
+check "N chips 1" "✓ pick  ✓ impl  ✗ fast"                  "$(line "$out" 2)"
+
+echo "== Fixture O: loop dies right after posting PARK, before the terminal DONE -> STALE names the PARK phase, chip_name's catch-all renders it acceptably (issue #28 review nit) =="
+F="$SB/o.jsonl"
+{ ev 100 PICK      ok    0 2
+  ev 101 IMPL      ok    0 2 harness/logs/issue-5-iter1.claude.log
+  ev 500 FAST_GATE red   3 0 harness/logs/issue-5-pass3.gate.log
+  ev 890 PARK       ok    3 0 "" "issue=5"
+} > "$F"
+out="$(render_banner "$F" 0 1000)"
+check "O status names the unmapped PARK phase, not blank or a crash" "STALE (loop died in PARK)" "$(line "$out" 4)"
 
 echo
 echo "==== $pass passed, $fail failed ===="

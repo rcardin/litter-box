@@ -27,8 +27,8 @@ burn repair budget or dispatch a FIX.
 
 ### Domain
 
-`src/Domain.scala` holds the closed types: `LoopExit` (the seven terminal states and their process
-exit codes 0/10/11/20/30/40/50 — the rc contract shared with `watch.sh`, never change a meaning),
+`src/Domain.scala` holds the closed types: `LoopExit` (the eight terminal states and their process
+exit codes 0/10/11/20/30/40/50/60 — the rc contract shared with `watch.sh`, never change a meaning),
 `StageResult`, `GateResult`, `Verdict`, `FailureKind` (whose `text` strings appear verbatim in logs,
 commits and PR notes), `InfraFault`, `Role`, `Template`, `Config`.
 
