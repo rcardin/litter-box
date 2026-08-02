@@ -382,24 +382,42 @@ object Machine:
     // accessors ambiguous with them the moment anything below asks for one implicitly (see `Caps`'s
     // own doc). Passed to `Runner.step` explicitly instead, which needs no such import here at all.
     //
-    // Seeded from `cfg.repairBudget` (issue #32 review finding 6), the same value `cur.budget` is
-    // mirrored from a few lines below, rather than a hardcoded `0`: Pick is the only node run
-    // through the runner today, its `cost` is `Cost.NoDispatch`, and nothing dispatches through the
-    // runner yet, so no real charge is ever attempted against this ledger regardless of what it is
-    // seeded with, and this change moves no golden. This ledger is NOT yet the authoritative repair
-    // counter, though: `implementAndRepair` still owns that today, tracked in its own `cur.budget`
-    // field, entirely independent of this value. Issue #33 is where the two get unified into one
-    // counter; until then this seed only matters to whichever future node actually dispatches
-    // through the runner.
+    // Seeded to `math.max(0, cfg.repairBudget) + 1`, not a bare `cfg.repairBudget + 1` (issue #33
+    // review round 2 finding A): `REPAIR_BUDGET` reaches here through a bare `toIntOption`
+    // (`Main.scala`) or a bare `conf.getInt` (`Settings.scala`), neither of which rejects a negative
+    // value, and this codebase already treats negatives as reachable (the `<= 0`, not `== 0`, guard
+    // at `cfg.repairBudget <= 0` a few screens down). An unclamped `cfg.repairBudget + 1` with
+    // `REPAIR_BUDGET=-1` seeds `Ledger(0)`, so `canAfford(Cost.OneDispatch)` is false and this tick
+    // parks BEFORE `Implement` ever dispatches — a regression, since every tick before issue #33 ran
+    // this dispatch unconditionally regardless of the budget's sign. `math.max(0, ...)` floors the
+    // seed at `1` (one dispatch) for any `REPAIR_BUDGET <= 0`, matching what a `0` budget already
+    // guaranteed before this clamp existed.
+    //
+    // The `+ 1` itself exists to keep `Implement` (the one `Cost.OneDispatch` node currently wired
+    // through the `Runner`) affordable no matter how small `cfg.repairBudget` is configured,
+    // including `REPAIR_BUDGET=0`, which must still dispatch the initial IMPL rather than park before
+    // ever running it (the `ScenarioSpec` case this ledger is required to keep green). It is NOT yet
+    // the tick's real dispatch ceiling: FIX and REVIEW dispatches are not charged against this ledger
+    // at all today. FIX reaches the unwrapped `agents` from `implementAndRepair`'s own `using` clause
+    // (its repair loop, `fixRound`, still spends against its own separate `cur.budget` counter), and
+    // the REVIEW dispatch happens in `iterate` after `implementAndRepair` returns — neither passes
+    // through `Runner.step`'s `charging` decorator. So `remainingDispatches` (`Kit.scala`, exposed
+    // today for tests, with an operator-facing status line only floated as a later use) is not yet
+    // an authoritative per-tick number: a tick that runs IMPL plus `cfg.repairBudget` FIX rounds
+    // plus one REVIEW has really spent `cfg.repairBudget + 2`
+    // dispatches, while this ledger only ever sees the one IMPL charge. Issues #34 and #35 are where
+    // FIX and REVIEW route through `Runner.step` for real; whichever lands first must revisit this
+    // seed so it reflects the tick's actual ceiling — one IMPL plus `cfg.repairBudget` FIX plus one
+    // REVIEW — rather than the placeholder above.
     val caps   = Caps(cfg, gh, git, agents, gates, hostGates, log, notify, fs, clock, logger)
-    val ledger = Runner.Ledger(cfg.repairBudget)
+    val ledger = Runner.Ledger(math.max(0, cfg.repairBudget) + 1)
     val setup = Runner.step(Pick, PickInput(n, cur))(using caps, faulting, ledger) match
       case NodeOutcome.Stopped(exit) => return exit
       case NodeOutcome.Done(ready)   => ready
     import setup.{issue, bodyFile, workerPromptFile, isClass1, branch, resumeAuthors, carriesParked}
 
     val implemented =
-      implementAndRepair(n, cur, issue, bodyFile, workerPromptFile, resumeAuthors) match
+      implementAndRepair(n, cur, issue, bodyFile, workerPromptFile, resumeAuthors, caps, ledger) match
       case ImplementAndRepair.StoppedEarly(exit) => return exit
       case ready: ImplementAndRepair.Ready       => ready
     import implemented.{pass, outcome, gateStatus, failureKind, reviewed, reviewFile}
@@ -870,6 +888,140 @@ object Machine:
           case ready: PickAndSetup.Ready       => NodeOutcome.Done(ready)
     )
 
+  /** `Implement`'s input (issue #33): the values `dispatchInitialImplement` needs, named for the
+    * same reason `PickInput` is (`Kit.Node`'s own doc): a graph step reads with a named input
+    * instead of an anonymous tuple. `cur` still travels as the mutable `Cursor` (not a value copied
+    * in): `emit` reads it live, and `dispatchInitialImplement` writes nothing to it itself, so this
+    * is a read-only borrow in practice, same as every other node input that carries it.
+    */
+  private final case class ImplementInput(n: Int, cur: Cursor, issue: Int, workerPromptFile: String)
+
+  /** The initial worker dispatch and the patch seam crossing, extracted so `Implement.run` below has
+    * a named method to call instead of a context-function literal (issue #33, same reason `Pick`
+    * wraps `pickAndSetup` instead of being rewritten inline: `return` does not work inside a
+    * `(Caps, Fault) ?=> ...` literal, and this body needs it for the empty-patch exit). This is
+    * `implementAndRepair`'s own former `case None =>` arm, moved here unchanged line for line
+    * (`currentPatch` at this call site was always its freshly-declared `None`, never yet mutated, so
+    * inlining that literal costs nothing): dispatch, reset-then-inspect-then-apply the patch
+    * (`stagePatch`), then either stop the whole run on an empty patch or hand the guard's verdict
+    * back through `handleStageResult`. Returns `NodeOutcome[StageVerdict]` directly, rather than a
+    * domain type `Implement.run` would still have to translate, because unlike `PickAndSetup` this
+    * phase's own two live outcomes (`StageVerdict.Applied`/`Rejected`) already exist as a domain
+    * type with no `NodeOutcome`-shaped case of their own to lose by returning `NodeOutcome` here
+    * instead.
+    */
+  private def dispatchInitialImplement(
+      n: Int,
+      cur: Cursor,
+      issue: Int,
+      workerPromptFile: String
+  )(using
+      cfg: Config,
+      git: Git,
+      agents: AgentDispatch,
+      fs: HarnessFs,
+      log: StatusLog,
+      logger: Log,
+      notify: Notify
+  )(using Faulting): NodeOutcome[StageVerdict] =
+    val implLog   = artifact(issue, s"-iter$n.claude.log")
+    val implPatch = artifact(issue, s"-iter$n.impl.patch")
+    emit(cur, "IMPL", "start", implLog)
+    stagePatch(Role.IMPL, workerPromptFile, implPatch, implLog, None) match
+      case StageResult.Empty =>
+        emit(cur, "IMPL", "ok", implLog, "no diff")
+        logger.log(
+          "no changes produced by the iteration — leaving issue in-progress, not opening a PR"
+        )
+        NodeOutcome.Stopped(LoopExit.NothingMade)
+      case result =>
+        NodeOutcome.Done(handleStageResult(cur, Role.IMPL, implLog, result))
+
+  /** The bound `Implement`'s own `Node.timeout` declares: `cfg.iterTimeout + cfg.implementSlack`,
+    * computed with a saturating add rather than a bare `+` (issue #33 review round 2 finding C). A
+    * bare `+` overflows silently for a large enough `ITER_TIMEOUT`: `Int.MaxValue` (2147483647,
+    * which parses fine off a bare `toIntOption`/`getInt` in `Main.scala`/`Settings.scala`) plus any
+    * positive slack wraps to a NEGATIVE `Int`, so `Runner.step`'s `elapsedMs > seconds.toLong * 1000L`
+    * check (`Kit.scala`) then compares against a negative threshold and every tick faults
+    * immediately — the exact inverse of what configuring a large `ITER_TIMEOUT` is meant to buy an
+    * operator. `math.max(a, a + b)` cannot do that: two non-negative `Int`s summing past
+    * `Int.MaxValue` always wrap to a value BELOW `a`, never above it, so if `a + b` overflows, the
+    * `max` falls back to `a` itself — never smaller than the un-slacked bound, and never negative.
+    * `cfg.implementSlack` (`Domain.scala`) is where the WHY this figure is a config key, rather than
+    * a literal, is documented: the git work `Implement` brackets around the worker dispatch (see
+    * `Implement`'s own doc below) needs a bound strictly larger than `LiveAgentDispatch`'s identical
+    * `cfg.iterTimeout`, and an operator on a host with no `timeout`/`gtimeout` binary needs to be able
+    * to raise it.
+    */
+  private def implementNodeTimeoutSeconds(cfg: Config): Int =
+    math.max(cfg.iterTimeout, cfg.iterTimeout + cfg.implementSlack)
+
+  /** Implement, converted to a `Node` (issue #33): `cost = Cost.OneDispatch`, the one real agent
+    * dispatch this phase's conversion is actually meant to cost against a shared budget (issue #33's
+    * own title: "cost is one dispatch"); the previous, unconverted code ran this dispatch entirely
+    * uncharged. `timeout = Timeout.After(implementNodeTimeoutSeconds(cfg))`: declaring this bound at
+    * all is "timeout is declared data" (issue #33's own title), a second, independent guard at the
+    * pure decision layer, observable and testable without Docker, rather than a bound that exists
+    * only as a shell-level implementation detail one layer down. It is not simply `cfg.iterTimeout`,
+    * though (issue #33 review finding 1): `Runner.step`'s window for a node starts before `probe` and
+    * ends only after `run` returns, and for `Implement` that window brackets the probe's own git
+    * read, the worker dispatch, AND `dispatchInitialImplement`'s own git work after the worker child
+    * already exited (`stagePatch`'s reset-then-inspect-then-apply plus a status emit), while
+    * `LiveAgentDispatch` (`Live.scala`) bounds only the worker CHILD process, at `cfg.iterTimeout`
+    * alone. Guarding the node at that identical number, with no slack, would make it a strictly
+    * LARGER window guarded by an identical figure: a worker that legitimately exits a second under
+    * `cfg.iterTimeout` could still let the git work push the node's own elapsed time past it, faulting
+    * a tick that would otherwise have gone on to the gate. `implementNodeTimeoutSeconds`'s own doc
+    * covers why the addition is saturating and `cfg.implementSlack`'s own doc (`Domain.scala`) covers
+    * why the slack is a config key. Takes `cfg` as a plain parameter, not a `using` clause: a
+    * `using cfg: Config` here would NOT make
+    * `cfg` a second, ambiguous candidate against `Caps.given`'s own derived `Config` accessor inside
+    * `probe`/`run` below (compiled and checked: it is not an ambiguity error). The real hazard is
+    * worse than that would be, precisely because it compiles clean: a captured, named parameter of
+    * the same type silently WINS implicit search over a bundle-derived given reached through a
+    * nested `?=>` context parameter, so `probe`/`run` would go on resolving `Config` from `caps.cfg`
+    * as always, while THIS method's own body read the `cfg` closed over from its enclosing scope,
+    * with nothing marking the split. Concretely: `Implement(cfg)` is called with
+    * `implementAndRepair`'s own `Config` parameter, so `cfg.iterTimeout` above is read from THAT
+    * value, while `probe`/`run` read `caps.cfg`; the two agree today only because `iterate` builds
+    * `caps` from that same `cfg` (`src/Machine.scala:411`), not because anything here forces them
+    * to. A plain parameter keeps the two reads visibly separate call sites instead of one silently
+    * shadowing the other.
+    *
+    * `probe` answers `None` unconditionally (issue #33 review finding 2), reading no git state at
+    * all: `pickAndSetup`'s own `git.statusClean()` guard, upstream of this node
+    * (`src/Machine.scala:808`), already refuses to start a tick at all unless the working tree is
+    * clean, and `Pick`'s own `checkoutBranch` between that guard and here neither resets nor applies
+    * anything. So in production `statusClean() == true` already implies the index cannot differ from
+    * `HEAD` by the time this probe runs: a hypothetical `Git.anythingStaged()` read here would always
+    * answer `false`, making any branch on it dead code, not a real decision. It stays `None`
+    * regardless, rather than being written as a conditional that happens to always take one branch,
+    * because `None` (never re-using a possibly-abandoned index) is also the only answer that is safe
+    * if that upstream invariant were ever weakened; the reason it is unconditional today is that the
+    * invariant already holds, not that the safe answer changed.
+    *
+    * A `Some` here would need a git fact this codebase does not have a safe way to obtain today: a
+    * two-dot diff against `origin/main` was tried and reverted during issue #28 for exactly this
+    * purpose, because `origin/main` can move between when work was staged and when a later tick reads
+    * it, and a stale comparison can silently carry deletion hunks for everything `main` gained
+    * meanwhile, unsafe for deciding whether to resume work. Until a stronger signal exists (recording
+    * which artifact iteration actually staged what is on the index, rather than inferring it from the
+    * tree), `None` is the only answer that cannot be wrong. Kept as the literal `_ => None` rather
+    * than a git read that would always agree with it, so the code says exactly what it does: this
+    * node always dispatches, the same as the straight-line code it replaced always did, with no path
+    * through it that silently skips an issue's implementation.
+    */
+  private def Implement(cfg: Config): Node[ImplementInput, StageVerdict] =
+    Node(
+      name = "Implement",
+      cost = Cost.OneDispatch,
+      timeout = Timeout.After(implementNodeTimeoutSeconds(cfg)),
+      probe = _ => None,
+      run = input =>
+        given Faulting = summon[Fault].label
+        dispatchInitialImplement(input.n, input.cur, input.issue, input.workerPromptFile)
+    )
+
   /** The second of the phase extractions `iterate` is being split into (issue #30 / RFC #26
     * decision 12); the same reasoning as `pickAndSetup` applies here: naming this phase and giving
     * it a return type of its own is what makes the later node conversion a reshape instead of a
@@ -893,7 +1045,19 @@ object Machine:
       issue: Int,
       bodyFile: String,
       workerPromptFile: String,
-      resumeAuthors: Option[List[String]]
+      resumeAuthors: Option[List[String]],
+      // Plain parameters, not `using` (issue #33 review finding 4): a `using caps: Caps` here would
+      // NOT make every one of `Caps.given`'s accessors ambiguous with the individual `using cfg:
+      // Config, git: Git, ...` parameters below (compiled and checked, flat same-scope shape
+      // included: no ambiguity error). The real hazard is silent shadowing instead, worse than an
+      // ambiguity would be because it compiles clean: a captured, named `using` parameter of a given
+      // type always wins implicit search over a `Caps.given` accessor deriving that same type from a
+      // `Caps` in scope, so a stray `summon[Config]` inside this function's own body would keep
+      // reading `cfg` exactly as it does today, silently, with no diagnostic marking that a second,
+      // `Caps`-derived candidate existed at all. Threaded through only so `Implement` (below) can be
+      // run via `Runner.step`; nothing else in this function ever touches either.
+      caps: Caps,
+      ledger: Runner.Ledger
   )(using
       cfg: Config,
       gh: GitHub,
@@ -904,7 +1068,7 @@ object Machine:
       log: StatusLog,
       logger: Log,
       notify: Notify
-  )(using Faulting): ImplementAndRepair =
+  )(using faulting: Faulting): ImplementAndRepair =
     // --- bounded self-repair state -------------------------------------------------------
     // Declared BEFORE the initial dispatch: a patch-guard rejection on the very first worker
     // patch sets outcome/failureKind and skips the repair loop entirely. This function still
@@ -1056,21 +1220,19 @@ object Machine:
         // 4, round 3).
         if outcome.isDefined then gateStatus = "SKIPPED"
       case None =>
-        val implLog   = artifact(issue, s"-iter$n.claude.log")
-        val implPatch = artifact(issue, s"-iter$n.impl.patch")
-        emit(cur, "IMPL", "start", implLog)
-        stagePatch(Role.IMPL, workerPromptFile, implPatch, implLog, currentPatch) match
-          case StageResult.Empty =>
-            emit(cur, "IMPL", "ok", implLog, "no diff")
-            logger.log(
-              "no changes produced by the iteration — leaving issue in-progress, not opening a PR"
-            )
-            return ImplementAndRepair.StoppedEarly(LoopExit.NothingMade)
-          case result =>
-            handleStageResult(cur, Role.IMPL, implLog, result) match
-              case StageVerdict.Applied(p)     => currentPatch = Some(p)
-              case StageVerdict.Rejected(kind) =>
-                outcome = Some(Outcome.Fail); failureKind = Some(kind); gateStatus = "SKIPPED"
+        // The initial worker dispatch and the patch seam crossing, now `Implement`, a `Node`
+        // (issue #33). Same adapter shape `Pick` uses: `Runner.step` owns the ledger charge and the
+        // wall-clock check, this call site owns nothing but mapping the result back onto the same
+        // locals `handleStageResult`'s two verdicts always set.
+        Runner.step(Implement(cfg), ImplementInput(n, cur, issue, workerPromptFile))(using
+          caps,
+          faulting,
+          ledger
+        ) match
+          case NodeOutcome.Stopped(exit) => return ImplementAndRepair.StoppedEarly(exit)
+          case NodeOutcome.Done(StageVerdict.Applied(p)) => currentPatch = Some(p)
+          case NodeOutcome.Done(StageVerdict.Rejected(kind)) =>
+            outcome = Some(Outcome.Fail); failureKind = Some(kind); gateStatus = "SKIPPED"
 
     // --- bounded self-repair loop --------------------------------------------------------
     // Skipped entirely if the initial patch was already rejected (outcome set above).

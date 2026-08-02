@@ -84,7 +84,8 @@ object Main:
       iterTimeout = int("ITER_TIMEOUT", base.iterTimeout),
       ciWaitTimeout = int("CI_WAIT_TIMEOUT", base.ciWaitTimeout),
       ciAppearTimeout = int("CI_APPEAR_TIMEOUT", base.ciAppearTimeout),
-      ciAppearInterval = int("CI_APPEAR_INTERVAL", base.ciAppearInterval)
+      ciAppearInterval = int("CI_APPEAR_INTERVAL", base.ciAppearInterval),
+      implementSlack = int("IMPLEMENT_SLACK", base.implementSlack)
     )
 
     ParsedEnv(

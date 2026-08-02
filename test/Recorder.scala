@@ -103,6 +103,20 @@ final class TestWorld:
   var prStateAnswer: String             = "MERGED"
   var mergeRc: Int                      = 0        // bash's $merge_rc; nonzero = merge cmd failed
   var applySucceeds: Boolean            = true
+
+  /** How much `Clock.nowMillis()` advances on every single call, starting from `0`; defaults to `0`,
+    * an unmoving clock, so every scenario that never touches this knob keeps reading a constant `0`
+    * exactly as before this field existed. Deliberately NOT a scripted list of exact answers (issue
+    * #33 review finding 6): `Runner.step` (`Kit.scala`) reads the clock once before a node's
+    * `probe`/`run` and, for a `Timeout.After` node, once after, so a scripted list's overrun entry
+    * would only land where intended if a test also got the exact number of PRIOR reads right, e.g.
+    * how many nodes ran before the one under test and whether each is `Unbounded` or `After`; adding
+    * or reordering a node anywhere ahead of the one under test would silently shift the list. A
+    * per-call step avoids that: set it above whatever bound is under test and ANY two reads at least
+    * one call apart see a gap that already exceeds the bound, so a scenario driving a `Timeout.After`
+    * node into an overrun does not have to know or care how many reads happened first.
+    */
+  var clockStepMillis: Long = 0L
   var cleanTree: Boolean                = true
   var fetchSucceeds: Boolean            = true
   var checkoutSucceeds: Boolean         = true
@@ -319,12 +333,19 @@ final class TestWorld:
     def read(path: String): String                 = files.getOrElse(path, "")
     def sizeBytes(path: String): Long = files.get(path).map(_.length.toLong).getOrElse(0L)
 
+  private var clockCalls: Long = 0
+
   val clock: Clock = new Clock:
     def sleepSeconds(s: Int): Unit = sleeps = sleeps :+ s
-    // Constant rather than advancing: no scenario here drives a `Timeout.After` node (the only node
-    // wired through the runner today, Pick, is `Timeout.Unbounded`), so there is nothing for a
-    // moving clock to matter to yet; `RunnerSpec` scripts its own `Clock` for the tests that do care.
-    def nowMillis(): Long = 0L
+    // Advances by `clockStepMillis` on every call, starting at `0` (issue #33 review finding 6):
+    // `Implement` is now a `Timeout.After` node, so a scenario testing its overrun needs a moving
+    // clock; `RunnerSpec` additionally scripts its own `Clock` for the generic runner-mechanics
+    // tests. With the default `0L` step this stays the same unmoving `0` every scenario before
+    // `clockStepMillis` existed relied on.
+    def nowMillis(): Long =
+      val at = clockCalls * clockStepMillis
+      clockCalls += 1
+      at
 
   val logger: Log = new Log:
     def log(msg: String): Unit = logLines += msg

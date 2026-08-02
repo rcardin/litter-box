@@ -137,7 +137,7 @@ issues.labels { ready = "ready", active = "in-progress", blocked = "blocked", pa
 issues.park-on-exhaustion = true          # false opens a needs-human PR instead, the earlier contract
 protect  = [".litter-box/**", ".github/**", "CONTEXT.md"]
 budgets  { repair = 2, max-patch-bytes = 1000000 }
-timeouts { iter = 1800, ci-wait = 900, ci-appear = 300, ci-appear-interval = 10 }
+timeouts { iter = 1800, ci-wait = 900, ci-appear = 300, ci-appear-interval = 10, implement-slack = 300 }
 ```
 
 `gate.sandboxed` defaults to `true`, so a `config.conf` written before the key existed inherits the
@@ -273,6 +273,7 @@ exist. See [Getting started](#getting-started) for `init`, `eject`, `--dry-run` 
 | `GATE_CMD` | `false` | The gate (overrides `gate.fast`); the default fails on purpose, because litter-box never guesses your build command. Exporting it also forces `gate.sandboxed` to false — the gate runs on the host with everything your shell has, not in the container — and skips the whole Docker preflight that would have built that container; setting it in `.litter-box/.env` only changes the command |
 | `GATE_TIMEOUT` | `900` | Gate timeout (seconds) |
 | `ITER_TIMEOUT` | `1800` | Worker dispatch timeout |
+| `IMPLEMENT_SLACK` | `300` | Added on top of `ITER_TIMEOUT` for the Implement node's own timeout; raise it on a host with no `timeout`/`gtimeout` binary, where the worker runs unbounded and this is the only backstop left |
 | `CI_WAIT_TIMEOUT` / `CI_APPEAR_TIMEOUT` / `CI_APPEAR_INTERVAL` | `900` / `300` / `10` | CI polling |
 | `NTFY_TOPIC` | — | ntfy.sh topic for notifications |
 

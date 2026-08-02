@@ -35,6 +35,7 @@ class MainSpec extends AnyFlatSpec with Matchers:
     parsed.cfg.ciWaitTimeout shouldBe 900
     parsed.cfg.ciAppearTimeout shouldBe 300
     parsed.cfg.ciAppearInterval shouldBe 10
+    parsed.cfg.implementSlack shouldBe 300
     parsed.maxIters shouldBe 1
     parsed.implCmd shouldBe None
     parsed.fixCmd shouldBe None
@@ -145,7 +146,8 @@ class MainSpec extends AnyFlatSpec with Matchers:
         "MAX_PATCH_BYTES"    -> "2000",
         "CI_WAIT_TIMEOUT"    -> "62",
         "CI_APPEAR_TIMEOUT"  -> "63",
-        "CI_APPEAR_INTERVAL" -> "5"
+        "CI_APPEAR_INTERVAL" -> "5",
+        "IMPLEMENT_SLACK"    -> "64"
       )
     )
 
@@ -157,6 +159,7 @@ class MainSpec extends AnyFlatSpec with Matchers:
     parsed.cfg.ciWaitTimeout shouldBe 62
     parsed.cfg.ciAppearTimeout shouldBe 63
     parsed.cfg.ciAppearInterval shouldBe 5
+    parsed.cfg.implementSlack shouldBe 64
   }
 
   // ===============================================================================================
