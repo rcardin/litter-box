@@ -179,6 +179,8 @@ object LiveClock extends Clock:
   def sleepSeconds(s: Int): Unit =
     Thread.sleep(s * 1000L)
 
+  def nowMillis(): Long = System.currentTimeMillis()
+
 /** Shared subprocess-execution helper for the `gh`/`git` handlers below. Captures stdout/stderr as
   * raw bytes on two drain threads (never line-reconstructed, so diff/patch text stays byte-exact)
   * to avoid the classic deadlock where a child blocks on a full pipe nobody is reading.

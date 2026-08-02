@@ -222,6 +222,15 @@ trait HarnessFs:
 trait Clock:
   def sleepSeconds(s: Int): Unit
 
+  /** Wall-clock now, in milliseconds, added for issue #32: `Runner.step` reads this once before a
+    * `Node`'s `probe`/`run` and once after, and subtracts. Millisecond resolution rather than
+    * `Config`'s usual whole seconds: the two readings are subtracted first, and only that difference
+    * is ever compared against a bound (`seconds.toLong * 1000L`), so pre-truncating either reading to
+    * the second would risk stacking up to a whole extra second of drift into the comparison for no
+    * reason.
+    */
+  def nowMillis(): Long
+
 /** The operator-facing log stream (bash's `log()` helper, loop.sh:141 — `[loop HH:MM:SS] msg` on
   * stderr).
   *
@@ -236,3 +245,60 @@ trait Clock:
   */
 trait Log:
   def log(msg: String): Unit
+
+/** The capability bundle a `Node` (`src/Kit.scala`) receives as its one context parameter, added for
+  * issue #32. Every function above it takes each capability as its own separate `using` parameter,
+  * and that stays true for all of them: this bundle is additive, not a replacement.
+  *
+  * Why bundle at all: the RFC's node signature is `I => Caps ?=> O`, one context parameter, so a
+  * node author writes exactly one `using` in their own code no matter how many capabilities the
+  * loop grows. Why not migrate every existing function to take `Caps` instead: every call site
+  * already in this file (`Machine.pickAndSetup`, `implementAndRepair`, `terminal`, ...) would have
+  * to change in lockstep, for a task scoped to converting one phase (Pick) into one node. The
+  * `given` accessors below are what make BOTH worlds compile unchanged: a function still declared
+  * with `(using cfg: Config, gh: GitHub, ...)` keeps resolving those individually wherever a plain
+  * `Caps` is the only thing actually in scope (a `Node`'s own `probe`/`run` body), because each
+  * accessor derives its one capability from that `Caps` value.
+  *
+  * Given-ambiguity trap this design invites, and how it is avoided here: importing `Caps.given` into
+  * a scope where BOTH a real `given Caps` AND the individual capabilities (as their own named `using`
+  * parameters) are simultaneously visible would make every one of these accessors genuinely
+  * ambiguous with the local parameter of the same type. Nothing in this codebase does that: the only
+  * place a real `given Caps` exists is inside a `Node`'s own context-function body (`Machine.Pick`),
+  * which never also carries the individual capabilities as named parameters, and the only place the
+  * individual capabilities are named parameters (`Machine.iterate` and everything it calls) never
+  * also introduces a `given Caps`: `iterate` builds a plain, non-given `Caps` value instead,
+  * precisely so it never becomes a second candidate for its own already-named parameters.
+  */
+final case class Caps(
+    cfg: Config,
+    gh: GitHub,
+    git: Git,
+    agents: AgentDispatch,
+    gates: GateRunner,
+    hostGates: HostGateRunner,
+    status: StatusLog,
+    // Named `notifier`, not the RFC sketch's `notify`: a case class field named `notify` generates a
+    // zero-arg `def notify: Notify` accessor, which collides with `java.lang.Object.notify(): Unit`
+    // (a FINAL method every Scala class already inherits), and fails to compile no matter what it
+    // returns. `Recorder.scala`'s own `TestWorld` already sidesteps the same clash the same way
+    // (its capability val is `notifier`, not `notify`), so this keeps the two files' vocabulary for
+    // the same capability in agreement.
+    notifier: Notify,
+    fs: HarnessFs,
+    clock: Clock,
+    logger: Log
+)
+
+object Caps:
+  given (using c: Caps): Config         = c.cfg
+  given (using c: Caps): GitHub         = c.gh
+  given (using c: Caps): Git            = c.git
+  given (using c: Caps): AgentDispatch  = c.agents
+  given (using c: Caps): GateRunner     = c.gates
+  given (using c: Caps): HostGateRunner = c.hostGates
+  given (using c: Caps): StatusLog      = c.status
+  given (using c: Caps): Notify         = c.notifier
+  given (using c: Caps): HarnessFs      = c.fs
+  given (using c: Caps): Clock          = c.clock
+  given (using c: Caps): Log            = c.logger

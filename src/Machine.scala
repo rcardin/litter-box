@@ -3,21 +3,23 @@ package in.rcard.litterbox
 import scala.util.boundary
 import scala.util.boundary.break
 
+// `Faulting` (the infra-fault short-circuit channel) moved to `src/Kit.scala`, `private[litterbox]`
+// now rather than `private` here, so `Runner.step` (also in that file) can name it too (issue #32).
+// `Node`'s own `probe`/`run` signatures never name `Faulting` itself; they take the narrower `Fault`
+// wrapper instead. See `Kit.scala`'s doc for the full rationale; every use of the name below is
+// unchanged.
+
+// `Caps.given` (`src/Caps.scala`): resolves an individual capability (`Config`, `GitHub`, ...) from
+// an ambient `Caps` value, used by `Pick`'s `run` body below to call the untouched `pickAndSetup`
+// without that method's own `using` clause changing at all. Safe to import file-wide: every other
+// function in this file keeps its capabilities as separately named `using` parameters, never a
+// `Caps`, so there is never a scope where both a real `given Caps` and this file's own named
+// parameters are simultaneously visible to the same call (see `Caps`'s own doc for the trap this
+// avoids).
+import Caps.given
+
 /** The loop state machine for one US, ported from `harness/loop.sh` iterate(). */
 object Machine:
-
-  /** The infra-fault short-circuit channel, formerly a `Raise[InfraFault]` effect capability.
-    *
-    * `boundary.Label[LoopExit]` is the capability to abandon the current iteration and hand
-    * `LoopExit.InfraFault` straight to `runOnce`'s boundary. It carries the same guarantee the
-    * `Raise` capability did, and for the same reason: a function that can fault must SAY so in its
-    * signature, and no code after a fault can run — so no fault path can decrement the repair budget
-    * or dispatch a FIX. That is the v3 invariant, still enforced by the type system.
-    *
-    * The alias exists so the four signatures that need it read as one named concept rather than as
-    * an incidental `boundary.Label`.
-    */
-  private type Faulting = boundary.Label[LoopExit]
 
   /** Path of one per-iteration artifact (prompt, patch, gate log, marker) for a US.
     *
@@ -321,8 +323,15 @@ object Machine:
     * `boundary` that breaks straight to `LoopExit.InfraFault` there is no handler to hang it on, so
     * it moves here — the observable order (fault line, then notify, then the terminal DONE event
     * `runOnce` emits) is unchanged.
+    *
+    * `private[litterbox]`, not `private`, since issue #32: `Runner.step` (`src/Kit.scala`) reports a
+    * node's timeout overrun through this exact helper rather than inventing a second fault path with
+    * its own wording, so a `Runner`-caused fault reads identically to every other fault site in this
+    * file, both in the log and in the notify text.
     */
-  private def infraFault(reason: String)(using logger: Log, notify: Notify)(using Faulting): Nothing =
+  private[litterbox] def infraFault(reason: String)(using logger: Log, notify: Notify)(using
+      Faulting
+  ): Nothing =
     logger.log(reason)
     notify.notify(
       "harness: infra fault — loop exited rc=50 for inspection (issue stays in-progress)"
@@ -366,10 +375,27 @@ object Machine:
       fs: HarnessFs,
       clock: Clock,
       logger: Log
-  )(using Faulting): LoopExit =
-    val setup = pickAndSetup(n, cur) match
-      case PickAndSetup.StoppedEarly(exit) => return exit
-      case ready: PickAndSetup.Ready       => ready
+  )(using faulting: Faulting): LoopExit =
+    // The `Caps` bundle and the `Ledger` `Runner.step` needs, built from the individual capabilities
+    // already in this parameter list (issue #32). Plain `val`s, never `given`: a `given Caps` here
+    // would sit in the same scope as `cfg`/`gh`/... above and make every one of `Caps.given`'s
+    // accessors ambiguous with them the moment anything below asks for one implicitly (see `Caps`'s
+    // own doc). Passed to `Runner.step` explicitly instead, which needs no such import here at all.
+    //
+    // Seeded from `cfg.repairBudget` (issue #32 review finding 6), the same value `cur.budget` is
+    // mirrored from a few lines below, rather than a hardcoded `0`: Pick is the only node run
+    // through the runner today, its `cost` is `Cost.NoDispatch`, and nothing dispatches through the
+    // runner yet, so no real charge is ever attempted against this ledger regardless of what it is
+    // seeded with, and this change moves no golden. This ledger is NOT yet the authoritative repair
+    // counter, though: `implementAndRepair` still owns that today, tracked in its own `cur.budget`
+    // field, entirely independent of this value. Issue #33 is where the two get unified into one
+    // counter; until then this seed only matters to whichever future node actually dispatches
+    // through the runner.
+    val caps   = Caps(cfg, gh, git, agents, gates, hostGates, log, notify, fs, clock, logger)
+    val ledger = Runner.Ledger(cfg.repairBudget)
+    val setup = Runner.step(Pick, PickInput(n, cur))(using caps, faulting, ledger) match
+      case NodeOutcome.Stopped(exit) => return exit
+      case NodeOutcome.Done(ready)   => ready
     import setup.{issue, bodyFile, workerPromptFile, isClass1, branch, resumeAuthors, carriesParked}
 
     val implemented =
@@ -786,6 +812,63 @@ object Machine:
       logger.log(s"WARNING: could not flip #$issue to in-progress (flip by hand)")
 
     PickAndSetup.Ready(issue, bodyFile, workerPromptFile, isClass1, branch, resumeAuthors, carriesParked)
+
+  /** `Pick`'s input (issue #32): the same two values `pickAndSetup` has always taken, `n` and the
+    * shared `Cursor`, named as a case class rather than left a bare `(Int, Cursor)` so `Pick`'s own
+    * type, `Node[PickInput, PickAndSetup.Ready]`, reads as a graph step with a named input instead
+    * of an anonymous tuple a reader has to cross-reference against `pickAndSetup`'s own parameter
+    * list to understand.
+    */
+  private final case class PickInput(n: Int, cur: Cursor)
+
+  /** Pick, converted to a `Node` (issue #32): the body is `pickAndSetup`, completely untouched,
+    * behind a thin adapter that maps its result onto `NodeOutcome`.
+    *
+    * Why an adapter rather than a rewrite: `pickAndSetup` has eight `return
+    * PickAndSetup.StoppedEarly(...)` sites, and `return` does not work from inside a context
+    * function literal (`Node.run`'s own type is `I => (Caps, Fault) ?=> NodeOutcome[O]`, and a
+    * `return` inside one only unwinds the anonymous function value, not `iterate`, exactly the same
+    * trap `pickFromQueue`'s own doc, a few screens up, already hit once for a nested `def`).
+    * Re-expressing all eight sites without moving a single `logger.log`, `gh.*`, `git.*`, `fs.*` or
+    * `emit` call relative to its neighbours would be a much larger, much riskier diff for identical
+    * behaviour, against a golden log contract that cannot tell "reshaped, but byte-identical output"
+    * apart from "subtly reordered" except by comparing the whole stream. Calling the untouched
+    * method and mapping its result keeps every one of those call sites exactly where it already was.
+    *
+    * `cost = Cost.NoDispatch`, `timeout = Timeout.Unbounded`: Pick dispatches no agent (the worker
+    * dispatch is `implementAndRepair`'s job, untouched by this node), so both are no-ops at runtime
+    * today and neither can move a golden.
+    *
+    * `probe = _ => None`: Pick is the entry node, and its entire job on every tick is to read the
+    * world fresh from `gh.inProgressIssue()`, `gh.parkedIssues()` and `gh.oldestReadyIssue()`. There
+    * is no prior Pick result to detect here, and a stored notion of "already picked" is the PR #17
+    * latch bug at larger scale, which RFC #26 decision 6 exists to forbid. Nothing behind this probe
+    * reads a stored position; a constant `None` says so directly rather than leaving a reader to
+    * infer it from the absence of a body.
+    *
+    * `pickAndSetup(input.n, input.cur)` resolves its own `using` clause (`Config`, `GitHub`, `Git`,
+    * `HarnessFs`, `StatusLog`, `Log`, `Notify`, plus `Faulting`) entirely from the ambient `Caps`
+    * this context function body already carries via the `Caps.given` accessors imported at the top
+    * of this file, plus a `Faulting` recovered from the ambient `Fault` (`fault.label`). That
+    * recovery is only possible because this file and `Fault` are in the same package: `Fault`
+    * deliberately does not expose `label` outside `litterbox` (see `Fault`'s own doc), and the only
+    * reason it is safe for THIS adapter to reach around it is that the raw label only ever flows
+    * straight into `pickAndSetup`, a method that itself only ever reaches `LoopExit.InfraFault`
+    * through `Machine.infraFault`, never through a bare `boundary.break`. A future node written
+    * against this kit is not expected to take the same shortcut; `Fault.raise` is its only route.
+    */
+  private val Pick: Node[PickInput, PickAndSetup.Ready] =
+    Node(
+      name = "Pick",
+      cost = Cost.NoDispatch,
+      timeout = Timeout.Unbounded,
+      probe = _ => None,
+      run = input =>
+        given Faulting = summon[Fault].label
+        pickAndSetup(input.n, input.cur) match
+          case PickAndSetup.StoppedEarly(exit) => NodeOutcome.Stopped(exit)
+          case ready: PickAndSetup.Ready       => NodeOutcome.Done(ready)
+    )
 
   /** The second of the phase extractions `iterate` is being split into (issue #30 / RFC #26
     * decision 12); the same reasoning as `pickAndSetup` applies here: naming this phase and giving
