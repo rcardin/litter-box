@@ -265,7 +265,7 @@ final class TestWorld:
     def push(branch: String): Unit =
       record(s"git push -u origin $branch"); pushedBranches = pushedBranches :+ branch
 
-  val agents: AgentDispatch = new AgentDispatch:
+  val agents: AgentDispatch = new AgentDispatchImpl:
     def worker(
         role: Role,
         promptFile: String,
@@ -287,7 +287,16 @@ final class TestWorld:
           files(patchOut) = content; DispatchOutcome.Done
         case WorkerScript.Empty    => DispatchOutcome.Done
         case WorkerScript.TimedOut => DispatchOutcome.TimedOut
-    def review(prompt: String, reviewFile: String): DispatchOutcome =
+    // Overrides `dispatchReview`, not `review` (issue #35: see `AgentDispatch.review`'s own doc,
+    // `src/Caps.scala`, for why). Extends `AgentDispatchImpl`, not `AgentDispatch` directly (round
+    // three of issue #35's review: `AgentDispatch` is `sealed`, only extendable from `Caps.scala`
+    // itself). `TestWorld` can write this override at all only because it lives inside this
+    // library's own package, in.rcard.litterbox; that is a boundary a consumer's own package cannot
+    // cross to build their own fake `AgentDispatch`, but it is NOT a boundary the published testkit
+    // itself respects, since `TestWorld` is exactly that library-side code and mints by design the
+    // moment anyone puts it on a test classpath (RFC #26 decision 14; see `AgentDispatch`'s own doc,
+    // `src/Caps.scala`, for the guarantee stated once, in full).
+    private[litterbox] def dispatchReview(prompt: String, reviewFile: String): DispatchOutcome =
       record(s"dispatch REVIEW reviewFile=$reviewFile")
       reviewScripts match
         case Nil    => DispatchOutcome.Done

@@ -301,7 +301,7 @@ object Runner:
     * only needs to be reachable from within `Runner` itself, so it is scoped to that, not to the
     * whole package.
     */
-  private def charging(agents: AgentDispatch, ledger: Ledger): AgentDispatch = new AgentDispatch:
+  private def charging(agents: AgentDispatch, ledger: Ledger): AgentDispatch = new AgentDispatchImpl:
     def worker(
         role: Role,
         promptFile: String,
@@ -311,9 +311,16 @@ object Runner:
     ): DispatchOutcome =
       ledger.chargeDispatch()
       agents.worker(role, promptFile, patchOut, logFile, currentPatch)
-    def review(prompt: String, reviewFile: String): DispatchOutcome =
+    // Overrides `dispatchReview`, not `review` (issue #35: see `AgentDispatch.review`'s own doc,
+    // `src/Caps.scala`, for why). `.value` below unwraps `agents.review`'s own freshly minted
+    // `Judged`, from the WRAPPED `agents`, so the charge lands on the real dispatch. Extends
+    // `AgentDispatchImpl`, not `AgentDispatch` directly (round three of issue #35's review:
+    // `AgentDispatch` is `sealed`, only extendable from `Caps.scala` itself); `private[litterbox]`
+    // here matches the abstract member's own visibility, see `AgentDispatch`'s own doc for the
+    // guarantee this whole split buys.
+    private[litterbox] def dispatchReview(prompt: String, reviewFile: String): DispatchOutcome =
       ledger.chargeDispatch()
-      agents.review(prompt, reviewFile)
+      agents.review(prompt, reviewFile).value
 
   /** Runs exactly one `Node`. The `Caps` a node's `probe`/`run` actually see is built HERE, not
     * passed through unchanged from the caller (issue #32 review finding 2): `agents` is replaced

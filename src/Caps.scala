@@ -151,8 +151,51 @@ enum DispatchOutcome:
   case Done
   case TimedOut
 
-/** The agent seam (IMPL_CMD / FIX_CMD / REVIEW_CMD / sandbox run-agent.sh, run-reviewer.sh). */
-trait AgentDispatch:
+/** The agent seam (IMPL_CMD / FIX_CMD / REVIEW_CMD / sandbox run-agent.sh, run-reviewer.sh).
+  *
+  * `sealed` (issue #35 review, round three): `private[litterbox]` on the abstract member below
+  * restricts who can CALL `dispatchReview`, not who can IMPLEMENT it, because Scala always lets a
+  * subclass widen an inherited member's access. A foreign package could define
+  * `class Sneaky extends AgentDispatch` and declare its own `dispatchReview` `public`, which
+  * compiles, so `private[litterbox]` alone never closed the hole RFC #26 decision 7 asks for.
+  * `sealed` is the qualifier Scala actually enforces against a foreign IMPLEMENTOR: only code in
+  * THIS file may extend `AgentDispatch` directly, and a foreign package cannot even write the
+  * `extends` clause.
+  *
+  * That is why no implementor below extends this trait directly. `AgentDispatchImpl` is the one
+  * child living in this file, and every real implementation (`LiveAgentDispatch` in
+  * `src/Live.scala`, `Runner.charging` in `src/Kit.scala`, `TestWorld`'s scripted fake in
+  * `test/Recorder.scala`) extends `AgentDispatchImpl` instead, each from its own file. Scala permits
+  * that because `AgentDispatchImpl` is not `sealed`, only `private[litterbox]`, a modifier that
+  * still lets any file inside this package extend it, while a foreign package cannot even name it to
+  * try.
+  *
+  * The guarantee this buys, stated once here rather than re-derived at every call site that used to
+  * repeat it (`dispatchReview` and `review` below, `AgentDispatch.Judged`, `AgentDispatchImpl`,
+  * `TestWorld` in `test/Recorder.scala`, `RunnerSpec`'s Judged section), has four parts.
+  *
+  * First, no foreign package can implement `AgentDispatch` (extend it directly, extend
+  * `AgentDispatchImpl`, or widen `dispatchReview`'s access), so no foreign package can construct one,
+  * so `review` (`final`, the only way to mint a `Judged`) is reachable only through a dispatch this
+  * library itself wired. RFC #26 decision 7's trust boundary sits at the capability, not at a shipped
+  * step.
+  *
+  * Second, this is a Scala COMPILE TIME guarantee, nothing more. `Judged.mint` is `public` in the
+  * compiled bytecode (`private[AgentDispatch]` is a Scala access control construct with no JVM
+  * equivalent), so a Java or Kotlin caller of the same jar can invoke it directly. Nothing here
+  * defends against a non Scala caller.
+  *
+  * Third, PACKAGE INJECTION defeats it: a consumer file whose first line is `package
+  * in.rcard.litterbox` compiles as library code and can do everything library code can, including
+  * satisfy `AgentDispatchImpl`. Accepted as a residual, not chased further, because it requires a
+  * consumer to deliberately misdeclare their own file's package, a hostile act no accidental
+  * agent authored node performs.
+  *
+  * Fourth, `TestWorld` (RFC #26 decision 14's published testkit) mints by design: it lives inside this
+  * package on purpose, and putting a testkit on a test classpath is itself the choice to run against a
+  * fake world.
+  */
+sealed trait AgentDispatch:
   /** Runs the worker; the contract is "a patch is produced at `patchOut`" (possibly empty). The
     * child's combined stdout+stderr is written to `logFile` (bash's `$logf`). `currentPatch` seeds
     * the container tree with the prior cumulative work on a FIX.
@@ -165,8 +208,85 @@ trait AgentDispatch:
       currentPatch: Option[String]
   ): DispatchOutcome
 
-  /** Runs the cold reviewer; its stdout is written to `reviewFile`. */
-  def review(prompt: String, reviewFile: String): DispatchOutcome
+  /** The real reviewer subprocess call (issue #35): what `LiveAgentDispatch` and `TestWorld`'s
+    * scripted fake each override to run their own version of "dispatch the cold reviewer, write its
+    * stdout to `reviewFile`". `review` below is the ONLY caller, so an implementation can vary how
+    * the dispatch actually happens without ever being able to vary what wraps its answer, since
+    * nothing outside this trait's own body can call `dispatchReview` directly and hand the result to
+    * anything but `review`.
+    *
+    * `private[litterbox]` here is what every implementor overrides at, unchanged, because every
+    * implementor lives inside this package (that is what `AgentDispatchImpl` is for). This modifier
+    * alone does not keep a foreign package out, a subclass can always widen it; `sealed` on
+    * `AgentDispatch` above is what actually does that job. See this trait's own doc for the full
+    * guarantee and its exact residual limits.
+    */
+  private[litterbox] def dispatchReview(prompt: String, reviewFile: String): DispatchOutcome
+
+  /** Runs the reviewer; its stdout is written to `reviewFile`. Mints `AgentDispatch.Judged` around
+    * whatever `dispatchReview` answers (issue #35, RFC #26 decisions 3 and 7: "the trust token is
+    * minted by the capability, not by a shipped step"). `final`, so no subclass, no decorator
+    * (`Runner.charging`, `src/Kit.scala`) and no consumer writing their own review node against this
+    * trait can override `review` itself to skip the real dispatch and hand back a `Judged` built
+    * from a value it invented; the only thing an implementation is free to vary is `dispatchReview`,
+    * the actual subprocess call, and whatever it returns is always wrapped by this SAME mint call,
+    * never re-implemented at a second site a future override could diverge from.
+    *
+    * What the token binds to is this `AgentDispatch` present in `Caps`, not to any particular
+    * quality of the dispatch itself. `dispatchReview` is abstract, so the mint site cannot know, and
+    * does not claim, that the reviewer session started cold: a scripted fake or a hostile
+    * implementation can return a canned `DispatchOutcome` and still receive a genuine `Judged`. Cold,
+    * zero-mount, no-mutating-tools isolation is a property `LiveAgentDispatch` chooses to provide
+    * (`src/Live.scala`), not something this signature can enforce. Whoever wires the concrete
+    * `AgentDispatch` a `Caps` carries is bounded by construction, not merely trusted, for the reasons
+    * this trait's own doc states in full.
+    */
+  final def review(prompt: String, reviewFile: String): AgentDispatch.Judged[DispatchOutcome] =
+    AgentDispatch.Judged.mint(dispatchReview(prompt, reviewFile))
+
+/** The one direct child of the `sealed` `AgentDispatch` above, and the sole extension point every
+  * real implementor uses instead of extending `AgentDispatch` itself (see that trait's own doc for
+  * why the split exists and exactly what it buys). Not `sealed` itself, only `private[litterbox]`:
+  * every real implementor lives in a DIFFERENT file (`src/Live.scala`, `src/Kit.scala`,
+  * `test/Recorder.scala`), so sealing this type too would just relocate the "same file" wall to a
+  * name none of them could cross. `private[litterbox]` is the modifier that keeps them out instead:
+  * a foreign package cannot even name `AgentDispatchImpl` to write an `extends` clause against it.
+  */
+private[litterbox] trait AgentDispatchImpl extends AgentDispatch
+
+object AgentDispatch:
+  /** The trust token a cold review verdict travels in, from the moment a real dispatch answers to
+    * the moment `Machine`'s review node reads it (issue #35). Unforgeable by construction, not by
+    * convention: the only constructor, `Judged.mint`, is `private[AgentDispatch]`, reachable from
+    * `review`'s own body above and from nowhere else, not a subclass of `AgentDispatch`, not a
+    * consumer's own review node, not even other code elsewhere in this same file, past this point.
+    *
+    * `sealed` alone would only stop a foreign FILE from writing a new subclass; it would not stop
+    * code inside THIS file from writing `new Judged(fakeValue) {}` directly, skipping `mint`
+    * entirely. Narrowing the constructor itself to `private[AgentDispatch]` is what closes that gap:
+    * the only place both the class and a value to build one from are in scope together is `mint`'s
+    * own one-line body.
+    *
+    * `value`/`map` are the only operations offered. `map` is deliberately total over an unconstrained
+    * `A => B`: RFC #26's own consumer sketch is `judged.map(parseMyScore)`, so a node must be able to
+    * parse whatever the reviewer actually wrote into its own verdict type, with its own logic. That
+    * freedom is also the exact limit of what this token proves. `Judged[A]` guarantees that a
+    * dispatch through `AgentDispatch.review` happened; it does NOT guarantee that the `A` a consumer
+    * ends up holding was derived from that dispatch's answer at all, since nothing stops
+    * `judged.map(_ => Verdict.Approve)`, which returns a genuine `Judged[Verdict]` carrying a verdict
+    * the reviewer never gave. There is still no route back to a constructor (no `copy`, no public
+    * `apply`, no `unapply`), so the one fact this token certifies, that the dispatch happened, cannot
+    * be forged. What a downstream node reads out of a `Judged` payload beyond that is only as
+    * trustworthy as the mapping chain that produced it, the same trust a node already extends to any
+    * value it computes for itself. Who can even get hold of an `AgentDispatch` to call `review` on in
+    * the first place is `AgentDispatch`'s own doc, above, not this one's.
+    */
+  sealed abstract class Judged[+A] private[AgentDispatch] (raw: A):
+    def value: A                     = raw
+    def map[B](f: A => B): Judged[B] = Judged.mint(f(raw))
+
+  object Judged:
+    private[AgentDispatch] def mint[A](value: A): Judged[A] = new Judged[A](value) {}
 
 /** run_gate: a tier command under a timeout, log captured. Reused by the CI wait. */
 trait GateRunner:
