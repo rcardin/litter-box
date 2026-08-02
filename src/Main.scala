@@ -333,7 +333,11 @@ object Main:
     case LoopExit.NothingMade => s"iteration $i produced nothing — exiting for inspection"
     case LoopExit.InfraFault  => "infra fault — exiting for inspection (issue stays in-progress)"
     case LoopExit.Parked      =>
-      s"iteration $i parked, waiting on a human reply, exiting (next tick re-checks)"
+      // Not "waiting on a human reply": that used to be true of every `Parked` exit, but issue #50
+      // review finding 2 adds one where a human HAS already replied and the loop is waiting on the
+      // operator to raise `REPAIR_BUDGET` instead (the per-tick log line from `pickAndSetup`
+      // already says which one this actually is). Worded generically so it stays true of both.
+      s"iteration $i parked, exiting (next tick re-checks)"
 
   /** loop.sh:927-943: run up to `maxIters` ticks, applying the rc -> action map after each one.
     * Returns the process exit code the caller must `sys.exit` with; `sys.exit` itself stays out of

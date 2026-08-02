@@ -1,0 +1,13 @@
+iteration 1 -> issue #777
+issue #777: resuming from parked, a human replied on the issue
+issue #777: resuming from parked with a human reply, dispatching FIX (budget now 1)
+issue #777: third-party comments were spliced into the FIX prompt
+FIX worker timed out (infra fault); exiting without spending further budget
+iteration 1 -> issue #777
+issue #777: resuming from parked, a human replied on the issue
+issue #777: resuming from parked with a human reply, dispatching FIX (budget now 1)
+issue #777: third-party comments were spliced into the FIX prompt
+FAST gate GREEN (pass 1) — running tamper check + cold reviewer
+reviewer verdict: APPROVE (pass 1)
+PR #123 opened for #777 (outcome SUCCESS)
+issue #777 -> needs-review

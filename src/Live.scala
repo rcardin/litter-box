@@ -845,7 +845,14 @@ final class LiveGitHub(
       ".[0].number"
     ).stdoutTrimmedTrailingNewlines.toIntOption
 
-  /** loop.sh:629-630; the whole jq program is ONE argv element. */
+  /** loop.sh:629-630; the whole jq program is ONE argv element.
+    *
+    * `--limit` pinned explicitly (issue #50 review, round 3, finding I; same class as
+    * `parkedIssues`' own `--limit 1000` below): without it, `gh`'s own default page size (30) sorts
+    * and takes `.[0]` from only the newest 30 open `ready` issues, not the oldest overall, so a repo
+    * with more than 30 open `ready` issues can silently pick a newer one ahead of a genuinely older
+    * one still waiting.
+    */
   def oldestReadyIssue(): Option[Int] =
     gh(
       "issue",
@@ -854,6 +861,8 @@ final class LiveGitHub(
       "open",
       "--label",
       labels.ready,
+      "--limit",
+      "1000",
       "--json",
       "number,createdAt",
       "--jq",
@@ -869,6 +878,14 @@ final class LiveGitHub(
     * `None` on a nonzero `gh` exit rather than folding a failed read into `Some(Nil)`, same
     * reasoning as `commentsOf` (issue #28 review finding 7, round 3): a rate limited or auth
     * expired read must read as "the loop does not know", not as "the queue is empty".
+    *
+    * `--limit` pinned explicitly, well above `gh`'s own default page size of 30 (issue #50 review
+    * finding 4): before this, a repo with more than 30 open parked issues silently truncated the
+    * list, and truncation used to only affect WHICH issue got picked, a self-correcting mistake the
+    * next tick's read would fix on its own. It stopped being self-correcting once `carriesParked`
+    * (`Machine.pickAndSetup`) started deciding whether `parked` is removed at the terminal from
+    * membership in this same list: an issue outside a truncated window would read as "not parked"
+    * even while genuinely carrying the label, stranding it exactly like the review's finding 1.
     */
   def parkedIssues(): Option[List[Int]] =
     val r = gh(
@@ -878,6 +895,8 @@ final class LiveGitHub(
       "open",
       "--label",
       labels.parked,
+      "--limit",
+      "1000",
       "--json",
       "number,createdAt",
       "--jq",
@@ -953,7 +972,12 @@ final class LiveGitHub(
       remove.flatMap(l => Seq("--remove-label", l))
     gh(args*).rc == 0
 
-  /** loop.sh:392: `gh issue list --state open --label <blocked> --json number --jq .[].number`. */
+  /** loop.sh:392: `gh issue list --state open --label <blocked> --json number --jq .[].number`.
+    *
+    * `--limit` pinned explicitly, same reasoning and same value as `oldestReadyIssue` and
+    * `parkedIssues` above (issue #50 review, round 3, finding I): every match is meant to be
+    * returned, not just `gh`'s own default first page of 30.
+    */
   def openBlockedIssues(): List[Int] =
     gh(
       "issue",
@@ -962,6 +986,8 @@ final class LiveGitHub(
       "open",
       "--label",
       labels.blocked,
+      "--limit",
+      "1000",
       "--json",
       "number",
       "--jq",
