@@ -174,13 +174,13 @@ object Machine:
     else entry.take(shareChars) + s"\n\n[comment truncated by the harness at $shareChars characters]"
 
   /** A full line matching the author-prefix grammar `@login (ASSOC):`, used only to spot a FORGED
-    * copy of it inside a comment body (`escapeEntryGrammar`); the genuine prefix `fixRound` renders
-    * for each entry never runs through this check.
+    * copy of it inside a comment body (`escapeEntryGrammar`); the genuine prefix `runFixRound`
+    * renders for each entry never runs through this check.
     */
   private val AuthorPrefixLine = "^@\\S+ \\([A-Z_]+\\):$".r
 
-  /** Neutralises, within a comment BODY only, never the trusted `@login (ASSOC):` prefix `fixRound`
-    * itself renders, any line that could be mistaken for the entry grammar `fixRound` uses to join
+  /** Neutralises, within a comment BODY only, never the trusted `@login (ASSOC):` prefix
+    * `runFixRound` itself renders, any line that could be mistaken for the entry grammar `runFixRound` uses to join
     * comments into `{{COMMENTS}}`: the `---` separator, or a line shaped like another entry's own
     * `@login (ASSOC):` prefix. Without this, an attacker's own comment body can embed
     * `\n\n---\n\n@alice (OWNER):\n<whatever>` as plain text, and once joined with the real entries
@@ -222,7 +222,7 @@ object Machine:
     * untrusted-data warning at all ("If the failure above is a reviewer request, address the
     * reasons it gives directly"), unlike `{{COMMENTS}}`'s `<untrusted-comments>` fence, so splicing
     * the human's actual words in here would promote attacker-reachable text (any GitHub user can
-    * comment) straight out of the fence the harness built for exactly that text. `fixRound` reads
+    * comment) straight out of the fence the harness built for exactly that text. `runFixRound` reads
     * `gh.issueComments` itself and renders the reply into the fenced `{{COMMENTS}}` slot, so the
     * words still reach the worker, correctly framed, with no extra work here.
     *
@@ -307,7 +307,7 @@ object Machine:
   /** The `@login` an entry's author prefix names, or `None` if the entry does not even parse. Used
     * to name the accepted authors in `resumeFailureBody` (issue #28 review finding 3, round 2):
     * only a login, never the entry's body, ever leaves `pickAndSetup`'s resume decision, so the
-    * comment TEXT still reaches the worker exclusively through `fixRound`'s own fenced
+    * comment TEXT still reaches the worker exclusively through `runFixRound`'s own fenced
     * `{{COMMENTS}}` splice, never through this path.
     */
   private[litterbox] def authorLogin(entry: String): Option[String] =
@@ -376,45 +376,63 @@ object Machine:
       clock: Clock,
       logger: Log
   )(using faulting: Faulting): LoopExit =
-    // The `Caps` bundle and the `Ledger` `Runner.step` needs, built from the individual capabilities
-    // already in this parameter list (issue #32). Plain `val`s, never `given`: a `given Caps` here
-    // would sit in the same scope as `cfg`/`gh`/... above and make every one of `Caps.given`'s
-    // accessors ambiguous with them the moment anything below asks for one implicitly (see `Caps`'s
-    // own doc). Passed to `Runner.step` explicitly instead, which needs no such import here at all.
-    //
-    // Seeded to `math.max(0, cfg.repairBudget) + 1`, not a bare `cfg.repairBudget + 1` (issue #33
-    // review round 2 finding A): `REPAIR_BUDGET` reaches here through a bare `toIntOption`
-    // (`Main.scala`) or a bare `conf.getInt` (`Settings.scala`), neither of which rejects a negative
-    // value, and this codebase already treats negatives as reachable (the `<= 0`, not `== 0`, guard
-    // at `cfg.repairBudget <= 0` a few screens down). An unclamped `cfg.repairBudget + 1` with
-    // `REPAIR_BUDGET=-1` seeds `Ledger(0)`, so `canAfford(Cost.OneDispatch)` is false and this tick
-    // parks BEFORE `Implement` ever dispatches — a regression, since every tick before issue #33 ran
-    // this dispatch unconditionally regardless of the budget's sign. `math.max(0, ...)` floors the
-    // seed at `1` (one dispatch) for any `REPAIR_BUDGET <= 0`, matching what a `0` budget already
-    // guaranteed before this clamp existed.
-    //
-    // The `+ 1` itself exists to keep `Implement` (the one `Cost.OneDispatch` node currently wired
-    // through the `Runner`) affordable no matter how small `cfg.repairBudget` is configured,
-    // including `REPAIR_BUDGET=0`, which must still dispatch the initial IMPL rather than park before
-    // ever running it (the `ScenarioSpec` case this ledger is required to keep green). It is NOT yet
-    // the tick's real dispatch ceiling: FIX and REVIEW dispatches are not charged against this ledger
-    // at all today. FIX reaches the unwrapped `agents` from `implementAndRepair`'s own `using` clause
-    // (its repair loop, `fixRound`, still spends against its own separate `cur.budget` counter), and
-    // the REVIEW dispatch happens in `iterate` after `implementAndRepair` returns — neither passes
-    // through `Runner.step`'s `charging` decorator. So `remainingDispatches` (`Kit.scala`, exposed
-    // today for tests, with an operator-facing status line only floated as a later use) is not yet
-    // an authoritative per-tick number: a tick that runs IMPL plus `cfg.repairBudget` FIX rounds
-    // plus one REVIEW has really spent `cfg.repairBudget + 2`
-    // dispatches, while this ledger only ever sees the one IMPL charge. Issues #34 and #35 are where
-    // FIX and REVIEW route through `Runner.step` for real; whichever lands first must revisit this
-    // seed so it reflects the tick's actual ceiling — one IMPL plus `cfg.repairBudget` FIX plus one
-    // REVIEW — rather than the placeholder above.
-    val caps   = Caps(cfg, gh, git, agents, gates, hostGates, log, notify, fs, clock, logger)
-    val ledger = Runner.Ledger(math.max(0, cfg.repairBudget) + 1)
-    val setup = Runner.step(Pick, PickInput(n, cur))(using caps, faulting, ledger) match
+    // The `Caps` bundle `Runner.step` needs, built from the individual capabilities already in this
+    // parameter list (issue #32). A plain `val`, never `given`: a `given Caps` here would sit in the
+    // same scope as `cfg`/`gh`/... above and make every one of `Caps.given`'s accessors ambiguous
+    // with them the moment anything below asks for one implicitly (see `Caps`'s own doc). Passed to
+    // `Runner.step` explicitly instead, which needs no such import here at all.
+    val caps = Caps(cfg, gh, git, agents, gates, hostGates, log, notify, fs, clock, logger)
+
+    // `pickAndSetup`'s own `using` clause (its declaration a few screens up) carries no
+    // `AgentDispatch` at all, so nothing inside it can call `agents.*` regardless of what `Cost`
+    // `Pick` declares or what `Ledger` it runs under; that signature, not `Cost.NoDispatch`, is what
+    // actually enforces "spends nothing" here, since `Cost` alone only gates whether `Runner.step`
+    // lets a node START (`Cost`'s own doc), never what it can spend once running. A throwaway
+    // `Ledger(0)` is enough to satisfy `Runner.step`'s own signature here. The REAL, shared `Ledger`
+    // cannot be built before this call returns (issue #34 review finding F4): whether the tick is a
+    // resume is `Pick`'s own OUTPUT (`resumeAuthors`), not known any earlier, and the seed below
+    // needs it.
+    val setup = Runner.step(Pick, PickInput(n, cur))(using caps, faulting, Runner.Ledger(0)) match
       case NodeOutcome.Stopped(exit) => return exit
       case NodeOutcome.Done(ready)   => ready
     import setup.{issue, bodyFile, workerPromptFile, isClass1, branch, resumeAuthors, carriesParked}
+
+    // The shared dispatch `Ledger` every `Cost.OneDispatch` node from here on (`Implement`, `Repair`)
+    // draws from, seeded resume-aware (issue #34 review finding F4) now that `resumeAuthors` is
+    // known:
+    //
+    //   - an ORDINARY tick runs `Implement` (one dispatch) and then up to `cfg.repairBudget` `Repair`
+    //     rounds, so the seed is `cfg.repairBudget + 1`;
+    //   - a RESUMED tick (`resumeAuthors.isDefined`) skips `Implement` entirely and dispatches its
+    //     own first FIX straight through `Repair` (`implementAndRepair`'s own `resumeAuthors` branch,
+    //     also converted onto that node by the same finding), so the seed is `cfg.repairBudget` with
+    //     no `Implement`-sized headroom added on top.
+    //
+    // Every `Implement`/`Repair` dispatch this tick can make charges this one `Ledger`, through
+    // `Runner.step`'s own decorator, so `remainingDispatches` cannot drift from what `attemptRepair`'s
+    // own local reasoning used to track by hand for THOSE two nodes. The REVIEW dispatch inside
+    // `runCycle` below (`agents.review`) is NOT one of those two nodes: it calls the raw, undecorated
+    // `agents` this method already closes over, never `Runner.step`, so it spends nothing against this
+    // `Ledger` at all. A tick that runs IMPL, N FIX rounds and M REVIEW dispatches really spends
+    // N + M + 1 agent dispatches while this `Ledger` only ever sees N + 1; `ledgerSeed` is therefore
+    // not yet the tick's real dispatch ceiling, only the FIX/IMPL slice of it, until REVIEW becomes a
+    // node of its own and is charged the same way (issue #35).
+    //
+    // `math.max(0, cfg.repairBudget)`, not a bare `cfg.repairBudget` (issue #33 review round 2
+    // finding A, still relevant here): `REPAIR_BUDGET` reaches here through a bare `toIntOption`
+    // (`Main.scala`) or a bare `conf.getInt` (`Settings.scala`), neither of which rejects a negative
+    // value, and this codebase already treats negatives as reachable (the `<= 0`, not `== 0`, guard
+    // at `cfg.repairBudget <= 0` a few screens up in `pickAndSetup`). The `+ 1` on the ordinary path
+    // keeps `Implement` affordable no matter how small `cfg.repairBudget` is configured, including
+    // `REPAIR_BUDGET=0`, which must still dispatch the initial IMPL rather than park before ever
+    // running it (the `ScenarioSpec` case this ledger is required to keep green); a resumed tick
+    // never runs `Implement`, so it needs no matching `+ 1`, and `pickAndSetup` only ever sets
+    // `resumeAuthors` when `cfg.repairBudget > 0` (that guard's own doc), so this seed is guaranteed
+    // positive on that path without a floor of its own.
+    val ledgerSeed =
+      if resumeAuthors.isDefined then math.max(0, cfg.repairBudget)
+      else math.max(0, cfg.repairBudget) + 1
+    val ledger = Runner.Ledger(ledgerSeed)
 
     val implemented =
       implementAndRepair(n, cur, issue, bodyFile, workerPromptFile, resumeAuthors, caps, ledger) match
@@ -1022,6 +1040,281 @@ object Machine:
         dispatchInitialImplement(input.n, input.cur, input.issue, input.workerPromptFile)
     )
 
+  /** `Gate`'s input (issue #34): the values `runFastGate` needs, named for the same reason
+    * `ImplementInput` is. `pass` travels as a plain field, not a mutable counter a while loop used
+    * to own: the retry transition that loop used to express by re-testing a `var` is now a value
+    * the caller (`implementAndRepair`'s own recursive walk, see its doc) passes down, so the gate
+    * run and the repair round it triggers always agree on which pass they are, by construction,
+    * not by two sites reading the same mutable cell in the right order.
+    */
+  private final case class GateInput(cur: Cursor, issue: Int, pass: Int)
+
+  /** What one FAST gate run concluded, for the caller to route on. `GateResult.Timeout` is
+    * deliberately not a case here: RFC #26 decision 12 / issue #34's own acceptance criterion is
+    * that a gate timeout is an infra fault, not a code failure, so it can never become an ordinary
+    * value for a caller to branch on; `runFastGate` raises it straight through `Fault.raise`
+    * instead, before it ever has a chance to become a return value, the same channel every other
+    * fault in this loop already uses.
+    *
+    * `Red` carries the gate log path rather than making the caller re-derive it from `issue`/`pass`
+    * a second time: `attemptRepair` (`implementAndRepair`'s own nested method) needs that exact
+    * path to build the FIX prompt's failure content, and re-computing the same `artifact(...)` call
+    * a second time at a second call site is exactly the kind of duplication that drifts.
+    */
+  private enum GateVerdict:
+    case Red(gateLog: String)
+    case Green
+
+  /** The FAST gate run, extracted from the former while loop's body (issue #34) so `Gate`'s node
+    * `run` has a named method to call instead of a context-function literal, the same shape every
+    * other node in this file already uses. Takes `Fault` directly, not a recovered `Faulting`
+    * (unlike `dispatchInitialImplement`'s adapter, or `runFixRound` below): this body is new code
+    * for this conversion, not a relocated call into an already-`Faulting`-typed function, so there
+    * is no old signature to preserve and no reason to reach for the `Faulting`-recovery escape
+    * hatch `Fault`'s own doc reserves for exactly that narrower case.
+    *
+    * `git.addAll()` before the gate run, and `cur.pass = pass` before the first status event: both
+    * moved here unchanged from the former while loop's own first two statements, so a new file, or
+    * a change staged only in the index, still shows up in the gate's diff and in `emit`'s own
+    * `cur.pass` field exactly as before.
+    */
+  private def runFastGate(cur: Cursor, issue: Int, pass: Int)(using
+      cfg: Config,
+      git: Git,
+      gates: GateRunner,
+      log: StatusLog,
+      logger: Log
+  )(using fault: Fault): GateVerdict =
+    git.addAll() // stage so new files show in diff/gate/tamper
+    cur.pass = pass
+    val gateLog = artifact(issue, s"-pass$pass.gate.log")
+    emit(cur, "FAST_GATE", "start", gateLog)
+    gates.run("FAST", cfg.gateCmd, cfg.gateTimeout, gateLog) match
+      case GateResult.Timeout =>
+        fault.raise(
+          s"WARNING: FAST gate hit the ${cfg.gateTimeout}s timeout — infra fault, not a code failure"
+        )
+      case GateResult.Red =>
+        emit(cur, "FAST_GATE", "red", gateLog)
+        logger.log(s"FAST gate RED (pass $pass, see $gateLog)")
+        GateVerdict.Red(gateLog)
+      case GateResult.Green =>
+        emit(cur, "FAST_GATE", "ok", gateLog)
+        logger.log(s"FAST gate GREEN (pass $pass) — running tamper check + cold reviewer")
+        GateVerdict.Green
+
+  /** Gate, converted to a `Node` (issue #34). `cost = Cost.NoDispatch`: the FAST gate is a
+    * `GateRunner` call, never an `AgentDispatch` one, so it can never be charged by the `Ledger`
+    * regardless of what `cost` claims (`Cost`'s own doc); declaring `NoDispatch` says that plainly
+    * instead of leaving a reader to wonder why a `OneDispatch` node never seems to spend anything.
+    * It also means an exhausted repair budget can never block a gate run from starting: whether a
+    * gate cycle is even attempted is `implementAndRepair`'s own decision (its `attemptRepair` never
+    * calls this node again once `outcome` is set), not something `Runner.step`'s own ledger check
+    * should additionally gate.
+    *
+    * `timeout = Timeout.Unbounded`: the `while` loop this replaces had no node-level bound on the
+    * gate at all, only `gates.run`'s own subprocess bound at `cfg.gateTimeout`, and a gate that
+    * genuinely hangs past that bound is `GateResult.Timeout`, raised straight through `Fault.raise`
+    * inside `runFastGate` above, which is what issue #34's own AC3 is about, not a second,
+    * `Runner`-level backstop layered on top. A node-level `Timeout.After(cfg.gateTimeout)` was tried
+    * and reverted (issue #34 review): this node's own measured window also brackets `git.addAll()`
+    * (a real `git add -A` subprocess, `Live.scala`) run BEFORE the gate, so a bound equal to
+    * `cfg.gateTimeout` would have zero slack over a window that is strictly larger than the figure
+    * it is being compared to, and `gates.run` is itself entirely unbounded whenever
+    * `Config.timeoutBin` is `None` (`Live.scala`), so a legitimately slow-but-finishing gate could
+    * be faulted here for a reason that has nothing to do with the gate itself hanging, and with the
+    * index left staged for the next tick's `statusClean()` guard besides. `Unbounded` keeps this
+    * conversion faithful to the behaviour it replaces: `GateResult.Timeout` stays the only way a
+    * gate becomes an infra fault.
+    *
+    * `probe = _ => None`: same reasoning as `Implement`'s, sharpened for a gate specifically, since
+    * a FAST gate result is a fact about the CURRENT working tree, not a stored position, and RFC #26
+    * decision 6 is exactly the rule that forbids latching one.
+    */
+  private def Gate(cfg: Config): Node[GateInput, GateVerdict] =
+    Node(
+      name = "Gate",
+      cost = Cost.NoDispatch,
+      timeout = Timeout.Unbounded,
+      probe = _ => None,
+      run = input => NodeOutcome.Done(runFastGate(input.cur, input.issue, input.pass))
+    )
+
+  /** `Repair`'s input (issue #34): the values `runFixRound` needs. `failFile` and `bodyFile` travel
+    * as paths, not their contents, for the same reason every other artifact-carrying input in this
+    * file does: the node reads them itself, at the point it actually needs them, rather than the
+    * caller reading ahead of time and handing over text that could go stale between the read and
+    * the dispatch.
+    */
+  private final case class RepairInput(
+      cur: Cursor,
+      issue: Int,
+      pass: Int,
+      failFile: String,
+      bodyFile: String,
+      currentPatch: Option[String]
+  )
+
+  /** The fixer dispatch across the patch seam, extracted from the former while loop's `fixRound`
+    * (issue #34), which used to mutate `implementAndRepair`'s own `currentPatch`/`outcome`/
+    * `failureKind` locals by closure. This version returns `StageVerdict` instead: `attemptRepair`
+    * (`implementAndRepair`'s own nested method, the direct replacement for `spendOrExhaust`) is the
+    * one place that still owns those locals, and it decides what a `Rejected` means for them,
+    * exactly as `dispatchInitialImplement`'s caller already does for `Implement`'s own verdict.
+    *
+    * An empty fixer diff is folded into `StageVerdict.Rejected(FailureKind.EmptyFix)` rather than
+    * kept as a separate return shape: `EmptyFix` already exists as an ordinary `FailureKind`, a real
+    * case of that enum since before this issue, produced at exactly this one site though read at two
+    * others downstream (the marker-file guard and the needs-human PR note, both in `terminal`), and
+    * every `Rejected` kind, whether a guard rejection or an empty fix, means exactly the same thing
+    * to `attemptRepair`:
+    * stop, do not re-gate. Reusing the shape `handleStageResult` already returns for every other outcome
+    * keeps this function's own emit/log lines exactly where the old inline `case StageResult.Empty`
+    * arm already put them, only reachable through the same `stagePatch` match this always was.
+    *
+    * Still declares `(using Faulting)`, not `Fault`: unlike `runFastGate`, this body's tail is a
+    * call into `handleStageResult`, an already-`Faulting`-typed function this issue does not touch,
+    * so `Repair`'s own node adapter recovers `Faulting` from `Fault` the same way `Implement`'s
+    * does, for the same reason (`Fault`'s own doc).
+    */
+  private def runFixRound(
+      cur: Cursor,
+      issue: Int,
+      pass: Int,
+      failFile: String,
+      bodyFile: String,
+      currentPatch: Option[String]
+  )(using
+      cfg: Config,
+      gh: GitHub,
+      git: Git,
+      agents: AgentDispatch,
+      fs: HarnessFs,
+      log: StatusLog,
+      logger: Log,
+      notify: Notify
+  )(using Faulting): StageVerdict =
+    val fixPromptFile = artifact(issue, s"-pass$pass.fix.prompt.txt")
+    // Third-party comments are untrusted content, same as the issue body; see
+    // `Caps.GitHub.issueComments` for why they arrive as a List of prefixed entries rather than a
+    // joined string, and why `Option` keeps a failed read distinct from "no comments". COMMENTS is
+    // still spliced last here as defence in depth, though `renderTemplate`'s single pass (see its
+    // own scaladoc) already makes splice order immaterial to the rescan guarantee.
+    //
+    // commentsData and commentsLogLine come out of the SAME match on commentsRead, not two
+    // independent matches, so the prompt text and the log line can never drift out of sync with
+    // each other one arm at a time.
+    val commentsRead                    = gh.issueComments(issue)
+    val (commentsData, commentsLogLine) = commentsRead match
+      case None =>
+        (
+          "[harness: comments could not be read]",
+          Some(
+            s"issue #$issue: could not read comments for the FIX prompt (gh failed); proceeding without them"
+          )
+        )
+      case Some(Nil) =>
+        ("[harness: no comments]", None)
+      case Some(entries) =>
+        // Escape the entry grammar (issue #28 review finding 1, round 3), THEN defuse a forged
+        // fence tag, THEN cap PER ENTRY (issue #28 review finding 2, round 3), in that order:
+        // capping first could itself cut a forged boundary in half and change whether it still
+        // parses as one, and escaping after capping could not see the part of a line the cap
+        // already dropped.
+        val share = commentShareChars(entries.size)
+        (
+          entries
+            .map(e => truncateEntry(defuseFenceCloser(escapeEntryGrammar(e)), share))
+            .mkString("\n\n---\n\n"),
+          Some(s"issue #$issue: third-party comments were spliced into the FIX prompt")
+        )
+    commentsLogLine.foreach(logger.log)
+    val fixTemplate = fs.readTemplate(Template.Fix)
+    // An ejected fix-prompt.md that predates #27 has no {{COMMENTS}} line, so the marker never
+    // matches and whatever was read above is silently dropped. Only warn when there was something
+    // real to lose: no comments or a failed read leaves nothing for the missing marker to hide,
+    // and warning on every ordinary comment-free iteration would just be noise the log-parity
+    // goldens would then have to carry for every scenario.
+    if !fixTemplate.contains("{{COMMENTS}}") && commentsRead.exists(_.nonEmpty) then
+      logger.log(
+        s"WARNING: issue #$issue has comments but the resolved FIX skeleton has no {{COMMENTS}} marker to hold them (ejected before issue #27; add {{COMMENTS}} or re-eject fix-prompt.md)"
+      )
+    fs.write(
+      fixPromptFile,
+      renderTemplate(
+        fixTemplate,
+        "PROTECTED"   -> protectedList(cfg.protect),
+        "GATE"        -> cfg.gateCmd,
+        "CONVENTIONS" -> fs.conventions(),
+        "ISSUE"       -> fs.read(bodyFile),
+        "FAILURE"     -> fs.read(failFile),
+        "COMMENTS"    -> commentsData
+      )
+    )
+    val fixLog   = artifact(issue, s"-pass$pass.fix.claude.log")
+    val fixPatch = artifact(issue, s"-pass$pass.fix.patch")
+    emit(cur, "FIX", "start", fixLog)
+    stagePatch(Role.FIX, fixPromptFile, fixPatch, fixLog, currentPatch) match
+      case StageResult.Empty =>
+        // The fixer reverted all prior work — route to needs-human, never re-gate an empty tree.
+        emit(cur, "FIX", "red", fixLog, "empty fix")
+        logger.log("FIX produced no diff (the fixer reverted all prior work); routing to needs-human")
+        StageVerdict.Rejected(FailureKind.EmptyFix)
+      case result =>
+        handleStageResult(cur, Role.FIX, fixLog, result)
+
+  /** Repair, converted to a `Node` (issue #34): `cost = Cost.OneDispatch`, the one real FIX
+    * dispatch a repair round costs, charged for real by `Runner.step`'s own decorator the moment
+    * `runFixRound`'s call into `stagePatch` reaches `agents.worker`, never by `attemptRepair` itself,
+    * which only ever READS `Runner.Ledger.remainingDispatches` (public, unlike the methods that
+    * actually spend it) to decide whether to attempt a round at all and to compute the
+    * `self-repair: budget now N` line's own number, exactly the same split `Cost`'s own doc draws
+    * between a declared ceiling and a real charge.
+    *
+    * `timeout = Timeout.After(implementNodeTimeoutSeconds(cfg))`: the SAME bound `Implement`
+    * declares, not a separately-derived one, shared despite a wider pre-dispatch window, not because
+    * the two windows match. Both nodes' timed window ends the same way, `stagePatch`'s own
+    * dispatch-reset-apply seam bracketed by the same two capability calls (`agents.worker`, then
+    * `git`'s own reset/apply), so the same slack over `cfg.iterTimeout` that keeps `Implement` from
+    * faulting a worker that legitimately finishes close to the wire covers that shared tail here too.
+    * But `Runner.step` times `probe` and `run` TOGETHER (`Kit.scala`'s own doc), and `runFixRound`'s
+    * `run` does real work before it ever reaches `stagePatch`: a `gh.issueComments` call (a real
+    * `gh api` subprocess), an `fs.readTemplate`, four `fs.read` calls and an `fs.write`, none of which
+    * `dispatchInitialImplement` has an equivalent of. So `Repair`'s own timed window is strictly
+    * larger than `Implement`'s under this same figure, not equal to it; the shared bound is a
+    * deliberate choice to give that extra pre-dispatch work headroom out of the same slack rather
+    * than deriving it a bound of its own, not evidence the two windows are the same shape.
+
+    *
+    * A resumed parked issue's OWN initial FIX round (`implementAndRepair`'s `resumeAuthors` branch)
+    * is this node too (issue #34 review finding F4): the identical fixer work must be charged and
+    * `Timeout.After`-bounded the same way regardless of which call site dispatches it, or a third
+    * FIX site could dispatch uncharged and unbounded again by construction. That branch derives its
+    * own log line from `Runner.Ledger.remainingDispatches` the same way `attemptRepair` does, and
+    * the `Ledger` `iterate` seeds this node with is resume-aware for exactly this reason (`iterate`'s
+    * own comment on the seed): a resumed tick never runs `Implement`, so its seed carries no
+    * `Implement`-sized headroom for this node to spend against for free.
+    */
+  private def Repair(cfg: Config): Node[RepairInput, StageVerdict] =
+    Node(
+      name = "Repair",
+      cost = Cost.OneDispatch,
+      timeout = Timeout.After(implementNodeTimeoutSeconds(cfg)),
+      probe = _ => None,
+      run = input =>
+        given Faulting = summon[Fault].label
+        NodeOutcome.Done(
+          runFixRound(
+            input.cur,
+            input.issue,
+            input.pass,
+            input.failFile,
+            input.bodyFile,
+            input.currentPatch
+          )
+        )
+    )
+
   /** The second of the phase extractions `iterate` is being split into (issue #30 / RFC #26
     * decision 12); the same reasoning as `pickAndSetup` applies here: naming this phase and giving
     * it a return type of its own is what makes the later node conversion a reshape instead of a
@@ -1063,7 +1356,6 @@ object Machine:
       gh: GitHub,
       git: Git,
       agents: AgentDispatch,
-      gates: GateRunner,
       fs: HarnessFs,
       log: StatusLog,
       logger: Log,
@@ -1073,7 +1365,6 @@ object Machine:
     // Declared BEFORE the initial dispatch: a patch-guard rejection on the very first worker
     // patch sets outcome/failureKind and skips the repair loop entirely. This function still
     // returns a `Ready`, with `gateStatus` left at "SKIPPED".
-    var budget                           = cfg.repairBudget
     var pass                             = 0
     var outcome: Option[Outcome]         = None
     var gateStatus                       = ""
@@ -1083,99 +1374,66 @@ object Machine:
     fs.write(reviewFile, "") // empty until the first review
     var reviewed = false
 
-    // The fixer dispatch across the patch seam plus the mapping of its StageResult onto the
-    // repair loop's control flow (bash dispatch_fix + handle_fix_result). Infra faults raise;
-    // guard rejections and an empty fix become the terminal FAIL; Ok advances currentPatch.
-    def fixRound(pass: Int, failFile: String): Unit =
-      val fixPromptFile = artifact(issue, s"-pass$pass.fix.prompt.txt")
-      // Third-party comments are untrusted content, same as the issue body; see
-      // `Caps.GitHub.issueComments` for why they arrive as a List of prefixed entries rather than a
-      // joined string, and why `Option` keeps a failed read distinct from "no comments". COMMENTS is
-      // still spliced last here as defence in depth, though `renderTemplate`'s single pass (see its
-      // own scaladoc) already makes splice order immaterial to the rescan guarantee.
-      //
-      // commentsData and commentsLogLine come out of the SAME match on commentsRead, not two
-      // independent matches, so the prompt text and the log line can never drift out of sync with
-      // each other one arm at a time.
-      val commentsRead                    = gh.issueComments(issue)
-      val (commentsData, commentsLogLine) = commentsRead match
-        case None =>
-          (
-            "[harness: comments could not be read]",
-            Some(
-              s"issue #$issue: could not read comments for the FIX prompt (gh failed); proceeding without them"
-            )
-          )
-        case Some(Nil) =>
-          ("[harness: no comments]", None)
-        case Some(entries) =>
-          // Escape the entry grammar (issue #28 review finding 1, round 3), THEN defuse a forged
-          // fence tag, THEN cap PER ENTRY (issue #28 review finding 2, round 3), in that order:
-          // capping first could itself cut a forged boundary in half and change whether it still
-          // parses as one, and escaping after capping could not see the part of a line the cap
-          // already dropped.
-          val share = commentShareChars(entries.size)
-          (
-            entries
-              .map(e => truncateEntry(defuseFenceCloser(escapeEntryGrammar(e)), share))
-              .mkString("\n\n---\n\n"),
-            Some(s"issue #$issue: third-party comments were spliced into the FIX prompt")
-          )
-      commentsLogLine.foreach(logger.log)
-      val fixTemplate = fs.readTemplate(Template.Fix)
-      // An ejected fix-prompt.md that predates #27 has no {{COMMENTS}} line, so the marker never
-      // matches and whatever was read above is silently dropped. Only warn when there was something
-      // real to lose: no comments or a failed read leaves nothing for the missing marker to hide,
-      // and warning on every ordinary comment-free iteration would just be noise the log-parity
-      // goldens would then have to carry for every scenario.
-      if !fixTemplate.contains("{{COMMENTS}}") && commentsRead.exists(_.nonEmpty) then
-        logger.log(
-          s"WARNING: issue #$issue has comments but the resolved FIX skeleton has no {{COMMENTS}} marker to hold them (ejected before issue #27; add {{COMMENTS}} or re-eject fix-prompt.md)"
-        )
-      fs.write(
-        fixPromptFile,
-        renderTemplate(
-          fixTemplate,
-          "PROTECTED"   -> protectedList(cfg.protect),
-          "GATE"        -> cfg.gateCmd,
-          "CONVENTIONS" -> fs.conventions(),
-          "ISSUE"       -> fs.read(bodyFile),
-          "FAILURE"     -> fs.read(failFile),
-          "COMMENTS"    -> commentsData
-        )
-      )
-      val fixLog   = artifact(issue, s"-pass$pass.fix.claude.log")
-      val fixPatch = artifact(issue, s"-pass$pass.fix.patch")
-      emit(cur, "FIX", "start", fixLog)
-      stagePatch(Role.FIX, fixPromptFile, fixPatch, fixLog, currentPatch) match
-        case StageResult.Empty =>
-          // The fixer reverted all prior work — route to needs-human, never re-gate an empty tree.
-          emit(cur, "FIX", "red", fixLog, "empty fix")
-          logger.log("FIX produced no diff (the fixer reverted all prior work); routing to needs-human")
-          outcome = Some(Outcome.Fail); failureKind = Some(FailureKind.EmptyFix)
-        case result =>
-          handleStageResult(cur, Role.FIX, fixLog, result) match
-            case StageVerdict.Applied(p)     => currentPatch = Some(p)
-            case StageVerdict.Rejected(kind) =>
-              outcome = Some(Outcome.Fail); failureKind = Some(kind)
-
     // Shared shape of both repair triggers (gate-RED, REQUEST_CHANGES): out of budget fails the
-    // outcome, otherwise spend one unit, write the fail file with the stage-specific content, and
-    // dispatch a FIX round. failureKind/gateStatus are set by the caller before this runs.
+    // outcome, otherwise write the fail file with the stage-specific content and dispatch a FIX
+    // round through `Repair`, the `Node` (issue #34). Returns `Right(applied)`, whether a fresh
+    // patch was applied, i.e. whether the caller should loop back to another gate cycle: this is
+    // the ONLY thing that decides the retry edge now, replacing the former while loop's own
+    // re-check of `outcome.isEmpty` after this call returned `Unit`. `Left(exit)` is the
+    // `Repair` node's own (practically unreachable) `Stopped` case, handed up as data rather than
+    // thrown (issue #34 review finding F2): `return` inside THIS nested `def` only unwinds
+    // `attemptRepair` itself, not `implementAndRepair` (`pickFromQueue`'s own doc, `src/Machine.scala`,
+    // covers the identical trap for a sibling nested `def`), so turning it into
+    // `ImplementAndRepair.StoppedEarly` has to happen at a call site that sits directly in
+    // `implementAndRepair`'s own body; `runCycle` below, and the final `if outcome.isEmpty` guard
+    // further down, are what thread this `Either` the rest of the way out.
     //
-    // `budget <= 0`, not `budget == 0` (issue #28 review finding 3): `REPAIR_BUDGET` is
-    // env-settable to 0 with no validation, and the resume branch below can start already at that
-    // floor. A bare `== 0` guard never trips once budget has gone negative, so any caller that
-    // decremented past zero without checking first (as the resume branch used to) would defeat this
-    // guard for the rest of the tick, not just for its own dispatch.
-    def spendOrExhaust(trigger: FailureKind, failContent: String): Unit =
-      if budget <= 0 then outcome = Some(Outcome.Fail)
+    // No local `budget` any more (issue #34 review finding F3): `ledger.remainingDispatches` is
+    // read directly, both for the `<= 0` guard and for the `self-repair: budget now N` line's own
+    // number, computed as `remainingDispatches - 1` BEFORE the dispatch below actually charges it
+    // (not after: a `Repair` round that itself infra-faults, e.g. a timed-out FIX worker, unwinds
+    // through `Fault.raise` and never returns here at all, so a log line placed after the dispatch
+    // would silently vanish on exactly that path, and `test/golden/fix-timeout.log` pins that it
+    // must not). `remainingDispatches - 1` reads as a genuine prediction only in the sense that the
+    // charge itself happens a moment later, inside `Runner.step`; there is no second counter left
+    // to drift out of step with it, which is the property `Cost`'s own doc draws between a declared
+    // ceiling and a real charge, applied here to a value derived from the one real counter instead
+    // of shadowed by a second local that used to just happen to agree with it.
+    //
+    // `remainingDispatches <= 0`, not `== 0` (issue #28 review finding 3, still the reason): a
+    // `Ledger` cannot itself go negative (`chargeDispatch` saturates at zero), but `<= 0` keeps the
+    // guard's own shape honest against that invariant rather than resting on it silently.
+    def attemptRepair(pass: Int, trigger: FailureKind, failContent: String): Either[LoopExit, Boolean] =
+      if ledger.remainingDispatches <= 0 then
+        outcome = Some(Outcome.Fail)
+        Right(false)
       else
-        budget -= 1; cur.budget = budget
-        logger.log(s"self-repair: budget now $budget — dispatching FIX for ${trigger.text}")
+        val budgetAfter = ledger.remainingDispatches - 1
+        cur.budget = budgetAfter
+        logger.log(s"self-repair: budget now $budgetAfter — dispatching FIX for ${trigger.text}")
         val failFile = artifact(issue, s"-pass$pass.failure.md")
         fs.write(failFile, failContent)
-        fixRound(pass, failFile)
+        Runner.step(
+          Repair(cfg),
+          RepairInput(cur, issue, pass, failFile, bodyFile, currentPatch)
+        )(using caps, faulting, ledger) match
+          case NodeOutcome.Done(StageVerdict.Applied(p)) =>
+            currentPatch = Some(p)
+            Right(true)
+          case NodeOutcome.Done(StageVerdict.Rejected(kind)) =>
+            outcome = Some(Outcome.Fail); failureKind = Some(kind)
+            Right(false)
+          case NodeOutcome.Stopped(exit) =>
+            // Practically unreachable, same as before this issue's F2 fix removed the `throw` here:
+            // `Repair`'s own `run` never constructs `Stopped` (its only early exits raise through
+            // `Fault`, which never returns here at all), and its `Cost.OneDispatch` never blocks a
+            // call this function only ever makes once `ledger.remainingDispatches > 0` has already
+            // been checked against the SAME counter `Runner.step`'s own `canAfford` reads, not a
+            // second one that could disagree with it. Left as live code, not a `throw`, because
+            // `NodeOutcome.Stopped` is a real case of a real return type and a future change to
+            // `Repair`'s own `cost` (or to what shares this `Ledger`) could make it reachable; this
+            // is what makes that day a routed exit instead of a crash.
+            Left(exit)
 
     // Initial dispatch: a resumed parked issue (issue #28) skips the IMPL worker entirely and goes
     // straight to a FIX round over the human's reply, with `currentPatch` left `None`, same as the
@@ -1205,13 +1463,33 @@ object Machine:
         // review finding 7, round 2): deciding that BEFORE the pick-time label flip (which only
         // ever ADDS `active`, see that flip's own scaladoc), rather than discovering it here after
         // the flip already ran, is what stops a REPAIR_BUDGET=0 resume from silently losing the
-        // parked state and the human's reply for nothing. So `budget` (freshly `cfg.repairBudget`,
-        // set above) is guaranteed positive here.
-        budget -= 1; cur.budget = budget
+        // parked state and the human's reply for nothing. So `ledger.remainingDispatches` (freshly
+        // seeded resume-aware to `cfg.repairBudget`, `iterate`'s own comment on that seed) is
+        // guaranteed positive here.
+        val budgetAfter = ledger.remainingDispatches - 1
+        cur.budget = budgetAfter
         logger.log(
-          s"issue #$issue: resuming from parked with a human reply, dispatching FIX (budget now $budget)"
+          s"issue #$issue: resuming from parked with a human reply, dispatching FIX (budget now $budgetAfter)"
         )
-        fixRound(pass, failFile)
+        // Through `Repair(cfg)`, the `Node` (issue #34 review finding F4): before this fix this was
+        // still a direct, uncharged, unbounded `runFixRound` call, the one FIX dispatch site the
+        // rest of this issue's own conversion left uncovered. The literal `0`, not the outer `var
+        // pass`, the same value `fixRound`'s own call used before this extraction (`fixRound`'s own
+        // doc): the retry loop below always starts its OWN first cycle at pass 1 regardless of
+        // whether this branch ran, so nothing this method does before `runCycle` ever assigns the
+        // outer `var pass` away from its `0` declaration (`implementAndRepair`'s own header). Written
+        // as the literal here, not a read of that var, so the var has exactly one read left in this
+        // whole method, the final `Ready(pass, ...)` construction below; this is what makes
+        // `Kit.scala`'s "it decides nothing" claim about that var checkable against the code instead
+        // of merely true by accident of `pass` still being `0` when this line runs.
+        Runner.step(
+          Repair(cfg),
+          RepairInput(cur, issue, 0, failFile, bodyFile, currentPatch)
+        )(using caps, faulting, ledger) match
+          case NodeOutcome.Stopped(exit) => return ImplementAndRepair.StoppedEarly(exit)
+          case NodeOutcome.Done(StageVerdict.Applied(p)) => currentPatch = Some(p)
+          case NodeOutcome.Done(StageVerdict.Rejected(kind)) =>
+            outcome = Some(Outcome.Fail); failureKind = Some(kind)
         // The IMPL branch below sets gateStatus = "SKIPPED" on a guard rejection, because no gate
         // ever ran before the rejection. This branch dispatches straight into a FIX round with no
         // gate run beforehand either, so a rejection (or an empty fix) here must set the same value
@@ -1234,42 +1512,82 @@ object Machine:
           case NodeOutcome.Done(StageVerdict.Rejected(kind)) =>
             outcome = Some(Outcome.Fail); failureKind = Some(kind); gateStatus = "SKIPPED"
 
-    // --- bounded self-repair loop --------------------------------------------------------
-    // Skipped entirely if the initial patch was already rejected (outcome set above).
-    while outcome.isEmpty do
-      pass += 1
-      git.addAll() // stage so new files show in diff/gate/tamper
-      cur.pass = pass
-      val gateLog = artifact(issue, s"-pass$pass.gate.log")
-      emit(cur, "FAST_GATE", "start", gateLog)
-      gates.run("FAST", cfg.gateCmd, cfg.gateTimeout, gateLog) match
-        case GateResult.Timeout =>
-          infraFault(
-            s"WARNING: FAST gate hit the ${cfg.gateTimeout}s timeout — infra fault, not a code failure"
-          )
-        case GateResult.Red =>
+    // --- bounded self-repair loop, now a recursion over `Gate`/`Repair` node outputs ------
+    // (issue #34). The former `while outcome.isEmpty` loop re-tested a `var` after every
+    // iteration; the retry transition is expressed here instead by what each node's own OUTPUT
+    // says to do next, gate-RED or a REQUEST_CHANGES verdict into `attemptRepair`, an applied
+    // repair back into another `runCycle`, the same shape `Next.Goto`'s own `andThen` describes
+    // (`Kit.scala`).
+    //
+    // This is genuinely NOT built from real `Next`/`Workflow` values, though (issue #34 review
+    // finding F1), and the reason is a provable type-level one, not a convenience: `Next` has
+    // exactly two cases, `Goto` (recurse into another node) and `Finish(exit: LoopExit)` (stop).
+    // To terminate a chain of `Next.Goto` values at all, SOME `andThen` has to return a `Finish`;
+    // there is no third case for "stop with an ordinary value". This cycle's own terminal values
+    // are not `LoopExit`, though: an exhausted-budget or `Rejected` stop is `Outcome.Fail`, and a
+    // reviewer `Approve` is `Outcome.Success` plus everything else `Ready` carries (`gateStatus`,
+    // `failureKind`, `reviewed`, `reviewFile`, `pass`). Neither has an injection into `LoopExit`,
+    // a closed set fixed by RFC #26 decision 10 to the rc contract `watch.sh` parses, and the real
+    // `LoopExit` this whole tick eventually reaches is not even decided yet at this point in
+    // `iterate`: `terminal`, untouched by this issue and called only after this method returns, is
+    // what turns an `Outcome` into one, after label flips, a PR, and CI. So expressing this cycle's
+    // own edges through literal `Next` values would need EITHER a `Next.Finish` that lies about
+    // carrying a `LoopExit` it does not have yet, or a change to `Next`'s own shape to carry a wider
+    // result, i.e. widening `Kit.Next` itself, RFC #26 decision 10 territory this issue does not
+    // reopen. What IS real: the retry edge is decided by node output, not by re-testing a flag
+    // independent of it, and no `throw` reaches past this function on the (practically unreachable)
+    // `Stopped` arms below any more (issue #34 review finding F2); `attemptRepair`'s and
+    // `runCycle`'s own `Either[LoopExit, _]` return types hand a stop up as data instead, since
+    // `return` inside either nested `def` only unwinds that `def`, not `implementAndRepair`
+    // (`pickFromQueue`'s own doc has the identical trap for a sibling nested `def`); the actual
+    // `return ImplementAndRepair.StoppedEarly(exit)` only happens once this recursion is fully
+    // unwound, at the call site directly in this method's own body below.
+    //
+    // `p` travels as this method's own argument, not the outer `var pass`, so the gate run and the
+    // repair round it triggers always agree on which pass they are BY CONSTRUCTION; the outer
+    // `var pass` is still assigned first thing, so `Ready`'s own `pass` field (read once this
+    // recursion returns) keeps reporting the last cycle reached, exactly as the while loop did. It
+    // decides nothing about control flow here, only mirrors `p` for that one final read.
+    //
+    // Skipped entirely if the initial patch was already rejected (`outcome` already set above):
+    // the `if outcome.isEmpty then runCycle(1)` guard below is this recursion's own entry check,
+    // replacing the while loop's own condition on its very first test.
+    @annotation.tailrec
+    def runCycle(p: Int): Either[LoopExit, Unit] =
+      pass = p
+      Runner.step(Gate(cfg), GateInput(cur, issue, p))(using caps, faulting, ledger) match
+        case NodeOutcome.Stopped(exit) =>
+          // Practically unreachable, same reasoning as `attemptRepair`'s own `Stopped` arm above:
+          // `Gate`'s `cost = Cost.NoDispatch` makes `Runner.step`'s own ledger check unconditionally
+          // true (`Cost`'s own doc), and `runFastGate` never constructs `Stopped` itself (its only
+          // early exit raises through `Fault`, which never returns here). Routed as data, not
+          // thrown, for the same forward-compatibility reason (issue #34 review finding F2).
+          Left(exit)
+        case NodeOutcome.Done(GateVerdict.Red(gateLog)) =>
           gateStatus = "RED"
           failureKind = Some(FailureKind.GateRed)
-          emit(cur, "FAST_GATE", "red", gateLog)
-          logger.log(s"FAST gate RED (pass $pass, see $gateLog)")
-          spendOrExhaust(
+          attemptRepair(
+            p,
             FailureKind.GateRed,
-            s"## FAST gate RED (pass $pass)\n\n" +
+            s"## FAST gate RED (pass $p)\n\n" +
               s"The fast tier gate command is `${cfg.gateCmd}`. It ran at the repository root and " +
               s"exited with a nonzero status.\n\n" +
               s"Tail of the fast-gate log:\n\n```\n${fs.read(gateLog)}\n```\n"
-          )
-        case GateResult.Green =>
+          ) match
+            case Left(exit)      => Left(exit)
+            case Right(applied)  => if applied then runCycle(p + 1) else Right(())
+        case NodeOutcome.Done(GateVerdict.Green) =>
           gateStatus = "GREEN"
-          emit(cur, "FAST_GATE", "ok", gateLog)
-          logger.log(s"FAST gate GREEN (pass $pass) — running tamper check + cold reviewer")
 
-          // Tamper check feeds the reviewer (the harness surfaces, does not block).
+          // Tamper check feeds the reviewer (the harness surfaces, does not block). Unchanged
+          // inline code (issue #35 is where REVIEW becomes a node of its own): still runs directly
+          // inside this same cycle, since a GREEN gate's next step is the reviewer, not another
+          // gate/repair edge.
           val tamperFile = artifact(issue, "-tamper.md")
           fs.write(tamperFile, tamperReport(currentPatch.map(git.applyNumstat).getOrElse("")))
           val diffFile = artifact(issue, "-diff.patch")
           fs.write(diffFile, git.diffCachedOriginMain())
-          val reviewPromptFile = artifact(issue, s"-pass$pass.review.prompt.txt")
+          val reviewPromptFile = artifact(issue, s"-pass$p.review.prompt.txt")
           fs.write(
             reviewPromptFile,
             renderTemplate(
@@ -1301,19 +1619,27 @@ object Machine:
             case None    =>
               logger.log("reviewer emitted no VERDICT sentinel — fail-safe REQUEST_CHANGES")
               Verdict.RequestChanges
-          logger.log(s"reviewer verdict: ${verdictText(verdict)} (pass $pass)")
+          logger.log(s"reviewer verdict: ${verdictText(verdict)} (pass $p)")
           emit(cur, "REVIEW", "ok", reviewFile, s"verdict=${verdictText(verdict)}")
           verdict match
             case Verdict.Approve =>
               outcome = Some(Outcome.Success)
+              Right(())
             case Verdict.RequestChanges =>
               // REQUEST_CHANGES — spend from the same shared budget as gate-RED.
               failureKind = Some(FailureKind.ReviewChanges)
-              spendOrExhaust(
+              attemptRepair(
+                p,
                 FailureKind.ReviewChanges,
                 s"## The independent reviewer requested changes\n\n${fs.read(reviewFile)}\n\n${fs.read(tamperFile)}"
-              )
-    end while
+              ) match
+                case Left(exit)     => Left(exit)
+                case Right(applied) => if applied then runCycle(p + 1) else Right(())
+
+    val cycleResult = if outcome.isEmpty then runCycle(1) else Right(())
+    cycleResult match
+      case Left(exit) => return ImplementAndRepair.StoppedEarly(exit)
+      case Right(())  => ()
 
     // `outcome.getOrElse(Outcome.Fail)`: unreachable in practice; see `Ready`'s scaladoc.
     ImplementAndRepair.Ready(pass, outcome.getOrElse(Outcome.Fail), gateStatus, failureKind, reviewed, reviewFile)
@@ -1770,18 +2096,23 @@ object Machine:
     case StoppedEarly(exit: LoopExit)
 
     /** The values that used to be mutable locals declared before the initial dispatch and read by
-      * `iterate` long after this phase returned, plus `reviewFile`. `budget` and `currentPatch`
-      * are not here. `currentPatch` is pure bookkeeping internal to the repair loop, never read
-      * once this function returns. `budget` leaves through the shared `cur.budget`, which `emit`
-      * copies into every `StatusEvent`; it does not leave through this return value, so there is
-      * no local copy to carry here either. Field names match what `iterate` imports them as, same
-      * convention as `PickAndSetup.Ready`.
+      * `iterate` long after this phase returned, plus `reviewFile`. Remaining budget and
+      * `currentPatch` are not here. `currentPatch` is pure bookkeeping internal to the repair loop,
+      * never read once this function returns. The remaining budget (no longer a local `var` at all,
+      * issue #34 review finding F3; read straight off `ledger.remainingDispatches`) leaves through
+      * the shared `cur.budget`, which `emit` copies into every `StatusEvent`; it does not leave
+      * through this return value, so there is no local copy to carry here either. Field names match
+      * what `iterate` imports them as, same convention as `PickAndSetup.Ready`.
       *
-      * `outcome` is `Outcome`, not `Option[Outcome]`. The `while outcome.isEmpty` loop above can
-      * only exit with `Some`, and the only other way to reach this `Ready` is the initial-patch
-      * rejection path, which already set `Some(Outcome.Fail)`. So `None` was never reachable here;
-      * this is the one field where the explicit result type discharges that invariant for free
-      * instead of carrying a case nothing produces. The construction collapses it with
+      * `outcome` is `Outcome`, not `Option[Outcome]`. `runCycle` above returns (`Right(())`) only
+      * from two places, and both have already set `outcome` to `Some` before returning: the
+      * `Verdict.Approve` arm (`outcome = Some(Outcome.Success)`) and either `attemptRepair`
+      * `Right(false)` arm reached with `outcome` already `Some` (gate-RED or REQUEST_CHANGES budget
+      * exhaustion, both set inside `attemptRepair` before it returns `Right(false)`). The only other
+      * way to reach this `Ready` is the initial-patch rejection path above `runCycle`, which already
+      * set `Some(Outcome.Fail)` before `outcome.isEmpty` is even tested. So `None` was never
+      * reachable here; this is the one field where the explicit result type discharges that
+      * invariant for free instead of carrying a case nothing produces. The construction collapses it with
       * `outcome.getOrElse(Outcome.Fail)`, which is exactly what the terminal used to do by reading
       * `outcome.contains(Outcome.Success)`: a `None` there already meant `Fail`, so the collapse
       * changes no observable behaviour. `failureKind` stays `Option[FailureKind]`: that one
