@@ -321,6 +321,10 @@ final class TestWorld:
 
   val clock: Clock = new Clock:
     def sleepSeconds(s: Int): Unit = sleeps = sleeps :+ s
+    // Constant rather than advancing: no scenario here drives a `Timeout.After` node (the only node
+    // wired through the runner today, Pick, is `Timeout.Unbounded`), so there is nothing for a
+    // moving clock to matter to yet; `RunnerSpec` scripts its own `Clock` for the tests that do care.
+    def nowMillis(): Long = 0L
 
   val logger: Log = new Log:
     def log(msg: String): Unit = logLines += msg
