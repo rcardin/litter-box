@@ -84,6 +84,27 @@ trait GitHub:
 
   /** Returns the PR URL (empty/garbage URL is the caller's infra fault to raise). */
   def createPr(branch: String, title: String, body: String): String
+
+  /** The number of the PR already OPEN for `branch`, if any (`gh pr view <branch>`, which resolves
+    * by head branch as well as by number). Added for issue #36: `Machine`'s PR-open node reads this
+    * BEFORE calling `createPr`, so a crashed tick that already opened a PR is recognised by asking
+    * GitHub, never by a stored position (RFC #26 decision 6): `gh pr create` itself refuses a
+    * second PR for a branch that already has one open, so re-attempting it on every resumed tick
+    * would either fail outright or, worse, depend on that refusal alone to avoid a duplicate.
+    *
+    * `None` on a failed read, the same fail-open answer `checksRollupCount` gives on its own failed
+    * read: this method exists only to SKIP an unnecessary `createPr`, and a caller that cannot tell
+    * "no PR yet" from "the read itself failed" must still be free to attempt one, the safe default
+    * either way.
+    *
+    * Also `None` when a PR exists for `branch` but its state is not `OPEN` (issue #36 review,
+    * BLOCKER 1): `gh pr view <branch>` resolves a CLOSED or MERGED PR for that head branch just as
+    * readily as an OPEN one, and the justification above holds only for an OPEN PR, since `gh pr
+    * create` refuses a SECOND OPEN PR for a branch, it does not refuse one after the first was merged or
+    * closed. A caller that adopted a MERGED PR's number here would treat this iteration's own commits
+    * as already shipped without ever opening a PR for them, or merging one.
+    */
+  def prForBranch(branch: String): Option[Int]
   def prComment(pr: Int, body: String): Unit
 
   /** Posts a comment on an issue. Mirrors `prComment`, except the return value is load-bearing:

@@ -22,7 +22,17 @@ import scala.util.boundary
 // argument does, and the var itself has exactly one read left in the whole method, the final
 // `Ready(pass, ...)` construction (the resume dispatch that used to read it instead passes the
 // literal `0` it is provably still holding at that point, `implementAndRepair`'s own doc on that
-// call site). The rest of `iterate` (terminal) stays a plain function for now.
+// call site). `Machine.Review` (issue #35) is the fifth node, the cold-reviewer dispatch; unlike
+// `Gate`/`Repair`, its own call site (`implementAndRepair`'s `runCycle`) hands it a fresh, dedicated
+// `Runner.Ledger(1)` rather than the shared FIX/IMPL one, for the reason that node's own doc gives.
+// `Machine.RouteDecision`, `Machine.CommitAndPush`, `Machine.OpenPr`, `Machine.CiWait`,
+// `Machine.Merge` and `Machine.PostMergeCleanup` (issue #36) are the sixth through eleventh, the
+// terminal phase's own PR-open and auto-merge chain; `Machine.terminal` itself, like
+// `implementAndRepair` above it, stays a plain function that dispatches each of these through
+// `Runner.step` in turn rather than becoming a `Node` itself, for the same reason: its own early
+// returns (the guard checks, `Route.Parked`'s dedicated handling, the NeedsHuman notify) are not
+// values any of these nodes' OUTPUT could route through without inventing a case in `LoopExit` or
+// `NodeOutcome` this codebase does not otherwise need.
 //
 // Two of the concerns a hand-written phase like `pickAndSetup` used to own for itself, spending
 // dispatch budget and enforcing a wall-clock timeout, move here, onto the `Runner`, so that no

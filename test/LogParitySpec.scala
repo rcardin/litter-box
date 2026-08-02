@@ -202,6 +202,25 @@ class LogParitySpec extends AnyFlatSpec with Matchers:
     w.logShouldMatchGolden("auto-merge-chain")
   }
 
+  /** The probe-hit path's own operator lines (issue #36 review, MINOR 5): the "already open" log
+    * line `OpenPr`'s probe emits, and the `PR:skip` event, were pinned by no golden before this,
+    * unlike every other terminal-phase log line in this file. `w.inProgress`/`w.ready` (not
+    * `w.labels`) are what make this a genuine crash-resume rather than a fresh pick landing on a
+    * stale PR (issue #36 review, MAJOR 2; see `ScenarioSpec`'s own tests for that distinction spelled
+    * out mechanically).
+    */
+  it should "match the golden for a resumed tick recognising the PR its own earlier attempt already opened" in {
+    val w = TestWorld()
+    w.inProgress = Some(999)
+    w.ready = None
+    w.labels = List("in-progress", "class-1")
+    w.existingPrNumber = Some(123)
+
+    w.runLoop() shouldBe LoopExit.Success
+
+    w.logShouldMatchGolden("openpr-probe-hit-resumed")
+  }
+
   it should "match the golden for a failed merge, carrying the child's rc into the failure line" in {
     val w = TestWorld()
     w.labels = List("ready", "class-1")
@@ -210,7 +229,12 @@ class LogParitySpec extends AnyFlatSpec with Matchers:
     w.runLoop() shouldBe LoopExit.InfraFault
 
     w.logShouldMatchGolden("merge-rc-carried")
-    w.called("gh pr view 123 --json state") shouldBe false // fault raised before verification
+    // Zero `gh pr view ... --json state` calls (issue #36 review, MAJOR 3/MINOR 8): `Merge`'s own
+    // probe is `_ => None` unconditionally (see that node's own doc), so `performMerge` calls
+    // `gh.merge` unconditionally too, exactly as `main` does; the only read of this string would be
+    // the post-merge VERIFICATION `performMerge` makes once `mergeRc == 0`, never reached here
+    // because the merge command itself fails first.
+    w.called("gh pr view 123 --json state") shouldBe false
   }
 
   it should "match the golden for a CI-RED auto-merge candidate, with no self-repair" in {
