@@ -545,7 +545,7 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
 
     val outcome = dispatch.review("the prompt (unused by the stub)", "logs/r.md")
 
-    outcome shouldBe DispatchOutcome.Done
+    outcome.value shouldBe DispatchOutcome.Done
     readString(root.resolve("logs/r.md")) should include("VERDICT: APPROVE")
     readString(root.resolve("logs/r.md.stderr")) should include("diagnostic")
   }
@@ -587,7 +587,7 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
         reviewCmd = Some("exit 124")
       )
 
-    dispatch.review("prompt", "logs/r.md") shouldBe DispatchOutcome.Done
+    dispatch.review("prompt", "logs/r.md").value shouldBe DispatchOutcome.Done
   }
 
   // =============================================================================================

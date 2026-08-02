@@ -410,13 +410,13 @@ object Machine:
     //
     // Every `Implement`/`Repair` dispatch this tick can make charges this one `Ledger`, through
     // `Runner.step`'s own decorator, so `remainingDispatches` cannot drift from what `attemptRepair`'s
-    // own local reasoning used to track by hand for THOSE two nodes. The REVIEW dispatch inside
-    // `runCycle` below (`agents.review`) is NOT one of those two nodes: it calls the raw, undecorated
-    // `agents` this method already closes over, never `Runner.step`, so it spends nothing against this
-    // `Ledger` at all. A tick that runs IMPL, N FIX rounds and M REVIEW dispatches really spends
-    // N + M + 1 agent dispatches while this `Ledger` only ever sees N + 1; `ledgerSeed` is therefore
-    // not yet the tick's real dispatch ceiling, only the FIX/IMPL slice of it, until REVIEW becomes a
-    // node of its own and is charged the same way (issue #35).
+    // own local reasoning used to track by hand for THOSE two nodes. `Review` (issue #35) is also a
+    // node now and also runs through `Runner.step`, but NOT against this `Ledger`: `runCycle` below
+    // hands it a fresh, per-call `Runner.Ledger(1)` of its own (that call site's own doc has the
+    // reasoning), so a review dispatch still spends nothing against THIS `Ledger`. That split is what
+    // keeps `ledgerSeed` here exactly the FIX/IMPL slice of the tick's real dispatch count, and what
+    // keeps every `self-repair: budget now N` golden line true regardless of how many review rounds
+    // preceded it.
     //
     // `math.max(0, cfg.repairBudget)`, not a bare `cfg.repairBudget` (issue #33 review round 2
     // finding A, still relevant here): `REPAIR_BUDGET` reaches here through a bare `toIntOption`
@@ -1315,6 +1315,160 @@ object Machine:
         )
     )
 
+  /** `Review`'s input (issue #35): the values `runReview` needs. `reviewFile` travels as the fixed
+    * path `implementAndRepair` computes once for the whole tick (every review round overwrites the
+    * same file, never a `pass`-suffixed sibling), because `terminal` reads this exact path back for
+    * the PR body after `runCycle` finishes, regardless of which pass produced the last verdict.
+    */
+  private final case class ReviewInput(
+      cur: Cursor,
+      issue: Int,
+      pass: Int,
+      bodyFile: String,
+      reviewFile: String,
+      currentPatch: Option[String]
+  )
+
+  /** The cold-reviewer dispatch, extracted from the former while loop's body (issue #35), the same
+    * shape `runFastGate`/`runFixRound` (issue #34) already established: a named method `Review`'s own
+    * `run` calls instead of a context-function literal. Takes `Fault` directly, not a recovered
+    * `Faulting`, for the same reason `runFastGate` does rather than `runFixRound`'s: this body is new
+    * code for this conversion, not a relocated call into an already-`Faulting`-typed function.
+    *
+    * Returns `AgentDispatch.Judged[Verdict]`, not a bare `Verdict` (issue #35 review finding 2): the
+    * token `agents.review` mints has to keep travelling past this function, all the way to
+    * `runCycle`'s own call site, or `Judged` would appear in no signature outside `Caps.scala` and
+    * the shipped node, the one example a consumer copies, would be the one place that throws the
+    * token away early. The dispatch-timeout and empty-review checks below still read `judged.value`
+    * and still raise through `fault.raise` exactly as before; only the final step, deriving a
+    * `Verdict` from the reviewer's text, moves inside `judged.map` (round two of issue #35's review:
+    * corrected from an earlier draft of this paragraph, which claimed this `map` "carries the token
+    * from the dispatch's raw `DispatchOutcome` to the parsed `Verdict`"; that is not what the lambda
+    * does. The reviewer's answer lives on disk, at `reviewFile`, not in the `DispatchOutcome` `map`
+    * hands the lambda; the lambda ignores that argument entirely and derives the verdict from an
+    * independent `fs.read(reviewFile)`. What this `map` actually buys is narrower and still real: it
+    * is a REWRAP, not a derivation from the dispatch's own payload, that keeps `Judged` in this
+    * function's return type instead of calling `.value` early and returning a bare `Verdict` that
+    * carries no token at all. Never a case of its own for a dispatch timeout: a reviewer
+    * timeout is an infra fault, raised straight through `fault.raise` before this function ever has a
+    * value to return, the identical reasoning `GateVerdict`'s own doc gives for leaving
+    * `GateResult.Timeout` out of that enum. An empty review gets the same treatment one line later: a
+    * crashed or timed-out reviewer is not a verdict either. A missing `VERDICT:` sentinel, by
+    * contrast, IS an ordinary `Verdict` value, `Verdict.RequestChanges`: the reviewer answered, just
+    * not in the expected shape, and the fail-safe this file has always applied treats that the same
+    * as a real `REQUEST_CHANGES`, something `attemptRepair` (`implementAndRepair`'s own nested
+    * method) can act on rather than something that has to abort the tick.
+    */
+  private def runReview(
+      cur: Cursor,
+      issue: Int,
+      pass: Int,
+      bodyFile: String,
+      reviewFile: String,
+      currentPatch: Option[String]
+  )(using
+      cfg: Config,
+      git: Git,
+      agents: AgentDispatch,
+      fs: HarnessFs,
+      log: StatusLog,
+      logger: Log
+  )(using fault: Fault): AgentDispatch.Judged[Verdict] =
+    val tamperFile = artifact(issue, "-tamper.md")
+    fs.write(tamperFile, tamperReport(currentPatch.map(git.applyNumstat).getOrElse("")))
+    val diffFile = artifact(issue, "-diff.patch")
+    fs.write(diffFile, git.diffCachedOriginMain())
+    val reviewPromptFile = artifact(issue, s"-pass$pass.review.prompt.txt")
+    fs.write(
+      reviewPromptFile,
+      renderTemplate(
+        fs.readTemplate(Template.Review),
+        "PROTECTED"   -> protectedList(cfg.protect),
+        "GATE"        -> cfg.gateCmd,
+        "CONVENTIONS" -> fs.conventions(),
+        "ISSUE"       -> fs.read(bodyFile),
+        "TAMPER"      -> fs.read(tamperFile),
+        "DIFF"        -> fs.read(diffFile)
+      )
+    )
+    emit(cur, "REVIEW", "start", reviewFile)
+    val judged = agents.review(fs.read(reviewPromptFile), reviewFile)
+    judged.value match
+      case DispatchOutcome.TimedOut =>
+        emit(cur, "REVIEW", "red", reviewFile, "timeout")
+        fault.raise("REVIEWER timed out — infra fault; exiting without spending budget")
+      case DispatchOutcome.Done => ()
+
+    // An empty (or whitespace-only) review is a crashed reviewer, not a verdict.
+    if fs.read(reviewFile).isBlank then
+      emit(cur, "REVIEW", "red", reviewFile, "empty review")
+      fault.raise("reviewer produced no output — infra fault (crashed or timed-out reviewer)")
+
+    // Grep, not parse. Missing sentinel -> REQUEST_CHANGES (fail safe, never auto-approve). The
+    // derivation itself stays inside `judged.map` below, not computed first and wrapped after, so
+    // the token travels through the SAME derivation this file already did, rather than being
+    // reconstructed around it. The two `logger.log` calls and the `emit` that used to sit inside that
+    // same lambda (round two of issue #35's review) are pulled out below instead: `map` is total and
+    // eager here, so today nothing breaks, but `map` is also the one extension point this file's own
+    // scaladoc hands a consumer (`AgentDispatch.Judged`'s doc, `judged.map(parseMyScore)`), and a
+    // shipped example with side effects inside it teaches that side effects belong there. Reading
+    // `reviewFile`'s text once, outside the lambda, and passing the parsed `Option[Verdict]` in
+    // rather than re-reading inside it, is what lets the missing-sentinel log line move out too
+    // without a second `fs.read`/`parseVerdict` call appearing where the original had only one.
+    val reviewText     = fs.read(reviewFile)
+    val parsedVerdict  = parseVerdict(reviewText)
+    val judgedVerdict  = judged.map(_ => parsedVerdict.getOrElse(Verdict.RequestChanges))
+    val verdict        = judgedVerdict.value
+    if parsedVerdict.isEmpty then
+      logger.log("reviewer emitted no VERDICT sentinel — fail-safe REQUEST_CHANGES")
+    logger.log(s"reviewer verdict: ${verdictText(verdict)} (pass $pass)")
+    emit(cur, "REVIEW", "ok", reviewFile, s"verdict=${verdictText(verdict)}")
+    judgedVerdict
+
+  /** Review, converted to a `Node` (issue #35): `cost = Cost.OneDispatch`, the one real reviewer
+    * dispatch a review round costs, declared honestly the same way `Implement`/`Repair` declare
+    * theirs. Unlike those two, though, `runCycle`'s own call site below hands this node a fresh,
+    * dedicated `Runner.Ledger(1)`, never the shared repair-budget `ledger` `Gate`/`Repair` draw from,
+    * and that split is deliberate, not an oversight this issue left behind: `Runner.step`'s charging
+    * decorator charges a real dispatch for real regardless of what `cost` declares
+    * (`Runner.Ledger.chargeDispatch`'s own doc), so if `Review`'s dispatch charged the SAME `Ledger`
+    * `attemptRepair` reads for its own `self-repair: budget now N` line, that number would silently
+    * drop by one for every review round preceding a repair, on every scenario that ever requests
+    * changes. `test/golden/request-changes-repair.log` and `test/golden/missing-verdict.log` both pin
+    * `budget now 1` immediately after a review dispatch, a figure that only holds because the review
+    * dispatch never touches the counter that line reads. A fresh `Runner.Ledger(1)`, built and
+    * discarded at the call site, is what "this node costs one dispatch, from a budget of exactly one"
+    * means for a node whose own spend must never compete with the FIX budget the retry decision (and
+    * every golden log line derived from it) actually reads.
+    *
+    * `timeout = Timeout.Unbounded`: the former inline code carried no node-level bound on the review
+    * dispatch either, only the subprocess-level `DispatchOutcome.TimedOut` check `runReview` still
+    * raises straight through `fault.raise`. `Gate`'s own `Unbounded` choice already covers the fuller
+    * argument against adding one here: a node-level bound would also bracket the tamper/diff/prompt
+    * file work ahead of the dispatch, a strictly larger window than the figure it would be measured
+    * against, for behaviour this conversion is not meant to change.
+    *
+    * `probe = _ => None`: same reasoning as every other node in this file, sharpened for a review
+    * specifically, since a verdict is a fact about a dispatch that has not happened yet, never a
+    * stored position (RFC #26 decision 6).
+    *
+    * `Node[ReviewInput, AgentDispatch.Judged[Verdict]]`, not `Node[ReviewInput, Verdict]` (issue #35
+    * review finding 2): `runReview` already carries the token this far, so the node's own output type
+    * says so too, rather than unwrapping with `.value` here and losing it one call earlier than it
+    * needs to be lost. No `cfg` parameter, unlike `Gate`: nothing in this node's body reads it.
+    */
+  private def Review: Node[ReviewInput, AgentDispatch.Judged[Verdict]] =
+    Node(
+      name = "Review",
+      cost = Cost.OneDispatch,
+      timeout = Timeout.Unbounded,
+      probe = _ => None,
+      run = input =>
+        NodeOutcome.Done(
+          runReview(input.cur, input.issue, input.pass, input.bodyFile, input.reviewFile, input.currentPatch)
+        )
+    )
+
   /** The second of the phase extractions `iterate` is being split into (issue #30 / RFC #26
     * decision 12); the same reasoning as `pickAndSetup` applies here: naming this phase and giving
     * it a return type of its own is what makes the later node conversion a reshape instead of a
@@ -1351,15 +1505,19 @@ object Machine:
       // run via `Runner.step`; nothing else in this function ever touches either.
       caps: Caps,
       ledger: Runner.Ledger
+      // `cfg`, `fs`, `logger`: the only three this function's own body still reads directly (round
+      // two of issue #35's review). `gh`, `git`, `agents`, `log` (`StatusLog`) and `notify` were
+      // still declared here after the review block moved out to `Review`/`runReview`, dead `using`
+      // parameters with no caller left inside this function. `agents` is the load-bearing one to
+      // have dropped: it is the raw, uncharged, unbounded dispatcher, and leaving it in scope with
+      // no reader is the exact shape issue #34 review finding F4 closed at the resume FIX site, a
+      // capability sitting unused where a future edit could reach for it instead of going through
+      // `caps`/`Runner.step`'s charging decorator. `gh`, `log` and `notify` were already dead before
+      // this diff; narrowing the clause removes them too rather than leaving a partial cleanup.
   )(using
       cfg: Config,
-      gh: GitHub,
-      git: Git,
-      agents: AgentDispatch,
       fs: HarnessFs,
-      log: StatusLog,
-      logger: Log,
-      notify: Notify
+      logger: Log
   )(using faulting: Faulting): ImplementAndRepair =
     // --- bounded self-repair state -------------------------------------------------------
     // Declared BEFORE the initial dispatch: a patch-guard rejection on the very first worker
@@ -1579,62 +1737,70 @@ object Machine:
         case NodeOutcome.Done(GateVerdict.Green) =>
           gateStatus = "GREEN"
 
-          // Tamper check feeds the reviewer (the harness surfaces, does not block). Unchanged
-          // inline code (issue #35 is where REVIEW becomes a node of its own): still runs directly
-          // inside this same cycle, since a GREEN gate's next step is the reviewer, not another
-          // gate/repair edge.
-          val tamperFile = artifact(issue, "-tamper.md")
-          fs.write(tamperFile, tamperReport(currentPatch.map(git.applyNumstat).getOrElse("")))
-          val diffFile = artifact(issue, "-diff.patch")
-          fs.write(diffFile, git.diffCachedOriginMain())
-          val reviewPromptFile = artifact(issue, s"-pass$p.review.prompt.txt")
-          fs.write(
-            reviewPromptFile,
-            renderTemplate(
-              fs.readTemplate(Template.Review),
-              "PROTECTED"   -> protectedList(cfg.protect),
-              "GATE"        -> cfg.gateCmd,
-              "CONVENTIONS" -> fs.conventions(),
-              "ISSUE"       -> fs.read(bodyFile),
-              "TAMPER"      -> fs.read(tamperFile),
-              "DIFF"        -> fs.read(diffFile)
-            )
-          )
-          emit(cur, "REVIEW", "start", reviewFile)
-          agents.review(fs.read(reviewPromptFile), reviewFile) match
-            case DispatchOutcome.TimedOut =>
-              emit(cur, "REVIEW", "red", reviewFile, "timeout")
-              infraFault("REVIEWER timed out — infra fault; exiting without spending budget")
-            case DispatchOutcome.Done => ()
-          reviewed = true
-
-          // An empty (or whitespace-only) review is a crashed reviewer, not a verdict.
-          if fs.read(reviewFile).isBlank then
-            emit(cur, "REVIEW", "red", reviewFile, "empty review")
-            infraFault("reviewer produced no output — infra fault (crashed or timed-out reviewer)")
-
-          // Grep, not parse. Missing sentinel -> REQUEST_CHANGES (fail safe, never auto-approve).
-          val verdict = parseVerdict(fs.read(reviewFile)) match
-            case Some(v) => v
-            case None    =>
-              logger.log("reviewer emitted no VERDICT sentinel — fail-safe REQUEST_CHANGES")
-              Verdict.RequestChanges
-          logger.log(s"reviewer verdict: ${verdictText(verdict)} (pass $p)")
-          emit(cur, "REVIEW", "ok", reviewFile, s"verdict=${verdictText(verdict)}")
-          verdict match
-            case Verdict.Approve =>
-              outcome = Some(Outcome.Success)
-              Right(())
-            case Verdict.RequestChanges =>
-              // REQUEST_CHANGES — spend from the same shared budget as gate-RED.
-              failureKind = Some(FailureKind.ReviewChanges)
-              attemptRepair(
-                p,
-                FailureKind.ReviewChanges,
-                s"## The independent reviewer requested changes\n\n${fs.read(reviewFile)}\n\n${fs.read(tamperFile)}"
-              ) match
-                case Left(exit)     => Left(exit)
-                case Right(applied) => if applied then runCycle(p + 1) else Right(())
+          // Review, the Node (issue #35): `Runner.Ledger(1)`, not the shared `ledger` Gate/Repair
+          // draw from, a fresh one, built and discarded right here, per call. `Review`'s own doc has
+          // the full reasoning; the short version is that a real dispatch is charged for real
+          // regardless of declared `Cost`, and every `self-repair: budget now N` golden line only
+          // holds if a review dispatch never touches the counter that line reads.
+          //
+          // Deliberate stopgap, not the shape #37 leaves behind. Minting a fresh `Runner.Ledger` and
+          // re-entering `Runner.step` with it is exactly what `Ledger`'s `private[litterbox]`
+          // constructor exists to discourage (`src/Kit.scala`, issue #32 review finding 2c); this
+          // call site does it anyway because review spend must not compete with the repair budget the
+          // `self-repair: budget now N` golden lines read, and this issue forbids moving goldens to
+          // fix that the clean way. The cost of the shortcut: it sidesteps the single-ledger
+          // discipline the rest of this method follows, and it makes `Review`'s declared
+          // `Cost.OneDispatch` unfalsifiable at this site, since nothing here can ever observe this
+          // throwaway `Ledger` running short. Issue #37, where `Runner.run` walks the whole graph
+          // against one shared `Ledger`, is where this gets closed for good.
+          //
+          // The `Cost` half above is only half of what this call site leaves unobserved (round two
+          // of issue #35's review): `Review`'s declared `Timeout.Unbounded` and `probe = _ => None`
+          // (`Review`'s own doc, above) are exactly as unfalsifiable here, for the same root cause.
+          // `ScenarioSpec` proves #33's `Implement` and #34's `Gate`/`Repair` are genuinely wired as
+          // nodes by asserting on their declared `Timeout`/`probe` behaviour end to end; no
+          // equivalent coverage exists for `Review` here, so if this call site were reverted to a
+          // plain, un-costed `runReview(...)` call tomorrow, nothing in this suite would fail. #37
+          // inherits closing this gap too, not only the `Cost` one.
+          Runner.step(
+            Review,
+            ReviewInput(cur, issue, p, bodyFile, reviewFile, currentPatch)
+          )(using caps, faulting, Runner.Ledger(1)) match
+            case NodeOutcome.Stopped(exit) =>
+              // Practically unreachable, same reasoning as `Gate`'s own `Stopped` arm above:
+              // `Review`'s `run` never constructs `Stopped` itself (its only early exits raise
+              // through `Fault`, which never returns here), and its dedicated, freshly built
+              // `Runner.Ledger(1)` always affords its own `Cost.OneDispatch`. Routed as data, not
+              // thrown, for the same forward-compatibility reason (issue #34 review finding F2,
+              // carried forward).
+              Left(exit)
+            case NodeOutcome.Done(judged) =>
+              reviewed = true
+              // `.value` unwraps the token here, at the point the verdict is actually matched on,
+              // not inside `Review`'s own `run` (issue #35 review finding 2): everything upstream of
+              // this line, `runReview`, `Review`, `Runner.step`'s own `NodeOutcome.Done`, carries
+              // `AgentDispatch.Judged[Verdict]`, so `Judged` appears in every signature between the
+              // mint site and here instead of being discarded one call early.
+              val verdict = judged.value
+              verdict match
+                case Verdict.Approve =>
+                  outcome = Some(Outcome.Success)
+                  Right(())
+                case Verdict.RequestChanges =>
+                  // REQUEST_CHANGES spends from the same shared budget as gate-RED. `tamperFile`'s
+                  // path is recomputed, not carried on `Verdict` the way `GateVerdict.Red` carries
+                  // `gateLog`: unlike `gateLog`, it is never `pass`-suffixed (`runReview`'s own
+                  // `artifact(issue, "-tamper.md")` call), so recomputing the identical literal here
+                  // cannot drift the way a `pass`-suffixed path could.
+                  failureKind = Some(FailureKind.ReviewChanges)
+                  attemptRepair(
+                    p,
+                    FailureKind.ReviewChanges,
+                    s"## The independent reviewer requested changes\n\n${fs.read(reviewFile)}\n\n${fs
+                        .read(artifact(issue, "-tamper.md"))}"
+                  ) match
+                    case Left(exit)     => Left(exit)
+                    case Right(applied) => if applied then runCycle(p + 1) else Right(())
 
     val cycleResult = if outcome.isEmpty then runCycle(1) else Right(())
     cycleResult match

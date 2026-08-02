@@ -239,6 +239,231 @@ class RunnerSpec extends AnyFlatSpec with Matchers:
     world.callCount("dispatch REVIEW") shouldBe 1
   }
 
+  // ---- Judged is minted only by AgentDispatch.review, never fabricated by LIBRARY code (issue #35) --
+
+  /** Every test below in this section is a compile time check, not a runtime one, because the
+    * property under test IS "this does not typecheck": `AgentDispatch.Judged`'s only constructor
+    * and `Judged.mint` are both `private[AgentDispatch]` (`src/Caps.scala`), so a fabrication
+    * attempt cannot be exercised at runtime the way the rest of this file exercises `Runner`, there
+    * is no value to hand a runtime assertion because the compiler refuses to produce one. The
+    * snippet under test has to live inside a string literal handed to
+    * `scala.compiletime.testing.typeCheckErrors` (Scala 3 stdlib, no new test dependency, see
+    * `project.scala`'s single `scalatest` test dep and `CONVENTIONS.md`'s one test dep rule):
+    * writing the fabrication as ordinary code in this file would just stop `RunnerSpec.scala` itself
+    * from compiling, which proves nothing about the review node design and only breaks this suite.
+    *
+    * What this section can and cannot prove, precisely (round two of issue #35's review):
+    * `typeCheckErrors` type-checks its string argument spliced in at THIS call site's own lexical
+    * position, not as an independent, freshly packaged compilation unit (confirmed while drafting
+    * this section: a snippet run from here resolves `Caps` and friends unqualified with NO import at
+    * all, and a `package foo { ... }` clause written inside the string is flatly rejected, "this kind
+    * of statement is not allowed here", the same restriction ordinary Scala places on a `package`
+    * clause inside a method body). So every snippet below is compiled from inside package
+    * `in.rcard.litterbox`, the SAME package `LiveAgentDispatch`, `Runner.charging` and `TestWorld`
+    * live in, no matter what it claims to be: this section proves the mint site is closed to LIBRARY
+    * code, not that it is closed to a CONSUMER's package. `Caps.given` has to be imported by name
+    * inside each snippet for the same reason: `summon[AgentDispatch]` inside a node's `run` body only
+    * resolves through the given conversions `Caps.scala` declares, and those are not ambient just
+    * because the snippet sits in the right package.
+    *
+    * The other half, that a genuinely foreign package cannot implement `AgentDispatch` at all (the
+    * actual round two BLOCKER: an anonymous `AgentDispatch` a node body defines and instantiates
+    * itself, never touching a real `Caps`, still minting a genuine `Judged`), is proved separately in
+    * `ConsumerBoundarySpec` (`test/ConsumerBoundarySpec.scala`), a spec file physically declared
+    * `package com.example.consumer` so the same call-site splicing that traps this section inside
+    * `in.rcard.litterbox` traps that one inside a package this library does not own.
+    *
+    * Every negative snippet below has a positive twin identical in every line except the one that
+    * fabricates: the `Node` shape, its `cost`, its declared result type, all held constant, so the
+    * only variable between a snippet that fails and one that succeeds is the fabrication itself.
+    * Without that twin, a negative test proves nothing: a typo anywhere in the snippet (a misspelled
+    * `Node` field, a missing import) also makes it fail to compile, for a completely wrong reason,
+    * and `assertDoesNotCompile` alone cannot tell the two apart. `typeCheckErrors`, not
+    * `assertDoesNotCompile`, carries the negative cases specifically so the assertion can also pin
+    * the REASON: each one asserts the reported message names the exact inaccessible member
+    * (`mint`, the `Judged` constructor, or `review` itself), not merely that some error, any error,
+    * came back.
+    *
+    * Round three of issue #35's review found `private[litterbox]` alone does not close the
+    * foreign-IMPLEMENTOR hole (a subclass can always widen an inherited member's access); the fix is
+    * `AgentDispatch` being `sealed`, with `AgentDispatchImpl` as the one file-local child every real
+    * implementor extends instead (`src/Caps.scala` carries the full guarantee and its residual
+    * limits, stated once there). That change reaches the snippets below too: a snippet in THIS file
+    * that tries `extends AgentDispatch` directly is now also a different-file subclass of a sealed
+    * trait, so it fails for that reason as well as, or instead of, whatever it originally set out to
+    * prove; the tests further down that need a working library-side implementation
+    * (`AgentDispatch`'s `review` being `final`, `dispatchReview` being overridable) extend
+    * `AgentDispatchImpl` instead, and a dedicated test proves the direct-`extends`-`AgentDispatch`
+    * route is genuinely closed even for library code in a different file.
+    */
+
+  it should "refuse to typecheck a node body that fabricates a Judged by calling AgentDispatch.Judged.mint directly" in {
+    val errors = scala.compiletime.testing.typeCheckErrors(
+      """
+        |import in.rcard.litterbox._
+        |import in.rcard.litterbox.Caps.given
+        |
+        |val node: Node[Unit, AgentDispatch.Judged[DispatchOutcome]] = Node(
+        |  name = "fabricator",
+        |  cost = Cost.OneDispatch,
+        |  timeout = Timeout.Unbounded,
+        |  probe = _ => None,
+        |  run = _ => NodeOutcome.Done(AgentDispatch.Judged.mint(DispatchOutcome.Done))
+        |)
+        |""".stripMargin
+    )
+
+    errors should not be empty
+    val messages = errors.map(_.message).mkString("\n")
+    messages should include("mint")
+    messages should include("private[AgentDispatch]")
+  }
+
+  it should "refuse to typecheck a node body that fabricates a Judged by subclassing or directly constructing it" in {
+    val errors = scala.compiletime.testing.typeCheckErrors(
+      """
+        |import in.rcard.litterbox._
+        |import in.rcard.litterbox.Caps.given
+        |
+        |val node: Node[Unit, AgentDispatch.Judged[DispatchOutcome]] = Node(
+        |  name = "fabricator",
+        |  cost = Cost.OneDispatch,
+        |  timeout = Timeout.Unbounded,
+        |  probe = _ => None,
+        |  run = _ => NodeOutcome.Done(new AgentDispatch.Judged[DispatchOutcome](DispatchOutcome.Done) {})
+        |)
+        |""".stripMargin
+    )
+
+    errors should not be empty
+    val messages = errors.map(_.message).mkString("\n")
+    // Two separate reasons stack here, `sealed` and the `private[AgentDispatch]` constructor (see
+    // `AgentDispatch.Judged`'s own scaladoc on why the constructor narrowing is the one that
+    // actually closes the gap `sealed` alone leaves open); asserting on the constructor message
+    // specifically is what proves the narrower, load bearing guard is doing real work here, not
+    // merely riding on `sealed` rejecting an out of file subclass for an unrelated reason.
+    messages should include("constructor Judged")
+    messages should include("private[AgentDispatch]")
+  }
+
+  it should "typecheck the analogous node body that mints its Judged the only legitimate way, by dispatching through review" in {
+    // The positive control every negative snippet above is measured against (RFC #26 decision 7):
+    // same `Node` shape, same declared result type, same `cost`, and the one line that differs is
+    // exactly the line each negative test above also varies. If this failed to compile too, the
+    // negative tests would be passing on a shared typo rather than on the fabrication each claims
+    // to catch.
+    val errors = scala.compiletime.testing.typeCheckErrors(
+      """
+        |import in.rcard.litterbox._
+        |import in.rcard.litterbox.Caps.given
+        |
+        |val node: Node[Unit, AgentDispatch.Judged[DispatchOutcome]] = Node(
+        |  name = "reviewer",
+        |  cost = Cost.OneDispatch,
+        |  timeout = Timeout.Unbounded,
+        |  probe = _ => None,
+        |  run = _ => NodeOutcome.Done(summon[AgentDispatch].review("prompt", "review-file"))
+        |)
+        |""".stripMargin
+    )
+
+    errors shouldBe empty
+  }
+
+  it should "refuse to typecheck a library-side subclass of AgentDispatchImpl overriding review, while overriding dispatchReview instead still typechecks" in {
+    // `review` is `final` precisely so no implementation, decorator (`Runner.charging` above) or
+    // hostile node author can skip the real dispatch and hand back a `Judged` it invented; this is
+    // the guard on the OTHER side of the trait from the two tests above, the mint site rather than
+    // the call site. `dispatchReview` is the one seam `AgentDispatch` actually leaves open, so its
+    // override is the positive twin proving the rejection above is `final` doing its job, not some
+    // unrelated typo in the subclass body.
+    //
+    // Extends `AgentDispatchImpl`, not `AgentDispatch` directly (round three of issue #35's review:
+    // `AgentDispatch` is `sealed`, extendable only from `Caps.scala` itself, so a snippet run from
+    // here, a different file, could not even name it in an `extends` clause without failing for that
+    // reason FIRST, which would make the assertion below prove nothing about `final`).
+    // `AgentDispatchImpl` is the file-local escape hatch `LiveAgentDispatch`/`Runner.charging`/
+    // `TestWorld` all use for the same reason.
+    val overrideReview = scala.compiletime.testing.typeCheckErrors(
+      """
+        |import in.rcard.litterbox._
+        |
+        |class Cheater extends AgentDispatchImpl:
+        |  private[litterbox] def dispatchReview(prompt: String, reviewFile: String): DispatchOutcome =
+        |    DispatchOutcome.Done
+        |  override def review(prompt: String, reviewFile: String): AgentDispatch.Judged[DispatchOutcome] =
+        |    review(prompt, reviewFile)
+        |  def worker(
+        |      role: Role,
+        |      promptFile: String,
+        |      patchOut: String,
+        |      logFile: String,
+        |      currentPatch: Option[String]
+        |  ): DispatchOutcome = DispatchOutcome.Done
+        |""".stripMargin
+    )
+
+    overrideReview should not be empty
+    val messages = overrideReview.map(_.message).mkString("\n")
+    messages should include("cannot override final member")
+
+    // `private[litterbox]`, matching the trait's own modifier: this snippet is still LIBRARY code
+    // (it runs from inside `RunnerSpec.scala`, package `in.rcard.litterbox`, see this section's own
+    // header above), so it can write the exact same modifier `LiveAgentDispatch`/`Runner.charging`/
+    // `TestWorld` do, and `AgentDispatchImpl` is nameable from any file in this package.
+    // `ConsumerBoundarySpec` (`test/ConsumerBoundarySpec.scala`) is the twin of THIS test from
+    // outside that package, where neither `AgentDispatch` nor `AgentDispatchImpl` can be named at
+    // all.
+    val overrideDispatchReview = scala.compiletime.testing.typeCheckErrors(
+      """
+        |import in.rcard.litterbox._
+        |
+        |class Honest extends AgentDispatchImpl:
+        |  private[litterbox] def dispatchReview(prompt: String, reviewFile: String): DispatchOutcome =
+        |    DispatchOutcome.Done
+        |  def worker(
+        |      role: Role,
+        |      promptFile: String,
+        |      patchOut: String,
+        |      logFile: String,
+        |      currentPatch: Option[String]
+        |  ): DispatchOutcome = DispatchOutcome.Done
+        |""".stripMargin
+    )
+
+    overrideDispatchReview shouldBe empty
+  }
+
+  it should "refuse to typecheck a library-side class extending the sealed AgentDispatch directly from a different file" in {
+    // The other half of round three's fix: `sealed` is what actually keeps a foreign IMPLEMENTOR
+    // out (see `AgentDispatch`'s own doc, `src/Caps.scala`), and that restriction applies even to
+    // LIBRARY code, not only to a consumer's package, the moment the attempt is in a different file
+    // than `Caps.scala`. `AgentDispatchImpl` two tests above is the escape hatch every real
+    // implementor uses instead; this test is what proves the direct route it avoids is actually
+    // closed, not merely unused by convention.
+    val errors = scala.compiletime.testing.typeCheckErrors(
+      """
+        |import in.rcard.litterbox._
+        |
+        |class DirectSubclass extends AgentDispatch:
+        |  private[litterbox] def dispatchReview(prompt: String, reviewFile: String): DispatchOutcome =
+        |    DispatchOutcome.Done
+        |  def worker(
+        |      role: Role,
+        |      promptFile: String,
+        |      patchOut: String,
+        |      logFile: String,
+        |      currentPatch: Option[String]
+        |  ): DispatchOutcome = DispatchOutcome.Done
+        |""".stripMargin
+    )
+
+    errors should not be empty
+    val messages = errors.map(_.message).mkString("\n")
+    messages should include("sealed trait AgentDispatch")
+    messages should include("different source file")
+  }
+
   it should "leave the ledger untouched for a Cost.NoDispatch node that never actually dispatches" in {
     val world  = new TestWorld
     val clock  = new FakeClock(List(0L))

@@ -543,7 +543,7 @@ object LiveGateRunner:
   * review stub cannot simulate a reviewer timeout at all in the current suite), not something this
   * port introduced. Preserved verbatim, not "fixed" into worker-like rc-124 propagation.
   */
-final class LiveAgentDispatch(
+final class LiveAgentDispatch private[litterbox] (
     root: Path,
     sandboxDir: Path,
     timeoutBin: Option[String],
@@ -551,7 +551,7 @@ final class LiveAgentDispatch(
     implCmd: Option[String],
     fixCmd: Option[String],
     reviewCmd: Option[String]
-) extends AgentDispatch:
+) extends AgentDispatchImpl:
 
   // "" means unset, folded once on the way in (LiveProc.seam).
   private val implSeam   = LiveProc.seam(implCmd)
@@ -602,7 +602,13 @@ final class LiveAgentDispatch(
           LiveLog.log(s"$role sandbox dispatch exited rc=$rc (patch written by the container)")
           DispatchOutcome.Done
 
-  def review(prompt: String, reviewFile: String): DispatchOutcome =
+  // Overrides `dispatchReview`, not `review` (issue #35: see `AgentDispatch.review`'s own doc,
+  // `src/Caps.scala`, for why). Extends `AgentDispatchImpl`, not `AgentDispatch` directly (round
+  // three of issue #35's review: `AgentDispatch` is `sealed`, so only `Caps.scala` itself may extend
+  // it; `AgentDispatchImpl` is this file's way in). `private[litterbox]` here matches the abstract
+  // member's own visibility, which is what `AgentDispatch`'s own doc explains the exact guarantee
+  // and residual limits of.
+  private[litterbox] def dispatchReview(prompt: String, reviewFile: String): DispatchOutcome =
     // loop.sh:313 logs `$review_file`, which the call site (loop.sh:683) sets to `$LOG_DIR/...`,
     // i.e. absolute. Same rule as the gate and worker lines above: log the resolved path.
     val reviewPath = root.resolve(reviewFile)
