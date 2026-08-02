@@ -100,9 +100,33 @@ final class TestWorld:
   var ciWaitResult: GateResult          = GateResult.Green
   var rollupCounts: List[Int]           = List(1)   // last value repeats
   var prUrl: String                     = "https://github.com/test/test/pull/123"
-  var prStateAnswer: String             = "MERGED"
-  var mergeRc: Int                      = 0        // bash's $merge_rc; nonzero = merge cmd failed
-  var applySucceeds: Boolean            = true
+
+  /** `GitHub.prForBranch`'s answer (issue #36): `None` by default, the ordinary fresh-tick shape
+    * (no PR open yet, `Machine`'s PR-open node's own probe finds nothing and proceeds to
+    * `createPr`). Script `Some(n)` to simulate a crashed tick resuming after a PR was already
+    * opened: the probe then recognises it and `gh pr create` is never called a second time,
+    * PROVIDED `existingPrState` below still reads `"OPEN"` (see that field's own doc).
+    */
+  var existingPrNumber: Option[Int] = None
+
+  /** The state `prForBranch`'s probe reads for `existingPrNumber` (issue #36 review, BLOCKER 1):
+    * separate from `prStateAnswer` below, which models the state THIS run's own `Merge` node reads
+    * post-merge, because the crash-resume story `existingPrNumber` alone cannot script is a PR that
+    * is already CLOSED or MERGED when this tick starts, a fact entirely independent of anything this
+    * tick's own `gh.merge` call ever does. Defaults `"OPEN"`, so every scenario predating this field,
+    * which scripts `existingPrNumber` alone, keeps adopting it exactly as it always did.
+    */
+  var existingPrState: String = "OPEN"
+
+  /** `GitHub.prState`'s answer to `Merge`'s own post-merge VERIFICATION read (issue #36): the only
+    * call site left that reads it, now that `Merge`'s own probe is `_ => None` unconditionally (issue
+    * #36 review, BLOCKER 2/MAJOR 3: `performMerge` always calls `gh.merge`, matching `main`, so
+    * there is no pre-merge read of this to model separately). Defaults `"MERGED"`, the ordinary
+    * happy-path shape. Script `"OPEN"` (Scenario N) to simulate an unverifiable merge.
+    */
+  var prStateAnswer: String  = "MERGED"
+  var mergeRc: Int           = 0    // bash's $merge_rc; nonzero = merge cmd failed
+  var applySucceeds: Boolean = true
 
   /** How much `Clock.nowMillis()` advances on every single call, starting from `0`; defaults to `0`,
     * an unmoving clock, so every scenario that never touches this knob keeps reading a constant `0`
@@ -215,6 +239,9 @@ final class TestWorld:
       record("gh issue list --label blocked"); blockedIssues
     def createPr(branch: String, title: String, body: String): String =
       record(s"gh pr create --head $branch --title $title"); prBodies = prBodies :+ body; prUrl
+    def prForBranch(branch: String): Option[Int] =
+      record(s"gh pr view $branch --json number,state")
+      existingPrNumber.filter(_ => existingPrState == "OPEN")
     def prComment(pr: Int, body: String): Unit =
       record(s"gh pr comment $pr")
     def issueComment(issue: Int, body: String): Boolean =
@@ -226,7 +253,8 @@ final class TestWorld:
       record(s"gh pr view $pr --json comments")
       Some(prCommentBodies.getOrElse(pr, Nil))
     def prState(pr: Int): String =
-      record(s"gh pr view $pr --json state"); prStateAnswer
+      record(s"gh pr view $pr --json state")
+      prStateAnswer
     def checksRollupCount(pr: Int): Option[Int] =
       record(s"gh pr view $pr --json statusCheckRollup")
       rollupCounts match

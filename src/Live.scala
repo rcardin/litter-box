@@ -1023,6 +1023,29 @@ final class LiveGitHub(
       ).stdoutTrimmedTrailingNewlines
     finally Files.deleteIfExists(tmp)
 
+  /** Added for issue #36 (`Caps.GitHub.prForBranch`'s own doc has the reason): `gh pr view` resolves
+    * by head branch as well as by number/URL, so this needs no separate lookup subcommand. Any
+    * nonzero exit (no PR for this branch, or the read itself failed) reads as `None`, the same
+    * fail-open shape `prState`'s own `if r.rc == 0` gives.
+    *
+    * Reads `state` alongside `number` and only returns a number when `state` is `OPEN` (issue #36
+    * review, BLOCKER 1): `gh pr view <branch>` resolves a CLOSED or MERGED pull request for that
+    * head branch exactly as readily as an OPEN one, and `branch` is deterministic (`s"us-$issue"`,
+    * `Machine.iterate`'s own `val branch`), so without this filter a tick resuming an issue whose
+    * earlier PR was already merged (or closed) would adopt that stale PR instead of opening a fresh
+    * one, and every node downstream of `OpenPr` would then reason about a PR that has nothing to do
+    * with this iteration's own commits. `--json`/`--jq` ask for both fields in one call rather than a
+    * second round trip: `.number,.state` prints the two on separate lines, the same shape
+    * `commentsOf` above already relies on `linesIterator` to split.
+    */
+  def prForBranch(branch: String): Option[Int] =
+    val r = gh("pr", "view", branch, "--json", "number,state", "--jq", ".number,.state")
+    if r.rc != 0 then None
+    else
+      r.stdoutTrimmedTrailingNewlines.linesIterator.toList match
+        case numStr :: state :: Nil if state == "OPEN" => numStr.toIntOption
+        case _                                         => None
+
   /** loop.sh:462: `gh pr comment PR --body BODY` (argv, not `--body-file`). */
   def prComment(pr: Int, body: String): Unit =
     gh("pr", "comment", pr.toString, "--body", body)

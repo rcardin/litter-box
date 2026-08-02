@@ -239,6 +239,100 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     )
   }
 
+  // ---- issue #36: the PR-open step probes GitHub for "already done" ------------------------
+
+  it should "recognise an OPEN PR a crashed tick already opened and not open a second one (issue #36)" in {
+    // Simulates a tick RESUMING (issue #36 review, MAJOR 2: `w.inProgress`, not `w.ready`, is what
+    // makes this a genuine crash-resume rather than a fresh pick; see `OpenPr`'s own doc for why that
+    // distinction is what its probe now gates on) after an earlier, crashed attempt already ran
+    // `gh pr create` successfully for this branch: `OpenPr`'s own probe (`GitHub.prForBranch`) is
+    // what a real resumed tick would ask GitHub, so scripting the answer directly is enough to
+    // exercise it, without needing to actually replay two separate `runLoop()` calls.
+    val w = TestWorld()
+    w.inProgress = Some(999)
+    w.ready = None
+    w.labels = List("in-progress", "class-1")
+    w.existingPrNumber = Some(123)
+    // w.existingPrState defaults "OPEN": the ordinary crash-resume shape this probe exists for.
+
+    val exit = w.runLoop()
+
+    exit shouldBe LoopExit.Success
+    w.called("gh pr create") shouldBe false // the probe found OPEN #123; createPr never ran
+    w.called("gh pr view us-999 --json number,state") shouldBe true // the probe DID ask GitHub
+    // everything downstream of the (reused) PR number still runs normally against it
+    w.called("gh pr merge 123 --squash --delete-branch") shouldBe true
+    w.called("gh issue edit 999 --remove-label in-progress") shouldBe true
+    // the probe hit's own observability (issue #36 review, MAJOR 4): the PR chip still lights,
+    // as a distinct "skip" state rather than silently vanishing off the phase sequence.
+    w.events.exists(e => e.phase == "PR" && e.state == "skip" && e.detail.contains("pr=123")) shouldBe true
+  }
+
+  it should "NOT adopt a MERGED PR left over on the branch, and open a genuine new one instead (issue #36 review, BLOCKER 1)" in {
+    // A resumed tick (see the previous test for why `w.inProgress`, not `w.ready`, is what makes it
+    // one) whose earlier, crashed attempt opened a PR that has SINCE been merged out of band (by a
+    // human, or GitHub auto-merge) while this run was down: `gh pr view <branch>` resolves a
+    // CLOSED/MERGED PR for that head branch just as readily as an OPEN one, so that history (#123)
+    // must not be treated as this iteration's own outcome. `OpenPr`'s probe declines it, `gh pr
+    // create` opens a genuinely fresh PR (#456 here, deliberately a different number so the
+    // assertions below cannot pass by coincidence), and the rest of the chain merges THAT one, never
+    // #123.
+    val w = TestWorld()
+    w.inProgress = Some(999)
+    w.ready = None
+    w.labels = List("in-progress", "class-1")
+    w.existingPrNumber = Some(123)
+    w.existingPrState = "MERGED"
+    w.prUrl = "https://github.com/test/test/pull/456"
+
+    val exit = w.runLoop()
+
+    exit shouldBe LoopExit.Success
+    w.called("gh pr view us-999 --json number,state") shouldBe true // the probe DID ask GitHub
+    w.called("gh pr create") shouldBe true // declined adoption of #123; a new PR was opened
+    w.called("gh pr merge 456 --squash --delete-branch") shouldBe true // the NEW PR is what merges
+    w.called("gh pr merge 123") shouldBe false // the stale, already-merged PR is never touched
+    w.called("gh issue edit 999 --remove-label in-progress") shouldBe true
+    w.notifications shouldBe List("harness: #999 auto-merged (PR #456, CI green, reviewer APPROVE)")
+  }
+
+  it should "NOT adopt a stale OPEN audit PR left open by an earlier, TERMINAL needs-human/needs-review " +
+    "iteration, when a human relabels the issue ready again (issue #36 review, MAJOR 2)" in {
+    // The dangerous case MAJOR 2 named: `branch` (`us-999`) is the SAME for every attempt at this
+    // issue, ever. An earlier, fully COMPLETED iteration reached `needs-human`/`needs-review` and, by
+    // design, left its own PR open pending a human (only `Route.Parked` skips opening one). If a
+    // human later relabels #999 `ready` again without closing that PR, THIS tick is a genuinely FRESH
+    // pick (`w.ready`, not `w.inProgress`, same as every other scenario in this file that never
+    // touches either field), never resumed from anything, so it must not adopt PR #123: doing so
+    // would silently discard this run's own freshly rendered PR body/note and, on this class-1
+    // APPROVE route, auto-merge a PR whose body may still carry the earlier outcome's "do NOT merge"
+    // wording. `OpenPr`'s probe now declines WITHOUT even asking GitHub about #123 (there is nothing
+    // in this tick's own bookkeeping that could make #123 its own), so `run` calls `gh pr create`
+    // for what it believes is a genuinely fresh PR.
+    //
+    // On real GitHub, `gh pr create` itself refuses a second PR on a branch that already has one open
+    // (Machine.scala's own `OpenPr` doc, issue #36 review, MAJOR 1): the earlier version of this test
+    // scripted `w.prUrl` as a SECOND, successful create against #123's own still-OPEN branch, a world
+    // real `gh` cannot produce. `w.prUrl = ""` is what a refused `gh pr create` actually prints to
+    // stdout; `LiveGitHub.createPr` never inspects the exit code, so `prNumberOf` reads no PR number
+    // out of that empty result and this tick infra-faults, rc 50, rather than opening or merging
+    // anything, exactly the outcome `OpenPr`'s own doc now names for this path. The non-adoption
+    // assertion below is the one this test exists to pin: #123 is never even asked about.
+    val w = TestWorld()
+    w.labels = List("ready", "class-1")
+    w.existingPrNumber = Some(123) // the stale audit PR, still OPEN
+    w.prUrl = ""
+
+    val exit = w.runLoop()
+
+    exit shouldBe LoopExit.InfraFault
+    exit.rc shouldBe 50
+    w.called("gh pr view us-999 --json number,state") shouldBe false // never asked: not resumed
+    w.called("gh pr create") shouldBe true // a fresh PR was attempted, and refused on real GitHub
+    w.called("gh pr merge 456 --squash --delete-branch") shouldBe false // nothing merges on a fault
+    w.called("gh pr merge 123") shouldBe false // the stale audit PR is never touched
+  }
+
   // ---- issue #11: which runner each tier gets ----------------------------------------------
 
   it should "send the CI wait to the host runner and only the FAST gate to the sandboxable one" in {
@@ -1934,7 +2028,13 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     val exit = w.runLoop()
 
     exit shouldBe LoopExit.InfraFault
-    w.called("gh pr view 123 --json state") shouldBe false // verify not reached
+    // Zero reads (issue #36 review, MAJOR 3/MINOR 8): `Merge`'s own probe is `_ => None`
+    // unconditionally (see that node's own doc for why it no longer reads `prState` ahead of
+    // `gh.merge`), so `performMerge` always calls `gh.merge` first, exactly as `main` does; the
+    // ONLY read of this string would be the POST-merge verification, never reached because the
+    // merge command itself fails first, see `LogParitySpec`'s "merge-rc-carried" for the same
+    // invariant pinned against the golden log stream.
+    w.called("gh pr view 123 --json state") shouldBe false
     w.callCount("--remove-label in-progress") shouldBe 0
     w.notifications shouldBe List(
       "harness: infra fault — loop exited rc=50 for inspection (issue stays in-progress)"

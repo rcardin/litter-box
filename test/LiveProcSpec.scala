@@ -1068,6 +1068,49 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
     )
   }
 
+  "LiveGitHub.prForBranch" should "return the PR number on success and None on a failed lookup" in {
+    val root    = tempRoot()
+    val binDir  = Files.createTempDirectory("fake-gh-branch-bin")
+    writeExecutable(
+      binDir,
+      "gh",
+      """#!/usr/bin/env bash
+        |case "$3" in
+        |  us-999) printf '42\nOPEN\n' ;;
+        |  *) echo "gh: no pull requests found for branch \"$3\"" >&2; exit 1 ;;
+        |esac
+        |""".stripMargin
+    )
+    val gh = LiveGitHub(root, None, None, extraPath = Some(binDir.toString))
+
+    gh.prForBranch("us-999") shouldBe Some(42)
+    gh.prForBranch("us-666") shouldBe None
+  }
+
+  it should "NOT adopt a PR for the branch that is already MERGED or CLOSED (issue #36 review, BLOCKER 1)" in {
+    // `gh pr view <branch>` resolves a closed/merged PR for that head branch exactly as readily as
+    // an open one; `prForBranch`'s whole justification (`Caps.GitHub.prForBranch`'s own doc) holds
+    // only for an OPEN PR, so a non-OPEN state must read back as `None`, the same as no PR at all.
+    val root   = tempRoot()
+    val binDir = Files.createTempDirectory("fake-gh-branch-state-bin")
+    writeExecutable(
+      binDir,
+      "gh",
+      """#!/usr/bin/env bash
+        |case "$3" in
+        |  us-open)   printf '42\nOPEN\n' ;;
+        |  us-merged) printf '43\nMERGED\n' ;;
+        |  us-closed) printf '44\nCLOSED\n' ;;
+        |esac
+        |""".stripMargin
+    )
+    val gh = LiveGitHub(root, None, None, extraPath = Some(binDir.toString))
+
+    gh.prForBranch("us-open") shouldBe Some(42)
+    gh.prForBranch("us-merged") shouldBe None
+    gh.prForBranch("us-closed") shouldBe None
+  }
+
   "LiveGitHub.checksRollupCount" should "call the default gh argv when CI_APPEAR_CMD is unset" in {
     val root                   = tempRoot()
     val (binDir, callsFile, _) = setupFakeGh()

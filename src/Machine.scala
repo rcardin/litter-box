@@ -395,7 +395,16 @@ object Machine:
     val setup = Runner.step(Pick, PickInput(n, cur))(using caps, faulting, Runner.Ledger(0)) match
       case NodeOutcome.Stopped(exit) => return exit
       case NodeOutcome.Done(ready)   => ready
-    import setup.{issue, bodyFile, workerPromptFile, isClass1, branch, resumeAuthors, carriesParked}
+    import setup.{
+      issue,
+      bodyFile,
+      workerPromptFile,
+      isClass1,
+      branch,
+      resumeAuthors,
+      carriesParked,
+      resumedFromInProgress
+    }
 
     // The shared dispatch `Ledger` every `Cost.OneDispatch` node from here on (`Implement`, `Repair`)
     // draws from, seeded resume-aware (issue #34 review finding F4) now that `resumeAuthors` is
@@ -452,7 +461,17 @@ object Machine:
       failureKind = failureKind,
       reviewed = reviewed,
       reviewFile = reviewFile,
-      carriesParked = carriesParked
+      carriesParked = carriesParked,
+      resumedFromInProgress = resumedFromInProgress,
+      caps = caps,
+      // The SAME shared `Ledger` `Implement`/`Repair` already draw from, not a fresh one: every
+      // node this phase runs (`RouteDecision`, `CommitAndPush`, `OpenPr`, `CiWait`, `Merge`,
+      // `PostMergeCleanup`) declares `Cost.NoDispatch` and calls no `AgentDispatch` method at all, so
+      // none of them can ever charge it (`Ledger.chargeDispatch` only fires from a real dispatch
+      // call, `Kit.scala`'s own doc), unlike `Review`'s own dedicated `Runner.Ledger(1)` a few
+      // screens up, which exists precisely because that node DOES dispatch. Reusing `ledger` here
+      // costs nothing and avoids minting a value with no purpose.
+      ledger = ledger
     )
 
   /** The four outcomes `pickAndSetup`'s reply check can reach for one candidate parked issue, named
@@ -786,6 +805,17 @@ object Machine:
     // tick above instead, so there is no degraded case left for this membership test to answer for.
     val carriesParked = parkedCandidates.contains(issue)
 
+    // Whether `issue` was ALREADY `in-progress` before this tick's own pick, i.e. the crash-resume
+    // shape `OpenPr`'s own probe exists for (issue #36 review, MAJOR 2): read straight off `inProgress`
+    // above, which is this tick's own, already-taken `gh.inProgressIssue()` answer, never a stored
+    // position from an earlier tick (RFC #26 decision 6). `false` on every OTHER pick path (the ready
+    // queue, or the parked queue with a freshly accepted reply): a freshly picked issue's `in-progress`
+    // label is one THIS tick's own flip below is about to add, not one it found already there, so no
+    // earlier attempt of THIS SAME issue can have left a PR in flight for `OpenPr` to legitimately
+    // adopt. See `OpenPr`'s own doc for why that distinction, not "an OPEN PR exists on the branch"
+    // alone, is what its probe now gates on.
+    val resumedFromInProgress = inProgress.contains(issue)
+
     cur.iter = n; cur.issue = issue.toString; cur.pass = 0; cur.budget = cfg.repairBudget
     emit(cur, "PICK", "ok", detail = s"issue=$issue")
     logger.log(s"iteration $n -> issue #$issue")
@@ -847,7 +877,16 @@ object Machine:
     if !gh.editLabels(issue, add = List(cfg.labels.active), remove = remove) then
       logger.log(s"WARNING: could not flip #$issue to in-progress (flip by hand)")
 
-    PickAndSetup.Ready(issue, bodyFile, workerPromptFile, isClass1, branch, resumeAuthors, carriesParked)
+    PickAndSetup.Ready(
+      issue,
+      bodyFile,
+      workerPromptFile,
+      isClass1,
+      branch,
+      resumeAuthors,
+      carriesParked,
+      resumedFromInProgress
+    )
 
   /** `Pick`'s input (issue #32): the same two values `pickAndSetup` has always taken, `n` and the
     * shared `Cursor`, named as a case class rather than left a bare `(Int, Cursor)` so `Pick`'s own
@@ -1829,15 +1868,214 @@ object Machine:
   private def activeAndParked(carriesParked: Boolean)(using cfg: Config): List[String] =
     cfg.labels.active :: (if carriesParked then List(cfg.labels.parked) else Nil)
 
+  /** `RouteDecision`'s input (issue #36): the three values `terminal`'s own route decision has ever
+    * read (`Outcome`, `isClass1`, `failureKind`); `cfg.parkOnExhaustion` reaches the node's `run`
+    * through the ambient `Caps`, the same way every other capability a node's body needs does,
+    * rather than travelling as a fourth field here.
+    */
+  private final case class RouteInput(outcome: Outcome, isClass1: Boolean, failureKind: Option[FailureKind])
+
+  /** The terminal route decision, unchanged line for line from `terminal`'s own former `val route =
+    * ...`, extracted only so `RouteDecision`'s `run` has a named function to call.
+    */
+  private def decideRoute(outcome: Outcome, isClass1: Boolean, failureKind: Option[FailureKind])(using
+      cfg: Config
+  ): Route =
+    if outcome == Outcome.Success && isClass1 then Route.AutoMergeCandidate
+    else if outcome == Outcome.Success then Route.NeedsReview
+    else if cfg.parkOnExhaustion &&
+        (failureKind.contains(FailureKind.GateRed) || failureKind.contains(FailureKind.ReviewChanges))
+    then Route.Parked
+    else Route.NeedsHuman
+
+  /** RouteDecision, converted to a `Node` (issue #36), named distinctly from the `Route` enum itself
+    * (already the name the enum's own generated companion object holds in this scope) rather than
+    * `Route`. `cost = Cost.NoDispatch`, `timeout = Timeout.Unbounded`: this node calls no capability
+    * at all, `decideRoute` is pure, so both are trivially true rather than a claim about real work
+    * this node skips. It is still a `Node`, not a plain call inside `terminal`, so that the dispatch
+    * immediately after it (which node runs next, `CommitAndPush`/`OpenPr` either way, then
+    * `autoMerge` or the needs-review/needs-human flip) is chosen from THIS node's own OUTPUT, the
+    * same shape every other transition in this graph already takes (`Kit.Node`'s own checklist).
+    *
+    * `probe = _ => None`: a route is a fact about `outcome`/`isClass1`/`failureKind`, all already
+    * decided by the time this node runs, never a stored position to rediscover (RFC #26 decision 6),
+    * the same reasoning `Pick`'s own `probe` doc gives.
+    */
+  private val RouteDecision: Node[RouteInput, Route] =
+    Node(
+      name = "Route",
+      cost = Cost.NoDispatch,
+      timeout = Timeout.Unbounded,
+      probe = _ => None,
+      run = input => NodeOutcome.Done(decideRoute(input.outcome, input.isClass1, input.failureKind))
+    )
+
+  /** `CommitAndPush`'s input (issue #36): the two values `commitAndPush` needs. */
+  private final case class CommitPushInput(branch: String, message: String)
+
+  private def commitAndPush(branch: String, message: String)(using git: Git): Unit =
+    git.commit(message)
+    git.push(branch)
+
+  /** CommitAndPush, converted to a `Node` (issue #36): `cost = Cost.NoDispatch` (a `Git` call, never
+    * an `AgentDispatch` one), `timeout = Timeout.Unbounded` (the former straight-line code carried no
+    * bound of its own here either).
+    *
+    * `probe = _ => None`, and unlike `CiWait`/`PostMergeCleanup` below this is not a provably
+    * unreachable condition, it is a genuinely UNAVAILABLE one: git alone has no safe way to tell a
+    * pushed branch from an unpushed one without a two-dot diff against `origin/main`, the exact
+    * comparison issue #28 already tried and reverted for a different probe (`Implement`'s own doc has
+    * the full argument, PR #17/PR #28). Nor is a duplicate here the hazard the PR/merge steps below
+    * guard against: a resumed tick only ever reaches this node after `Implement`/`Repair` produced a
+    * FRESH cumulative patch, so a second commit here is simply THIS iteration's own commit, never a
+    * replay of an earlier one.
+    */
+  private val CommitAndPush: Node[CommitPushInput, Unit] =
+    Node(
+      name = "CommitAndPush",
+      cost = Cost.NoDispatch,
+      timeout = Timeout.Unbounded,
+      probe = _ => None,
+      run = input =>
+        commitAndPush(input.branch, input.message)
+        NodeOutcome.Done(())
+    )
+
+  /** `OpenPr`'s input (issue #36): the values `openPr` needs, `cur`/`issue`/`outcomeText` travelling
+    * only so `openPr` can still emit and log exactly as `terminal`'s former inline code did.
+    * `resumedFromInProgress` (issue #36 review, MAJOR 2) is what the probe gates adoption on; see the
+    * node's own doc.
+    */
+  private final case class OpenPrInput(
+      cur: Cursor,
+      issue: Int,
+      branch: String,
+      title: String,
+      body: String,
+      outcomeText: String,
+      resumedFromInProgress: Boolean
+  )
+
+  /** The PR-open half of `terminal`'s former inline code, extracted so `OpenPr`'s node `run` has a
+    * named method to call, the same shape every other node in this file already uses. Takes a
+    * recovered `Faulting`, not `Fault` directly: this body is relocated, not new, so it keeps
+    * raising through the SAME `infraFault` this file already had.
+    */
+  private def openPr(cur: Cursor, issue: Int, branch: String, title: String, body: String, outcomeText: String)(
+      using gh: GitHub, log: StatusLog, logger: Log, notify: Notify
+  )(using Faulting): Int =
+    val prUrl = gh.createPr(branch, title, body)
+    val prNum = prNumberOf(prUrl) match
+      case None =>
+        infraFault("could not determine PR number from gh pr create output — infra fault")
+      case Some(p) => p
+    logger.log(s"PR #$prNum opened for #$issue (outcome $outcomeText)")
+    emit(cur, "PR", "ok", detail = s"pr=$prNum outcome=$outcomeText")
+    prNum
+
+  /** OpenPr, converted to a `Node` (issue #36): `cost = Cost.NoDispatch`, `timeout =
+    * Timeout.Unbounded`, the same reasoning as `CommitAndPush` above.
+    *
+    * `probe` reads `gh.prForBranch(input.branch)`, a genuine GitHub answer (RFC #26 decision 6),
+    * never a stored position, and, when it finds an OPEN PR already open for this branch, hands its
+    * number straight back instead of calling `gh.createPr` a second time. Unlike `CommitAndPush`'s
+    * own `_ => None`, this signal genuinely exists (`Caps.GitHub.prForBranch`'s own doc has the
+    * reason it was added) and the condition it detects is genuinely reachable: a crash between a
+    * successful `createPr` and this node returning leaves `issue` still `in-progress` with no PR
+    * number recorded anywhere `Pick` can read, so the next tick redoes `Implement`/`Repair`/`Review`
+    * and arrives back here with the SAME `branch`, the one fact `gh pr create` itself refuses to
+    * open a second PR against, and the one fact this probe can ask GitHub about directly.
+    * `prForBranch` itself only ever answers with an OPEN PR (issue #36 review, BLOCKER 1): a branch
+    * whose only PR is already MERGED or CLOSED is, as far as THIS probe is concerned, a branch with
+    * no PR at all, so `run` opens a genuine new one for it rather than treating stale history as
+    * this iteration's own outcome.
+    *
+    * The GitHub read alone is NOT enough (issue #36 review, MAJOR 2): every US always branches to the
+    * SAME `us-$issue`, for every attempt at that issue, ever, so "an OPEN PR exists on `branch`" does
+    * not by itself mean "an EARLIER HALF of THIS SAME iteration opened it". A `needs-review` or
+    * `needs-human` route also opens a PR (only `Route.Parked` skips it) and leaves it open for a
+    * human, by design, potentially for a long time; if a human later relabels that issue `ready`
+    * again without closing that PR, and the loop picks it up fresh, this probe would otherwise adopt
+    * that stale PR, silently discard the freshly rendered `.pr-body.md` (its `prNote` reflecting
+    * whatever THIS run decided, not what the old PR's body still says), and, on the class-1 APPROVE
+    * route, auto-merge a PR whose body may still read "do NOT merge" from the earlier outcome. There
+    * is no `gh pr edit` capability in this file to correct a stale body after the fact, so adoption
+    * has to be prevented, not patched up after.
+    *
+    * The fix does not read anything new from GitHub: it is gated on `input.resumedFromInProgress`,
+    * which `pickAndSetup` already derives, this SAME tick, from its own `gh.inProgressIssue()` read
+    * (`PickAndSetup.Ready`'s own doc), the fact that distinguishes the two stories in the ordinary
+    * case. A genuine crash-resume reaches `OpenPr` with `issue` having been `in-progress` before this
+    * tick's pick even ran (that is what "resumed" means throughout this file when the flip that sets
+    * it lands; see `CiWait`'s own doc for the same premise used the same way, with the same
+    * qualification), and a freshly picked `ready` issue ordinarily never was. Neither half of that is
+    * proven, though (issue #36 review, MAJOR 3): both directions depend on a label flip elsewhere in
+    * this file actually landing, and every flip in this file is warn only (issue #50 review, round 3,
+    * finding B), so a failed one is a real, silent gap here, not something this fix rules out by
+    * construction, in the same honest idiom `PostMergeCleanup`'s own doc below uses for its own gap.
+    * A failed pick-time flip (`pickAndSetup`, the `editLabels` call that adds `active`) leaves a
+    * genuine crash-resume looking to this same read exactly like a fresh pick, since the label that
+    * read would have found was never actually set; `test/golden/ci-red-label-flip-failed.log` pins a
+    * tick that fails a flip and keeps going regardless, so this is not hypothetical. A failed terminal
+    * flip on the `needs-review`/`needs-human` route (see that route's own `editLabels` call below)
+    * leaves `in-progress` set on an issue whose PR is otherwise done; if a human later relabels that
+    * issue `ready` without closing the PR, the next pick reads `in-progress` still present and reports
+    * `resumedFromInProgress = true` for what is genuinely a fresh pick, which is precisely the stale
+    * audit PR adoption MAJOR 2 above set out to prevent, recurring through the one path that check
+    * does not cover. So on the ordinary path, when `resumedFromInProgress` is `false`, the probe
+    * declines unconditionally, without even asking `prForBranch`, and `run` opens a fresh PR for it.
+    * If a flip above has already failed and left an OPEN PR on this SAME branch from an earlier
+    * attempt, `gh pr create` itself refuses a second one (`Caps.GitHub.prForBranch`'s own doc);
+    * `LiveGitHub.createPr` ignores its rc, `prNumberOf` finds no PR number in the empty result, and
+    * this node infra-faults, rc 50, by design, rather than guessing which of two PRs on the branch is
+    * this run's own; a human closes the stale PR by hand and the next tick proceeds. On the ordinary
+    * path this is still a real, deliberate behaviour change from adopting any OPEN PR on the branch:
+    * it is the whole point, and it costs nothing this file already had another use for, since
+    * `resumedFromInProgress` is only ever forwarded, not re-derived.
+    *
+    * A probe hit skips `run`, and with it the `logger.log`/`emit(cur, "PR", "ok", ...)` pair `run`'s
+    * own `openPr` would otherwise have produced (issue #36 review, MAJOR 4): `resources/observe`'s
+    * banner renders its `pr` chip straight off that phase event, so leaving the hit path silent would
+    * have a resumed, probe-satisfied tick print nothing on the `pr` chip at all, while the rest of the
+    * banner carries on past it. `emit`'s own `"skip"` state already has a distinct glyph
+    * (`banner.sh`'s `sym`), so the hit path emits that, not `"ok"`: an operator reading the banner can
+    * tell a PR this tick actually opened apart from one it recognised as already there.
+    */
+  private val OpenPr: Node[OpenPrInput, Int] =
+    Node(
+      name = "OpenPr",
+      cost = Cost.NoDispatch,
+      timeout = Timeout.Unbounded,
+      probe = input =>
+        if !input.resumedFromInProgress then None
+        else
+          summon[GitHub].prForBranch(input.branch).map { prNum =>
+            summon[Log].log(s"PR #$prNum already open for #${input.issue} (found by OpenPr's own probe)")
+            emit(input.cur, "PR", "skip", detail = s"pr=$prNum outcome=${input.outcomeText}")
+            prNum
+          },
+      run = input =>
+        given Faulting = summon[Fault].label
+        NodeOutcome.Done(
+          openPr(input.cur, input.issue, input.branch, input.title, input.body, input.outcomeText)
+        )
+    )
+
   /** The third and last of the phase extractions `iterate` is being split into (issue #31 / RFC #26
     * decision 12). Unlike `pickAndSetup` and `implementAndRepair`, there is nothing left in `iterate`
     * after this phase runs, so its result IS `iterate`'s result: a plain `LoopExit`, not a
     * `StoppedEarly`/`Ready` sum type invented for symmetry with the other two. A sum type here would
     * have no second case to distinguish.
     *
-    * Takes `hostGates` and `clock` only because `autoMerge` needs them; this function itself never
-    * touches either directly. Carrying them is the price of naming the phase as one function rather
-    * than inlining `autoMerge`'s dispatch back into `iterate`.
+    * `caps`/`ledger` are plain parameters, not `using` (issue #36, the same reasoning
+    * `implementAndRepair`'s own doc gives for its identical pair): they exist only so the six
+    * `Node`s this phase now runs (`RouteDecision`, `CommitAndPush`, `OpenPr`, and, inside
+    * `autoMerge`, `CiWait`/`Merge`/`PostMergeCleanup`) can go through `Runner.step`, and a `using
+    * caps: Caps` here would risk the exact silent-shadowing trap `implementAndRepair`'s doc
+    * describes for its own capabilities. `hostGates`/`clock`, which `autoMerge` used to need as
+    * individual `using` parameters threaded through this function for no other reason, are gone from
+    * this signature entirely now that `caps` (which already carries both) is what `autoMerge`
+    * receives instead.
     *
     * The terminal route is decided ONCE, here, and threaded to every downstream site instead of
     * being re-tested: see `Route`'s own scaladoc for why that property matters.
@@ -1854,7 +2092,10 @@ object Machine:
       failureKind: Option[FailureKind],
       reviewed: Boolean,
       reviewFile: String,
-      carriesParked: Boolean
+      carriesParked: Boolean,
+      resumedFromInProgress: Boolean,
+      caps: Caps,
+      ledger: Runner.Ledger
   )(using
       cfg: Config,
       gh: GitHub,
@@ -1862,10 +2103,8 @@ object Machine:
       fs: HarnessFs,
       log: StatusLog,
       notify: Notify,
-      logger: Log,
-      hostGates: HostGateRunner,
-      clock: Clock
-  )(using Faulting): LoopExit =
+      logger: Log
+  )(using faulting: Faulting): LoopExit =
     // A fixer that produced no diff left the tree pristine (stagePatch reset to origin/main
     // before it saw the empty patch), so the "nothing staged" guard below would otherwise fire
     // first and mask the routing. Stage a small tracked marker so the needs-human audit PR
@@ -1894,14 +2133,19 @@ object Machine:
     // `Route.Parked` (issue #28) is deliberately narrow: only the GENERIC budget-exhaustion
     // sub-case (gate-RED or REQUEST_CHANGES) parks. A guard rejection (protected-path, oversized)
     // or an empty fix produced no usable work and is not "waiting on guidance"; those keep going
-    // to `Route.NeedsHuman` exactly as before, regardless of `cfg.parkOnExhaustion`.
-    val route =
-      if outcome == Outcome.Success && isClass1 then Route.AutoMergeCandidate
-      else if outcome == Outcome.Success then Route.NeedsReview
-      else if cfg.parkOnExhaustion &&
-          (failureKind.contains(FailureKind.GateRed) || failureKind.contains(FailureKind.ReviewChanges))
-      then Route.Parked
-      else Route.NeedsHuman
+    // to `Route.NeedsHuman` exactly as before, regardless of `cfg.parkOnExhaustion`. Runs through
+    // `RouteDecision` (issue #36), a `Node` only so this decision's OUTPUT is what the rest of this
+    // function's own dispatch reads (`Kit.Node`'s own checklist: "`Next.Goto` picks the next edge
+    // from the node's OUTPUT"), not because it touches any capability, see that node's own doc.
+    val route = Runner.step(RouteDecision, RouteInput(outcome, isClass1, failureKind))(using
+      caps,
+      faulting,
+      ledger
+    ) match
+      case NodeOutcome.Done(r)       => r
+      case NodeOutcome.Stopped(exit) =>
+        // Unreachable: `RouteDecision.run` only ever returns `NodeOutcome.Done` (see its own doc).
+        return exit
 
     val (label, commitTag, prNote) =
       route match
@@ -2004,16 +2248,22 @@ object Machine:
     if route == Route.NeedsHuman then
       notify.notify(s"harness: #$issue needs-human ($kindText, gate $gateStatus)")
 
-    git.commit(
-      s"""feat(US-$issue): autonomous iteration — $commitTag
-         |
-         |Refs #$issue. Loop iteration $n, $pass gate pass(es). Outcome: $outcomeText.
-         |This commit was produced by an unattended claude -p iteration (harness v2).
-         |
-         |Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>""".stripMargin
-    )
-
-    git.push(branch)
+    Runner.step(
+      CommitAndPush,
+      CommitPushInput(
+        branch,
+        s"""feat(US-$issue): autonomous iteration — $commitTag
+           |
+           |Refs #$issue. Loop iteration $n, $pass gate pass(es). Outcome: $outcomeText.
+           |This commit was produced by an unattended claude -p iteration (harness v2).
+           |
+           |Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>""".stripMargin
+      )
+    )(using caps, faulting, ledger) match
+      case NodeOutcome.Done(())      => ()
+      case NodeOutcome.Stopped(exit) =>
+        // Unreachable: `CommitAndPush.run` only ever returns `NodeOutcome.Done` (see its own doc).
+        return exit
 
     val prBody = StringBuilder()
     prBody ++= s"Autonomous harness (v2) iteration $n for #$issue.\n\n"
@@ -2027,20 +2277,26 @@ object Machine:
     prBody ++= s"Closes #$issue\n"
     fs.write(artifact(issue, ".pr-body.md"), prBody.toString)
 
-    val prUrl = gh.createPr(
-      branch,
-      s"US-$issue: autonomous iteration ($outcomeText, gate $gateStatus)",
-      prBody.toString
-    )
-    val prNum = prNumberOf(prUrl) match
-      case None =>
-        infraFault("could not determine PR number from gh pr create output — infra fault")
-      case Some(p) => p
-    logger.log(s"PR #$prNum opened for #$issue (outcome $outcomeText)")
-    emit(cur, "PR", "ok", detail = s"pr=$prNum outcome=$outcomeText")
+    val prNum = Runner.step(
+      OpenPr,
+      OpenPrInput(
+        cur,
+        issue,
+        branch,
+        s"US-$issue: autonomous iteration ($outcomeText, gate $gateStatus)",
+        prBody.toString,
+        outcomeText,
+        resumedFromInProgress
+      )
+    )(using caps, faulting, ledger) match
+      case NodeOutcome.Done(n)       => n
+      case NodeOutcome.Stopped(exit) =>
+        // Unreachable: `OpenPr.run` only ever returns `NodeOutcome.Done` (see its own doc); its
+        // only early exit is `infraFault`, which never returns a value for this case to carry.
+        return exit
 
     route match
-      case Route.AutoMergeCandidate => autoMerge(issue, prNum, cur, carriesParked)
+      case Route.AutoMergeCandidate => autoMerge(issue, prNum, cur, carriesParked, caps, ledger)
       case Route.NeedsReview | Route.NeedsHuman =>
         // A failed flip here (issue #50 review, round 3, finding B) used to be silently discarded:
         // the tick would still return `Success`/`NeedsHuman` with #issue left `in-progress` and no
@@ -2057,21 +2313,34 @@ object Machine:
         // exhaustivity check is what notices a future `Route` case added without a return here too.
         throw IllegalStateException("unreachable: Route.Parked returns before this point")
 
-  /** v4 auto-merge (class-1 + APPROVE only): wait-appear -> watch -> merge -> VERIFY the PR state
-    * is MERGED (unverified = infra fault) -> drop in-progress -> flip blocked -> fetch -> notify.
-    * CI red after green local gates = needs-human WITHOUT self-repair: the loop never repairs
-    * against the independent check.
+  /** `CiWait`'s input (issue #36): the values `ciWait` needs. `carriesParked` travels here, not
+    * just to `PostMergeCleanup` below, because the CI-RED branch flips the SAME `activeAndParked`
+    * label set the post-merge drop does, on the needs-human path instead of the success one.
     */
-  private def autoMerge(issue: Int, prNum: Int, cur: Cursor, carriesParked: Boolean)(using
+  private final case class CiWaitInput(cur: Cursor, issue: Int, prNum: Int, carriesParked: Boolean)
+
+  /** The CI-appear-poll-then-watch half of the former `autoMerge`, extracted so `CiWait`'s node
+    * `run` has a named method to call, the same shape every other node in this file already uses.
+    * Takes a recovered `Faulting`, not `Fault` directly (unlike `runFastGate`/`runReview`): this
+    * body is relocated, not new, so it keeps calling the SAME `infraFault`/`waitForChecks` this file
+    * already had rather than switching to `fault.raise` for no behavioural reason.
+    *
+    * Returns `NodeOutcome[Unit]` directly rather than a domain verdict `CiWait.run` would still have
+    * to translate (issue #34's `Gate` precedent doesn't apply here: unlike `GateVerdict`, CI-RED has
+    * nowhere further to route TO: it is its own terminal, `LoopExit.NeedsHuman`, so there is no
+    * caller-side `match` left for a narrower return type to serve). `Done(())` means "green, proceed
+    * to `Merge`"; `Stopped(LoopExit.NeedsHuman)` means the chain ends here, with every one of the
+    * CI-RED branch's own side effects (the PR comment, the label flip, the notify) already done.
+    */
+  private def ciWait(cur: Cursor, issue: Int, prNum: Int, carriesParked: Boolean)(using
       cfg: Config,
       gh: GitHub,
-      git: Git,
       hostGates: HostGateRunner,
       log: StatusLog,
       notify: Notify,
-      clock: Clock,
-      logger: Log
-  )(using Faulting): LoopExit =
+      logger: Log,
+      clock: Clock
+  )(using Faulting): NodeOutcome[Unit] =
     val ciLog = artifact(issue, ".ci-wait.log")
     emit(cur, "CI_WAIT", "start", ciLog)
     // Discriminate on data, not on the exit code: a fresh PR routinely reports zero checks
@@ -2106,34 +2375,201 @@ object Machine:
         if !gh.editLabels(issue, add = List("needs-human"), remove = activeAndParked(carriesParked)) then
           logger.log(s"WARNING: could not flip #$issue to needs-human (flip by hand)")
         notify.notify(s"harness: #$issue CI RED -> needs-human (PR #$prNum)")
-        LoopExit.NeedsHuman
+        NodeOutcome.Stopped(LoopExit.NeedsHuman)
       case GateResult.Green =>
         emit(cur, "CI_WAIT", "ok", ciLog)
         logger.log(s"CI green — merging PR #$prNum")
-        emit(cur, "MERGE", "start")
-        // Same `ciLog` the CI watch just wrote: bash appends the merge output to it (loop.sh:473).
-        val mergeRc = gh.merge(prNum, ciLog)
-        // loop.sh:475 prints the rc: it is what tells "PR not mergeable" from "gh auth expired".
-        if mergeRc != 0 then infraFault(s"merge command failed rc=$mergeRc — infra fault")
-        val state = gh.prState(prNum)
-        if state != "MERGED" then
-          // bash's `${state:-unknown}` (loop.sh:481): an empty answer from `gh pr view` is the
-          // very case this fault exists to report, so it must not print as an empty pair of quotes.
-          val shown = if state.isEmpty then "unknown" else state
-          infraFault(s"merge NOT verified (PR state '$shown') — infra fault")
-        emit(cur, "MERGE", "ok", detail = s"pr=$prNum")
-        // A failed drop here (issue #50 review, round 3, finding B) used to leave a genuinely
-        // MERGED issue silently `in-progress` forever, with the merge itself already verified above
-        // so nothing else about the tick would ever surface the problem. Warn, same as every other
-        // flip site in this file.
-        if !gh.editLabels(issue, add = Nil, remove = activeAndParked(carriesParked)) then
-          logger.log(s"WARNING: could not drop in-progress/parked from #$issue after merge (flip by hand)")
-        flipBlocked(issue)
-        // a post-merge fetch failure is tolerated: next tick re-fetches
-        if !git.fetchOriginMain() then
-          logger.log("post-merge fetch failed (next iteration re-fetches anyway)")
-        notify.notify(s"harness: #$issue auto-merged (PR #$prNum, CI green, reviewer APPROVE)")
-        LoopExit.Success
+        NodeOutcome.Done(())
+
+  /** CiWait, converted to a `Node` (issue #36): `cost = Cost.NoDispatch` (no `AgentDispatch` call
+    * anywhere in this chain), `timeout = Timeout.Unbounded` (the former straight-line code carried
+    * no node-level bound either, only `cfg.ciAppearTimeout`/`cfg.ciWaitTimeout`'s own subprocess-level
+    * ones, both still enforced exactly as before, inside `ciWait` itself).
+    *
+    * `probe = _ => None`, deliberately, not merely by default: a probe that answered "CI was already
+    * found red" would be dead code, never reachable through this loop's own resume path, because the
+    * CI-RED branch above REMOVES `in-progress` (through `activeAndParked`) as part of completing, when
+    * that flip succeeds (issue #36 review, MINOR 4; the flip is warn only, like every other one in this
+    * file, and `test/golden/ci-red-label-flip-failed.log` pins a tick where it fails), so a tick that
+    * ended CI-RED is ordinarily never resumed at all; there is no red result left to skip past a second
+    * time in the common case. That is NOT the only way a resumed tick reaches `CiWait` again, though
+    * (issue #36 review, MAJOR 1): CI can equally have gone GREEN on an earlier attempt, with the crash landing later,
+    * inside `Merge` or `PostMergeCleanup`, both of which leave `in-progress` set on anything short of
+    * full success. A tick resumed off that state runs `CommitAndPush` again first, unconditionally
+    * (its own doc), which pushes a fresh commit onto the SAME PR; the check rollup `CiWait` reads is
+    * for whatever commit is on the branch NOW, not for the one an earlier, already-forgotten watch
+    * judged green, so re-running the watch here is answering a genuinely new question, not repeating
+    * an old one. Either way, `_ => None` is correct: a red-then-resumed tick cannot exist to probe
+    * for, and a green-then-resumed one must be re-watched, never adopted from stale memory. The same
+    * reasoning about WHAT removes `in-progress`, but not this same conclusion, is relevant to
+    * `PostMergeCleanup` below; see that node's own doc for why its own gap is different in kind.
+    */
+  private val CiWait: Node[CiWaitInput, Unit] =
+    Node(
+      name = "CiWait",
+      cost = Cost.NoDispatch,
+      timeout = Timeout.Unbounded,
+      probe = _ => None,
+      run = input =>
+        given Faulting = summon[Fault].label
+        ciWait(input.cur, input.issue, input.prNum, input.carriesParked)
+    )
+
+  /** `Merge`'s input (issue #36): the values `performMerge` needs. */
+  private final case class MergeInput(cur: Cursor, issue: Int, prNum: Int)
+
+  /** The merge-then-verify half of the former `autoMerge`, extracted the same way `ciWait` above is,
+    * for the same reason: a recovered `Faulting`, not `Fault`, because this is relocated code, not
+    * new.
+    */
+  private def performMerge(cur: Cursor, issue: Int, prNum: Int)(using
+      cfg: Config,
+      gh: GitHub,
+      log: StatusLog,
+      logger: Log,
+      notify: Notify
+  )(using Faulting): Unit =
+    val ciLog = artifact(issue, ".ci-wait.log")
+    emit(cur, "MERGE", "start")
+    // Same `ciLog` the CI watch just wrote: bash appends the merge output to it (loop.sh:473).
+    val mergeRc = gh.merge(prNum, ciLog)
+    // loop.sh:475 prints the rc: it is what tells "PR not mergeable" from "gh auth expired".
+    if mergeRc != 0 then infraFault(s"merge command failed rc=$mergeRc — infra fault")
+    val state = gh.prState(prNum)
+    if state != "MERGED" then
+      // bash's `${state:-unknown}` (loop.sh:481): an empty answer from `gh pr view` is the
+      // very case this fault exists to report, so it must not print as an empty pair of quotes.
+      val shown = if state.isEmpty then "unknown" else state
+      infraFault(s"merge NOT verified (PR state '$shown') — infra fault")
+    emit(cur, "MERGE", "ok", detail = s"pr=$prNum")
+
+  /** Merge, converted to a `Node` (issue #36): `cost = Cost.NoDispatch`, `timeout =
+    * Timeout.Unbounded`, the same reasoning as `CiWait` above.
+    *
+    * `probe = _ => None`, unconditionally, not a `gh.prState(prNum)` read (issue #36 review,
+    * BLOCKER 1/BLOCKER 2/MAJOR 3): an earlier version of this node DID read `prState` here and
+    * skipped `performMerge` (and so `gh.merge`) once it already read `"MERGED"`, on the claim that a
+    * resumed tick could reach this node with a `prNum` `OpenPr`'s own probe (above) had handed back
+    * from an EARLIER, crashed attempt that already merged it. `OpenPr`'s probe no longer does that:
+    * `Caps.GitHub.prForBranch` only ever answers with an OPEN PR, so a `prNum` reaching this node
+    * through `OpenPr` is never one this loop's own bookkeeping already knows is merged, and the
+    * crash-resume window that reasoning depended on does not exist once that fix is in place.
+    *
+    * The one live case a `prState` probe here COULD still catch is different in kind: a PR merged
+    * OUT OF BAND (a human, or GitHub auto-merge) while THIS tick's own `CiWait` was still watching,
+    * with `PostMergeCleanup` never having run at all. A probe answering `Some(())` for that case would
+    * skip `gh.merge` silently and return `LoopExit.Success` with the branch never `--delete-branch`ed
+    * by this run, and with `PostMergeCleanup`'s own notify and dependency flip never running either, a
+    * SILENT drop of every side effect THIS loop is responsible for, on the say-so of a state read this
+    * node has no way to attribute to its own merge. `OpenPr`'s OPEN-only adoption is what proves no
+    * already-merged `prNum` reaches `Merge` through any path this loop itself controls (issue #36
+    * review, MINOR 4); it says nothing about a merge completed entirely outside that path, which is a
+    * different reachability route, not a case the same constraint already rules out. `probe = _ =>
+    * None` keeps it that way for both: `performMerge` always calls `gh.merge`, and an out-of-band
+    * merge is discovered the same way it always was, by that call failing.
+    */
+  private val Merge: Node[MergeInput, Unit] =
+    Node(
+      name = "Merge",
+      cost = Cost.NoDispatch,
+      timeout = Timeout.Unbounded,
+      probe = _ => None,
+      run = input =>
+        given Faulting = summon[Fault].label
+        performMerge(input.cur, input.issue, input.prNum)
+        NodeOutcome.Done(())
+    )
+
+  /** `PostMergeCleanup`'s input (issue #36): the values `postMergeCleanup` needs. */
+  private final case class PostMergeCleanupInput(cur: Cursor, issue: Int, prNum: Int, carriesParked: Boolean)
+
+  /** The drop-label/flip-blocked/fetch/notify tail of the former `autoMerge`, extracted the same way
+    * `performMerge` above is, for the same reason.
+    */
+  private def postMergeCleanup(cur: Cursor, issue: Int, prNum: Int, carriesParked: Boolean)(using
+      cfg: Config,
+      gh: GitHub,
+      git: Git,
+      notify: Notify,
+      logger: Log
+  ): Unit =
+    // A failed drop here (issue #50 review, round 3, finding B) used to leave a genuinely
+    // MERGED issue silently `in-progress` forever, with the merge itself already verified above
+    // so nothing else about the tick would ever surface the problem. Warn, same as every other
+    // flip site in this file.
+    if !gh.editLabels(issue, add = Nil, remove = activeAndParked(carriesParked)) then
+      logger.log(s"WARNING: could not drop in-progress/parked from #$issue after merge (flip by hand)")
+    flipBlocked(issue)
+    // a post-merge fetch failure is tolerated: next tick re-fetches
+    if !git.fetchOriginMain() then
+      logger.log("post-merge fetch failed (next iteration re-fetches anyway)")
+    notify.notify(s"harness: #$issue auto-merged (PR #$prNum, CI green, reviewer APPROVE)")
+
+  /** PostMergeCleanup, converted to a `Node` (issue #36): `cost = Cost.NoDispatch`, `timeout =
+    * Timeout.Unbounded`, the same reasoning as `CiWait`/`Merge` above.
+    *
+    * `probe = _ => None`, and deliberately so, not from an oversight, but NOT for the reason `CiWait`
+    * gives (issue #36 review, MAJOR 3): a probe checking `gh.issueLabels(issue)` for `in-progress`'s
+    * absence would indeed be dead code, but not because `in-progress` presence is what gates a second
+    * visit here. The load-bearing fact is `terminal`'s own PR body, which always carries `Closes
+    * #$issue`, and `Merge` only ever reaches this node after its own `gh.prState(prNum) ==
+    * "MERGED"` verification passed: a genuinely merged PR with that body closes the issue on GitHub
+    * as a side effect of the merge itself, and `LiveGitHub.inProgressIssue` (`Live.scala:842-854`)
+    * queries `--state open`. So a closed issue never satisfies `inProgressIssue()` again, regardless
+    * of whether the `in-progress` LABEL is still sitting on it, and `Pick` has no other read path
+    * that would surface a closed issue either. A tick that crashes after `Merge`'s own verification
+    * but before this node's `editLabels`/`flipBlocked`/`notify` complete is therefore never re-picked
+    * by anything in this file, and those three effects are lost with nothing here to record the gap.
+    * That is identical to `main`, so it is not a regression this migration introduces, but it is a
+    * real, silent hole, not a proven impossibility: #36's own "already had its labels flipped" case
+    * for this node is knowingly OUT OF REACH for this fix, not unreachable by construction the way a
+    * label-absence probe would be dead code. Writing a probe for the label-absence condition would
+    * still be untested, unreachable code with the same observable behaviour as `_ => None`, exactly
+    * the kind of signature this file's own guidance (RFC #26, "if your design needs ... say so and
+    * stop rather than widening") warns against forcing in; it just is not the reason a second visit
+    * cannot happen.
+    */
+  private val PostMergeCleanup: Node[PostMergeCleanupInput, Unit] =
+    Node(
+      name = "PostMergeCleanup",
+      cost = Cost.NoDispatch,
+      timeout = Timeout.Unbounded,
+      probe = _ => None,
+      run = input =>
+        postMergeCleanup(input.cur, input.issue, input.prNum, input.carriesParked)
+        NodeOutcome.Done(())
+    )
+
+  /** v4 auto-merge (class-1 + APPROVE only): wait-appear -> watch -> merge -> VERIFY the PR state
+    * is MERGED (unverified = infra fault) -> drop in-progress -> flip blocked -> fetch -> notify.
+    * CI red after green local gates = needs-human WITHOUT self-repair: the loop never repairs
+    * against the independent check.
+    *
+    * Three `Runner.step` calls, one per chain node (issue #36), replacing what used to be one
+    * straight-line function: `CiWait` can end the chain early (`NodeOutcome.Stopped(NeedsHuman)`),
+    * which this function threads straight back out; `Merge` and `PostMergeCleanup` never do (see
+    * each node's own doc), so their `Stopped` arms are unreachable, kept only for exhaustivity, the
+    * same shape `terminal`'s own `CommitAndPush`/`OpenPr` call sites use.
+    */
+  private def autoMerge(issue: Int, prNum: Int, cur: Cursor, carriesParked: Boolean, caps: Caps, ledger: Runner.Ledger)(using
+      faulting: Faulting
+  ): LoopExit =
+    Runner.step(CiWait, CiWaitInput(cur, issue, prNum, carriesParked))(using caps, faulting, ledger) match
+      case NodeOutcome.Stopped(exit) => return exit
+      case NodeOutcome.Done(())      => ()
+
+    Runner.step(Merge, MergeInput(cur, issue, prNum))(using caps, faulting, ledger) match
+      case NodeOutcome.Stopped(exit) => return exit // unreachable: see `Merge`'s own doc
+      case NodeOutcome.Done(())      => ()
+
+    Runner.step(
+      PostMergeCleanup,
+      PostMergeCleanupInput(cur, issue, prNum, carriesParked)
+    )(using caps, faulting, ledger) match
+      case NodeOutcome.Stopped(exit) => return exit // unreachable: see `PostMergeCleanup`'s own doc
+      case NodeOutcome.Done(())      => ()
+
+    LoopExit.Success
 
   /** Poll the rollup length until > 0, bounded by ciAppearTimeout. True once >=1 check is
     * registered, false on timeout.
@@ -2232,6 +2668,18 @@ object Machine:
       * verified auto-merge, or a CI-red needs-human flip). `Route.Parked` itself never removes
       * `parked`, it ADDS it, whether as a fresh park or a re-park, and never calls
       * `activeAndParked` at all.
+      *
+      * `resumedFromInProgress` (issue #36, MAJOR 2): whether `issue` already carried `in-progress`
+      * BEFORE this tick's own pick, i.e. `inProgress.contains(issue)` at the point this tick asked
+      * `gh.inProgressIssue()`, computed once and carried forward rather than re-asked, the same
+      * pattern `carriesParked` already uses for `parkedIssues()`. `OpenPr`'s own probe is the one
+      * reader: an OPEN PR it finds on `branch` is only trustworthy as "this iteration's own,
+      * mid-flight work" when the issue was already in flight before this pick ran; a freshly picked
+      * `ready` issue reusing the same branch name (every US always branches to `us-$issue`) can find
+      * an OPEN PR there for a completely different reason, an earlier, fully TERMINAL iteration's own
+      * `needs-review`/`needs-human` PR, left open pending a human, that a human later overrode by
+      * relabelling the issue `ready` again without closing it. See `OpenPr`'s own doc for the full
+      * argument and its blast radius.
       */
     case Ready(
         issue: Int,
@@ -2240,7 +2688,8 @@ object Machine:
         isClass1: Boolean,
         branch: String,
         resumeAuthors: Option[List[String]],
-        carriesParked: Boolean
+        carriesParked: Boolean,
+        resumedFromInProgress: Boolean
     )
 
   /** What `implementAndRepair` concluded: either the initial IMPL patch was empty and `iterate`
