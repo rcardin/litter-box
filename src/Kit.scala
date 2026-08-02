@@ -4,8 +4,9 @@ import scala.annotation.tailrec
 import scala.util.boundary
 
 // The graph kit (issue #32): `Node`, `Workflow` and the `Runner` that executes one. `Machine.Pick`
-// is the first node built on this; the rest of `iterate` (implement, repair, terminal) stays a
-// plain function for now, so this file only has to carry one node's worth of real traffic today.
+// is the first node built on this; `Machine.Implement` (issue #33) is the second, and the first to
+// carry a real dispatch and a real `Timeout.After` through it. The rest of `iterate` (repair,
+// terminal) stays a plain function for now.
 //
 // Two of the concerns a hand-written phase like `pickAndSetup` used to own for itself, spending
 // dispatch budget and enforcing a wall-clock timeout, move here, onto the `Runner`, so that no
@@ -65,7 +66,8 @@ private[litterbox] type Faulting = boundary.Label[LoopExit]
   * label is how `Machine.Pick`'s adapter recovers a `Faulting` to hand to the untouched
   * `pickAndSetup` (both live in the same file, same package, and `pickAndSetup` already reaches
   * `LoopExit.InfraFault` only through `Machine.infraFault` itself, never a bare `break`), not a route
-  * a node's own body is meant to take.
+  * a node's own body is meant to take. `Machine.Implement`'s adapter does the same, for the same
+  * reason, to hand a recovered `Faulting` to `dispatchInitialImplement`.
   */
 final class Fault private[litterbox] (
     private[litterbox] val label: Faulting,
@@ -214,9 +216,10 @@ final case class Workflow[I](name: String, start: I => Next)
 /** Executes a `Workflow` (or, via `step`, a single `Node`) against the capabilities in scope,
   * owning every concern a node itself is not allowed to own: whether a `probe` already answered the
   * question, whether the run's shared budget can afford this node, and whether the node's own
-  * `probe`/`run` overran its declared `timeout`. `Machine.Pick` is the only node wired through this
-  * today (`Machine.iterate`); `RunnerSpec` exercises the mechanics below with fake nodes instead, so
-  * this file stays usable ahead of a second real node ever joining the graph.
+  * `probe`/`run` overran its declared `timeout`. `Machine.Pick` and `Machine.Implement` are the
+  * nodes wired through this today (`Machine.iterate`); `RunnerSpec` additionally exercises the
+  * mechanics below with fake nodes, so this file stays usable ahead of a third real node joining the
+  * graph.
   *
   * Emits no log line and no status event of its own, on any path: the only observable side effect a
   * `Runner` call can ever cause is a `Node`'s own `probe`/`run` body doing something (which already

@@ -2167,3 +2167,156 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     w.called("gate CI-WAIT cmd=false") shouldBe true
     w.called("gate CI-WAIT cmd=gh pr checks") shouldBe false
   }
+
+  // ---- issue #33: the implement stage becomes a node ---------------------------------------
+
+  it should "dispatch the initial IMPL unconditionally even when REPAIR_BUDGET=0, since the runner's " +
+    "ledger seeds one dispatch above the repair budget, not from it" in {
+      // Pins the hazard the issue itself calls out: seeding `Runner.Ledger` from a bare
+      // `cfg.repairBudget` would make a `REPAIR_BUDGET=0` configuration park BEFORE this dispatch, a
+      // real behaviour change from every tick before issue #33, which always ran this dispatch
+      // unconditionally. `Machine.iterate` seeds the ledger to `math.max(0, cfg.repairBudget) + 1`
+      // instead (issue #33 review finding 3, clamped by review round 2 finding A), precisely so this
+      // stays true regardless of how small the repair budget is. A fresh (non-resume) pick is enough
+      // to show it; the more elaborate parked/resume interactions this same guarantee protects are
+      // already covered by "should wedge on NEITHER a ready issue NOR a second parked issue when
+      // REPAIR_BUDGET=0" above, and a NEGATIVE `REPAIR_BUDGET` is covered separately below.
+      val w = TestWorld()
+
+      val exit = w.runLoop(Config(repairBudget = 0))
+
+      exit shouldBe LoopExit.Success
+      w.callCount("dispatch IMPL") shouldBe 1
+      w.callCount("dispatch FIX") shouldBe 0
+      w.logged("node 'Implement' parked: dispatch budget exhausted before it could run") shouldBe false
+    }
+
+  it should "dispatch IMPL even when the branch's index is already staged, since the probe cannot " +
+    "safely tell an applied implementation apart from an abandoned prior attempt from git alone" in {
+      // `Implement`'s probe (issue #33 review finding 2) answers `None` unconditionally, reading no
+      // git state at all, so it never skips the dispatch on account of what the index looks like. A
+      // genuinely staged, uncommitted index at this point would not by itself prove THIS issue's
+      // implementation is already done even if the probe DID read it: "should never re-pick an issue
+      // that finished a terminal while carrying parked" (issue #50 review finding 1, a few screens
+      // up) proves a branch can carry staged, uncommitted work left by a PREVIOUS, abandoned attempt
+      // (a re-park whose own label flip failed, so `Route.Parked`'s reset never ran) that the next
+      // tick must still re-implement, not reuse. This test drives that same knob directly, on the
+      // simplest possible scenario, to pin that the probe stays conservative regardless.
+      val w = TestWorld()
+      w.staged = true
+
+      val exit = w.runLoop()
+
+      exit shouldBe LoopExit.Success
+      w.callCount("dispatch IMPL") shouldBe 1 // never skipped
+
+      // Pins the probe's OWN claim, not the whole tick's: the terminal step legitimately reads
+      // `anythingStaged()` later (to decide whether a fixer left anything to route), so asserting
+      // it never runs at all would fail for a reason unrelated to the probe. What the probe's
+      // scaladoc actually promises is narrower, namely no git read before it decides to dispatch, so
+      // the first `git diff --cached --quiet HEAD` call, if any, must come strictly after the
+      // dispatch it would otherwise have been able to skip.
+      val dispatchIdx = w.calls.indexWhere(_.startsWith("dispatch IMPL"))
+      val stagedIdx   = w.calls.indexWhere(_.contains("git diff --cached --quiet HEAD"))
+      dispatchIdx should be >= 0
+      (stagedIdx < 0 || stagedIdx > dispatchIdx) shouldBe true
+    }
+
+  it should "fault Implement's own declared Timeout.After(cfg.iterTimeout + slack), through the same " +
+    "infra-fault channel as every other timeout, when the node's own window genuinely overruns it" in {
+      // "timeout is declared data" (issue #33's own title): `Implement`'s own `Node.timeout` carries
+      // a bound at the pure decision layer, where `Runner.step` can enforce and this suite can
+      // observe it without Docker. `clockStepMillis` (issue #33 review finding 6), not a scripted
+      // list of exact answers: a list indexed by call count would silently stop testing the overrun
+      // if a node were ever added or reordered ahead of `Implement`, since it would shift which
+      // list entries land on which reads. A step comfortably larger than the full bound
+      // (`cfg.iterTimeout + cfg.implementSlack`) instead guarantees ANY two `Clock.nowMillis()`
+      // reads at least one call apart, wherever `Implement`'s own `startedAt` and post-hoc elapsed
+      // check land in the tick's overall read order, see a gap that already exceeds it. The worker
+      // dispatch itself still ran and produced a patch; the overrun is caught AFTER the node
+      // returns, not pre-emptively (`Runner.step`'s own scaladoc), so this proves the check fires
+      // regardless of whether the node's own work succeeded. Asserting on the fault message itself,
+      // not only the exit code, is what ties this failure to `Implement`'s own node rather than to
+      // some other fault that also produces `LoopExit.InfraFault`/rc 50.
+      val w   = TestWorld()
+      val cfg = Config()
+      w.clockStepMillis = (cfg.iterTimeout.toLong + cfg.implementSlack + 1) * 1000L
+
+      val exit = w.runLoop(cfg)
+
+      exit shouldBe LoopExit.InfraFault
+      exit.rc shouldBe 50
+      w.callCount("dispatch IMPL") shouldBe 1
+      w.logged(
+        s"node 'Implement' overran its ${cfg.iterTimeout + cfg.implementSlack}s " +
+          "timeout, an infra fault, not a code failure"
+      ) shouldBe true
+      w.notifications shouldBe List(
+        "harness: infra fault — loop exited rc=50 for inspection (issue stays in-progress)"
+      )
+    }
+
+  it should "NOT fault Implement's Timeout.After when its own window lands just past cfg.iterTimeout " +
+    "but still inside the declared slack above it (issue #33 review finding 1)" in {
+      // The failure scenario finding 1 pins: `Runner.step`'s window for `Implement` starts before
+      // `probe` and ends only after `run` returns, which is AFTER `dispatchInitialImplement`'s own
+      // git work (`stagePatch`'s reset-then-inspect-then-apply) runs, not merely after the worker
+      // subprocess `LiveAgentDispatch` bounds at `cfg.iterTimeout`. A worker that legitimately
+      // finishes close to `cfg.iterTimeout`, with that git work pushing the node's own elapsed time
+      // slightly past `cfg.iterTimeout`, must not fault a tick that would otherwise go on to the
+      // gate. One step lands between `Implement`'s own `startedAt` read and its post-hoc elapsed
+      // check (no other capability call in this fake path touches the clock in between), so setting
+      // that step just over `cfg.iterTimeout` reproduces exactly that shape.
+      val w   = TestWorld()
+      val cfg = Config()
+      w.clockStepMillis = (cfg.iterTimeout.toLong + 5) * 1000L
+
+      val exit = w.runLoop(cfg)
+
+      exit shouldBe LoopExit.Success
+      w.callCount("dispatch IMPL") shouldBe 1
+      w.logged("overran its") shouldBe false
+    }
+
+  it should "dispatch IMPL rather than park the whole tick when REPAIR_BUDGET is negative (issue #33 " +
+    "review round 2 finding A)" in {
+      // `REPAIR_BUDGET` reaches `Config` through a bare `toIntOption` (`Main.scala`) or a bare
+      // `conf.getInt` (`Settings.scala`), neither of which rejects a negative value, and the codebase
+      // already treats negatives as reachable elsewhere (`cfg.repairBudget <= 0`, not `== 0`, guards
+      // generic exhaustion a few screens up). Before the round 2 finding A clamp, `Runner.Ledger` was
+      // seeded to `cfg.repairBudget + 1`: with `REPAIR_BUDGET=-1` that seeds `Ledger(0)`,
+      // `canAfford(Cost.OneDispatch)` answers false, and the tick parks (`LoopExit.Parked`, rc 60)
+      // BEFORE `Implement` ever dispatches — a regression against every tick before issue #33, which
+      // ran this dispatch unconditionally regardless of the budget's sign. `Machine.iterate` now
+      // seeds the ledger to `math.max(0, cfg.repairBudget) + 1`, flooring the seed at one dispatch for
+      // any non-positive budget, so this must still run IMPL and complete the tick normally.
+      val w = TestWorld()
+
+      val exit = w.runLoop(Config(repairBudget = -1))
+
+      exit shouldBe LoopExit.Success
+      w.callCount("dispatch IMPL") shouldBe 1
+      w.logged("node 'Implement' parked: dispatch budget exhausted before it could run") shouldBe false
+    }
+
+  it should "not invert Implement's own declared timeout for a very large ITER_TIMEOUT (issue #33 " +
+    "review round 2 finding C)" in {
+      // `ITER_TIMEOUT=2147483647` (`Int.MaxValue`) parses fine off the bare `toIntOption` in
+      // `Main.scala`. Before the round 2 finding C fix, `Implement`'s own `Node.timeout` was declared
+      // as `cfg.iterTimeout + ImplementTimeoutSlackSeconds`, a bare `Int` `+`: that sum overflows and
+      // wraps to a NEGATIVE number (2147483647 + 300 wraps to -2147483349), so `Runner.step`'s
+      // `elapsedMs > seconds.toLong * 1000L` check (`Kit.scala`) compared this tick's elapsed time
+      // against a negative threshold and faulted immediately, on every tick, regardless of how fast
+      // the tick actually ran — the exact inverse of what configuring a large `ITER_TIMEOUT` is meant
+      // to buy an operator. `TestWorld`'s default `clockStepMillis = 0` keeps `Clock.nowMillis()` at a
+      // constant `0`, so this tick's real elapsed time is `0`; asserting `LoopExit.Success` here is
+      // only possible if the declared bound stayed non-negative, which is exactly what
+      // `Machine.implementNodeTimeoutSeconds`'s saturating `math.max(a, a + b)` guarantees.
+      val w = TestWorld()
+
+      val exit = w.runLoop(Config(iterTimeout = Int.MaxValue))
+
+      exit shouldBe LoopExit.Success
+      w.callCount("dispatch IMPL") shouldBe 1
+      w.logged("overran its") shouldBe false
+    }

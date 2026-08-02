@@ -67,7 +67,7 @@ object Settings:
       |issues.park-on-exhaustion = true
       |protect  = [".litter-box/**", ".github/**", "CONTEXT.md"]
       |budgets  { repair = 2, max-patch-bytes = 1000000 }
-      |timeouts { iter = 1800, ci-wait = 900, ci-appear = 300, ci-appear-interval = 10 }
+      |timeouts { iter = 1800, ci-wait = 900, ci-appear = 300, ci-appear-interval = 10, implement-slack = 300 }
       |""".stripMargin
 
   private lazy val reference: TsConfig = ConfigFactory.parseString(Reference)
@@ -331,5 +331,6 @@ object Settings:
       iterTimeout = conf.getInt("timeouts.iter"),
       ciWaitTimeout = conf.getInt("timeouts.ci-wait"),
       ciAppearTimeout = conf.getInt("timeouts.ci-appear"),
-      ciAppearInterval = conf.getInt("timeouts.ci-appear-interval")
+      ciAppearInterval = conf.getInt("timeouts.ci-appear-interval"),
+      implementSlack = conf.getInt("timeouts.implement-slack")
     )

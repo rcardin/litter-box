@@ -264,8 +264,9 @@ trait Log:
   * a scope where BOTH a real `given Caps` AND the individual capabilities (as their own named `using`
   * parameters) are simultaneously visible would make every one of these accessors genuinely
   * ambiguous with the local parameter of the same type. Nothing in this codebase does that: the only
-  * place a real `given Caps` exists is inside a `Node`'s own context-function body (`Machine.Pick`),
-  * which never also carries the individual capabilities as named parameters, and the only place the
+  * place a real `given Caps` exists is inside a `Node`'s own context-function body (`Machine.Pick`
+  * and, since issue #33, `Machine.Implement`'s `run` as well), which never also carries the
+  * individual capabilities as named parameters, and the only place the
   * individual capabilities are named parameters (`Machine.iterate` and everything it calls) never
   * also introduces a `given Caps`: `iterate` builds a plain, non-given `Caps` value instead,
   * precisely so it never becomes a second candidate for its own already-named parameters.

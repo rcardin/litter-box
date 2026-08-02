@@ -229,5 +229,32 @@ final case class Config(
     iterTimeout: Int = 1800,
     ciWaitTimeout: Int = 900,
     ciAppearTimeout: Int = 300,
-    ciAppearInterval: Int = 10
+    ciAppearInterval: Int = 10,
+    /** `timeouts.implement-slack`, overridable by `IMPLEMENT_SLACK` (issue #33 review round 2 finding
+      * D). Added on top of `iterTimeout` for `Machine.Implement`'s own `Node.timeout`, never used
+      * bare: `Runner.step`'s window for a node starts before `probe` and ends only after `run`
+      * returns (`Kit.scala`), and for `Implement` that window brackets the probe's own git read, the
+      * worker dispatch, AND the git work `Machine.dispatchInitialImplement` still does after the
+      * worker child already exited (`stagePatch`'s reset-then-inspect-then-apply, plus a status
+      * emit). `LiveAgentDispatch` (`Live.scala`) bounds only the worker CHILD process, at
+      * `iterTimeout` alone; declaring the node's own bound as that identical number, with no slack,
+      * would make it a strictly LARGER window guarded by an identical figure, so a worker that
+      * legitimately exits a second under `iterTimeout` could still let the git work push the node's
+      * own elapsed time past it, faulting a tick that would otherwise have gone on to the gate.
+      *
+      * A config key, not a literal, for a second reason beyond the usual per-repo-knob one: on a
+      * host with neither `timeout` nor `gtimeout` on `PATH`, `Main`'s preflight leaves the worker
+      * child's process wrapper unset (`timeoutBin = None`) and `LiveAgentDispatch` prepends no
+      * wrapper at all, so the worker child itself is UNBOUNDED there. This node's own bound
+      * (`iterTimeout + implementSlack`) is then the only bound left in the whole system, and it
+      * cannot cut anything off — `Runner.step` checks it only after the node has already returned —
+      * it can only re-label an already-finished success as an infra fault: a legitimate worker run
+      * that simply ran long, exited 0 and staged its patch successfully would still fault at that
+      * post hoc check, leaving the index staged for the next tick's `git.statusClean()` guard to trip
+      * over. An operator on that host class needs a knob to raise the slack above their worker's real
+      * running time; on a host WITH `timeout`/`gtimeout` the worker child is bounded independently, so
+      * `iterTimeout + implementSlack` is provably unreachable and this is the pure backstop it
+      * otherwise claims to be — the tunability matters for the unbounded-child host class only.
+      */
+    implementSlack: Int = 300
 )

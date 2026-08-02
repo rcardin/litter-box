@@ -51,7 +51,7 @@ class SettingsSpec extends AnyFlatSpec with Matchers:
       |issues.park-on-exhaustion = false
       |protect = ["secrets/**", "Makefile"]
       |budgets { repair = 7, max-patch-bytes = 4242 }
-      |timeouts { iter = 60, ci-wait = 61, ci-appear = 62, ci-appear-interval = 63 }
+      |timeouts { iter = 60, ci-wait = 61, ci-appear = 62, ci-appear-interval = 63, implement-slack = 64 }
       |""".stripMargin
 
   private def nonDefaultConfig: Config =
@@ -123,6 +123,7 @@ class SettingsSpec extends AnyFlatSpec with Matchers:
     cfg.ciWaitTimeout shouldBe 61
     cfg.ciAppearTimeout shouldBe 62
     cfg.ciAppearInterval shouldBe 63
+    cfg.implementSlack shouldBe 64
   }
 
   // ===============================================================================================
@@ -192,6 +193,7 @@ class SettingsSpec extends AnyFlatSpec with Matchers:
     // baked into parseEnv.
     parsed.cfg.gateTimeout shouldBe 111
     parsed.cfg.ciWaitTimeout shouldBe 61
+    parsed.cfg.implementSlack shouldBe 64
     parsed.cfg.logDir shouldBe "custom/logs"
     parsed.cfg.stopFile shouldBe "HALT.md"
     parsed.cfg.conventions shouldBe "RULES.md"
