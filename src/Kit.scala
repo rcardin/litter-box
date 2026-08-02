@@ -5,8 +5,24 @@ import scala.util.boundary
 
 // The graph kit (issue #32): `Node`, `Workflow` and the `Runner` that executes one. `Machine.Pick`
 // is the first node built on this; `Machine.Implement` (issue #33) is the second, and the first to
-// carry a real dispatch and a real `Timeout.After` through it. The rest of `iterate` (repair,
-// terminal) stays a plain function for now.
+// carry a real dispatch and a real `Timeout.After` through it. `Machine.Gate` and `Machine.Repair`
+// (issue #34) are the third and fourth. The former FAST-gate-run/self-repair `while` loop is now a
+// recursion (`Machine.implementAndRepair`'s own `runCycle`) whose retry edge, gate-RED or a
+// REQUEST_CHANGES verdict into another `Repair` round, then back into another `Gate` cycle, is
+// chosen by what `Gate`/`Repair`'s own OUTPUT says, the same shape `Next.Goto`'s own `andThen`
+// describes. It is not literally built from `Next`/`Workflow` values, though: `runCycle`'s own doc
+// has the concrete, provable reason (`Next.Finish` is fixed to `LoopExit`, RFC #26 decision 10, and
+// this cycle's own terminal values, a domain `Outcome` plus the rest of `Ready`'s fields, have no
+// injection into that closed set at this point in `iterate`; `terminal`, untouched by this issue, is
+// what turns an `Outcome` into a real `LoopExit` later). The mutable `budget` counter the old loop
+// owned is gone; the shared `Runner.Ledger` is the only thing either the retry decision or the
+// `self-repair: budget now N` log line reads (`Machine.attemptRepair`'s own doc). A `pass` var still
+// survives inside `implementAndRepair`, but only as a mirror the recursion writes so `Ready`'s own
+// `pass` field can report which cycle was last reached; it decides nothing, the recursion's own `p`
+// argument does, and the var itself has exactly one read left in the whole method, the final
+// `Ready(pass, ...)` construction (the resume dispatch that used to read it instead passes the
+// literal `0` it is provably still holding at that point, `implementAndRepair`'s own doc on that
+// call site). The rest of `iterate` (terminal) stays a plain function for now.
 //
 // Two of the concerns a hand-written phase like `pickAndSetup` used to own for itself, spending
 // dispatch budget and enforcing a wall-clock timeout, move here, onto the `Runner`, so that no
@@ -216,10 +232,10 @@ final case class Workflow[I](name: String, start: I => Next)
 /** Executes a `Workflow` (or, via `step`, a single `Node`) against the capabilities in scope,
   * owning every concern a node itself is not allowed to own: whether a `probe` already answered the
   * question, whether the run's shared budget can afford this node, and whether the node's own
-  * `probe`/`run` overran its declared `timeout`. `Machine.Pick` and `Machine.Implement` are the
-  * nodes wired through this today (`Machine.iterate`); `RunnerSpec` additionally exercises the
-  * mechanics below with fake nodes, so this file stays usable ahead of a third real node joining the
-  * graph.
+  * `probe`/`run` overran its declared `timeout`. `Machine.Pick`, `Machine.Implement`,
+  * `Machine.Gate` and `Machine.Repair` are the nodes wired through this today (`Machine.iterate`);
+  * `RunnerSpec` additionally exercises the mechanics below with fake nodes, so this file stays
+  * usable ahead of the next real node joining the graph.
   *
   * Emits no log line and no status event of its own, on any path: the only observable side effect a
   * `Runner` call can ever cause is a `Node`'s own `probe`/`run` body doing something (which already

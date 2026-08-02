@@ -2320,3 +2320,157 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
       w.callCount("dispatch IMPL") shouldBe 1
       w.logged("overran its") shouldBe false
     }
+
+  // ---- issue #34: the gate and repair stages become nodes ----------------------------------
+
+  it should "not fault a slow-but-GREEN gate against Gate's own Node.timeout, which is Unbounded " +
+    "(issue #34 review finding F5, round 2 R5)" in {
+      // Scenario I (a few screens up) already pins the OTHER half of AC3, that `GateResult.Timeout`
+      // routes through `Fault.raise` regardless of what `Gate`'s own `Node.timeout` says, since that
+      // raise happens inside `runFastGate` and never returns to `Runner.step`'s own post-hoc elapsed
+      // check at all. It does not, and cannot, pin the `Timeout.Unbounded` DECLARATION itself: nothing
+      // in that scenario ever reaches the elapsed-time branch `Runner.step` guards behind
+      // `node.timeout` (`Kit.scala`), so flipping `Gate` to `Timeout.After(cfg.gateTimeout)` would not
+      // move that test at all (round 2 finding R5). This one does: a GREEN gate that still takes
+      // longer than `cfg.gateTimeout` to answer is exactly the case `Gate`'s own doc argues Unbounded
+      // for (its measured window brackets `git.addAll()` too, strictly larger than the figure a bound
+      // would be compared to), so a real node-level `Timeout.After(cfg.gateTimeout)` would fault this
+      // tick, and `Timeout.Unbounded` must not.
+      //
+      // `clockStepMillis` (not a scripted list, `TestWorld.clockStepMillis`'s own doc has why) set
+      // just over `cfg.gateTimeout` in seconds: big enough that a `Timeout.After(cfg.gateTimeout)`
+      // `Gate` would overrun on the very next `Clock.nowMillis()` read after its own start, small
+      // enough (905s) to stay well under `Implement`'s own `cfg.iterTimeout + cfg.implementSlack`
+      // bound (2100s under the default `Config`), which runs first in this same tick and must not be
+      // the thing that faults it instead.
+      val w   = TestWorld()
+      val cfg = Config()
+      w.clockStepMillis = (cfg.gateTimeout.toLong + 5) * 1000L
+      // `gateResults` left at its default (empty => GREEN forever, `TestWorld`'s own doc), and
+      // `reviewScripts` left at its default (an APPROVE), so this tick runs IMPL, one GREEN gate
+      // cycle and an APPROVE review straight through to a merged PR with no repair round at all.
+
+      val exit = w.runLoop(cfg)
+
+      exit shouldBe LoopExit.Success
+      w.logged("overran its") shouldBe false
+    }
+
+  it should "compose a resumed tick's own ledger seed with a gate-RED repair round on the same " +
+    "shared Ledger (issue #34 review finding R8)" in {
+      // The parked-resume golden (`parked-resume.log`) pins the resume-aware seed (F3), and the
+      // "thread the same pass number" test above pins the `Ledger` a gate-RED repair round spends
+      // from (F4), but neither drives both in the SAME tick: a resumed tick whose own initial FIX
+      // (`implementAndRepair`'s `resumeAuthors` branch) is immediately followed by a gate-RED repair
+      // round is the one path where the resume-aware seed (`math.max(0, cfg.repairBudget)`, no
+      // `Implement`-sized `+ 1`) and the shared `Ledger`'s post-resume state actually compose: a seed
+      // computed wrong by even one dispatch here would either park the repair round early or let it
+      // spend one more than the budget allows, and nothing else in this suite would catch it, since
+      // every other resume scenario answers GREEN on the first gate and every other gate-RED scenario
+      // starts from an ordinary (non-resumed) IMPL seed.
+      val w = TestWorld()
+      w.inProgress = None
+      w.ready = None
+      w.parked = List(777)
+      w.issueCommentBodies =
+        Map(777 -> List(markerEntry, "@alice (OWNER):\ntry using a HashMap instead"))
+      w.gateResults = List(GateResult.Red, GateResult.Green)
+      w.fixScripts = List(
+        WorkerScript.Produces(newFilePatch),                       // the resume's own FIX
+        WorkerScript.Produces("1\t0\tsrc/main/scala/Fix1.scala")    // the gate-RED repair's FIX
+      )
+
+      val exit = w.runLoop()
+
+      exit shouldBe LoopExit.Success
+      w.callCount("dispatch IMPL") shouldBe 0 // resumed ticks never dispatch IMPL
+      w.callCount("dispatch FIX") shouldBe 2
+      w.callCount("gate FAST") shouldBe 2
+      // The default `repairBudget` (2, `Config`'s own default) seeds the resume-aware `Ledger` at
+      // `math.max(0, 2)` = 2 (no `+ 1`, since a resumed tick never runs `Implement`); the resume's
+      // own FIX spends the first, leaving 1, and the gate-RED repair spends the second, leaving 0,
+      // exactly the "budget now 1" then "budget now 0" composition this scenario exists to pin.
+      w.logged(
+        "issue #777: resuming from parked with a human reply, dispatching FIX (budget now 1)"
+      ) shouldBe true
+      w.logged("self-repair: budget now 0 — dispatching FIX for gate-RED") shouldBe true
+    }
+
+  it should "thread the same pass number through a gate-RED repair round and, in the very next " +
+    "cycle, a REQUEST_CHANGES one, never letting the two triggers collide on a stale counter" in {
+      // The former `while` loop shared one mutable `var pass` between the gate-RED spend site and
+      // the REQUEST_CHANGES spend site; this recursion (`implementAndRepair`'s own `runCycle`)
+      // instead threads `p` as a plain argument through both `Gate` and `Repair`'s own inputs, and
+      // through the REQUEST_CHANGES trigger inline in the same cycle. Driving BOTH triggers in one
+      // tick, back to back, is the one scenario that would catch either site quietly reading the
+      // WRONG cycle's `p` (or the outer `var pass` before this method syncs it), something the
+      // existing single-trigger goldens (`gate-red-repair`, `request-changes-repair`) each pin only
+      // in isolation.
+      val w = TestWorld()
+      w.gateResults = List(GateResult.Red, GateResult.Green, GateResult.Green)
+      w.reviewScripts = List(
+        ReviewScript.Says("needs more work.\nVERDICT: REQUEST_CHANGES"),
+        ReviewScript.Says(approveReview)
+      )
+      w.fixScripts = List(
+        WorkerScript.Produces("1\t0\tsrc/main/scala/Fix1.scala"),
+        WorkerScript.Produces("1\t0\tsrc/main/scala/Fix2.scala")
+      )
+
+      val exit = w.runLoop()
+
+      exit shouldBe LoopExit.Success
+      w.callCount("gate FAST") shouldBe 3
+      w.callCount("dispatch FIX") shouldBe 2
+      w.calls.exists(
+        _.startsWith(s"dispatch FIX promptFile=$logDir/issue-999-pass1.fix.prompt.txt")
+      ) shouldBe true
+      w.calls.exists(
+        _.startsWith(s"dispatch FIX promptFile=$logDir/issue-999-pass2.fix.prompt.txt")
+      ) shouldBe true
+      w.logged("self-repair: budget now 1 — dispatching FIX for gate-RED") shouldBe true
+      w.logged("self-repair: budget now 0 — dispatching FIX for REQUEST_CHANGES") shouldBe true
+      w.logged("reviewer verdict: REQUEST_CHANGES (pass 2)") shouldBe true
+      w.logged("reviewer verdict: APPROVE (pass 3)") shouldBe true
+    }
+
+  it should "fault Repair's own declared Timeout.After(implementNodeTimeoutSeconds), through the " +
+    "same infra-fault channel as every other timeout, when the node's own window genuinely overruns it" in {
+      // Isolating `Repair`'s own node-level backstop from `Implement`'s identical one is not
+      // possible on an ordinary (non-resumed) tick with this suite's uniform-step fake clock:
+      // `Repair` shares `implementNodeTimeoutSeconds(cfg)` with `Implement` verbatim (`Repair`'s own
+      // scaladoc explains why the bound, not merely the number, is the same), and `Implement`
+      // always runs first in a fresh tick, so any step large enough to overrun `Repair` would
+      // overrun `Implement`'s identical bound first and fault there instead.
+      //
+      // A RESUMED tick sidesteps this: `implementAndRepair`'s `resumeAuthors` branch skips
+      // `Implement` entirely, and its own first FIX round now dispatches through `Repair` too
+      // (issue #34 review finding F4, `Repair`'s own scaladoc), so `Repair` is the FIRST, and in
+      // this scenario the ONLY, `Cost.OneDispatch`/`Timeout.After` node this tick ever runs; no
+      // second gate-RED round is needed to reach it. `Gate`'s own `Node.timeout` is `Unbounded`
+      // (issue #34 review finding F5), so there is no companion bound left to steer around either.
+      val w = TestWorld()
+      w.inProgress = None
+      w.ready = None
+      w.parked = List(777)
+      w.issueCommentBodies = Map(
+        777 -> List(markerEntry, "@alice (OWNER):\ntry using a HashMap instead")
+      )
+      w.fixScripts = List(WorkerScript.Produces(newFilePatch))
+      val cfg = Config()
+      w.clockStepMillis = (cfg.iterTimeout.toLong + cfg.implementSlack + 1) * 1000L
+
+      val exit = w.runLoop(cfg)
+
+      exit shouldBe LoopExit.InfraFault
+      exit.rc shouldBe 50
+      w.callCount("dispatch IMPL") shouldBe 0 // this tick never runs Implement at all
+      // The fixer dispatch itself still ran and produced a patch; the overrun is caught AFTER the
+      // node returns, not pre-emptively (`Runner.step`'s own scaladoc), same as `Implement`'s own
+      // overrun test above.
+      w.callCount("dispatch FIX") shouldBe 1
+      w.logged(
+        s"node 'Repair' overran its ${cfg.iterTimeout + cfg.implementSlack}s timeout, an infra " +
+          "fault, not a code failure"
+      ) shouldBe true
+    }
