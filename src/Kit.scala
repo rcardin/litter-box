@@ -61,9 +61,21 @@ import scala.util.boundary
 //
 // This is not the whole of what `pickAndSetup` did for itself, though: `Caps.gates`/`Caps.hostGates`
 // still run real subprocesses, and `Caps.git`/`Caps.gh` still mutate the world, entirely uncharged
-// and unbounded by anything here. That is not a scope violation, since decision 16's macro is the
-// intended future guard and is out of scope for this file, but this header must not claim the
+// and unbounded by anything here. That is not a scope violation: this header must not claim the
 // `Runner` covers more than dispatch budget and wall-clock time.
+//
+// Issue #38 is decision 16's cheap half. `Node` gains `trust` (derived from its own output type by
+// `TrustOf`, never declared by hand: `AgentDispatch.Judged` in, `Trust.Reviewed` out, anything else
+// `Trust.Plain`) and `guard` (declared by the node author, since "publishes outward" is a fact about
+// what a node's `run` body DOES, not something its type can carry). `Workflow` gains a `shape`, a
+// hand-written `Shape` describing the SAME graph its `Next.Goto` closures already encode, because
+// those closures cannot be walked without running them (`O` is erased, `andThen` is opaque, and in
+// `Machine.shippedWorkflow` running them performs real git/GitHub side effects). `Runner.validate`
+// walks a `Shape` alone, pure, and `Runner.run` calls it before `wf.start` ever runs, so a graph with
+// a path into a guarded node that never crosses a reviewed one is rejected before any node executes.
+// The `Shape`/closure split is an honest gap, not an oversight: nothing here stops the two from
+// drifting apart, and issue #39's compile time macro, reading the literal graph instead of a
+// hand-declared one, is the intended closer of that gap, still out of scope for this file.
 
 /** The infra-fault short-circuit channel, formerly a private alias inside `Machine` (`Machine.scala`
   * used to declare `private type Faulting = boundary.Label[LoopExit]` at the top of the file). Moved
@@ -196,6 +208,99 @@ enum Timeout:
     */
   case After(seconds: Int)
 
+/** Whether a `Node`'s own OUTPUT type carries an `AgentDispatch.Judged` (issue #38, RFC #26
+  * decision 16's cheap half). This is the fact `Runner.validate` (below) needs to tell a node that
+  * proves a cold review happened apart from one that does not, and it is stamped onto every `Node`
+  * by `Node.apply`'s own `given TrustOf[O]`, never written down by the node author: see `TrustOf`'s
+  * own doc for why deriving it from `O` closes off HAND mislabelling, and `Runner.step`'s own doc
+  * for the runtime check that closes the gap the derivation alone cannot (issue #38 review, BLOCKER
+  * 2): `NodeOutcome` is covariant in its output, so `NodeOutcome.Stopped(exit)`, typed
+  * `NodeOutcome[Nothing]`, conforms to `NodeOutcome[AgentDispatch.Judged[A]]` for any `A`, and a node
+  * whose `run` only ever returns `Stopped`, or only ever throws, or only ever calls `fault.raise`,
+  * never calling `AgentDispatch.review` at all, still gets `Trust.Reviewed` stamped on it by this
+  * very derivation, because the derivation looks at the DECLARED type, not at what the body actually
+  * does. `TrustOf` cannot see through that; only a runtime observation of an actual returned value
+  * can, and only for the executions that reach one.
+  */
+enum Trust:
+  case Plain
+  case Reviewed
+
+/** Derives a `Trust` from a `Node`'s own output type `O`, so `Node.apply` (below) can stamp the
+  * right one without a node author ever naming it. `judged` fires whenever `O` unifies with
+  * `AgentDispatch.Judged[A]` for some `A`; `LowPriorityTrustOf.plain` answers every other `O`,
+  * kept on a supertype so Scala's own priority rule (a given declared directly on `TrustOf`'s
+  * companion always outranks one only inherited from a parent trait) picks `judged` first whenever
+  * both would otherwise apply, rather than leaving the two genuinely ambiguous. There is no runtime
+  * inspection of a value anywhere in this derivation, only which of these two givens the compiler
+  * resolves for one particular `O`, decided once, at the call site that builds the `Node`.
+  *
+  * `judged` fires only when `O` IS `AgentDispatch.Judged[A]` exactly, never when `O` merely
+  * CONTAINS one: `Option[Judged[A]]`, `(Judged[A], B)` and `Either[E, Judged[A]]` all fail to unify
+  * with `AgentDispatch.Judged[A]` and so all resolve to `Trust.Plain` through `LowPriorityTrustOf`.
+  * A consumer node whose reviewer legitimately returns, say, `(Judged[Verdict], String)` gets
+  * `Trust.Plain`, not `Trust.Reviewed`, and a graph that needs it to clear a downstream
+  * `Guard.RequiresReview` is rejected at startup with a message about a missing reviewer, even
+  * though a review genuinely happened. State that plainly rather than let it surprise a consumer:
+  * the type has to BE a `Judged`, not merely carry one somewhere inside it.
+  */
+sealed trait TrustOf[O]:
+  def trust: Trust
+
+object TrustOf extends LowPriorityTrustOf:
+  given judged[A]: TrustOf[AgentDispatch.Judged[A]] with
+    def trust: Trust = Trust.Reviewed
+
+/** `sealed`, not merely public and open (issue #38 review): a consumer that could
+  * `extends LowPriorityTrustOf` would bring `plain` into a scope where Scala's own priority rule
+  * (this trait's own doc, above) no longer applies, since that rule only ranks `TrustOf`'s own
+  * companion above ITS parent, not above a second, unrelated mixin a consumer wrote: a name clash
+  * or an import order accident could then let `plain` outrank `judged` for a real
+  * `AgentDispatch.Judged` output, silently downgrading a genuine reviewer node to `Trust.Plain` and
+  * hiding it from `Runner.validate` entirely. `sealed` closes that door; nothing outside this file
+  * needs to extend this trait; `object TrustOf`'s own `extends LowPriorityTrustOf` still works,
+  * since `sealed` only forbids extension from OUTSIDE the file it is declared in, not within it.
+  */
+sealed trait LowPriorityTrustOf:
+  given plain[O]: TrustOf[O] with
+    def trust: Trust = Trust.Plain
+
+/** Whether a `Node` publishes outward in a way that must never happen without a review crossing its
+  * path first (issue #38, RFC #26 decision 16). Unlike `Trust` above, this is NOT derivable from a
+  * type: "opens a PR" or "merges to main" is a fact about what a node's own `run` body DOES, not a
+  * shape `O` carries, so declaring it is the node author's own job, the same way `cost`/`timeout`
+  * already are. State that limitation plainly rather than let it hide: a future node that calls
+  * `gh.createPr` or `gh.merge` without also writing `guard = Guard.RequiresReview` is invisible to
+  * `Runner.validate`, exactly the "drift between the declared shape and the closures" this issue's
+  * own design accepts as the price of the cheap half. Issue #39's compile time macro, extracting
+  * the literal graph from the real `Next` edges instead of a hand-declared `Shape`, is what would
+  * close this specific gap; this issue only narrows it.
+  *
+  * There is a second, sharper limit `guard` alone cannot express (issue #38 review, BLOCKER 1),
+  * proven by `Machine.shippedWorkflow` itself: `Merge` never runs unreviewed, but that guarantee is
+  * a DATA dependency, not a reachability property. `Merge` is reached only on
+  * `Route.AutoMergeCandidate`, produced only from `Outcome.Success`, set only after `Review`'s own
+  * `Verdict.Approve`, but `Transition` carries no branch discriminator, so an edge walk cannot see
+  * which VALUE of a node's output chose a given edge, only that some edge from that node exists.
+  * Every declared path into `Merge` runs through `RouteDecision`/`CommitAndPush`/`OpenPr`, and the
+  * rejection paths (an unreviewed patch, or a repair round that never crosses `Review`) legitimately
+  * reach those same nodes too, on their way to a `Route.NeedsHuman` audit-trail PR. A `guard` on
+  * `OpenPr` or `Merge` in THIS shape would therefore have to reject the shipped graph itself: the
+  * cheap half can state "a `Trust.Reviewed` node crosses every path", but it has no way to state "a
+  * `Trust.Reviewed` node crosses every path THAT REACHES THIS NODE VIA THAT PARTICULAR OUTPUT VALUE".
+  * That is genuinely out of reach for a `Shape`/reachability check, not merely undeclared: declaring
+  * a guard reachability cannot honestly discharge is what produced a shape curated to pass its own
+  * validator in the first place. So `Guard.RequiresReview` stays a real, tested facility for a
+  * consumer graph whose PR or merge node genuinely sits behind nothing but a reviewer (no
+  * legitimate unreviewed edge into it at all); `Machine.shippedWorkflow` itself does not use it,
+  * precisely because its own `Merge`/`OpenPr` do not meet that description. Issue #39's compile
+  * time macro is what would have to close this, too, by reading the actual branch a `Next.Goto`'s
+  * `andThen` took rather than a hand-declared edge list blind to it.
+  */
+enum Guard:
+  case Open
+  case RequiresReview
+
 /** One step of a graph: a name for logs/errors, its budget `cost` and wall-clock `timeout` (both
   * enforced by the `Runner`, never by the node itself), a `probe` that answers from the outside
   * world whether this step's work is already done, and the `run` that does the work when `probe`
@@ -213,14 +318,52 @@ enum Timeout:
   * check (see `RunnerSpec`'s own note on this). What a node CAN do is dispatch through
   * `Caps.agents`, and every such call is charged for real the moment it happens, regardless of what
   * `cost` claims (`Runner.step`).
+  *
+  * `trust` and `guard` (issue #38) are what `Runner.validate` reads a `Shape`'s own nodes back
+  * through. The primary constructor is `private`, confirmed against Scala 3.8.3 itself (not merely
+  * assumed) to also privatize the case class's own synthetic `apply` AND `copy`: a foreign call
+  * site attempting either fails to compile, and the two failures read differently, because they are
+  * two different members. `new Node(...)` calls the CONSTRUCTOR directly, and the compiler reports
+  * that access site by name: "constructor Node cannot be accessed as a member of ... from class ...",
+  * "private constructor Node can only be accessed from class Node in package in.rcard.litterbox"
+  * (verified against Scala 3.8.3, `GraphValidationSpec`'s own test). `n.copy(...)` similarly reports
+  * "method copy cannot be accessed as a member of ..." / "private method copy can only be accessed
+  * from class Node in package in.rcard.litterbox". Neither reads "object Node does not take
+  * parameters", the message a bare `Node(...)` call would get if NO `apply` resolved at all; that is
+  * not this guarantee, since `Node.apply` in the companion object below always resolves for an
+  * ordinary call. That same `Node.apply` is the only way in, and it takes `trust` from nowhere a
+  * caller can name: `t.trust`, read off the
+  * `given TrustOf[O]` its own `using` clause resolves, so a node author cannot write the wrong
+  * `Trust` into it BY HAND, the same way `copy` cannot be used to swap it either afterward. That
+  * closes off hand mislabelling, not mislabelling as such: `NodeOutcome`'s own covariance still lets
+  * a `Node` whose DECLARED output type is `AgentDispatch.Judged[A]` earn `Trust.Reviewed` from this
+  * exact derivation while never once calling `AgentDispatch.review` (`Trust`'s own doc has the
+  * mechanism; `Runner.step`'s own doc has the runtime check that catches it for every execution that
+  * reaches a `Done`). In a codebase whose thesis is distrust, claiming more than that here would be
+  * a false structural guarantee, worse than none at all. `guard` stays an ordinary, defaulted
+  * parameter on that same `apply`, because (see `Guard`'s own doc) it is not derivable from `O` at
+  * all.
   */
-final case class Node[I, O](
+final case class Node[I, O] private (
     name: String,
     cost: Cost,
     timeout: Timeout,
     probe: I => (Caps, Fault) ?=> Option[O],
-    run: I => (Caps, Fault) ?=> NodeOutcome[O]
+    run: I => (Caps, Fault) ?=> NodeOutcome[O],
+    trust: Trust,
+    guard: Guard
 )
+
+object Node:
+  def apply[I, O](
+      name: String,
+      cost: Cost,
+      timeout: Timeout,
+      probe: I => (Caps, Fault) ?=> Option[O],
+      run: I => (Caps, Fault) ?=> NodeOutcome[O],
+      guard: Guard = Guard.Open
+  )(using t: TrustOf[O]): Node[I, O] =
+    new Node(name, cost, timeout, probe, run, t.trust, guard)
 
 /** One edge of a `Workflow`'s graph, chosen by the PREVIOUS node's output (or, for the first node,
   * by the workflow's own input): either the run finishes here, or execution goes to another `Node`
@@ -244,6 +387,43 @@ enum Next:
     */
   case Goto[I, O](node: Node[I, O], input: I, andThen: O => Next) extends Next
 
+/** One declared edge of a `Workflow`'s own `Shape` (issue #38): from one `Node` to another,
+  * existentially typed over each node's `[I, O]` pair for the same reason `Next.Goto` is (that
+  * enum case's own doc): a `Shape` has to hold every node the graph reaches, regardless of how many
+  * distinct input/output shapes they carry, without inventing a common supertype for all of them.
+  */
+final case class Transition(from: Node[?, ?], to: Node[?, ?])
+
+/** The declared shape of a `Workflow`'s graph (issue #38, RFC #26 decision 16's cheap half): which
+  * nodes a walk can begin at (`entry`), and which node can follow which (`transitions`). This is
+  * DATA a workflow author writes by hand, describing the SAME graph the `Next.Goto` closures
+  * already encode, never derived from them: `Next.Goto`'s own `andThen: O => Next` is an opaque
+  * closure over an erased `O` (`Next`'s own doc), so nothing can walk it without running it, and
+  * running it for real, in `Machine.shippedWorkflow`, fires real git/GitHub side effects. `Shape`
+  * exists so `Runner.validate` (below) has something to walk that is not those closures.
+  *
+  * Hand declaring this alongside the closures it describes is the acknowledged weakness of this
+  * issue's cheap half: nothing here stops a `Shape` from drifting out of sync with what its own
+  * closures actually do, the same way a stale comment can drift from the code beside it. Issue
+  * #39's compile time macro, extracting the literal graph straight from the real `Next` values, is
+  * what removes that gap; this issue only narrows it, by giving the drift somewhere concrete to be
+  * caught. A wrong `Shape` still lets a bad graph pass validation, but a right one genuinely rejects
+  * one, which is strictly more than no check at all.
+  *
+  * A second limit sits beside that drift risk, not caused by it: a `Transition` names two `Node`s,
+  * nothing about which VALUE of the `from` node's output chose that edge (`Transition`'s own doc).
+  * A guarantee like "`Merge` never runs unreviewed" can be true of a real graph for a DATA reason
+  * (only one `Route` value ever reaches it, and that value is only ever produced after a real
+  * review) while being false of the same graph's reachability shape (some OTHER edge out of an
+  * upstream node reaches the same downstream nodes `Merge` sits behind, without a reviewer). A
+  * `Shape` walk cannot tell those two cases apart; it only sees that an edge exists, never which
+  * output value it was chosen for. `Machine.shippedWorkflow`'s own doc on its `Merge`/`OpenPr` nodes
+  * is the concrete case this limit is not hypothetical for. Issue #39's macro would still have to
+  * read the actual branch a running `andThen` took to close this, the same way it closes the drift
+  * risk above; naming the limit here is what stops it being silently rediscovered as a fresh bug.
+  */
+final case class Shape(entry: List[Node[?, ?]], transitions: List[Transition])
+
 /** A named graph: `start` computes the first `Next` from the workflow's own input. The user (whoever
   * builds a `Workflow` value) owns every transition `start`/`andThen` describe; only the `Runner`
   * ever actually walks them, so budget/timeout accounting stays in exactly one place regardless of
@@ -254,8 +434,18 @@ enum Next:
   * touches a `Workflow` (`Next`, `Runner.run`'s own signature, every node's `andThen`) for a
   * degree of freedom nothing in this codebase uses, since every real terminal already IS a
   * `LoopExit`.
+  *
+  * `shape` (issue #38) defaults to `Shape(Nil, Nil)`, an empty declaration that `Runner.validate`
+  * reads as trivially valid (no declared entry means no path to walk, so no violation can ever be
+  * found): every `Workflow` value `RunnerSpec` builds with fake nodes predates this field and has
+  * nothing to say about review reachability, so the default is what keeps every one of those tests
+  * compiling and passing unchanged rather than forcing an unrelated `Shape` onto graphs that were
+  * never about this concern. Said plainly, not left to be inferred: a `Workflow` built with no
+  * `shape` argument at all is EXPLICITLY UNVALIDATED, not proven safe by an empty result: `validate`
+  * finding no violation on `Shape(Nil, Nil)` means nothing was walked, not that nothing is wrong.
+  * `Machine.shippedWorkflow` is the one caller that supplies a real one.
   */
-final case class Workflow[I](name: String, start: I => Next)
+final case class Workflow[I](name: String, start: I => Next, shape: Shape = Shape(Nil, Nil))
 
 /** Executes a `Workflow` (or, via `step`, a single `Node`) against the capabilities in scope,
   * owning every concern a node itself is not allowed to own: whether a `probe` already answered the
@@ -372,6 +562,35 @@ object Runner:
     * timeouts are already enforced one layer down, at the subprocess boundary that actually
     * dispatches a worker/fixer/reviewer/gate. This check exists only to make an overrun observable,
     * not to cut the node off.
+    *
+    * A second check here, added by issue #38 review BLOCKER 2, is what makes `Trust.Reviewed` an
+    * observed fact rather than a claim `TrustOf` merely typechecked: `NodeOutcome`'s own covariance
+    * (`NodeOutcome`'s own doc) lets `Stopped(exit)`, typed `NodeOutcome[Nothing]`, satisfy a
+    * `run`/`probe` signature declared to return `NodeOutcome[AgentDispatch.Judged[A]]`, so a `Node`
+    * whose declared output type happens to be `Judged`-shaped earns `Trust.Reviewed` from `TrustOf`
+    * even if its body never calls `AgentDispatch.review` at all, so long as it never returns a
+    * `Done`. That is a real gap in what the type-level derivation alone can promise (`Trust`'s own
+    * doc), and this runtime check is the other half: whenever a `Trust.Reviewed` node's `outcome`
+    * IS a `Done(value)`, `value` is checked against the actual runtime class `AgentDispatch.Judged`,
+    * not merely its declared type, and a mismatch faults through the same `fault.raise` every other
+    * observed violation in this method already uses. A `Stopped` result is NOT itself a forgery and
+    * must not fault here: a node that only ever stops never claims to have produced a review, it
+    * simply never reaches the point where that claim could be checked (the walk it sits on ends
+    * there instead, so nothing downstream of it runs unreviewed either). This cannot fire on
+    * `Machine.shippedWorkflow`: `Machine.Review` is the one node in that graph whose output type is
+    * `AgentDispatch.Judged`, and its `run` body only ever produces one through a genuine
+    * `AgentDispatch.review` dispatch (`Machine.Review`'s own doc), so its `Done` always carries a
+    * real one and no golden log moves.
+    *
+    * The strongest justification this check has is not the covariance gap above, which at least
+    * requires a node author to write a plausible, honestly-typed `Node`: `TrustOf` (`TrustOf`'s own
+    * doc) is `sealed`, but sealed only closes off a THIRD PARTY writing a new instance, never a cast
+    * on an existing one: `TrustOf.judged.asInstanceOf[TrustOf[MyType]]` compiles today and would
+    * stamp `Trust.Reviewed` onto an entirely ordinary node's `MyType` output at the `Node.apply` call
+    * site, with nothing in `Node`'s own constructor able to tell the difference. This runtime check
+    * is what still catches that forgery, the same way it catches every other one: the first time such
+    * a node's `run` actually reaches a `Done`, the value is checked against the real runtime class,
+    * not the (forged) declared type, and it faults right there.
     */
   def step[I, O](node: Node[I, O], input: I)(using
       caps: Caps,
@@ -393,6 +612,14 @@ object Runner:
         else node.run(input)(using chargingCaps, fault)
 
     outcome match
+      case NodeOutcome.Done(value)
+          if node.trust == Trust.Reviewed && !value.isInstanceOf[AgentDispatch.Judged[?]] =>
+        fault.raise(
+          s"node '${node.name}' is stamped Trust.Reviewed (its declared output type unifies with " +
+            "AgentDispatch.Judged) but returned a Done value that is not one at runtime, this node's " +
+            "own body never produced a genuine review, so Runner.validate's reachability check would " +
+            "have wrongly treated every path through it as reviewed"
+        )
       case NodeOutcome.Stopped(LoopExit.InfraFault) =>
         fault.raise(s"node '${node.name}' returned Stopped(LoopExit.InfraFault) directly")
       case _ => ()
@@ -408,18 +635,223 @@ object Runner:
 
     outcome
 
+  /** Caps how many violation messages get joined into one fault line (issue #38 review finding 4): a
+    * large invalid graph can otherwise produce enough violations for the joined string alone to run
+    * to hundreds of megabytes. `20` is generous enough that an ordinary mistake in a hand-declared
+    * `Shape` still shows every offending path; past that, the message is summarized rather than
+    * spelled out in full, since past a couple dozen the point ("this graph's declaration is wrong")
+    * is already made.
+    */
+  private val MaxReportedViolations = 20
+
+  /** Joins `violations` into one fault line, capped at `MaxReportedViolations` (see that val's own
+    * doc): the first `MaxReportedViolations` messages verbatim, then how many more were left out.
+    * Shared by `run` (below) and `Machine.runOnce`'s own hoisted validation (issue #38 review finding
+    * 3), so an operator reads the same wording no matter which of the two call sites caught the bad
+    * graph.
+    */
+  private[litterbox] def describeViolations(violations: List[String]): String =
+    if violations.size <= MaxReportedViolations then violations.mkString("; ")
+    else
+      violations.take(MaxReportedViolations).mkString("; ") +
+        s"; and ${violations.size - MaxReportedViolations} more"
+
+  /** The one operator-facing sentence a `Shape` violation is ever reported through (issue #38 review
+    * finding 8/nit): `run` (below) and `Machine.runOnce`'s own hoisted validation used to copy-paste
+    * this exact three-line message, `describeViolations` having already been extracted once for the
+    * shared CAPPING logic but not for the wording wrapped AROUND it. Extracting the whole sentence
+    * here, not just the cap, is what actually keeps the two call sites from drifting apart in
+    * wording the next time either one is edited; `describeViolations` alone left that risk open.
+    * States plainly that the GRAPH DECLARATION is wrong, not merely that something failed (issue #38
+    * review finding 7): unlike every other `infraFault` site in this codebase, a bad `Shape` cannot
+    * be healed by the next tick simply retrying, since nothing about the graph's own declared data
+    * changes between ticks; an operator reading rc 50 here should reach for the `Shape`, not go
+    * hunting for a transient cause.
+    */
+  private[litterbox] def invalidShapeMessage(name: String, violations: List[String]): String =
+    s"workflow '$name' has an invalid declared shape and cannot be walked, fix the Shape " +
+      "(the loop cannot proceed, and retrying will not repair a bad graph declaration): " +
+      describeViolations(violations)
+
+  /** Walks `shape` from its own declared `entry` nodes over its own declared `transitions`, looking
+    * for a path that reaches a `Guard.RequiresReview` node without ever crossing a `Trust.Reviewed`
+    * one first (issue #38, RFC #26 decision 16's cheap half). Pure: no `Caps`, no side effect,
+    * nothing but a `Shape`'s own two lists in and a list of violation messages out, empty meaning
+    * valid, which is what lets `run` (below) call this before a single capability exists.
+    *
+    * Three checks below run over the DECLARATION itself, before any walk, because each is a fact
+    * about the `Shape`'s own data, not about any one path through it (issue #38 review findings 5
+    * and 6):
+    *
+    *   - `entry` empty while `transitions` is not: nothing declares where a walk could even begin,
+    *     so every transition is dead data and the walk below would examine nothing at all. Reported
+    *     as its own violation ("transitions declared with no entry") instead of silently agreeing,
+    *     because `Shape(Nil, Nil)`, the genuine "no shape declared" default (`Workflow`'s own doc),
+    *     and `Shape(Nil, someTransitions)`, a `Shape` that forgot its own `entry`, must not read the
+    *     same way: only the former is a deliberate opt-out, and this case short circuits with only
+    *     that one message, since nothing else below has anything to examine either.
+    *   - two nodes sharing one `name` across `entry ++ transitions` that disagree on `cost`,
+    *     `timeout`, `trust` or `guard`: `byFrom` below keys on `name` alone, so two nodes with the
+    *     same name silently merge their edges and inherit whichever instance a given walk happened
+    *     to reach first (issue #38 review finding 6). `name` ALONE is deliberately not enough to
+    *     call two `Node` values duplicates, though: `Machine.shippedWorkflow` legitimately declares
+    *     the same conceptual node (`Gate(cfg)`, say) more than once across its own
+    *     `entry`/`transitions`, and every one of those calls builds a fresh `Node` with fresh
+    *     `probe`/`run` closures that are never `==` to one another (functions compare by reference,
+    *     not by behaviour), comparing on the closures would flag that legitimate, load-bearing
+    *     pattern as a duplicate on every single call. Comparing on `cost`/`timeout`/`trust`/`guard`
+    *     instead, the four facts this validator and `Runner.step` actually read, only fires when two
+    *     nodes sharing a name genuinely disagree about one of them.
+    *   - a node named somewhere in `transitions` (as a `from` or a `to`) that the walk below never
+    *     actually reaches from any declared `entry`: previously skipped in silence, now reported,
+    *     since an unreachable node in a hand-declared `Shape` is at least as likely to be a forgotten
+    *     `entry` or a typoed name as it is a deliberate, dead declaration.
+    *
+    * The walk itself is a breadth first search over a SINGLE, GLOBAL visited set keyed on
+    * `(node name, reviewed so far)`, not a fresh `visited` set threaded down each path (issue #38
+    * review finding 4): threading `visited` per path makes the walk enumerate every PATH through the
+    * graph rather than every STATE, which is exponential in how many diamonds a graph happens to
+    * chain, twenty chained diamonds produced over a million violations in a couple of seconds
+    * before this fix, all bound for one `mkString`d fault line. Sharing one set across the whole
+    * walk means each `(name, reviewed)` state is expanded at most once, however many paths reach it,
+    * which is linear in the size of the declared graph instead. BFS, not DFS, is what makes the
+    * reported path the SHORTEST one into a guarded node: this validator's contract is to name a path
+    * an operator can act on, and the shortest one is the most directly actionable. The walk is
+    * written iteratively, over an explicit queue, not recursively, matching the `@tailrec` standard
+    * `run`'s own walk (below) already holds itself to, rather than leaving a large declared graph's
+    * stack safety an accident of how deep a recursion happens to go.
+    *
+    * Crossing a `Trust.Reviewed` node sets the "reviewed so far" flag for every state reached beyond
+    * it, and it never clears back, because one review earlier on a path clears every guarded node
+    * later on that SAME path. "Beyond it" is deliberate and load bearing: a node's own guard is
+    * tested against the flag the walk carried IN, from before that node ran, never against the flag
+    * folded with that SAME node's own trust, so a node that happens to be both `Trust.Reviewed` and
+    * `Guard.RequiresReview` cannot clear its own guard by virtue of its own trust (issue #38 review,
+    * second round: a consumer node that opens a PR and then reviews the very same call is not a
+    * review of anything, and the walk must not read it as one). Violation messages name the whole
+    * offending path, its node names
+    * joined by `->`, and the guarded node it reaches, not merely that some path somewhere is bad:
+    * fixing this means knowing which edge needs a review in front of it, and a bare node name leaves
+    * that to guesswork on any graph with more than one way to reach it. Ordering is deterministic:
+    * `shape.entry` enqueued in its own declared order, and each node's own `transitions` enqueued in
+    * their own declared order as that node is dequeued, never a `Set`/`Map` iteration order, so the
+    * same `Shape` reports the same violations in the same order on every call.
+    */
+  def validate(shape: Shape): List[String] =
+    if shape.entry.isEmpty && shape.transitions.nonEmpty then
+      List("transitions declared with no entry: nothing was validated")
+    else
+      val allNodes: List[Node[?, ?]] =
+        shape.entry ++ shape.transitions.flatMap(t => List(t.from, t.to))
+
+      def identityOf(n: Node[?, ?]) = (n.cost, n.timeout, n.trust, n.guard)
+
+      val declaredNames = allNodes.map(_.name).distinct
+
+      val duplicateNameViolations = declaredNames.flatMap { name =>
+        val identities = allNodes.filter(_.name == name).map(identityOf).distinct
+        if identities.size > 1 then
+          List(
+            s"node name '$name' is declared by ${identities.size} structurally different nodes " +
+              "(differing cost, timeout, trust or guard) across entry/transitions; two declared " +
+              "nodes sharing a name must agree on every fact this validator reads"
+          )
+        else Nil
+      }
+
+      val byFrom: Map[String, List[Node[?, ?]]] =
+        shape.transitions.groupBy(_.from.name).view.mapValues(_.map(_.to)).toMap
+
+      final case class Item(node: Node[?, ?], path: List[String], reviewed: Boolean)
+
+      val visited        = scala.collection.mutable.Set.empty[(String, Boolean)]
+      val reached        = scala.collection.mutable.Set.empty[String]
+      val pathViolations = scala.collection.mutable.ListBuffer.empty[String]
+      val queue          = scala.collection.mutable.Queue.empty[Item]
+      shape.entry.foreach(e => queue.enqueue(Item(e, Nil, false)))
+
+      while queue.nonEmpty do
+        val Item(node, path, reviewed) = queue.dequeue()
+        val key                        = (node.name, reviewed)
+        if !visited.contains(key) then
+          visited += key
+          reached += node.name
+          val pathHere = path :+ node.name
+          // The guard test reads `reviewed`, the flag carried IN from the walk before this node ran
+          // at all, never `reviewedHere` below (issue #38 review, second round, real logic bug): a
+          // node that is BOTH `Trust.Reviewed` and `Guard.RequiresReview` must not be able to clear
+          // its own guard by virtue of its own trust, the same way a reviewer dispatching a PR in the
+          // same breath it reviews it is not a review of anything. `reviewed` is exactly the state of
+          // the walk one step BEFORE this node's own output is considered.
+          if node.guard == Guard.RequiresReview && !reviewed then
+            pathViolations +=
+              s"path ${pathHere.mkString(" -> ")} reaches '${node.name}' with no reviewed node before it; " +
+                "a node whose output is AgentDispatch.Judged must appear on every path into it"
+          // `reviewedHere`, unlike the guard test above, DOES fold in this node's own trust: a
+          // reviewer node still clears the guard on every node AFTER it on the same path, exactly as
+          // before; only this node's own guard, checked one line up, must not be cleared by its own
+          // trust.
+          val reviewedHere = reviewed || node.trust == Trust.Reviewed
+          byFrom
+            .getOrElse(node.name, Nil)
+            .foreach(child => queue.enqueue(Item(child, pathHere, reviewedHere)))
+
+      val unreachableViolations = declaredNames.collect {
+        case name if !reached.contains(name) =>
+          s"node '$name' is declared in transitions but is unreachable from any declared entry; it was never examined by this validator"
+      }
+
+      duplicateNameViolations ++ pathViolations.toList ++ unreachableViolations
+
   /** Walks `wf` from `input` to a `LoopExit`, one `step` at a time: `Next.Finish` ends the walk,
     * `Next.Goto` steps its node and, on `NodeOutcome.Done`, hands the value to `andThen` for the
     * next `Next`; `NodeOutcome.Stopped` ends the walk early with that node's own exit, and nothing
     * after it ever runs. `@tailrec` pins the stack safety a graph of unbounded length needs, rather
     * than leaving it an accident of how the match compiles today.
+    *
+    * `validate(wf.shape)` runs FIRST, before `wf.start(input)` is ever called (issue #38): a
+    * violation is a fact about the graph's own declared shape, true before any node has run, so
+    * checking it after even one node's side effects fired would be too late to mean "rejects a
+    * graph before executing any node". On a violation this goes through the SAME fault channel
+    * every other fault in this loop already uses, `Machine.infraFault`, so it logs, notifies and
+    * abandons the tick exactly like any other infra fault, never a second, differently shaped exit.
+    * On a valid graph, `validate` returns `Nil` and this emits nothing at all: every golden log
+    * this suite pins stays byte identical, since the only paths that ever produce a fresh log line
+    * here are ones that were already going to abandon the run.
+    *
+    * `Machine.runOnce` (issue #38 review finding 3) additionally validates `shippedShape(cfg)` at
+    * the very TOP of the tick, before even `Pick` runs, for the same reason this call sits before
+    * `wf.start`: a full node, `Pick`, otherwise runs (branch created, labels flipped, prompt files
+    * written) on an invalid graph before this method ever gets a chance to reject it. That earlier
+    * check does not replace this one: a consumer calling `run` directly, bypassing `runOnce`
+    * entirely, is still covered here. A valid graph therefore pays for `validate` at most twice, both
+    * calls pure and silent, never a third time, and a genuinely valid graph emits nothing either way.
+    * The fault message, built by `invalidShapeMessage` (above, issue #38 review findings 7 and 8),
+    * states plainly that the GRAPH DECLARATION is wrong, not merely that something failed: unlike
+    * every other `infraFault` site in this codebase, a bad `Shape` cannot be healed by the next tick
+    * simply retrying, since nothing about the graph's own declared data changes between ticks; an
+    * operator reading rc 50 here should reach for the `Shape`, not go hunting for a transient cause.
+    * `Machine.runOnce`'s own hoisted validation calls the same `invalidShapeMessage`, so an operator
+    * reads identical wording no matter which of the two call sites caught the bad graph, and
+    * `describeViolations` (above), which `invalidShapeMessage` itself calls, caps how much of the
+    * violation list actually lands in that one line (issue #38 review finding 4).
     */
-  def run[I](wf: Workflow[I], input: I)(using Caps, Faulting, Ledger): LoopExit =
-    @tailrec
-    def walk(next: Next): LoopExit = next match
-      case Next.Finish(exit) => exit
-      case g: Next.Goto[i, o] =>
-        step(g.node, g.input) match
-          case NodeOutcome.Done(o)     => walk(g.andThen(o))
-          case NodeOutcome.Stopped(ex) => ex
-    walk(wf.start(input))
+  def run[I](wf: Workflow[I], input: I)(using
+      caps: Caps,
+      faulting: Faulting,
+      ledger: Ledger
+  ): LoopExit =
+    val violations = validate(wf.shape)
+    if violations.nonEmpty then
+      Machine.infraFault(
+        invalidShapeMessage(wf.name, violations)
+      )(using caps.logger, caps.notifier)(using faulting)
+    else
+      @tailrec
+      def walk(next: Next): LoopExit = next match
+        case Next.Finish(exit) => exit
+        case g: Next.Goto[i, o] =>
+          step(g.node, g.input) match
+            case NodeOutcome.Done(o)     => walk(g.andThen(o))
+            case NodeOutcome.Stopped(ex) => ex
+      walk(wf.start(input))

@@ -355,6 +355,16 @@ object Machine:
     * all, so nothing about that placeholder ledger is ever observable), mints the real, resume-aware
     * `Ledger` exactly as before, then hands the rest of the tick to `Runner.run` over
     * `shippedWorkflow`.
+    *
+    * `Runner.validate(shippedShape(cfg))` runs FIRST, before `Pick` is even stepped (issue #38
+    * review, MAJOR 3): `Runner.run` already refuses to walk an invalid `Shape` (its own doc), but by
+    * the time this method reaches that call, `Pick` has already run, a branch created, labels
+    * flipped, prompt files written, real, observable work a bad graph declaration has no business
+    * causing. `shippedShape(cfg)` needs only `cfg`, already in scope here, so this check costs
+    * nothing this method did not already have. `Runner.run` still validates the same shape again,
+    * for its own reason (a consumer calling it directly, bypassing `runOnce` entirely, must stay
+    * covered too), so a valid graph pays for `validate` at most twice per tick and, either way,
+    * `validate` returning `Nil` emits nothing at all: no golden log moves.
     */
   def runOnce(n: Int)(using
       cfg: Config,
@@ -384,6 +394,18 @@ object Machine:
       // own doc), so `summon[Faulting]` resolves it here without this method needing a `using`
       // clause of its own for it.
       val faulting: Faulting = summon[Faulting]
+
+      // Hoisted here, before `Pick` runs (issue #38 review, MAJOR 3): a violation is a fact about
+      // `shippedShape(cfg)`'s own declared data, true before any node in the tick has executed, so
+      // checking it any later would let a full node's worth of real side effects (`Pick`'s own
+      // branch/label/prompt-file work) happen first on a graph this method was always going to
+      // reject. Goes through the same `infraFault` every other fault in this file already uses, and
+      // `Runner.invalidShapeMessage` (issue #38 review findings 7 and 8) is the SAME one-sentence
+      // builder `Runner.run`'s own check calls, not a second, hand-copied wording, so this reads
+      // identically whichever of the two call sites catches a bad `Shape`.
+      val shapeViolations = Runner.validate(shippedShape(cfg))
+      if shapeViolations.nonEmpty then
+        infraFault(Runner.invalidShapeMessage("shipped", shapeViolations))
 
       // `pickAndSetup`'s own `using` clause carries no `AgentDispatch` at all, so nothing inside it
       // can call `agents.*` regardless of what `Cost` `Pick` declares or what `Ledger` it runs under;
@@ -1605,6 +1627,12 @@ object Machine:
     * exposes something equivalent to `shippedWorkflow` outside this package, is not part of this
     * issue and is not attempted here. `Review`'s `Cost`/probe stay unfalsifiable at this one call site
     * for the reason above.
+    *
+    * `shape` (issue #38, RFC #26 decision 16's cheap half) is now `shippedShape(cfg)`, hoisted to its
+    * own function (issue #38 review finding 3) so `Machine.runOnce` can validate it before `Pick`
+    * ever runs, without needing this function's own `caps`/`faulting`/`ledger`, see that function's
+    * own doc for the full edge set and for why an earlier version of it was curated to omit three
+    * real edges rather than honestly declare them.
     */
   private[litterbox] def shippedWorkflow(
       cfg: Config,
@@ -2020,7 +2048,78 @@ object Machine:
                     )
                   )
               }
-            )
+            ),
+      shape = shippedShape(cfg)
+    )
+
+  /** The declared `Shape` of `shippedWorkflow` (issue #38, RFC #26 decision 16's cheap half),
+    * factored out to its own function (issue #38 review finding 3) so `Machine.runOnce` can validate
+    * it BEFORE `Pick` ever runs: every identifier this function closes over (`Implement`, `Gate`,
+    * `Repair`, `Review`, `RouteDecision`, `CommitAndPush`, `OpenPr`, `CiWait`, `Merge`,
+    * `PostMergeCleanup`) needs nothing but `cfg` to build, no `Caps`, no `Faulting`, no `Ledger`, so
+    * this is pure to call from `runOnce`'s very first line, before a single capability or a real
+    * `Ledger` exists for the tick.
+    *
+    * `Implement`/`Repair` (the two nodes a real tick can start at, ordinary dispatch or
+    * resumed-parked FIX) into `Gate`, `Gate`'s own RED retry into `Repair` and back, `Gate`'s GREEN
+    * edge into `Review`, `Review`'s own REQUEST_CHANGES retry into `Repair` and its APPROVE edge
+    * into `RouteDecision`, then the straight run `RouteDecision` to `CommitAndPush` to `OpenPr` to
+    * `CiWait` to `Merge` to `PostMergeCleanup`. `Gate` to `Review` and `Review` to `RouteDecision`
+    * are declared here even though `Review` is never a literal `Next.Goto` edge in the closures
+    * above (D1's own doc, above, has the reason it stays a direct `Runner.step` call against its own
+    * `Ledger`): the declared `Shape` is the honest statement of the TRUST flow this graph is meant
+    * to have, which is exactly what `Runner.validate` needs to see, not a literal transcription of
+    * which calls are, mechanically, a `Next.Goto` versus a plain method call.
+    *
+    * Three more edges are declared here that an earlier version of this `Shape` omitted (issue #38
+    * review, BLOCKER 1): `finish` (above) is also reached three other ways that skip `Gate`/`Review`
+    * entirely, an initial patch REJECTED by `Implement` (protected path or oversized patch, never
+    * gated at all), a REJECTED `Repair` round (a rejected FIX), and a `Gate` RED whose repair budget
+    * is already exhausted (`attemptRepairNext`'s own `stopped` callback, above, called with
+    * `ledger.remainingDispatches <= 0` before a `Repair` round is even attempted), each going
+    * straight from `Implement`/`Gate`/`Repair` to `RouteDecision`. An earlier version of this `Shape`
+    * left all three out, undocumented, PRECISELY because declaring them made the shape reject itself:
+    * `RouteDecision` led to `OpenPr`, which carried `Guard.RequiresReview`, and none of the three
+    * rejection paths ever cross `Review`. That is a shape curated to pass its own validator, not a
+    * true statement of the graph, and it is fixed here two ways at once: the three real edges are
+    * declared (below), and `OpenPr`/`Merge` no longer carry `Guard.RequiresReview` at all (their own
+    * doc has the reason, restated once more since it is the reason this `Shape` can now be complete
+    * AND clean). The three rejection edges open a PR anyway, on the `Route.NeedsHuman` route,
+    * precisely so a HUMAN reviews the rejection on GitHub, an audit trail, not an unattended merge:
+    * `Route.AutoMergeCandidate`, the only route that ever reaches `Merge`, is only ever produced from
+    * an `Outcome.Success` this file only ever sets after `Review`'s own `Verdict.Approve`. That is a
+    * DATA guarantee (which `Route` value chose the edge), not a reachability one (which edges exist
+    * at all), and `Guard`'s own doc (`Kit.scala`) states plainly why a `Shape` walk cannot express it.
+    *
+    * Said plainly, so the consequence is not left to be inferred (issue #38 review, second round): no
+    * node declared in this `Shape` carries `Guard.RequiresReview` at all, so `Runner.validate`'s
+    * review-reachability walk can never fire on THIS graph; what it actually checks here is
+    * declaration hygiene alone (an empty `entry`, two nodes disagreeing on a shared name, an orphan
+    * node `transitions` names but no `entry` reaches), real, but a strictly narrower guarantee than
+    * "no guarded node is reachable without a review". Issue #39's compile time macro, reading the
+    * literal graph the `Next.Goto` closures encode instead of this hand-declared `Shape`, is what
+    * would let a genuine `Merge`/`OpenPr` guard be stated and checked honestly; until then, this
+    * `Shape` is hygiene-checked only.
+    */
+  private[litterbox] def shippedShape(cfg: Config): Shape =
+    Shape(
+      entry = List(Implement(cfg), Repair(cfg)),
+      transitions = List(
+        Transition(Implement(cfg), Gate(cfg)),
+        Transition(Implement(cfg), RouteDecision),
+        Transition(Gate(cfg), Repair(cfg)),
+        Transition(Gate(cfg), RouteDecision),
+        Transition(Repair(cfg), Gate(cfg)),
+        Transition(Repair(cfg), RouteDecision),
+        Transition(Gate(cfg), Review),
+        Transition(Review, Repair(cfg)),
+        Transition(Review, RouteDecision),
+        Transition(RouteDecision, CommitAndPush),
+        Transition(CommitAndPush, OpenPr),
+        Transition(OpenPr, CiWait),
+        Transition(CiWait, Merge),
+        Transition(Merge, PostMergeCleanup)
+      )
     )
 
   /** The labels a terminal route removes when it flips an issue away from `in-progress`: always
@@ -2216,6 +2315,20 @@ object Machine:
     * banner carries on past it. `emit`'s own `"skip"` state already has a distinct glyph
     * (`banner.sh`'s `sym`), so the hit path emits that, not `"ok"`: an operator reading the banner can
     * tell a PR this tick actually opened apart from one it recognised as already there.
+    *
+    * No `guard = Guard.RequiresReview` here (issue #38 review, BLOCKER 1, reversing an earlier
+    * version of this node): this node publishes outward, but not EVERY path into it crosses a
+    * reviewer, by design, not by omission. `shippedShape`'s own doc (above) names the three genuine
+    * edges that reach `RouteDecision`, and so `OpenPr`, without ever crossing `Review`, a rejected
+    * initial patch, a rejected repair, and a gate-RED with the repair budget already exhausted, and
+    * every one of them still opens a PR on the `Route.NeedsHuman` route on purpose, for a human to
+    * review the rejection on GitHub. Declaring `Guard.RequiresReview` here would make that legitimate
+    * design a validation failure: a `Shape` walk can see that an edge into `OpenPr` exists, never
+    * which `Route` VALUE chose it, so it cannot honestly express "every path but these three
+    * specific, intentional ones". `Guard`'s own doc (`Kit.scala`) states this limit plainly. This
+    * node's own probe/adoption logic above is what actually stands between an unattended run and a
+    * bad PR body on this route; `Runner.validate`'s reachability check is simply not the tool for
+    * that job here.
     */
   private val OpenPr: Node[OpenPrInput, Int] =
     Node(
@@ -2391,6 +2504,25 @@ object Machine:
     * different reachability route, not a case the same constraint already rules out. `probe = _ =>
     * None` keeps it that way for both: `performMerge` always calls `gh.merge`, and an out-of-band
     * merge is discovered the same way it always was, by that call failing.
+    *
+    * No `guard = Guard.RequiresReview` here either (issue #38 review, BLOCKER 1, reversing an
+    * earlier version of this node): this is the SECOND, and more dangerous, place this loop
+    * publishes outward, since a merge lands on `main` with no further human gate at all, and the
+    * guarantee that it never runs unreviewed is real, but it is a DATA dependency, not a
+    * reachability property, and declaring a `guard` here would ask `Runner.validate` to discharge a
+    * claim it structurally cannot. `Merge` is reached only on `Route.AutoMergeCandidate`, produced
+    * only from an `Outcome.Success` this file only ever sets after `Review`'s own `Verdict.Approve`
+    * (`cycle`'s own body); every declared path INTO `Merge` still runs through
+    * `RouteDecision`/`CommitAndPush`/`OpenPr`, and the rejection paths (`shippedShape`'s own doc)
+    * legitimately reach those same three nodes too, on their way to a `Route.NeedsHuman` audit PR
+    * instead. `Transition` names two nodes, nothing about which VALUE of the upstream node's output
+    * chose that edge, so a `Shape` walk cannot tell "reaches `Merge` via `AutoMergeCandidate`" apart
+    * from "reaches `RouteDecision`, then `CommitAndPush`, then `OpenPr`, for an entirely different
+    * reason". Declaring `Guard.RequiresReview` on this node in THIS shape would make the shape reject
+    * itself, exactly the bug that shipped once already; `Guard`'s own doc (`Kit.scala`) is where this
+    * limit of the cheap half is stated for good, so it does not get silently rediscovered a second
+    * time. `Guard.RequiresReview` remains real and tested for a graph whose merge node genuinely has
+    * no other, legitimate way in.
     */
   private val Merge: Node[MergeInput, Unit] =
     Node(

@@ -1,7 +1,5 @@
 package in.rcard.litterbox
 
-import scala.util.boundary
-
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 
@@ -21,33 +19,9 @@ import org.scalatest.matchers.should.Matchers
   */
 class ShippedWorkflowSpec extends AnyFlatSpec with Matchers:
 
-  private def buildCaps(world: TestWorld): Caps =
-    Caps(
-      cfg = Config(),
-      gh = world.github,
-      git = world.git,
-      agents = world.agents,
-      gates = world.gates,
-      hostGates = world.hostGates,
-      status = world.status,
-      notifier = world.notifier,
-      fs = world.fs,
-      clock = world.clock,
-      logger = world.logger
-    )
-
-  /** Same shape as `RunnerSpec`'s own `withFaulting`: every `Runner.run`/`Runner.step` call needs a
-    * `Faulting` in scope, exactly the way `Machine.runOnce` gets one, from the `boundary[LoopExit]`
-    * it establishes for a real run.
-    */
-  private def withFaulting[T](body: Faulting ?=> T): Either[LoopExit, T] =
-    var out: Option[T] = None
-    val exit = boundary[LoopExit]:
-      out = Some(body)
-      LoopExit.Idle // never read: `out` is `Some` whenever this line is reached
-    out match
-      case Some(t) => Right(t)
-      case None    => Left(exit)
+  // `buildCaps`/`withFaulting` now live next to `TestWorld` itself (`test/Recorder.scala`, issue #38
+  // review nit): this file, `RunnerSpec` and `GraphValidationSpec` each used to carry an identical,
+  // separately maintained copy of both.
 
   private def start(resumeAuthors: Option[List[String]]): Machine.ShippedStart =
     Machine.ShippedStart(
