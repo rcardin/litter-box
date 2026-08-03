@@ -2,6 +2,7 @@ package in.rcard.litterbox
 
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
+import Script.*
 
 /** Proves the shipped pipeline (issue #37) is a genuine `Workflow[Machine.ShippedStart]` value, built
   * from the public kit constructs (`Node`, `Next`, `Workflow`, `Runner`) and drivable directly through
@@ -91,6 +92,32 @@ class ShippedWorkflowSpec extends AnyFlatSpec with Matchers:
       world.callCount("dispatch IMPL") shouldBe 1
       world.callCount("gate FAST") shouldBe 1
       world.callCount("dispatch REVIEW") shouldBe 1
+    }
+
+  // ---- issue #44: Route.Parked is a real Next.Goto edge into AskHuman -------------------------
+
+  it should "walk Implement, Gate and RouteDecision into AskHuman, reaching LoopExit.Parked, when " +
+    "the repair budget exhausts on a gate-RED (the same edge ScenarioSpec/LogParitySpec pin end to " +
+    "end; this proves it off the public Workflow value directly, the way the happy-path test above " +
+    "does for the ordinary chain)" in {
+      val world = TestWorld()
+      world.gateResults = List(GateResult.Red, GateResult.Red, GateResult.Red)
+      world.fixScripts = List(
+        WorkerScript.Produces(newFilePatch),
+        WorkerScript.Produces(newFilePatch)
+      )
+      val caps = buildCaps(world)
+
+      val result = withFaulting:
+        val ledger = Runner.Ledger(3) // Config().repairBudget (2) + 1, the ordinary-tick seed
+        Runner.run(
+          Machine.shippedWorkflow(Config(), caps, summon[Faulting], ledger),
+          start(resumeAuthors = None)
+        )(using caps, summon[Faulting], ledger)
+
+      result shouldBe Right(LoopExit.Parked)
+      world.called("gh issue comment 999") shouldBe true // AskHuman's own probe-miss park
+      world.postedIssueComments.last shouldBe (999 -> Machine.ParkBody)
     }
 
   // ---- declared stage set (issue #40) --------------------------------------------------------

@@ -224,10 +224,12 @@ This is the product. Everything else is plumbing.
   `REQUEST_CHANGES`. Exhausting it on that generic failure parks the issue by default
   (`issues.park-on-exhaustion`) rather than looping forever; a guard rejection or an empty fix
   still terminates straight to `needs-human` regardless of the knob.
-- **Only vouched-for accounts can resume a parked issue.** The marker comment that bounds the
-  resume probe, and any reply that resumes it, must come from an `OWNER`, `MEMBER` or
-  `COLLABORATOR` association. A comment from any other account is logged and ignored, so a public
-  issue thread cannot be used to force unbounded park/resume dispatch cycles.
+- **Only vouched-for accounts can resume a parked issue.** Every marker comment the harness itself
+  posts (the initial park comment, and the one it posts the moment a resumed reply is actually spent
+  on a fresh attempt) bounds the resume probe the same way: only a reply after the newest one, from
+  an `OWNER`, `MEMBER` or `COLLABORATOR` association, counts. A comment from any other account is
+  logged and ignored, so a public issue thread cannot be used to force unbounded park/resume
+  dispatch cycles.
 - **Infra faults are not code failures.** A Docker outage, a timed-out worker or a failed merge
   exits `50` with the budget untouched and the issue left `in-progress`, so the next tick resumes it.
   A crashed sandbox can never burn repair budget or trigger a FIX.

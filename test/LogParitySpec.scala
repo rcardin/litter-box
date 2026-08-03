@@ -312,6 +312,41 @@ class LogParitySpec extends AnyFlatSpec with Matchers:
     w.logShouldMatchGolden("parked-on-exhaustion")
   }
 
+  /** Issue #44: the reply path through the new `AskHuman` edge. A reply is already sitting after the
+    * marker the MOMENT the issue reaches `Route.Parked` for the first time, so `AskHuman`'s own probe
+    * hits; `finish`'s own closure logs why the reply cannot be spent this tick (the shared ledger is
+    * provably exhausted by the time `Route.Parked` is ever reached, `decideRoute`'s own invariant) and
+    * then calls `reparkKeepingReply`, NOT the `parkIssue` the probe-miss path (`askHumanRun`) uses
+    * (issue #44 review, MAJOR, round 2: posting a fresh marker on this path was the actual bug,
+    * burying the very reply the log line just named), so this golden's tail differs from
+    * `parked-on-exhaustion` above in exactly one line, the one naming the reply, and posts no comment
+    * at all, unlike that scenario's own trailing marker post. Kept as its own scenario rather than
+    * folded into `parked-on-exhaustion`: the two differ in exactly the one fact this issue adds,
+    * whether a reply is already there, and that one extra line is worth pinning on its own.
+    */
+  it should "match the golden for a reply already waiting the moment the issue parks, re-parking WITHOUT a fresh marker so the same reply resumes next tick" in {
+    val w = TestWorld()
+    w.gateResults = List(GateResult.Red, GateResult.Red, GateResult.Red)
+    w.fixScripts = List(
+      WorkerScript.Produces("1\t0\tsrc/main/scala/Fix1.scala"),
+      WorkerScript.Produces("1\t0\tsrc/main/scala/Fix2.scala")
+    )
+    w.issueCommentBodies = Map(
+      999 -> List(
+        s"@litter-box (OWNER):\n${Machine.ParkMarker}\nparked, awaiting a reply",
+        "@alice (OWNER):\ntry using a HashMap instead"
+      )
+    )
+
+    w.runLoop() shouldBe LoopExit.Parked
+
+    // The bug this round fixes, restated as a positive: no comment posted at all on this path, so
+    // alice's original reply is still the newest thing after the newest marker for the next tick.
+    w.postedIssueComments shouldBe empty
+
+    w.logShouldMatchGolden("parked-reply-already-waiting")
+  }
+
   it should "match the golden for a parked issue with no reply, exiting Parked again with nothing spent" in {
     val w = TestWorld()
     w.inProgress = None

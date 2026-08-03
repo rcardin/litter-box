@@ -140,6 +140,46 @@ class ConsumerBoundarySpec extends AnyFlatSpec with Matchers:
     messages should not include "weaker access privileges"
   }
 
+  it should "typecheck a consumer's own graph naming Machine.AskHuman, Machine.AskHumanInput and " +
+    "Machine.AskHumanReply directly and constructing a Workflow from them (issue #44 review MAJOR, " +
+    "round 3: the naming half of acceptance criterion 1 had no pin outside in.rcard.litterbox itself)" in {
+      // `RunnerSpec`'s own `AskHuman` section (`test/RunnerSpec.scala`) drives this node end to end
+      // through `Runner.run`, proving the FUNCTIONAL half of criterion 1; it lives inside
+      // `in.rcard.litterbox` itself, so, exactly like the `AgentDispatch` proofs above, it cannot
+      // prove the PACKAGE BOUNDARY half, that a foreign package can even write this graph down. This
+      // is that proof, following the same top-level-snippet shape every other check in this file uses.
+      //
+      // Deliberately NOT a `Runner.run` call, and deliberately not attempted (issue #44 review MAJOR:
+      // do not widen `Runner.Ledger`'s constructor to paper over this): `Ledger`'s own constructor
+      // stays `private[litterbox]` (RFC #26 decision 9, budget ownership belongs to the runner), so a
+      // consumer can name and compose this exact `Workflow` today but cannot yet construct a `Ledger`
+      // to run it outside the library. That gap is left to the publishing tickets (#41, #43), not this
+      // one; `AskHuman`'s own scaladoc (`src/Machine.scala`) states the same boundary in the library's
+      // own words.
+      val errors = scala.compiletime.testing.typeCheckErrors(
+        """
+          |import in.rcard.litterbox._
+          |
+          |val marker = "<!-- consumer:waiting-on-a-human -->"
+          |val input = Machine.AskHumanInput(
+          |  cur = Machine.Cursor(),
+          |  issue = 4242,
+          |  marker = marker,
+          |  body = s"$marker\nwhich branch should this land on?",
+          |  kindText = "consumer-question",
+          |  gateStatus = "n/a"
+          |)
+          |val next: Machine.AskHumanReply => Next = _ => Next.Finish(LoopExit.Success)
+          |val wf: Workflow[Unit] = Workflow(
+          |  "consumer-graph",
+          |  start = (_: Unit) => Next.Goto(Machine.AskHuman(Config()), input, next)
+          |)
+          |""".stripMargin
+      )
+
+      errors shouldBe empty
+    }
+
   it should "refuse to typecheck a consumer constructing LiveAgentDispatch directly" in {
     // Round three finding 2: `LiveAgentDispatch` (`src/Live.scala`) used to be a public class with a
     // public constructor, so a consumer needed no implementation of `AgentDispatch` at all, only the

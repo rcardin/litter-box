@@ -709,3 +709,128 @@ class RunnerSpec extends AnyFlatSpec with Matchers:
     result shouldBe Right(LoopExit.NeedsHuman)
     laterRan shouldBe false
   }
+
+  // ---- issue #44: AskHuman is genuinely usable from a THIRD PARTY graph, not merely the shipped
+  // ---- one, and a probe hit hands the reply TEXT on to whatever node the graph author wires next ---
+
+  /** A node that records the exact value it received, standing in for whatever a real consumer's
+    * "next node" would do with a human's reply (splice it into its own prompt, say). `Node[String,
+    * Unit]`, not `Node[Machine.AskHumanReply, Unit]`: this is deliberately the SHAPE acceptance
+    * criterion 3 asks for, "comment text available to the next node", so this node's own input is
+    * the text alone, exactly what `AskHuman`'s own `andThen` below hands it, not the whole reply
+    * value with the text still buried inside it.
+    */
+  private def textSinkNode(sink: mutable.ArrayBuffer[String]): Node[String, Unit] =
+    Node(
+      name = "consumer-next",
+      cost = Cost.NoDispatch,
+      timeout = Timeout.Unbounded,
+      probe = _ => None,
+      run = text =>
+        sink += text
+        NodeOutcome.Done(())
+    )
+
+  it should "let a graph independent of Machine.shippedWorkflow drive AskHuman end to end, handing a " +
+    "probe hit's reply TEXT on to the graph author's own next node (issue #44 acceptance criterion 3)" in {
+      // Not `Machine.shippedWorkflow`: this `Workflow` value is built here, in this spec, from
+      // nothing but `Machine.AskHuman`, `Machine.AskHumanInput` and `Machine.AskHumanReply`, all
+      // public (issue #44 review, MAJOR: they used to be `private[litterbox]`, reachable only from
+      // inside `in.rcard.litterbox` itself, which a genuine external consumer graph can never be).
+      // This spec still lives in that same package, so it cannot prove cross-package reachability by
+      // itself (issue #44 review, MAJOR, round 3): that half of acceptance criterion 1 is now pinned
+      // separately, in `test/ConsumerBoundarySpec.scala`, a genuinely separate compilation unit
+      // (that file's own doc has the reason `RunnerSpec` cannot prove it). What THIS test proves is
+      // the narrower, load-bearing FUNCTIONAL half: nothing about `AskHuman`'s own node ties it to
+      // `Machine.shippedWorkflow`'s own closures, ledger or marker, so a graph that owns none of
+      // those can still drive it end to end and receive the reply text criterion 3 asks for.
+      val world = new TestWorld
+      world.viewerLoginAnswer = Some("litter-box")
+      val ownMarker = "<!-- consumer:waiting-on-a-human -->"
+      world.issueCommentBodies = Map(
+        4242 -> List(
+          s"@litter-box (OWNER):\n$ownMarker\nwhich branch should this land on?",
+          "@carol (MEMBER):\nland it on release/4.2, not main"
+        )
+      )
+      val clock  = new FakeClock(List(0L))
+      val sink   = mutable.ArrayBuffer.empty[String]
+      val cur    = Machine.Cursor()
+      val input = Machine.AskHumanInput(
+        cur = cur,
+        issue = 4242,
+        marker = ownMarker,
+        body = s"$ownMarker\nwhich branch should this land on?",
+        kindText = "consumer-question",
+        gateStatus = "n/a"
+      )
+      val wf: Workflow[Unit] = Workflow(
+        "consumer-graph",
+        start = _ =>
+          Next.Goto(
+            Machine.AskHuman(Config()),
+            input,
+            (reply: Machine.AskHumanReply) =>
+              Next.Goto(textSinkNode(sink), reply.text, _ => Next.Finish(LoopExit.Success))
+          )
+      )
+
+      val result = withFaulting:
+        given caps: Caps            = buildCaps(world, clock)
+        given ledger: Runner.Ledger = Runner.Ledger(3)
+        Runner.run(wf, ())
+
+      // A probe hit: no question comment was posted a second time, no label touched, nothing reset,
+      // and the walk continued past `AskHuman` rather than parking (`NodeOutcome.Done`, not
+      // `Stopped`, is what `Runner.run`'s own walk needs to keep going, `Kit.scala`'s own doc).
+      result shouldBe Right(LoopExit.Success)
+      world.called("gh issue comment 4242") shouldBe false
+      world.called("gh issue edit") shouldBe false
+      // Criterion 3, proven honestly: the NEXT node received the reply's own text, not a list of
+      // author logins standing in for it.
+      sink.toList shouldBe List("@carol (MEMBER):\nland it on release/4.2, not main")
+  }
+
+  it should "let a graph independent of Machine.shippedWorkflow drive AskHuman's own PROBE-MISS side " +
+    "effects too, not only the benign probe-hit path above (issue #44 review, MAJOR F3, round 3: the " +
+    "only consumer-facing test before this one exercised the probe hit alone, so a reader of this " +
+    "file had no test showing what a probe MISS actually does to a consumer's own issue)" in {
+      // No comment thread at all on this issue: `AskHuman`'s own probe (`AskHumanProbe`'s doc,
+      // `src/Machine.scala`) reads no marker, answers a genuine miss, and `Runner.step` falls through
+      // to `askHumanRun`. `AskHuman`'s own scaladoc now states plainly (issue #44 review F3) that this
+      // path hard resets the working tree, flips labels and emits a `PARK` status event, none of which
+      // is "it posts a comment and waits" alone; this test is where a consumer-minded reader can see
+      // all three actually happen, from outside `Machine.shippedWorkflow` entirely, the same way the
+      // probe-hit test above proves the benign path.
+      val world = new TestWorld
+      world.viewerLoginAnswer = Some("litter-box")
+      world.issueCommentBodies = Map.empty
+      val clock  = new FakeClock(List(0L))
+      val cur    = Machine.Cursor()
+      val ownMarker = "<!-- consumer:waiting-on-a-human -->"
+      val input = Machine.AskHumanInput(
+        cur = cur,
+        issue = 4343,
+        marker = ownMarker,
+        body = s"$ownMarker\nwhich branch should this land on?",
+        kindText = "consumer-question",
+        gateStatus = "n/a"
+      )
+      val wf: Workflow[Unit] = Workflow(
+        "consumer-graph-probe-miss",
+        start = _ => Next.Goto(Machine.AskHuman(Config()), input, (_: Machine.AskHumanReply) => Next.Finish(LoopExit.Success))
+      )
+
+      val result = withFaulting:
+        given caps: Caps            = buildCaps(world, clock)
+        given ledger: Runner.Ledger = Runner.Ledger(3)
+        Runner.run(wf, ())
+
+      // A probe miss: the walk stops right here (`NodeOutcome.Stopped`, never reaching the `andThen`
+      // above), and every side effect the node's own scaladoc now names actually lands.
+      result shouldBe Right(LoopExit.Parked)
+      world.called("gh issue comment 4343") shouldBe true
+      world.postedIssueComments.last shouldBe (4343 -> input.body)
+      world.called("gh issue edit 4343 --add-label parked --remove-label in-progress") shouldBe true
+      world.called("git reset --hard origin/main && git clean -fd") shouldBe true
+  }

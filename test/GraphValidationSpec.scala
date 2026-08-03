@@ -548,6 +548,7 @@ class GraphValidationSpec extends AnyFlatSpec with Matchers:
       "Review"        -> "Repair",
       "Review"        -> "Route",
       "Route"         -> "CommitAndPush",
+      "Route"         -> "AskHuman",
       "CommitAndPush" -> "OpenPr",
       "OpenPr"        -> "CiWait",
       "CiWait"        -> "Merge",
