@@ -13,7 +13,7 @@ The central split, and the reason the whole suite runs in memory:
   why is in the `HostGateRunner` scaladoc, issue #11).
 - `src/Machine.scala` — `Machine.runOnce`, and the shipped `Workflow` (`Machine.shippedWorkflow`) it
   walks through `Runner.run`: pure decision logic. Touches the world through nothing but the
-  capabilities. No filesystem, no subprocess, no clock.
+  capabilities. No direct filesystem, subprocess, or clock access.
 - `src/Live.scala` — every real side effect (`LiveGit`, `LiveGitHub`, `LiveGateRunner`,
   `LiveAgentDispatch`, `LiveProc`, ...). Handlers take dependencies as constructor params.
 - `test/Recorder.scala` — `TestWorld`, scripted in-memory handlers for every capability plus an
