@@ -1,7 +1,6 @@
 package in.rcard.litterbox
 
 import scala.collection.mutable
-import scala.util.boundary
 
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
@@ -35,50 +34,9 @@ import Caps.given
   */
 class RunnerSpec extends AnyFlatSpec with Matchers:
 
-  /** A `Clock` a test can script by hand. `nowMillis` answers each element of `answers` in turn,
-    * and repeats the last one once exhausted, so a test only has to name as many readings as it
-    * cares about (one per `caps.clock.nowMillis()` call `Runner.step` makes around a node's
-    * `probe`/`run`).
-    */
-  private class FakeClock(answers: List[Long]) extends Clock:
-    private var remaining = answers
-    def sleepSeconds(s: Int): Unit = ()
-    def nowMillis(): Long = remaining match
-      case head :: tail =>
-        remaining = tail
-        head
-      case Nil => answers.lastOption.getOrElse(0L)
-
-  private def buildCaps(world: TestWorld, clock: Clock): Caps =
-    Caps(
-      cfg = Config(),
-      gh = world.github,
-      git = world.git,
-      agents = world.agents,
-      gates = world.gates,
-      hostGates = world.hostGates,
-      status = world.status,
-      notifier = world.notifier,
-      fs = world.fs,
-      clock = clock,
-      logger = world.logger
-    )
-
-  /** Every `Runner.step`/`Runner.run` call needs a `Faulting` in scope, exactly the way every real
-    * call site gets one: from the `boundary[LoopExit]` `Machine.runOnce` establishes for a real run.
-    * Reusing that same shape here, rather than a lighter-weight substitute, means a fault under test
-    * aborts to this boundary exactly the way it would in the real loop. `body` runs to completion and
-    * its result is captured in `Right`; a fault instead lands here as `Left(exit)`, `exit` being
-    * whatever `LoopExit` the fault broke to.
-    */
-  private def withFaulting[T](body: Faulting ?=> T): Either[LoopExit, T] =
-    var out: Option[T] = None
-    val exit = boundary[LoopExit]:
-      out = Some(body)
-      LoopExit.Idle // never read: `out` is `Some` whenever this line is reached
-    out match
-      case Some(t) => Right(t)
-      case None    => Left(exit)
+  // `FakeClock`, `buildCaps` and `withFaulting` now live next to `TestWorld` itself
+  // (`test/Recorder.scala`, issue #38 review nit): this file, `ShippedWorkflowSpec` and
+  // `GraphValidationSpec` all used to carry an identical, separately maintained copy of each.
 
   private def tracingNode(label: String, trace: mutable.ArrayBuffer[String]): Node[Unit, Unit] =
     Node(

@@ -11,6 +11,11 @@ The central split, and the reason the whole suite runs in memory:
   mechanics on the host side of the sandbox boundary, a second type purely so `Main.gateRunners`
   has to wire each tier by name from its own `LiveGateRunner` rather than reuse one instance (the
   why is in the `HostGateRunner` scaladoc, issue #11).
+- `src/Kit.scala`: the graph kit, `Node`, `Workflow` and the `Runner` that walks one, plus the
+  startup validation phase (`Runner.validate`, issue #38): a hand-declared `Shape` (`entry` nodes and
+  `Transition`s) describing the same graph a workflow's `Next.Goto` closures encode, walked BEFORE
+  `wf.start` ever runs, so a path into a `Guard.RequiresReview` node that never crosses a
+  `Trust.Reviewed` one is rejected before a single node executes.
 - `src/Machine.scala` — `Machine.runOnce`, and the shipped `Workflow` (`Machine.shippedWorkflow`) it
   walks through `Runner.run`: pure decision logic. Touches the world through nothing but the
   capabilities. No direct filesystem, subprocess, or clock access.
@@ -21,6 +26,21 @@ The central split, and the reason the whole suite runs in memory:
 
 Adding behaviour that needs the outside world means adding a capability method in `Caps.scala`, a
 decision in `Machine.scala`, an implementation in `Live.scala`, and a script in `Recorder.scala`.
+
+### Startup graph validation (issue #38)
+
+`Runner.validate` walks a `Workflow`'s own declared `Shape` before `Runner.run` ever calls `wf.start`,
+rejecting a graph where a path reaches a `Guard.RequiresReview` node without first crossing a
+`Trust.Reviewed` one. `Machine.shippedShape`, the shipped loop's own declared `Shape`, does not
+declare `Guard.RequiresReview` on any node: `OpenPr` and `Merge` are both reached by legitimate
+rejection paths that never cross `Review` (an unreviewed patch, a repair round that never got
+reviewed), so a `guard` on either would reject the shipped graph itself. Practically, this means
+`Runner.validate` only ever checks declaration hygiene on the shipped graph (an empty `entry`, two
+nodes sharing a name but disagreeing on `cost`/`timeout`/`trust`/`guard`, an orphan node declared in
+`transitions` but unreachable from `entry`), never review-reachability, since nothing in this graph
+ever exercises that check. Issue #39's compile time macro, reading the literal graph the `Next.Goto`
+closures encode instead of a hand-declared `Shape`, is what would let a real guard on `OpenPr`/`Merge`
+be stated and checked honestly.
 
 Infra faults short-circuit through `boundary.Label[LoopExit]` (aliased `Faulting` in `Machine`).
 That is a type-level guarantee, not a convention: no code after a fault can run, so no fault path can
