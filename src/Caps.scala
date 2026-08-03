@@ -3,8 +3,9 @@ package in.rcard.litterbox
 /** Capability traits (passed as `using` context parameters).
   *
   * Slice 1 provides only in-memory scripted handlers (test/Recorder.scala); the live
-  * subprocess/fs/gh handlers are slice 2 (Live.scala). Machine.iterate is pure decision logic over
-  * these — it touches the world through nothing else.
+  * subprocess/fs/gh handlers are slice 2 (Live.scala). Machine.runOnce, and the shipped Workflow
+  * (Machine.shippedWorkflow) it walks through Runner.run, are pure decision logic over these — they
+  * touch the world through nothing else.
   *
   * Deviation from the design doc's capability table: `pickIssue` is split into `inProgressIssue` /
   * `oldestReadyIssue` so the resume-in-progress-first decision stays in Machine (under test)
@@ -113,8 +114,8 @@ trait GitHub:
     * would risk labelling an issue `parked` with no marker on it at all, after which every comment
     * ever left on the issue reads as "the reply" on the next tick.
     *
-    * `false` = the underlying post failed (rc != 0); `Machine.terminal` treats that as an infra
-    * fault rather than completing the park.
+    * `false` = the underlying post failed (rc != 0); `Machine.shippedWorkflow`'s own `finish` (its
+    * `Route.Parked` branch) treats that as an infra fault rather than completing the park.
     */
   def issueComment(issue: Int, body: String): Boolean
 
@@ -394,8 +395,9 @@ trait Log:
   * Why bundle at all: the RFC's node signature is `I => Caps ?=> O`, one context parameter, so a
   * node author writes exactly one `using` in their own code no matter how many capabilities the
   * loop grows. Why not migrate every existing function to take `Caps` instead: every call site
-  * already in this file (`Machine.pickAndSetup`, `implementAndRepair`, `terminal`, ...) would have
-  * to change in lockstep, for a task scoped to converting one phase (Pick) into one node. The
+  * already in this file taking the individual capabilities as their own separate `using` parameters
+  * (`Machine.pickAndSetup`, ...) would have to change in lockstep, for a task scoped to converting
+  * one phase (Pick) into one node. The
   * `given` accessors below are what make BOTH worlds compile unchanged: a function still declared
   * with `(using cfg: Config, gh: GitHub, ...)` keeps resolving those individually wherever a plain
   * `Caps` is the only thing actually in scope (a `Node`'s own `probe`/`run` body), because each
@@ -408,8 +410,8 @@ trait Log:
   * place a real `given Caps` exists is inside a `Node`'s own context-function body (`Machine.Pick`
   * and, since issue #33, `Machine.Implement`'s `run` as well), which never also carries the
   * individual capabilities as named parameters, and the only place the
-  * individual capabilities are named parameters (`Machine.iterate` and everything it calls) never
-  * also introduces a `given Caps`: `iterate` builds a plain, non-given `Caps` value instead,
+  * individual capabilities are named parameters (`Machine.runOnce` and everything it calls) never
+  * also introduces a `given Caps`: `runOnce` builds a plain, non-given `Caps` value instead,
   * precisely so it never becomes a second candidate for its own already-named parameters.
   */
 final case class Caps(

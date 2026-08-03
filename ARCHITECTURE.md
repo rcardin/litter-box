@@ -11,8 +11,9 @@ The central split, and the reason the whole suite runs in memory:
   mechanics on the host side of the sandbox boundary, a second type purely so `Main.gateRunners`
   has to wire each tier by name from its own `LiveGateRunner` rather than reuse one instance (the
   why is in the `HostGateRunner` scaladoc, issue #11).
-- `src/Machine.scala` — `Machine.iterate` / `runOnce`: pure decision logic. Touches the world through
-  nothing but the capabilities. No filesystem, no subprocess, no clock.
+- `src/Machine.scala` — `Machine.runOnce`, and the shipped `Workflow` (`Machine.shippedWorkflow`) it
+  walks through `Runner.run`: pure decision logic. Touches the world through nothing but the
+  capabilities. No filesystem, no subprocess, no clock.
 - `src/Live.scala` — every real side effect (`LiveGit`, `LiveGitHub`, `LiveGateRunner`,
   `LiveAgentDispatch`, `LiveProc`, ...). Handlers take dependencies as constructor params.
 - `test/Recorder.scala` — `TestWorld`, scripted in-memory handlers for every capability plus an

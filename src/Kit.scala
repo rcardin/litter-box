@@ -4,35 +4,52 @@ import scala.annotation.tailrec
 import scala.util.boundary
 
 // The graph kit (issue #32): `Node`, `Workflow` and the `Runner` that executes one. `Machine.Pick`
-// is the first node built on this; `Machine.Implement` (issue #33) is the second, and the first to
+// was the first node built on this; `Machine.Implement` (issue #33) was the second, and the first to
 // carry a real dispatch and a real `Timeout.After` through it. `Machine.Gate` and `Machine.Repair`
-// (issue #34) are the third and fourth. The former FAST-gate-run/self-repair `while` loop is now a
-// recursion (`Machine.implementAndRepair`'s own `runCycle`) whose retry edge, gate-RED or a
-// REQUEST_CHANGES verdict into another `Repair` round, then back into another `Gate` cycle, is
-// chosen by what `Gate`/`Repair`'s own OUTPUT says, the same shape `Next.Goto`'s own `andThen`
-// describes. It is not literally built from `Next`/`Workflow` values, though: `runCycle`'s own doc
-// has the concrete, provable reason (`Next.Finish` is fixed to `LoopExit`, RFC #26 decision 10, and
-// this cycle's own terminal values, a domain `Outcome` plus the rest of `Ready`'s fields, have no
-// injection into that closed set at this point in `iterate`; `terminal`, untouched by this issue, is
-// what turns an `Outcome` into a real `LoopExit` later). The mutable `budget` counter the old loop
-// owned is gone; the shared `Runner.Ledger` is the only thing either the retry decision or the
-// `self-repair: budget now N` log line reads (`Machine.attemptRepair`'s own doc). A `pass` var still
-// survives inside `implementAndRepair`, but only as a mirror the recursion writes so `Ready`'s own
-// `pass` field can report which cycle was last reached; it decides nothing, the recursion's own `p`
-// argument does, and the var itself has exactly one read left in the whole method, the final
-// `Ready(pass, ...)` construction (the resume dispatch that used to read it instead passes the
-// literal `0` it is provably still holding at that point, `implementAndRepair`'s own doc on that
-// call site). `Machine.Review` (issue #35) is the fifth node, the cold-reviewer dispatch; unlike
-// `Gate`/`Repair`, its own call site (`implementAndRepair`'s `runCycle`) hands it a fresh, dedicated
-// `Runner.Ledger(1)` rather than the shared FIX/IMPL one, for the reason that node's own doc gives.
-// `Machine.RouteDecision`, `Machine.CommitAndPush`, `Machine.OpenPr`, `Machine.CiWait`,
-// `Machine.Merge` and `Machine.PostMergeCleanup` (issue #36) are the sixth through eleventh, the
-// terminal phase's own PR-open and auto-merge chain; `Machine.terminal` itself, like
-// `implementAndRepair` above it, stays a plain function that dispatches each of these through
-// `Runner.step` in turn rather than becoming a `Node` itself, for the same reason: its own early
-// returns (the guard checks, `Route.Parked`'s dedicated handling, the NeedsHuman notify) are not
-// values any of these nodes' OUTPUT could route through without inventing a case in `LoopExit` or
-// `NodeOutcome` this codebase does not otherwise need.
+// (issue #34) were the third and fourth. The former FAST-gate-run/self-repair `while` loop had, by
+// then, become a recursion (`Machine.implementAndRepair`'s own `runCycle`) whose retry edge, gate-RED
+// or a REQUEST_CHANGES verdict into another `Repair` round, then back into another `Gate` cycle, was
+// chosen by what `Gate`/`Repair`'s own OUTPUT said, the same shape `Next.Goto`'s own `andThen`
+// describes. It was not literally built from `Next`/`Workflow` values, though: `runCycle`'s own doc
+// had the concrete, provable reason (`Next.Finish` is fixed to `LoopExit`, RFC #26 decision 10, and
+// that cycle's own terminal values, a domain `Outcome` plus the rest of `Ready`'s fields, had no
+// injection into that closed set at that point in `iterate`; `terminal`, untouched by that issue, was
+// what turned an `Outcome` into a real `LoopExit` later). The mutable `budget` counter the old loop
+// owned was gone by then; the shared `Runner.Ledger` was the only thing either the retry decision or
+// the `self-repair: budget now N` log line read (`Machine.attemptRepair`'s own doc). A `pass` var
+// still survived inside `implementAndRepair`, but only as a mirror the recursion wrote so `Ready`'s
+// own `pass` field could report which cycle was last reached; it decided nothing, the recursion's own
+// `p` argument did, and the var itself had exactly one read left in the whole method, the final
+// `Ready(pass, ...)` construction (the resume dispatch that used to read it instead passed the
+// literal `0` it was provably still holding at that point, `implementAndRepair`'s own doc on that
+// call site). `Machine.Review` (issue #35) was the fifth node, the cold-reviewer dispatch; unlike
+// `Gate`/`Repair`, its own call site at the time (`implementAndRepair`'s `runCycle`) handed it a
+// fresh, dedicated `Runner.Ledger(1)` rather than the shared FIX/IMPL one, for the reason that node's
+// own doc gave. `Machine.RouteDecision`, `Machine.CommitAndPush`, `Machine.OpenPr`, `Machine.CiWait`,
+// `Machine.Merge` and `Machine.PostMergeCleanup` (issue #36) were the sixth through eleventh, the
+// terminal phase's own PR-open and auto-merge chain. At the point issue #36 landed, `Machine.terminal`
+// still stayed a plain function dispatching each of these through `Runner.step` in turn rather than
+// becoming a graph edge itself, for a reason that held only until `RouteDecision`'s own OUTPUT, a
+// `Route`, had somewhere real to route to: `terminal`'s own early returns (the guard checks,
+// `Route.Parked`'s dedicated handling, the NeedsHuman notify) were not yet values any node's OUTPUT
+// could route through.
+//
+// Issue #37 is where that stops being true. `Machine.implementAndRepair` and `Machine.terminal` are
+// both gone, folded into `Machine.shippedWorkflow`, one `Workflow[Machine.ShippedStart]` value built
+// from this file's own public shapes (`Node`, `Next.Goto`, `Next.Finish`, `Workflow`) and
+// walked by `Runner.run`. The former hand-recursion (`runCycle`, described above) becomes a plain
+// function, `cycle`, that builds one real `Next.Goto(Gate(cfg), ...)` value and returns; the
+// repetition a `while` loop, then a recursion, used to own now happens because `Runner.run`'s own
+// `@tailrec` walk calls back into whichever `andThen` closure that value carries, which may itself
+// call `cycle` again. `RouteDecision` through `PostMergeCleanup` fold into the SAME graph, ending in a
+// literal `Next.Finish(exit)`; the four non-node segments `terminal` used to own (the `EmptyFix`
+// marker, the `Route.Parked` block, the `NeedsHuman` notify, the PR body render) live inside the
+// `Next.Goto` closures between the edges they always sat next to, hand-written glue in exactly the
+// place a graph has for it. `Machine.Review` is the one node this issue deliberately leaves OUTSIDE
+// the graph proper: it stays a direct `Runner.step` call inside one closure, against its own fresh
+// `Runner.Ledger(1)`, never a `Next.Goto` edge, because a `Next.Goto` edge has no way to say "run this
+// one node against a different `Ledger` than the rest of the walk" (`Runner.run`'s own `using Ledger`
+// is fixed once, before the walk begins). `Machine.shippedWorkflow`'s own doc has the full reasoning.
 //
 // Two of the concerns a hand-written phase like `pickAndSetup` used to own for itself, spending
 // dispatch budget and enforcing a wall-clock timeout, move here, onto the `Runner`, so that no
@@ -66,8 +83,9 @@ import scala.util.boundary
   *
   * `boundary.Label[LoopExit]` is the capability to abandon the current iteration and hand
   * `LoopExit.InfraFault` straight to `Machine.runOnce`'s boundary; that boundary is still established
-  * exactly where it always was (`runOnce`, transitively wrapping `iterate` and everything `iterate`
-  * calls, including the `Runner`), so nothing about WHERE a fault lands moves with this file.
+  * exactly where it always was (`runOnce` itself, transitively wrapping `Pick`'s own throwaway-ledger
+  * dispatch and the whole `shippedWorkflow` walk `Runner.run` performs, including the `Runner`), so
+  * nothing about WHERE a fault lands moves with this file.
   */
 private[litterbox] type Faulting = boundary.Label[LoopExit]
 
@@ -242,10 +260,12 @@ final case class Workflow[I](name: String, start: I => Next)
 /** Executes a `Workflow` (or, via `step`, a single `Node`) against the capabilities in scope,
   * owning every concern a node itself is not allowed to own: whether a `probe` already answered the
   * question, whether the run's shared budget can afford this node, and whether the node's own
-  * `probe`/`run` overran its declared `timeout`. `Machine.Pick`, `Machine.Implement`,
-  * `Machine.Gate` and `Machine.Repair` are the nodes wired through this today (`Machine.iterate`);
-  * `RunnerSpec` additionally exercises the mechanics below with fake nodes, so this file stays
-  * usable ahead of the next real node joining the graph.
+  * `probe`/`run` overran its declared `timeout`. Every node `Machine.shippedWorkflow` (issue #37)
+  * walks, `Implement` through `PostMergeCleanup`, is wired through this, plus `Pick`, which
+  * `Machine.runOnce` steps outside the walk, against its own throwaway `Ledger`, before the real
+  * `Ledger` `shippedWorkflow` runs against even exists (`runOnce`'s own doc has the reason). `RunnerSpec`
+  * additionally exercises the mechanics below with fake nodes, so this file stays usable ahead of the
+  * next real node joining the graph.
   *
   * Emits no log line and no status event of its own, on any path: the only observable side effect a
   * `Runner` call can ever cause is a `Node`'s own `probe`/`run` body doing something (which already

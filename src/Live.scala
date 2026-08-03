@@ -1031,7 +1031,7 @@ final class LiveGitHub(
     * Reads `state` alongside `number` and only returns a number when `state` is `OPEN` (issue #36
     * review, BLOCKER 1): `gh pr view <branch>` resolves a CLOSED or MERGED pull request for that
     * head branch exactly as readily as an OPEN one, and `branch` is deterministic (`s"us-$issue"`,
-    * `Machine.iterate`'s own `val branch`), so without this filter a tick resuming an issue whose
+    * `Machine.pickAndSetup`'s own `val branch`), so without this filter a tick resuming an issue whose
     * earlier PR was already merged (or closed) would adopt that stale PR instead of opening a fresh
     * one, and every node downstream of `OpenPr` would then reason about a PR that has nothing to do
     * with this iteration's own commits. `--json`/`--jq` ask for both fields in one call rather than a

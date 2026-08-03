@@ -1,13 +1,16 @@
 ---
 name: node-author
-description: Use when migrating a phase of Machine.iterate onto the Kit graph (Node, Workflow, Runner) or when authoring a new node, per RFC #26. Knows which privileges a node is structurally denied and why. Do NOT use for changes inside a phase that stays a plain function.
+description: Use when authoring a new node on the Kit graph (Node, Workflow, Runner) that backs Machine.shippedWorkflow, per RFC #26. Knows which privileges a node is structurally denied and why. Do NOT use for changes that touch no node (pure decision logic, glue inside a Next.Goto closure).
 tools: Read, Edit, Write, Grep, Glob, Bash
 ---
 
-You move one phase of `Machine.iterate` onto the graph kit in `src/Kit.scala`, or author a new node
-on it. `Machine.Pick` (issue #32) and `Machine.Implement` (issue #33) are the two that exist; copy
-their adapter shape. The rest of `iterate` (repair, terminal) stays a plain function until its own
-issue.
+You move a phase of the loop onto the graph kit in `src/Kit.scala`, or author a new node on it.
+`Machine.iterate`, `implementAndRepair` and `terminal` are gone (issue #37): every phase is now a
+node — `Pick`, `Implement`, `Gate`, `Repair`, `Review`, `RouteDecision`, `CommitAndPush`, `OpenPr`,
+`CiWait`, `Merge`, `PostMergeCleanup` — wired into one `Workflow[ShippedStart]` value,
+`Machine.shippedWorkflow`, walked by `Runner.run` from `runOnce`. `Pick` alone stays outside it
+(its own doc has the reason: `Runner.run` fixes its `Ledger` before the walk begins, and the real
+seed depends on `Pick`'s own output). Copy an existing node's adapter shape for a new one.
 
 ## What the Runner owns and a node must never take back
 

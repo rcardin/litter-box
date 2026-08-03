@@ -692,8 +692,9 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     w.notifications shouldBe empty // parking is not an alert
     // Park writes NOTHING to git (issue #28 review finding 1, round 2): no commit, no push. The
     // failed work is discarded by resetting the tree to pristine origin/main instead, so a later
-    // resume never has to read a stale local commit back (see `Machine.terminal`'s own scaladoc for
-    // why a round-one design that committed and read the commit back was wrong).
+    // resume never has to read a stale local commit back (see `Machine.Implement`'s own scaladoc for
+    // the two-dot-diff argument against exactly that: a diff read back long after the fact is
+    // measured against an `origin/main` that has since moved).
     w.commitMessages shouldBe empty
     w.pushedBranches shouldBe empty
     w.staged shouldBe false
@@ -1038,9 +1039,9 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
 
   it should "never seed currentPatch on resume: the parked work was discarded at park time, not committed (review finding 1, round 2)" in {
     // Round one committed the failed work locally and read it back on resume; round two reverted
-    // that (see `Machine.terminal`'s scaladoc on `Route.Parked`) because a diff read back long
-    // after park time is measured against a stale `origin/main` and can carry deletion hunks for
-    // everything main gained meanwhile. The resumed FIX must always dispatch with an empty
+    // that (see `Machine.Implement`'s own scaladoc on its two-dot-diff argument) because a diff read
+    // back long after park time is measured against a stale `origin/main` and can carry deletion
+    // hunks for everything main gained meanwhile. The resumed FIX must always dispatch with an empty
     // `currentPatch`, seeded by nothing.
     val w = TestWorld()
     w.inProgress = None
@@ -1393,7 +1394,7 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     // Three ticks. Tick 1 resumes #777 off the parked queue with an accepted reply, fails again,
     // and re-parks; the marker post succeeds but ONLY the re-park's own label flip fails, so the
     // tick infra-faults with the NEW marker already the newest comment (the exact no-gh-failure gap
-    // the review traced at `terminal`'s `Route.Parked`). Tick 2 crash-resumes #777: no reply follows
+    // the review traced at `finish`'s `Route.Parked`). Tick 2 crash-resumes #777: no reply follows
     // the new marker, so this is an ordinary IMPL, not a FIX, and it succeeds. The fixed predicate
     // must still strip `parked` at that terminal even though tick 2 itself never saw a fresh reply.
     // Tick 3 models what a real `gh` now reports (#777 neither in-progress nor parked) to show the
@@ -2275,7 +2276,7 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
       // Pins the hazard the issue itself calls out: seeding `Runner.Ledger` from a bare
       // `cfg.repairBudget` would make a `REPAIR_BUDGET=0` configuration park BEFORE this dispatch, a
       // real behaviour change from every tick before issue #33, which always ran this dispatch
-      // unconditionally. `Machine.iterate` seeds the ledger to `math.max(0, cfg.repairBudget) + 1`
+      // unconditionally. `Machine.runOnce` seeds the ledger to `math.max(0, cfg.repairBudget) + 1`
       // instead (issue #33 review finding 3, clamped by review round 2 finding A), precisely so this
       // stays true regardless of how small the repair budget is. A fresh (non-resume) pick is enough
       // to show it; the more elaborate parked/resume interactions this same guarantee protects are
@@ -2387,7 +2388,7 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
       // seeded to `cfg.repairBudget + 1`: with `REPAIR_BUDGET=-1` that seeds `Ledger(0)`,
       // `canAfford(Cost.OneDispatch)` answers false, and the tick parks (`LoopExit.Parked`, rc 60)
       // BEFORE `Implement` ever dispatches — a regression against every tick before issue #33, which
-      // ran this dispatch unconditionally regardless of the budget's sign. `Machine.iterate` now
+      // ran this dispatch unconditionally regardless of the budget's sign. `Machine.runOnce` now
       // seeds the ledger to `math.max(0, cfg.repairBudget) + 1`, flooring the seed at one dispatch for
       // any non-positive budget, so this must still run IMPL and complete the tick normally.
       val w = TestWorld()
@@ -2461,7 +2462,7 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
       // The parked-resume golden (`parked-resume.log`) pins the resume-aware seed (F3), and the
       // "thread the same pass number" test above pins the `Ledger` a gate-RED repair round spends
       // from (F4), but neither drives both in the SAME tick: a resumed tick whose own initial FIX
-      // (`implementAndRepair`'s `resumeAuthors` branch) is immediately followed by a gate-RED repair
+      // (`shippedWorkflow`'s own `start`, its `resumeAuthors` branch) is immediately followed by a gate-RED repair
       // round is the one path where the resume-aware seed (`math.max(0, cfg.repairBudget)`, no
       // `Implement`-sized `+ 1`) and the shared `Ledger`'s post-resume state actually compose: a seed
       // computed wrong by even one dispatch here would either park the repair round early or let it
@@ -2499,7 +2500,7 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
   it should "thread the same pass number through a gate-RED repair round and, in the very next " +
     "cycle, a REQUEST_CHANGES one, never letting the two triggers collide on a stale counter" in {
       // The former `while` loop shared one mutable `var pass` between the gate-RED spend site and
-      // the REQUEST_CHANGES spend site; this recursion (`implementAndRepair`'s own `runCycle`)
+      // the REQUEST_CHANGES spend site; this graph (`shippedWorkflow`'s own `cycle`/`attemptRepairNext`)
       // instead threads `p` as a plain argument through both `Gate` and `Repair`'s own inputs, and
       // through the REQUEST_CHANGES trigger inline in the same cycle. Driving BOTH triggers in one
       // tick, back to back, is the one scenario that would catch either site quietly reading the
@@ -2543,7 +2544,7 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
       // always runs first in a fresh tick, so any step large enough to overrun `Repair` would
       // overrun `Implement`'s identical bound first and fault there instead.
       //
-      // A RESUMED tick sidesteps this: `implementAndRepair`'s `resumeAuthors` branch skips
+      // A RESUMED tick sidesteps this: `shippedWorkflow`'s own `start`, its `resumeAuthors` branch, skips
       // `Implement` entirely, and its own first FIX round now dispatches through `Repair` too
       // (issue #34 review finding F4, `Repair`'s own scaladoc), so `Repair` is the FIRST, and in
       // this scenario the ONLY, `Cost.OneDispatch`/`Timeout.After` node this tick ever runs; no
@@ -2573,4 +2574,95 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
         s"node 'Repair' overran its ${cfg.iterTimeout + cfg.implementSlack}s timeout, an infra " +
           "fault, not a code failure"
       ) shouldBe true
+    }
+
+  // ---- issue #37: the shipped pipeline becomes a Workflow, Review's own Timeout gets real coverage
+
+  it should "not fault a slow-but-approving Review on a RESUMED tick, where Repair, not Implement, " +
+    "is the only OTHER Timeout-bearing node in the walk and stays safely under its own bound" in {
+      // A resumed tick skips `Implement` entirely: `shippedWorkflow`'s own `start` dispatches the
+      // resume's own first FIX straight through `Repair` instead (`Repair`'s own scaladoc, issue #34
+      // review finding F4). So on THIS walk, `Repair`, not `Implement`, is the one node ahead of
+      // `Review` that declares a real `Timeout.After`. A `clockStepMillis` just over `cfg.gateTimeout`
+      // (905s under the default `Config`) is comfortably larger than any bound a reviewer round would
+      // plausibly be compared against, yet stays well under `Repair`'s own bound
+      // (`cfg.iterTimeout + cfg.implementSlack`, 2100s under the default `Config`, the identical slack
+      // the pre-existing Repair-timeout-fault scenario a few screens up relies on), so `Repair` cannot
+      // be what this test's assertion actually depends on. `Gate` declares `Timeout.Unbounded`
+      // regardless of the clock, so it is never a candidate either. That leaves `Review`, and only
+      // `Review`, as the one node whose declared `Timeout` decides whether this tick still reaches
+      // `LoopExit.Success`: this is the falsifiability the ordinary-tick version of this test never
+      // had, since that walk reaches `Review` through `Implement` first, and the pre-existing Gate
+      // scenario above already fails on its own the moment `Review`'s timeout regresses, so a second
+      // copy of that exact walk proved nothing new. If a future edit flips `Review` to
+      // `Timeout.After(n)` for any `n` smaller than this step, THIS test starts failing on a walk no
+      // other scenario in this file drives.
+      val w = TestWorld()
+      w.inProgress = None
+      w.ready = None
+      w.parked = List(777)
+      w.issueCommentBodies =
+        Map(777 -> List(markerEntry, "@alice (OWNER):\ntry using a HashMap instead"))
+      w.fixScripts = List(WorkerScript.Produces(newFilePatch))
+      val cfg = Config()
+      w.clockStepMillis = (cfg.gateTimeout.toLong + 5) * 1000L
+      // `gateResults`/`reviewScripts` left at their defaults (GREEN forever, an APPROVE), so the
+      // resume's own FIX round gates GREEN on the first try and this tick reaches Review with no
+      // second repair round at all.
+
+      val exit = w.runLoop(cfg)
+
+      exit shouldBe LoopExit.Success
+      w.callCount("dispatch IMPL") shouldBe 0 // resumed ticks never dispatch IMPL
+      w.callCount("dispatch FIX") shouldBe 1
+      w.callCount("gate FAST") shouldBe 1
+      w.callCount("dispatch REVIEW") shouldBe 1
+      w.logged("overran its") shouldBe false
+    }
+
+  it should "walk Implement, Gate and Review, in that order, on the happy path (issue #37: the " +
+    "graph walk visits nodes in the declared order, not merely reaches the right exit)" in {
+      // `w.calls` records every capability call in the order the loop actually made it; the three
+      // markers below (`dispatch IMPL`, `gate FAST`, `dispatch REVIEW`) are each written by exactly
+      // one node's own body (`Implement`, `Gate`, `Review`), so their relative index in `w.calls` is
+      // a direct trace of which `Next.Goto` edge `Runner.run`'s walk took, and in which order,
+      // without needing to reach into `shippedWorkflow`'s own internals to prove it.
+      val w = TestWorld()
+
+      val exit = w.runLoop()
+
+      exit shouldBe LoopExit.Success
+      val implIdx   = w.calls.indexWhere(_.startsWith("dispatch IMPL"))
+      val gateIdx   = w.calls.indexWhere(_.startsWith("gate FAST"))
+      val reviewIdx = w.calls.indexWhere(_.startsWith("dispatch REVIEW"))
+      implIdx should be >= 0
+      gateIdx should be > implIdx
+      reviewIdx should be > gateIdx
+    }
+
+  it should "walk Implement, Gate (RED), Repair, Gate (GREEN) and Review, in that order, on the " +
+    "gate-red-repair path (issue #37)" in {
+      // The gate-RED retry edge (`cycle`'s own `GateVerdict.Red` branch, `shippedWorkflow`) has to
+      // route back into ANOTHER `Gate` node, not merely into a repair round that happens to finish:
+      // this scenario pins that the SECOND `gate FAST` call, and the one `dispatch REVIEW` call that
+      // follows it, both happen strictly after the `dispatch FIX` round the first RED triggers, the
+      // same order the former hand-recursion (`runCycle`) produced.
+      val w = TestWorld()
+      w.gateResults = List(GateResult.Red, GateResult.Green)
+      w.fixScripts = List(WorkerScript.Produces("1\t0\tsrc/main/scala/Fix1.scala"))
+
+      val exit = w.runLoop()
+
+      exit shouldBe LoopExit.Success
+      w.callCount("gate FAST") shouldBe 2
+      val implIdx    = w.calls.indexWhere(_.startsWith("dispatch IMPL"))
+      val gate1Idx   = w.calls.indexWhere(_.startsWith("gate FAST"))
+      val fixIdx     = w.calls.indexWhere(_.startsWith("dispatch FIX"))
+      val gate2Idx   = w.calls.lastIndexWhere(_.startsWith("gate FAST"))
+      val reviewIdx  = w.calls.indexWhere(_.startsWith("dispatch REVIEW"))
+      implIdx should be >= 0
+      gate1Idx should be > implIdx
+      fixIdx should be > gate1Idx
+      gate2Idx should be > fixIdx
+      reviewIdx should be > gate2Idx
     }
