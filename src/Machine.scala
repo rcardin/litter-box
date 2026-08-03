@@ -202,21 +202,23 @@ object Machine:
           .mkString("\n")
         s"@$login ($assoc):\n$escapedBody"
 
-  /** The marker comment `terminal` posts on an issue it parks, and the exact substring
-    * `pickAndSetup`'s reply probe (`replySince`) searches for on a later tick. GitHub holds it, not
-    * a local file: a human who resets the branch or deletes the comment changes the answer the very
-    * next tick, which is the point (issue #28 / RFC #26 decision 6: parking is the terminal state
-    * of ONE tick, never a stored position).
+  /** The marker comment `shippedWorkflow`'s own `finish` posts (its `Route.Parked` branch) on an
+    * issue it parks, and the exact substring `pickAndSetup`'s reply probe (`replySince`) searches
+    * for on a later tick. GitHub holds it, not a local file: a human who resets the branch or
+    * deletes the comment changes the answer the very next tick, which is the point (issue #28 / RFC
+    * #26 decision 6: parking is the terminal state of ONE tick, never a stored position).
     */
   private[litterbox] val ParkMarker = "<!-- litter-box:parked -->"
 
-  /** The comment body `terminal` posts through `GitHub.issueComment` when it parks an issue. */
+  /** The comment body `finish`'s `Route.Parked` branch posts through `GitHub.issueComment` when it
+    * parks an issue.
+    */
   private[litterbox] val ParkBody: String =
     s"""$ParkMarker
        |Repair budget exhausted. Parked, waiting on a human. Comment on this issue with guidance and the
        |next tick will resume with a FIX.""".stripMargin
 
-  /** The `-resume.failure.md` content `implementAndRepair` writes when it dispatches a FIX over a
+  /** The `-resume.failure.md` content `shippedWorkflow`'s own `start` writes when it dispatches a FIX over a
     * parked issue's human reply. HARNESS-AUTHORED ONLY, containing no comment text whatsoever
     * (issue #28 review finding 2): the fix-prompt skeleton frames `{{FAILURE}}` with no
     * untrusted-data warning at all ("If the failure above is a reviewer request, address the
@@ -338,32 +340,23 @@ object Machine:
     )
     break(LoopExit.InfraFault)
 
-  /** One driver tick: bounds the infra-fault channel, so a fault anywhere inside `iterate` lands as
-    * LoopExit.InfraFault (rc 50), and emits the terminal DONE status event, exactly like the bash
-    * driver.
+  /** One driver tick: bounds the infra-fault channel, so a fault anywhere inside this method lands
+    * as `LoopExit.InfraFault` (rc 50), and emits the terminal DONE status event, exactly like the
+    * bash driver.
+    *
+    * The whole tick, `Implement` through `PostMergeCleanup`, is now one `Workflow` value
+    * (`shippedWorkflow`, issue #37), walked by `Runner.run`. `Pick` is the one node that still runs
+    * OUTSIDE that walk, and the reason is not a preference, it is what `Runner.run`'s own signature
+    * forces: it fixes its `Ledger` before the walk begins (`Kit.scala`'s own doc on `run`), and the
+    * real, shared dispatch budget this tick spends from is seeded resume-aware, off `Pick`'s own
+    * output (`resumeAuthors`), a fact this method cannot know before `Pick` has already run. So this
+    * method still dispatches `Pick` through a throwaway `Runner.Ledger(0)` first (`Pick` declares
+    * `Cost.NoDispatch` and its own `using` clause, `pickAndSetup`'s, carries no `AgentDispatch` at
+    * all, so nothing about that placeholder ledger is ever observable), mints the real, resume-aware
+    * `Ledger` exactly as before, then hands the rest of the tick to `Runner.run` over
+    * `shippedWorkflow`.
     */
   def runOnce(n: Int)(using
-      Config,
-      GitHub,
-      Git,
-      AgentDispatch,
-      GateRunner,
-      HostGateRunner,
-      StatusLog,
-      Notify,
-      HarnessFs,
-      Clock,
-      Log
-  ): LoopExit =
-    val cur  = Cursor()
-    val exit = boundary[LoopExit](iterate(n, cur))
-    emit(cur, "DONE", "end", detail = s"rc=${exit.rc}")
-    exit
-
-  /** One US, start to terminal. Infra faults short-circuit via the `Faulting` boundary: no code past
-    * a fault can spend repair budget or dispatch a FIX.
-    */
-  def iterate(n: Int, cur: Cursor)(using
       cfg: Config,
       gh: GitHub,
       git: Git,
@@ -375,104 +368,88 @@ object Machine:
       fs: HarnessFs,
       clock: Clock,
       logger: Log
-  )(using faulting: Faulting): LoopExit =
-    // The `Caps` bundle `Runner.step` needs, built from the individual capabilities already in this
-    // parameter list (issue #32). A plain `val`, never `given`: a `given Caps` here would sit in the
-    // same scope as `cfg`/`gh`/... above and make every one of `Caps.given`'s accessors ambiguous
-    // with them the moment anything below asks for one implicitly (see `Caps`'s own doc). Passed to
-    // `Runner.step` explicitly instead, which needs no such import here at all.
+  ): LoopExit =
+    val cur = Cursor()
+    // The `Caps` bundle `Runner.step`/`Runner.run` need, built from the individual capabilities
+    // already in this parameter list (issue #32), and reused for the whole tick, both `Pick`'s own
+    // throwaway-ledger dispatch below and the real `shippedWorkflow` walk after it. A plain `val`,
+    // never `given`: a `given Caps` here would sit in the same scope as `cfg`/`gh`/... above and make
+    // every one of `Caps.given`'s accessors ambiguous with them the moment anything below asks for
+    // one implicitly (see `Caps`'s own doc). Passed to `Runner.step`/`Runner.run` explicitly instead.
     val caps = Caps(cfg, gh, git, agents, gates, hostGates, log, notify, fs, clock, logger)
+    val exit = boundary[LoopExit]:
+      // Recovered here, once, the same way every node adapter in this file recovers a `Faulting`
+      // from an ambient `Fault`: `boundary`'s own body is a context function providing a
+      // `Label[LoopExit]`, and `Faulting` is a transparent alias for that same type (`Kit.scala`'s
+      // own doc), so `summon[Faulting]` resolves it here without this method needing a `using`
+      // clause of its own for it.
+      val faulting: Faulting = summon[Faulting]
 
-    // `pickAndSetup`'s own `using` clause (its declaration a few screens up) carries no
-    // `AgentDispatch` at all, so nothing inside it can call `agents.*` regardless of what `Cost`
-    // `Pick` declares or what `Ledger` it runs under; that signature, not `Cost.NoDispatch`, is what
-    // actually enforces "spends nothing" here, since `Cost` alone only gates whether `Runner.step`
-    // lets a node START (`Cost`'s own doc), never what it can spend once running. A throwaway
-    // `Ledger(0)` is enough to satisfy `Runner.step`'s own signature here. The REAL, shared `Ledger`
-    // cannot be built before this call returns (issue #34 review finding F4): whether the tick is a
-    // resume is `Pick`'s own OUTPUT (`resumeAuthors`), not known any earlier, and the seed below
-    // needs it.
-    val setup = Runner.step(Pick, PickInput(n, cur))(using caps, faulting, Runner.Ledger(0)) match
-      case NodeOutcome.Stopped(exit) => return exit
-      case NodeOutcome.Done(ready)   => ready
-    import setup.{
-      issue,
-      bodyFile,
-      workerPromptFile,
-      isClass1,
-      branch,
-      resumeAuthors,
-      carriesParked,
-      resumedFromInProgress
-    }
+      // `pickAndSetup`'s own `using` clause carries no `AgentDispatch` at all, so nothing inside it
+      // can call `agents.*` regardless of what `Cost` `Pick` declares or what `Ledger` it runs under;
+      // that signature, not `Cost.NoDispatch`, is what actually enforces "spends nothing" here, since
+      // `Cost` alone only gates whether `Runner.step` lets a node START (`Cost`'s own doc), never
+      // what it can spend once running. A throwaway `Ledger(0)` is enough to satisfy `Runner.step`'s
+      // own signature here. The REAL, shared `Ledger` cannot be built before this call returns (issue
+      // #34 review finding F4): whether the tick is a resume is `Pick`'s own OUTPUT
+      // (`resumeAuthors`), not known any earlier, and the seed below needs it.
+      Runner.step(Pick, PickInput(n, cur))(using caps, faulting, Runner.Ledger(0)) match
+        case NodeOutcome.Stopped(exit) => exit
+        case NodeOutcome.Done(setup) =>
+          // The shared dispatch `Ledger` every `Cost.OneDispatch` node from here on (`Implement`,
+          // `Repair`) draws from, seeded resume-aware (issue #34 review finding F4) now that
+          // `setup.resumeAuthors` is known:
+          //
+          //   - an ORDINARY tick runs `Implement` (one dispatch) and then up to `cfg.repairBudget`
+          //     `Repair` rounds, so the seed is `cfg.repairBudget + 1`;
+          //   - a RESUMED tick (`resumeAuthors.isDefined`) skips `Implement` entirely and dispatches
+          //     its own first FIX straight through `Repair` (`shippedWorkflow`'s own `resumeAuthors`
+          //     branch), so the seed is `cfg.repairBudget` with no `Implement`-sized headroom added
+          //     on top.
+          //
+          // Every `Implement`/`Repair` dispatch this tick can make charges this one `Ledger`, through
+          // `Runner.step`'s own decorator, so `remainingDispatches` cannot drift from what
+          // `attemptRepairNext`'s own local reasoning (`shippedWorkflow`) tracks by hand for THOSE
+          // two nodes. `Review` (issue #35) is also a node and also runs through `Runner.step`, but
+          // NOT against this `Ledger` (D1 of issue #37's own design: `shippedWorkflow`'s own doc has
+          // the full reasoning), so a review dispatch still spends nothing against THIS `Ledger`.
+          // That split is what keeps `ledgerSeed` here exactly the FIX/IMPL slice of the tick's real
+          // dispatch count, and what keeps every `self-repair: budget now N` golden line true
+          // regardless of how many review rounds preceded it.
+          //
+          // `math.max(0, cfg.repairBudget)`, not a bare `cfg.repairBudget` (issue #33 review round 2
+          // finding A, still relevant here): `REPAIR_BUDGET` reaches here through a bare
+          // `toIntOption` (`Main.scala`) or a bare `conf.getInt` (`Settings.scala`), neither of which
+          // rejects a negative value, and this codebase already treats negatives as reachable (the
+          // `<= 0`, not `== 0`, guard at `cfg.repairBudget <= 0` in `pickAndSetup`). The `+ 1` on the
+          // ordinary path keeps `Implement` affordable no matter how small `cfg.repairBudget` is
+          // configured, including `REPAIR_BUDGET=0`, which must still dispatch the initial IMPL
+          // rather than park before ever running it (the `ScenarioSpec` case this ledger is required
+          // to keep green); a resumed tick never runs `Implement`, so it needs no matching `+ 1`, and
+          // `pickAndSetup` only ever sets `resumeAuthors` when `cfg.repairBudget > 0` (that guard's
+          // own doc), so this seed is guaranteed positive on that path without a floor of its own.
+          val ledgerSeed =
+            if setup.resumeAuthors.isDefined then math.max(0, cfg.repairBudget)
+            else math.max(0, cfg.repairBudget) + 1
+          val ledger = Runner.Ledger(ledgerSeed)
 
-    // The shared dispatch `Ledger` every `Cost.OneDispatch` node from here on (`Implement`, `Repair`)
-    // draws from, seeded resume-aware (issue #34 review finding F4) now that `resumeAuthors` is
-    // known:
-    //
-    //   - an ORDINARY tick runs `Implement` (one dispatch) and then up to `cfg.repairBudget` `Repair`
-    //     rounds, so the seed is `cfg.repairBudget + 1`;
-    //   - a RESUMED tick (`resumeAuthors.isDefined`) skips `Implement` entirely and dispatches its
-    //     own first FIX straight through `Repair` (`implementAndRepair`'s own `resumeAuthors` branch,
-    //     also converted onto that node by the same finding), so the seed is `cfg.repairBudget` with
-    //     no `Implement`-sized headroom added on top.
-    //
-    // Every `Implement`/`Repair` dispatch this tick can make charges this one `Ledger`, through
-    // `Runner.step`'s own decorator, so `remainingDispatches` cannot drift from what `attemptRepair`'s
-    // own local reasoning used to track by hand for THOSE two nodes. `Review` (issue #35) is also a
-    // node now and also runs through `Runner.step`, but NOT against this `Ledger`: `runCycle` below
-    // hands it a fresh, per-call `Runner.Ledger(1)` of its own (that call site's own doc has the
-    // reasoning), so a review dispatch still spends nothing against THIS `Ledger`. That split is what
-    // keeps `ledgerSeed` here exactly the FIX/IMPL slice of the tick's real dispatch count, and what
-    // keeps every `self-repair: budget now N` golden line true regardless of how many review rounds
-    // preceded it.
-    //
-    // `math.max(0, cfg.repairBudget)`, not a bare `cfg.repairBudget` (issue #33 review round 2
-    // finding A, still relevant here): `REPAIR_BUDGET` reaches here through a bare `toIntOption`
-    // (`Main.scala`) or a bare `conf.getInt` (`Settings.scala`), neither of which rejects a negative
-    // value, and this codebase already treats negatives as reachable (the `<= 0`, not `== 0`, guard
-    // at `cfg.repairBudget <= 0` a few screens up in `pickAndSetup`). The `+ 1` on the ordinary path
-    // keeps `Implement` affordable no matter how small `cfg.repairBudget` is configured, including
-    // `REPAIR_BUDGET=0`, which must still dispatch the initial IMPL rather than park before ever
-    // running it (the `ScenarioSpec` case this ledger is required to keep green); a resumed tick
-    // never runs `Implement`, so it needs no matching `+ 1`, and `pickAndSetup` only ever sets
-    // `resumeAuthors` when `cfg.repairBudget > 0` (that guard's own doc), so this seed is guaranteed
-    // positive on that path without a floor of its own.
-    val ledgerSeed =
-      if resumeAuthors.isDefined then math.max(0, cfg.repairBudget)
-      else math.max(0, cfg.repairBudget) + 1
-    val ledger = Runner.Ledger(ledgerSeed)
-
-    val implemented =
-      implementAndRepair(n, cur, issue, bodyFile, workerPromptFile, resumeAuthors, caps, ledger) match
-      case ImplementAndRepair.StoppedEarly(exit) => return exit
-      case ready: ImplementAndRepair.Ready       => ready
-    import implemented.{pass, outcome, gateStatus, failureKind, reviewed, reviewFile}
-
-    terminal(
-      n = n,
-      cur = cur,
-      issue = issue,
-      isClass1 = isClass1,
-      branch = branch,
-      pass = pass,
-      outcome = outcome,
-      gateStatus = gateStatus,
-      failureKind = failureKind,
-      reviewed = reviewed,
-      reviewFile = reviewFile,
-      carriesParked = carriesParked,
-      resumedFromInProgress = resumedFromInProgress,
-      caps = caps,
-      // The SAME shared `Ledger` `Implement`/`Repair` already draw from, not a fresh one: every
-      // node this phase runs (`RouteDecision`, `CommitAndPush`, `OpenPr`, `CiWait`, `Merge`,
-      // `PostMergeCleanup`) declares `Cost.NoDispatch` and calls no `AgentDispatch` method at all, so
-      // none of them can ever charge it (`Ledger.chargeDispatch` only fires from a real dispatch
-      // call, `Kit.scala`'s own doc), unlike `Review`'s own dedicated `Runner.Ledger(1)` a few
-      // screens up, which exists precisely because that node DOES dispatch. Reusing `ledger` here
-      // costs nothing and avoids minting a value with no purpose.
-      ledger = ledger
-    )
+          Runner.run(
+            shippedWorkflow(cfg, caps, faulting, ledger),
+            ShippedStart(
+              n = n,
+              cur = cur,
+              issue = setup.issue,
+              bodyFile = setup.bodyFile,
+              workerPromptFile = setup.workerPromptFile,
+              isClass1 = setup.isClass1,
+              branch = setup.branch,
+              resumeAuthors = setup.resumeAuthors,
+              carriesParked = setup.carriesParked,
+              resumedFromInProgress = setup.resumedFromInProgress
+            )
+          )(using caps, faulting, ledger)
+    emit(cur, "DONE", "end", detail = s"rc=${exit.rc}")
+    exit
 
   /** The four outcomes `pickAndSetup`'s reply check can reach for one candidate parked issue, named
     * rather than left as an `Option[List[String]]` because its `None`-shaped cases are three
@@ -493,9 +470,10 @@ object Machine:
     case UnreadableComments
     case BudgetExhausted
 
-  /** This is the first of the phase extractions `iterate` is being split into (issue #29 / RFC #26
-    * decision 12); making that later split easy is why the pick-and-setup logic gets a name and a
-    * return type of its own before anything about its shape changes.
+  /** This was the first of the phase extractions `iterate` (the bash-ported monolith, gone since
+    * issue #37) was being split into (issue #29 / RFC #26 decision 12); making that later split easy
+    * was why the pick-and-setup logic got a name and a return type of its own before anything about
+    * its shape changed.
     *
     * Takes `(using Faulting, Notify)`: a failed `gh.parkedIssues()` read (issue #28 review finding
     * 7, round 3) is a fault site inside this phase when no issue is already in flight to fall back
@@ -795,7 +773,8 @@ object Machine:
             case Right(picked) => picked
 
     // Whether #issue currently carries the `parked` label, independent of why it was picked (issue
-    // #50 review finding 1). This is the fact `terminal` actually needs: `resumeAuthors.isDefined`
+    // #50 review finding 1). This is the fact the route-completion label removal (`finish`, `CiWait`,
+    // `PostMergeCleanup`, all via `activeAndParked`) actually needs: `resumeAuthors.isDefined`
     // only says THIS tick ran a parked resume with a freshly accepted reply, which is strictly
     // narrower and stays `false` through every gap case above (an unreadable comments list, an
     // unreadable viewer login, an exhausted budget, or a fault between `Route.Parked`'s marker post
@@ -902,8 +881,9 @@ object Machine:
     * Why an adapter rather than a rewrite: `pickAndSetup` has eight `return
     * PickAndSetup.StoppedEarly(...)` sites, and `return` does not work from inside a context
     * function literal (`Node.run`'s own type is `I => (Caps, Fault) ?=> NodeOutcome[O]`, and a
-    * `return` inside one only unwinds the anonymous function value, not `iterate`, exactly the same
-    * trap `pickFromQueue`'s own doc, a few screens up, already hit once for a nested `def`).
+    * `return` inside one only unwinds the anonymous function value, not `runOnce` (this node's own
+    * caller, transitively, through `Runner.step`), exactly the same trap `pickFromQueue`'s own doc, a
+    * few screens up, already hit once for a nested `def`).
     * Re-expressing all eight sites without moving a single `logger.log`, `gh.*`, `git.*`, `fs.*` or
     * `emit` call relative to its neighbours would be a much larger, much riskier diff for identical
     * behaviour, against a golden log contract that cannot tell "reshaped, but byte-identical output"
@@ -911,8 +891,8 @@ object Machine:
     * method and mapping its result keeps every one of those call sites exactly where it already was.
     *
     * `cost = Cost.NoDispatch`, `timeout = Timeout.Unbounded`: Pick dispatches no agent (the worker
-    * dispatch is `implementAndRepair`'s job, untouched by this node), so both are no-ops at runtime
-    * today and neither can move a golden.
+    * dispatch is `Implement`'s job, inside `shippedWorkflow`, untouched by this node), so both are
+    * no-ops at runtime today and neither can move a golden.
     *
     * `probe = _ => None`: Pick is the entry node, and its entire job on every tick is to read the
     * world fresh from `gh.inProgressIssue()`, `gh.parkedIssues()` and `gh.oldestReadyIssue()`. There
@@ -1039,11 +1019,11 @@ object Machine:
     * nested `?=>` context parameter, so `probe`/`run` would go on resolving `Config` from `caps.cfg`
     * as always, while THIS method's own body read the `cfg` closed over from its enclosing scope,
     * with nothing marking the split. Concretely: `Implement(cfg)` is called with
-    * `implementAndRepair`'s own `Config` parameter, so `cfg.iterTimeout` above is read from THAT
-    * value, while `probe`/`run` read `caps.cfg`; the two agree today only because `iterate` builds
-    * `caps` from that same `cfg` (`src/Machine.scala:411`), not because anything here forces them
-    * to. A plain parameter keeps the two reads visibly separate call sites instead of one silently
-    * shadowing the other.
+    * `shippedWorkflow`'s own `Config` parameter, so `cfg.iterTimeout` above is read from THAT value,
+    * while `probe`/`run` read `caps.cfg`; the two agree today only because `runOnce` builds `caps`
+    * from that same `cfg` (`runOnce`'s own `val caps = Caps(...)`) and hands both the SAME `cfg` to
+    * `shippedWorkflow`, not because anything here forces them to. A plain parameter keeps the two
+    * reads visibly separate call sites instead of one silently shadowing the other.
     *
     * `probe` answers `None` unconditionally (issue #33 review finding 2), reading no git state at
     * all: `pickAndSetup`'s own `git.statusClean()` guard, upstream of this node
@@ -1082,7 +1062,7 @@ object Machine:
   /** `Gate`'s input (issue #34): the values `runFastGate` needs, named for the same reason
     * `ImplementInput` is. `pass` travels as a plain field, not a mutable counter a while loop used
     * to own: the retry transition that loop used to express by re-testing a `var` is now a value
-    * the caller (`implementAndRepair`'s own recursive walk, see its doc) passes down, so the gate
+    * the caller (`shippedWorkflow`'s own `cycle`/`attemptRepairNext` pair, see their doc) passes down, so the gate
     * run and the repair round it triggers always agree on which pass they are, by construction,
     * not by two sites reading the same mutable cell in the right order.
     */
@@ -1096,7 +1076,7 @@ object Machine:
     * fault in this loop already uses.
     *
     * `Red` carries the gate log path rather than making the caller re-derive it from `issue`/`pass`
-    * a second time: `attemptRepair` (`implementAndRepair`'s own nested method) needs that exact
+    * a second time: `attemptRepairNext` (`shippedWorkflow`'s own nested method) needs that exact
     * path to build the FIX prompt's failure content, and re-computing the same `artifact(...)` call
     * a second time at a second call site is exactly the kind of duplication that drifts.
     */
@@ -1147,8 +1127,8 @@ object Machine:
     * regardless of what `cost` claims (`Cost`'s own doc); declaring `NoDispatch` says that plainly
     * instead of leaving a reader to wonder why a `OneDispatch` node never seems to spend anything.
     * It also means an exhausted repair budget can never block a gate run from starting: whether a
-    * gate cycle is even attempted is `implementAndRepair`'s own decision (its `attemptRepair` never
-    * calls this node again once `outcome` is set), not something `Runner.step`'s own ledger check
+    * gate cycle is even attempted is `shippedWorkflow`'s own decision (its `attemptRepairNext` never
+    * calls `cycle` again once `outcome` is set), not something `Runner.step`'s own ledger check
     * should additionally gate.
     *
     * `timeout = Timeout.Unbounded`: the `while` loop this replaces had no node-level bound on the
@@ -1196,17 +1176,17 @@ object Machine:
 
   /** The fixer dispatch across the patch seam, extracted from the former while loop's `fixRound`
     * (issue #34), which used to mutate `implementAndRepair`'s own `currentPatch`/`outcome`/
-    * `failureKind` locals by closure. This version returns `StageVerdict` instead: `attemptRepair`
-    * (`implementAndRepair`'s own nested method, the direct replacement for `spendOrExhaust`) is the
+    * `failureKind` locals by closure. This version returns `StageVerdict` instead: `attemptRepairNext`
+    * (`shippedWorkflow`'s own nested method, the direct replacement for `spendOrExhaust`) is the
     * one place that still owns those locals, and it decides what a `Rejected` means for them,
     * exactly as `dispatchInitialImplement`'s caller already does for `Implement`'s own verdict.
     *
     * An empty fixer diff is folded into `StageVerdict.Rejected(FailureKind.EmptyFix)` rather than
     * kept as a separate return shape: `EmptyFix` already exists as an ordinary `FailureKind`, a real
     * case of that enum since before this issue, produced at exactly this one site though read at two
-    * others downstream (the marker-file guard and the needs-human PR note, both in `terminal`), and
+    * others downstream (the marker-file guard and the needs-human PR note, both in `finish`), and
     * every `Rejected` kind, whether a guard rejection or an empty fix, means exactly the same thing
-    * to `attemptRepair`:
+    * to `attemptRepairNext`:
     * stop, do not re-gate. Reusing the shape `handleStageResult` already returns for every other outcome
     * keeps this function's own emit/log lines exactly where the old inline `case StageResult.Empty`
     * arm already put them, only reachable through the same `stagePatch` match this always was.
@@ -1304,7 +1284,7 @@ object Machine:
 
   /** Repair, converted to a `Node` (issue #34): `cost = Cost.OneDispatch`, the one real FIX
     * dispatch a repair round costs, charged for real by `Runner.step`'s own decorator the moment
-    * `runFixRound`'s call into `stagePatch` reaches `agents.worker`, never by `attemptRepair` itself,
+    * `runFixRound`'s call into `stagePatch` reaches `agents.worker`, never by `attemptRepairNext` itself,
     * which only ever READS `Runner.Ledger.remainingDispatches` (public, unlike the methods that
     * actually spend it) to decide whether to attempt a round at all and to compute the
     * `self-repair: budget now N` line's own number, exactly the same split `Cost`'s own doc draws
@@ -1325,13 +1305,13 @@ object Machine:
     * than deriving it a bound of its own, not evidence the two windows are the same shape.
 
     *
-    * A resumed parked issue's OWN initial FIX round (`implementAndRepair`'s `resumeAuthors` branch)
-    * is this node too (issue #34 review finding F4): the identical fixer work must be charged and
-    * `Timeout.After`-bounded the same way regardless of which call site dispatches it, or a third
-    * FIX site could dispatch uncharged and unbounded again by construction. That branch derives its
-    * own log line from `Runner.Ledger.remainingDispatches` the same way `attemptRepair` does, and
-    * the `Ledger` `iterate` seeds this node with is resume-aware for exactly this reason (`iterate`'s
-    * own comment on the seed): a resumed tick never runs `Implement`, so its seed carries no
+    * A resumed parked issue's OWN initial FIX round (`shippedWorkflow`'s own `start`, its
+    * `resumeAuthors` branch) is this node too (issue #34 review finding F4): the identical fixer work
+    * must be charged and `Timeout.After`-bounded the same way regardless of which call site
+    * dispatches it, or a third FIX site could dispatch uncharged and unbounded again by construction.
+    * That branch derives its own log line from `Runner.Ledger.remainingDispatches` the same way
+    * `attemptRepairNext` does, and the `Ledger` `runOnce` seeds this node with is resume-aware for
+    * exactly this reason (`runOnce`'s own comment on the seed): a resumed tick never runs `Implement`, so its seed carries no
     * `Implement`-sized headroom for this node to spend against for free.
     */
   private def Repair(cfg: Config): Node[RepairInput, StageVerdict] =
@@ -1355,9 +1335,9 @@ object Machine:
     )
 
   /** `Review`'s input (issue #35): the values `runReview` needs. `reviewFile` travels as the fixed
-    * path `implementAndRepair` computes once for the whole tick (every review round overwrites the
-    * same file, never a `pass`-suffixed sibling), because `terminal` reads this exact path back for
-    * the PR body after `runCycle` finishes, regardless of which pass produced the last verdict.
+    * path `shippedWorkflow`'s own `start` computes once for the whole tick (every review round
+    * overwrites the same file, never a `pass`-suffixed sibling), because `finish` reads this exact
+    * path back for the PR body, regardless of which pass produced the last verdict.
     */
   private final case class ReviewInput(
       cur: Cursor,
@@ -1376,7 +1356,7 @@ object Machine:
     *
     * Returns `AgentDispatch.Judged[Verdict]`, not a bare `Verdict` (issue #35 review finding 2): the
     * token `agents.review` mints has to keep travelling past this function, all the way to
-    * `runCycle`'s own call site, or `Judged` would appear in no signature outside `Caps.scala` and
+    * `cycle`'s own call site, or `Judged` would appear in no signature outside `Caps.scala` and
     * the shipped node, the one example a consumer copies, would be the one place that throws the
     * token away early. The dispatch-timeout and empty-review checks below still read `judged.value`
     * and still raise through `fault.raise` exactly as before; only the final step, deriving a
@@ -1395,7 +1375,7 @@ object Machine:
     * crashed or timed-out reviewer is not a verdict either. A missing `VERDICT:` sentinel, by
     * contrast, IS an ordinary `Verdict` value, `Verdict.RequestChanges`: the reviewer answered, just
     * not in the expected shape, and the fail-safe this file has always applied treats that the same
-    * as a real `REQUEST_CHANGES`, something `attemptRepair` (`implementAndRepair`'s own nested
+    * as a real `REQUEST_CHANGES`, something `attemptRepairNext` (`shippedWorkflow`'s own nested
     * method) can act on rather than something that has to abort the tick.
     */
   private def runReview(
@@ -1466,12 +1446,12 @@ object Machine:
 
   /** Review, converted to a `Node` (issue #35): `cost = Cost.OneDispatch`, the one real reviewer
     * dispatch a review round costs, declared honestly the same way `Implement`/`Repair` declare
-    * theirs. Unlike those two, though, `runCycle`'s own call site below hands this node a fresh,
+    * theirs. Unlike those two, though, `cycle`'s own call site below hands this node a fresh,
     * dedicated `Runner.Ledger(1)`, never the shared repair-budget `ledger` `Gate`/`Repair` draw from,
     * and that split is deliberate, not an oversight this issue left behind: `Runner.step`'s charging
     * decorator charges a real dispatch for real regardless of what `cost` declares
     * (`Runner.Ledger.chargeDispatch`'s own doc), so if `Review`'s dispatch charged the SAME `Ledger`
-    * `attemptRepair` reads for its own `self-repair: budget now N` line, that number would silently
+    * `attemptRepairNext` reads for its own `self-repair: budget now N` line, that number would silently
     * drop by one for every review round preceding a repair, on every scenario that ever requests
     * changes. `test/golden/request-changes-repair.log` and `test/golden/missing-verdict.log` both pin
     * `budget now 1` immediately after a review dispatch, a figure that only holds because the review
@@ -1508,346 +1488,540 @@ object Machine:
         )
     )
 
-  /** The second of the phase extractions `iterate` is being split into (issue #30 / RFC #26
-    * decision 12); the same reasoning as `pickAndSetup` applies here: naming this phase and giving
-    * it a return type of its own is what makes the later node conversion a reshape instead of a
-    * rewrite. The locals that used to be this phase's real interface, declared before the initial
-    * dispatch and carried across the phases by capture, are now the fields of `Ready` below; see
-    * that case's scaladoc for which ones and why.
-    *
-    * `reviewFile` is computed here, not passed in as a parameter: this phase is the only writer
-    * (an empty seed before the first review, then each review's raw output), so it belongs with
-    * the values `Ready` produces, not with the caller-supplied `bodyFile`/`workerPromptFile`. It
-    * is returned as a field of `Ready` so `terminal` can still read the reviewer transcript for
-    * the PR body.
-    *
-    * `(using Faulting)` still spans the whole function, for the same reason it spans
-    * `pickAndSetup`: a fault path that could return normally here would be a fault path that can
-    * spend repair budget, and the type system is what rules that out, not code review.
+  /** `shippedWorkflow`'s own input (issue #37): the whole tick from `Implement` onward, flattened
+    * out of `PickAndSetup.Ready` plus `n` rather than wrapping that type directly. `PickAndSetup` is
+    * a plain `private enum`, reachable only from inside `object Machine` itself, and this type has
+    * to be constructible from `RunnerSpec`-shaped tests in this same package that drive the shipped
+    * `Workflow` value directly (`ShippedWorkflowSpec`), never a `PickAndSetup.Ready` they have no way
+    * to build; flattening the fields is what makes that possible without widening `PickAndSetup`'s
+    * own visibility for a reason that has nothing to do with what it exists to guard.
     */
-  private def implementAndRepair(
+  private[litterbox] final case class ShippedStart(
       n: Int,
       cur: Cursor,
       issue: Int,
       bodyFile: String,
       workerPromptFile: String,
+      isClass1: Boolean,
+      branch: String,
       resumeAuthors: Option[List[String]],
-      // Plain parameters, not `using` (issue #33 review finding 4): a `using caps: Caps` here would
-      // NOT make every one of `Caps.given`'s accessors ambiguous with the individual `using cfg:
-      // Config, git: Git, ...` parameters below (compiled and checked, flat same-scope shape
-      // included: no ambiguity error). The real hazard is silent shadowing instead, worse than an
-      // ambiguity would be because it compiles clean: a captured, named `using` parameter of a given
-      // type always wins implicit search over a `Caps.given` accessor deriving that same type from a
-      // `Caps` in scope, so a stray `summon[Config]` inside this function's own body would keep
-      // reading `cfg` exactly as it does today, silently, with no diagnostic marking that a second,
-      // `Caps`-derived candidate existed at all. Threaded through only so `Implement` (below) can be
-      // run via `Runner.step`; nothing else in this function ever touches either.
-      caps: Caps,
-      ledger: Runner.Ledger
-      // `cfg`, `fs`, `logger`: the only three this function's own body still reads directly (round
-      // two of issue #35's review). `gh`, `git`, `agents`, `log` (`StatusLog`) and `notify` were
-      // still declared here after the review block moved out to `Review`/`runReview`, dead `using`
-      // parameters with no caller left inside this function. `agents` is the load-bearing one to
-      // have dropped: it is the raw, uncharged, unbounded dispatcher, and leaving it in scope with
-      // no reader is the exact shape issue #34 review finding F4 closed at the resume FIX site, a
-      // capability sitting unused where a future edit could reach for it instead of going through
-      // `caps`/`Runner.step`'s charging decorator. `gh`, `log` and `notify` were already dead before
-      // this diff; narrowing the clause removes them too rather than leaving a partial cleanup.
-  )(using
+      carriesParked: Boolean,
+      resumedFromInProgress: Boolean
+  )
+
+  /** The immutable replacement for the six `var`s (`pass`, `outcome`, `gateStatus`, `failureKind`,
+    * `currentPatch`, `reviewed`) the former `implementAndRepair` closed over and mutated from its own
+    * nested `def`s (issue #37). `pass` itself is not a field here: every function below that needs it
+    * (`cycle`, `finish`, the fail-file/log-line text `attemptRepairNext` builds) already receives it
+    * as its own plain argument, the same value `runCycle`'s own `p` was before this issue, so there is
+    * no separate mutable mirror left for `Ready`'s old `pass` field to be copied from; the LAST `p` a
+    * caller reaches `finish` with is the value the commit message renders, exactly
+    * what reading the final state of the old `var pass` after the recursion unwound used to produce.
+    * `reviewFile` is not a field either: it is fixed for the whole tick, computed once in `start`
+    * below from `issue` alone, so every closure that needs it reads the SAME local rather than a copy
+    * threaded through every state transition.
+    *
+    * `outcome` is `Option[Outcome]`, not `Outcome`, only because a `CycleState` freshly built by
+    * `start` (before `cycle` or `attemptRepairNext` has run at all) genuinely has none yet. By the
+    * time any call reaches `finish`, `outcome` is always `Some`: every path there sets it first.
+    * `attemptRepairNext`'s `stopped` callback sets `Some(Outcome.Fail)` before calling `finish`,
+    * whether the budget is exhausted or a `Repair` dispatch is `Rejected`; `cycle`'s own
+    * `Verdict.Approve` arm sets `Some(Outcome.Success)`; and `start`'s two initial-dispatch rejection
+    * branches (the resumed-parked FIX and the ordinary IMPL) each construct their `CycleState` with
+    * `Some(Outcome.Fail)` directly, never `None`. So `finish`'s own `state.outcome.getOrElse(
+    * Outcome.Fail)` never actually falls back in practice; the field's type has to admit `None` for
+    * the early construction above, the same invariant `ImplementAndRepair.Ready`'s former
+    * `outcome: Outcome` field (this issue's ancestor) discharged by not admitting `None` in its type
+    * at all.
+    */
+  private final case class CycleState(
+      outcome: Option[Outcome],
+      gateStatus: String,
+      failureKind: Option[FailureKind],
+      currentPatch: Option[String],
+      reviewed: Boolean
+  )
+
+  /** The shipped pipeline (issue #37): every node from `Implement` through `PostMergeCleanup`, as one
+    * `Workflow[ShippedStart]` value built from the public kit API (`Node`, `Next`, `Workflow`), walked
+    * by `Runner.run` from `runOnce`. `Pick` alone stays outside it (`runOnce`'s own doc has the reason,
+    * D2 of this issue's design: `Runner.run` fixes its `Ledger` before the walk begins, and the real
+    * seed depends on `Pick`'s own output).
+    *
+    * A `def`, not a top-level `val` (as this file's other node values are, `RouteDecision`,
+    * `CommitAndPush`, ...): every edge below closes over `caps`/`faulting`/`ledger`, none of which
+    * exist until a real tick calls `runOnce`, and `cfg` decides `Implement`/`Repair`'s own declared
+    * `Timeout` the same way it already does at their existing call sites. A `val` would have to
+    * either capture stale capabilities from the first tick that ever built one, or take none at all
+    * and lose the ability to call `Runner.step` for `Review` (below) from inside its own closures.
+    *
+    * `start`/every `andThen` here are PLAIN functions (`I => Next`, `O => Next`), not context
+    * functions: `Next.Goto`'s own shape (`Kit.scala`) carries no `(Caps, Faulting, Ledger) ?=>` on
+    * either field, since the WALK, `Runner.run`, is what resolves those three for every node it steps
+    * through, from its own `using` clause, fixed once before the walk begins. That is exactly why this
+    * function still takes `caps`/`faulting`/`ledger` as ordinary parameters (the same shape
+    * `implementAndRepair`/`terminal` used those three for, before this issue): the hand-written glue
+    * between edges (the four segments named below, and the one node call that is not an edge at all)
+    * has no context function of its own to resolve them from, only what this closure captured when
+    * `runOnce` built it.
+    *
+    * `Implement`, `Gate`, `Repair`, `RouteDecision`, `CommitAndPush`, `OpenPr`, `CiWait`, `Merge` and
+    * `PostMergeCleanup` are all real `Next.Goto` edges here, walked by `Runner.run` against the ONE
+    * `ledger` this function closed over: every one of them already drew from that same, shared
+    * `Ledger` at its call site before this issue (`terminal`'s own former doc: "reusing `ledger` here
+    * costs nothing"), so folding them into literal graph edges changes nothing about which counter
+    * they are charged against, only how the chain between them is expressed.
+    *
+    * `Review` is the one exception, and D1 of this issue's own design keeps it one: it is a direct
+    * `Runner.step` call inside the `GateVerdict.Green` closure below, against a fresh, per-call
+    * `Runner.Ledger(1)`, never a `Next.Goto` edge. A `Next.Goto` edge has no way to say "run this ONE
+    * node against a DIFFERENT ledger than the rest of the walk": `Runner.run`'s own `using Ledger` is
+    * fixed once, for the whole walk, before it ever calls `wf.start` (`Kit.scala`'s own doc on `run`).
+    * Folding `Review` into the graph would therefore force it to spend from the SAME `ledger` every
+    * other edge here does, the one `attemptRepairNext`'s own `self-repair: budget now N` line reads,
+    * and every review round preceding a repair would silently drop that number by one on every
+    * scenario that ever requests changes (`test/golden/request-changes-repair.log`,
+    * `test/golden/missing-verdict.log` both pin `budget now 1` right after a review dispatch, a figure
+    * that only holds if review spend never touches that counter). This issue does not reopen that
+    * golden text, so the split stays: two ledgers, not one, for exactly the reason the stale comment
+    * this replaces used to promise would go away here. It does not. Merging them for real needs a
+    * Node-declared budget-POOL concept (which `Ledger`/`Cost` do not have: a node can only declare it
+    * costs `NoDispatch` or `OneDispatch` against WHATEVER `Ledger` the walk supplies, never "spend from
+    * a pool of my own inside a shared walk"), and inventing that concept is not authorised by this
+    * issue. `ScenarioSpec`'s own resumed-tick Review-timeout scenario (issue #37 review: "not fault a
+    * slow-but-approving Review on a RESUMED tick, where Repair, not Implement, is the only OTHER
+    * Timeout-bearing node in the walk...") is what closes the OTHER half of the old comment's claim
+    * instead: it drives a walk where `Repair`, not `Implement`, is the sole other `Timeout.After` node
+    * ahead of `Review`, safely under ITS OWN bound, so the only thing left standing between that
+    * scenario's slow-but-successful review and an infra fault is `Review`'s own declared
+    * `Timeout.Unbounded`, the same way every other `Timeout`-bearing node in this file is proven
+    * (`ScenarioSpec`'s own Implement/Repair/Gate timeout scenarios). `ShippedWorkflowSpec` stays out of this claim
+    * entirely: it carries no clock and no `Timeout` assertion at all, its job is proving
+    * `shippedWorkflow` is a genuine `Workflow` value built from the public kit constructs, drivable
+    * directly from a test inside this package, not timing behaviour. That reachability is an
+    * in-package property only: `shippedWorkflow` itself is `private[litterbox]`, and so are both
+    * parameter types a caller needs to reach it, `Runner.Ledger`'s constructor and `Faulting`
+    * (`Kit.scala`). Full consumer reachability, a public entry point that owns its own `Ledger` and
+    * exposes something equivalent to `shippedWorkflow` outside this package, is not part of this
+    * issue and is not attempted here. `Review`'s `Cost`/probe stay unfalsifiable at this one call site
+    * for the reason above.
+    */
+  private[litterbox] def shippedWorkflow(
       cfg: Config,
-      fs: HarnessFs,
-      logger: Log
-  )(using faulting: Faulting): ImplementAndRepair =
-    // --- bounded self-repair state -------------------------------------------------------
-    // Declared BEFORE the initial dispatch: a patch-guard rejection on the very first worker
-    // patch sets outcome/failureKind and skips the repair loop entirely. This function still
-    // returns a `Ready`, with `gateStatus` left at "SKIPPED".
-    var pass                             = 0
-    var outcome: Option[Outcome]         = None
-    var gateStatus                       = ""
-    var failureKind: Option[FailureKind] = None
-    var currentPatch: Option[String]     = None
-    val reviewFile                       = artifact(issue, "-review.md")
-    fs.write(reviewFile, "") // empty until the first review
-    var reviewed = false
+      caps: Caps,
+      faulting: Faulting,
+      ledger: Runner.Ledger
+  ): Workflow[ShippedStart] =
+    Workflow(
+      "shipped",
+      start = input =>
+        import input.{
+          n,
+          cur,
+          issue,
+          bodyFile,
+          workerPromptFile,
+          isClass1,
+          branch,
+          resumeAuthors,
+          carriesParked,
+          resumedFromInProgress
+        }
 
-    // Shared shape of both repair triggers (gate-RED, REQUEST_CHANGES): out of budget fails the
-    // outcome, otherwise write the fail file with the stage-specific content and dispatch a FIX
-    // round through `Repair`, the `Node` (issue #34). Returns `Right(applied)`, whether a fresh
-    // patch was applied, i.e. whether the caller should loop back to another gate cycle: this is
-    // the ONLY thing that decides the retry edge now, replacing the former while loop's own
-    // re-check of `outcome.isEmpty` after this call returned `Unit`. `Left(exit)` is the
-    // `Repair` node's own (practically unreachable) `Stopped` case, handed up as data rather than
-    // thrown (issue #34 review finding F2): `return` inside THIS nested `def` only unwinds
-    // `attemptRepair` itself, not `implementAndRepair` (`pickFromQueue`'s own doc, `src/Machine.scala`,
-    // covers the identical trap for a sibling nested `def`), so turning it into
-    // `ImplementAndRepair.StoppedEarly` has to happen at a call site that sits directly in
-    // `implementAndRepair`'s own body; `runCycle` below, and the final `if outcome.isEmpty` guard
-    // further down, are what thread this `Either` the rest of the way out.
-    //
-    // No local `budget` any more (issue #34 review finding F3): `ledger.remainingDispatches` is
-    // read directly, both for the `<= 0` guard and for the `self-repair: budget now N` line's own
-    // number, computed as `remainingDispatches - 1` BEFORE the dispatch below actually charges it
-    // (not after: a `Repair` round that itself infra-faults, e.g. a timed-out FIX worker, unwinds
-    // through `Fault.raise` and never returns here at all, so a log line placed after the dispatch
-    // would silently vanish on exactly that path, and `test/golden/fix-timeout.log` pins that it
-    // must not). `remainingDispatches - 1` reads as a genuine prediction only in the sense that the
-    // charge itself happens a moment later, inside `Runner.step`; there is no second counter left
-    // to drift out of step with it, which is the property `Cost`'s own doc draws between a declared
-    // ceiling and a real charge, applied here to a value derived from the one real counter instead
-    // of shadowed by a second local that used to just happen to agree with it.
-    //
-    // `remainingDispatches <= 0`, not `== 0` (issue #28 review finding 3, still the reason): a
-    // `Ledger` cannot itself go negative (`chargeDispatch` saturates at zero), but `<= 0` keeps the
-    // guard's own shape honest against that invariant rather than resting on it silently.
-    def attemptRepair(pass: Int, trigger: FailureKind, failContent: String): Either[LoopExit, Boolean] =
-      if ledger.remainingDispatches <= 0 then
-        outcome = Some(Outcome.Fail)
-        Right(false)
-      else
-        val budgetAfter = ledger.remainingDispatches - 1
-        cur.budget = budgetAfter
-        logger.log(s"self-repair: budget now $budgetAfter — dispatching FIX for ${trigger.text}")
-        val failFile = artifact(issue, s"-pass$pass.failure.md")
-        fs.write(failFile, failContent)
-        Runner.step(
-          Repair(cfg),
-          RepairInput(cur, issue, pass, failFile, bodyFile, currentPatch)
-        )(using caps, faulting, ledger) match
-          case NodeOutcome.Done(StageVerdict.Applied(p)) =>
-            currentPatch = Some(p)
-            Right(true)
-          case NodeOutcome.Done(StageVerdict.Rejected(kind)) =>
-            outcome = Some(Outcome.Fail); failureKind = Some(kind)
-            Right(false)
-          case NodeOutcome.Stopped(exit) =>
-            // Practically unreachable, same as before this issue's F2 fix removed the `throw` here:
-            // `Repair`'s own `run` never constructs `Stopped` (its only early exits raise through
-            // `Fault`, which never returns here at all), and its `Cost.OneDispatch` never blocks a
-            // call this function only ever makes once `ledger.remainingDispatches > 0` has already
-            // been checked against the SAME counter `Runner.step`'s own `canAfford` reads, not a
-            // second one that could disagree with it. Left as live code, not a `throw`, because
-            // `NodeOutcome.Stopped` is a real case of a real return type and a future change to
-            // `Repair`'s own `cost` (or to what shares this `Ledger`) could make it reachable; this
-            // is what makes that day a routed exit instead of a crash.
-            Left(exit)
+        // `reviewFile` is computed here, not per node input: this is the only writer of an empty
+        // seed before the first review, then each review's raw output overwrites the SAME path
+        // (`Review`'s own doc), and `finish` below reads this exact local back for the PR body,
+        // regardless of which pass produced the last verdict. Written BEFORE the initial dispatch
+        // (constraint 3 of this issue's own design), the same position it always had.
+        val reviewFile = artifact(issue, "-review.md")(using cfg)
+        caps.fs.write(reviewFile, "") // empty until the first review
 
-    // Initial dispatch: a resumed parked issue (issue #28) skips the IMPL worker entirely and goes
-    // straight to a FIX round over the human's reply, with `currentPatch` left `None`, same as the
-    // ordinary first dispatch below.
-    //
-    // Round one had `Route.Parked` commit the failed work locally and this branch seed
-    // `currentPatch` from `git.diffOriginMainHead()` so the reset-then-apply cycle would not
-    // discard it. That was reverted (issue #28 review finding 1, round 2): `git diff origin/main
-    // HEAD` is a two-dot, tree-to-tree diff against whatever `origin/main` was AT PARK TIME. A
-    // human reply can arrive hours or days later, by which point `origin/main` has moved, so the
-    // diff would carry deletion hunks for every file `main` gained since the park; applied onto a
-    // fresh `git archive origin/main`, the resumed worker's output would carry the same deletions
-    // straight through to a green gate, an APPROVE, and a PR that reverts other people's merged
-    // work. The parked commit was also machine-local state a resume's correctness depended on,
-    // silently stranded by a crash, a fresh clone or a different runner. `Route.Parked` now writes
-    // nothing to git at all; it resets the tree to pristine `origin/main` and discards the failed
-    // work outright (its own scaladoc has the detail), so a resumed worker always starts from a
-    // pristine base plus the issue body and the human's reply, never from a patch whose base has
-    // drifted.
-    resumeAuthors match
-      case Some(authors) =>
-        val failFile = artifact(issue, "-resume.failure.md")
-        // HARNESS-AUTHORED ONLY: see `resumeFailureBody`'s own scaladoc for why the human's words
-        // must never land in this file (issue #28 review finding 2).
-        fs.write(failFile, resumeFailureBody(authors))
-        // `pickAndSetup` only ever sets `resumeAuthors` when `cfg.repairBudget > 0` (issue #28
-        // review finding 7, round 2): deciding that BEFORE the pick-time label flip (which only
-        // ever ADDS `active`, see that flip's own scaladoc), rather than discovering it here after
-        // the flip already ran, is what stops a REPAIR_BUDGET=0 resume from silently losing the
-        // parked state and the human's reply for nothing. So `ledger.remainingDispatches` (freshly
-        // seeded resume-aware to `cfg.repairBudget`, `iterate`'s own comment on that seed) is
-        // guaranteed positive here.
-        val budgetAfter = ledger.remainingDispatches - 1
-        cur.budget = budgetAfter
-        logger.log(
-          s"issue #$issue: resuming from parked with a human reply, dispatching FIX (budget now $budgetAfter)"
-        )
-        // Through `Repair(cfg)`, the `Node` (issue #34 review finding F4): before this fix this was
-        // still a direct, uncharged, unbounded `runFixRound` call, the one FIX dispatch site the
-        // rest of this issue's own conversion left uncovered. The literal `0`, not the outer `var
-        // pass`, the same value `fixRound`'s own call used before this extraction (`fixRound`'s own
-        // doc): the retry loop below always starts its OWN first cycle at pass 1 regardless of
-        // whether this branch ran, so nothing this method does before `runCycle` ever assigns the
-        // outer `var pass` away from its `0` declaration (`implementAndRepair`'s own header). Written
-        // as the literal here, not a read of that var, so the var has exactly one read left in this
-        // whole method, the final `Ready(pass, ...)` construction below; this is what makes
-        // `Kit.scala`'s "it decides nothing" claim about that var checkable against the code instead
-        // of merely true by accident of `pass` still being `0` when this line runs.
-        Runner.step(
-          Repair(cfg),
-          RepairInput(cur, issue, 0, failFile, bodyFile, currentPatch)
-        )(using caps, faulting, ledger) match
-          case NodeOutcome.Stopped(exit) => return ImplementAndRepair.StoppedEarly(exit)
-          case NodeOutcome.Done(StageVerdict.Applied(p)) => currentPatch = Some(p)
-          case NodeOutcome.Done(StageVerdict.Rejected(kind)) =>
-            outcome = Some(Outcome.Fail); failureKind = Some(kind)
-        // The IMPL branch below sets gateStatus = "SKIPPED" on a guard rejection, because no gate
-        // ever ran before the rejection. This branch dispatches straight into a FIX round with no
-        // gate run beforehand either, so a rejection (or an empty fix) here must set the same value
-        // for the same reason: gateStatus otherwise stays "" from its initial declaration, and the
-        // terminal commit/PR text renders "gate " with nothing after it (issue #28 review finding
-        // 4, round 3).
-        if outcome.isDefined then gateStatus = "SKIPPED"
-      case None =>
-        // The initial worker dispatch and the patch seam crossing, now `Implement`, a `Node`
-        // (issue #33). Same adapter shape `Pick` uses: `Runner.step` owns the ledger charge and the
-        // wall-clock check, this call site owns nothing but mapping the result back onto the same
-        // locals `handleStageResult`'s two verdicts always set.
-        Runner.step(Implement(cfg), ImplementInput(n, cur, issue, workerPromptFile))(using
-          caps,
-          faulting,
-          ledger
-        ) match
-          case NodeOutcome.Stopped(exit) => return ImplementAndRepair.StoppedEarly(exit)
-          case NodeOutcome.Done(StageVerdict.Applied(p)) => currentPatch = Some(p)
-          case NodeOutcome.Done(StageVerdict.Rejected(kind)) =>
-            outcome = Some(Outcome.Fail); failureKind = Some(kind); gateStatus = "SKIPPED"
+        // Shared shape of both repair triggers (gate-RED, REQUEST_CHANGES): out of budget finalizes
+        // the tick with `Outcome.Fail` SILENTLY (constraint 2 of this issue's own design: never
+        // delegated to `Runner.step`'s own `canAfford` guard, which would log a `node 'Repair'
+        // parked: ...` line no golden pins and return `Stopped(LoopExit.Parked)`, a different exit
+        // code), otherwise writes the fail file with the stage-specific content and dispatches a FIX
+        // round through `Repair`, a genuine `Next.Goto` edge. `applied`/`stopped` are what used to be
+        // `Right(true)`/`Right(false)` at this same call site: `applied` receives the fresh patch and
+        // decides what the NEXT `Next` is (always another `cycle` at `p + 1`, below), `stopped`
+        // receives the finalized `CycleState` (`outcome` always `Some` by the time either callback
+        // reaches it) and decides the terminal `Next` (always `finish(p, ...)`, below). Splitting the
+        // decision out as two callbacks, rather than returning `Either[LoopExit, Boolean]` the way
+        // `attemptRepair` used to, is what lets this function build a `Next` value directly instead of
+        // a result `cycle` would still have to translate into one.
+        def attemptRepairNext(p: Int, trigger: FailureKind, failContent: String, state: CycleState)(
+            applied: String => Next,
+            stopped: CycleState => Next
+        ): Next =
+          if ledger.remainingDispatches <= 0 then stopped(state.copy(outcome = Some(Outcome.Fail)))
+          else
+            val budgetAfter = ledger.remainingDispatches - 1
+            cur.budget = budgetAfter
+            caps.logger.log(s"self-repair: budget now $budgetAfter — dispatching FIX for ${trigger.text}")
+            val failFile = artifact(issue, s"-pass$p.failure.md")(using cfg)
+            caps.fs.write(failFile, failContent)
+            Next.Goto(
+              Repair(cfg),
+              RepairInput(cur, issue, p, failFile, bodyFile, state.currentPatch),
+              {
+                case StageVerdict.Applied(patch) => applied(patch)
+                case StageVerdict.Rejected(kind) =>
+                  stopped(state.copy(outcome = Some(Outcome.Fail), failureKind = Some(kind)))
+              }
+            )
 
-    // --- bounded self-repair loop, now a recursion over `Gate`/`Repair` node outputs ------
-    // (issue #34). The former `while outcome.isEmpty` loop re-tested a `var` after every
-    // iteration; the retry transition is expressed here instead by what each node's own OUTPUT
-    // says to do next, gate-RED or a REQUEST_CHANGES verdict into `attemptRepair`, an applied
-    // repair back into another `runCycle`, the same shape `Next.Goto`'s own `andThen` describes
-    // (`Kit.scala`).
-    //
-    // This is genuinely NOT built from real `Next`/`Workflow` values, though (issue #34 review
-    // finding F1), and the reason is a provable type-level one, not a convenience: `Next` has
-    // exactly two cases, `Goto` (recurse into another node) and `Finish(exit: LoopExit)` (stop).
-    // To terminate a chain of `Next.Goto` values at all, SOME `andThen` has to return a `Finish`;
-    // there is no third case for "stop with an ordinary value". This cycle's own terminal values
-    // are not `LoopExit`, though: an exhausted-budget or `Rejected` stop is `Outcome.Fail`, and a
-    // reviewer `Approve` is `Outcome.Success` plus everything else `Ready` carries (`gateStatus`,
-    // `failureKind`, `reviewed`, `reviewFile`, `pass`). Neither has an injection into `LoopExit`,
-    // a closed set fixed by RFC #26 decision 10 to the rc contract `watch.sh` parses, and the real
-    // `LoopExit` this whole tick eventually reaches is not even decided yet at this point in
-    // `iterate`: `terminal`, untouched by this issue and called only after this method returns, is
-    // what turns an `Outcome` into one, after label flips, a PR, and CI. So expressing this cycle's
-    // own edges through literal `Next` values would need EITHER a `Next.Finish` that lies about
-    // carrying a `LoopExit` it does not have yet, or a change to `Next`'s own shape to carry a wider
-    // result, i.e. widening `Kit.Next` itself, RFC #26 decision 10 territory this issue does not
-    // reopen. What IS real: the retry edge is decided by node output, not by re-testing a flag
-    // independent of it, and no `throw` reaches past this function on the (practically unreachable)
-    // `Stopped` arms below any more (issue #34 review finding F2); `attemptRepair`'s and
-    // `runCycle`'s own `Either[LoopExit, _]` return types hand a stop up as data instead, since
-    // `return` inside either nested `def` only unwinds that `def`, not `implementAndRepair`
-    // (`pickFromQueue`'s own doc has the identical trap for a sibling nested `def`); the actual
-    // `return ImplementAndRepair.StoppedEarly(exit)` only happens once this recursion is fully
-    // unwound, at the call site directly in this method's own body below.
-    //
-    // `p` travels as this method's own argument, not the outer `var pass`, so the gate run and the
-    // repair round it triggers always agree on which pass they are BY CONSTRUCTION; the outer
-    // `var pass` is still assigned first thing, so `Ready`'s own `pass` field (read once this
-    // recursion returns) keeps reporting the last cycle reached, exactly as the while loop did. It
-    // decides nothing about control flow here, only mirrors `p` for that one final read.
-    //
-    // Skipped entirely if the initial patch was already rejected (`outcome` already set above):
-    // the `if outcome.isEmpty then runCycle(1)` guard below is this recursion's own entry check,
-    // replacing the while loop's own condition on its very first test.
-    @annotation.tailrec
-    def runCycle(p: Int): Either[LoopExit, Unit] =
-      pass = p
-      Runner.step(Gate(cfg), GateInput(cur, issue, p))(using caps, faulting, ledger) match
-        case NodeOutcome.Stopped(exit) =>
-          // Practically unreachable, same reasoning as `attemptRepair`'s own `Stopped` arm above:
-          // `Gate`'s `cost = Cost.NoDispatch` makes `Runner.step`'s own ledger check unconditionally
-          // true (`Cost`'s own doc), and `runFastGate` never constructs `Stopped` itself (its only
-          // early exit raises through `Fault`, which never returns here). Routed as data, not
-          // thrown, for the same forward-compatibility reason (issue #34 review finding F2).
-          Left(exit)
-        case NodeOutcome.Done(GateVerdict.Red(gateLog)) =>
-          gateStatus = "RED"
-          failureKind = Some(FailureKind.GateRed)
-          attemptRepair(
-            p,
-            FailureKind.GateRed,
-            s"## FAST gate RED (pass $p)\n\n" +
-              s"The fast tier gate command is `${cfg.gateCmd}`. It ran at the repository root and " +
-              s"exited with a nonzero status.\n\n" +
-              s"Tail of the fast-gate log:\n\n```\n${fs.read(gateLog)}\n```\n"
-          ) match
-            case Left(exit)      => Left(exit)
-            case Right(applied)  => if applied then runCycle(p + 1) else Right(())
-        case NodeOutcome.Done(GateVerdict.Green) =>
-          gateStatus = "GREEN"
+        // The bounded self-repair loop, now a genuine graph edge per gate cycle (issue #37; issue #34
+        // first expressed the retry transition this way, over a hand-recursion that could not yet be
+        // real `Next`/`Workflow` values, for the type-level reason that recursion's own former doc
+        // gave: this cycle's own terminal values were not `LoopExit` yet at that point in the file,
+        // since `terminal` was untouched and ran only after the whole phase returned. Now `finish`
+        // below IS this cycle's own terminal, and it does produce a real `LoopExit`, so the retry edge
+        // can be a literal `Next.Goto` at last). `cycle(p, state)` builds and returns exactly one
+        // `Next.Goto(Gate(cfg), ...)` value; the repetition a `while` loop used to own happens instead
+        // when `Runner.run`'s own `@tailrec` walk later calls back into whichever `andThen` closure
+        // this call built, which may itself call `cycle` again for the next pass. No stack frame from
+        // THIS call survives that: `cycle` returns after constructing one value, so a chain of any
+        // length is exactly as stack-safe as `Runner.run`'s own walk (`Kit.scala`'s doc on `run`).
+        def cycle(p: Int, state: CycleState): Next =
+          Next.Goto(
+            Gate(cfg),
+            GateInput(cur, issue, p),
+            {
+              case GateVerdict.Red(gateLog) =>
+                val st1 = state.copy(gateStatus = "RED", failureKind = Some(FailureKind.GateRed))
+                attemptRepairNext(
+                  p,
+                  FailureKind.GateRed,
+                  s"## FAST gate RED (pass $p)\n\n" +
+                    s"The fast tier gate command is `${cfg.gateCmd}`. It ran at the repository root and " +
+                    s"exited with a nonzero status.\n\n" +
+                    s"Tail of the fast-gate log:\n\n```\n${caps.fs.read(gateLog)}\n```\n",
+                  st1
+                )(
+                  applied = patch => cycle(p + 1, st1.copy(currentPatch = Some(patch))),
+                  stopped = finalState => finish(p, finalState)
+                )
+              case GateVerdict.Green =>
+                val st1 = state.copy(gateStatus = "GREEN")
+                // Review (issue #35), a direct `Runner.step` call against its own fresh
+                // `Runner.Ledger(1)`, never a `Next.Goto` edge: see this function's own doc (D1) for
+                // why that split survives this issue rather than being closed by it.
+                Runner.step(
+                  Review,
+                  ReviewInput(cur, issue, p, bodyFile, reviewFile, st1.currentPatch)
+                )(using caps, faulting, Runner.Ledger(1)) match
+                  case NodeOutcome.Stopped(exit) =>
+                    // Practically unreachable, same reasoning as `Review`'s own doc gives for this
+                    // arm at its former call site: its dedicated, freshly built `Runner.Ledger(1)`
+                    // always affords its own `Cost.OneDispatch`, and its `run` never constructs
+                    // `Stopped` itself. `Next.Finish` here is never reached with `LoopExit.InfraFault`
+                    // (constraint 7 of this issue's own design): a genuine `Review` infra fault raises
+                    // through `Fault.raise` inside `runReview`, which never returns to this match at
+                    // all.
+                    Next.Finish(exit)
+                  case NodeOutcome.Done(judged) =>
+                    val st2 = st1.copy(reviewed = true)
+                    // `.value` unwrapped exactly once, at the latest possible point, the same
+                    // position issue #35 review finding 2 fixed it at (constraint 6 of this issue's
+                    // own design): everything upstream, `runReview`, `Review`, `Runner.step`'s own
+                    // `NodeOutcome.Done`, still carries `AgentDispatch.Judged[Verdict]`.
+                    judged.value match
+                      case Verdict.Approve =>
+                        finish(p, st2.copy(outcome = Some(Outcome.Success)))
+                      case Verdict.RequestChanges =>
+                        val st3 = st2.copy(failureKind = Some(FailureKind.ReviewChanges))
+                        attemptRepairNext(
+                          p,
+                          FailureKind.ReviewChanges,
+                          s"## The independent reviewer requested changes\n\n${caps.fs.read(reviewFile)}\n\n${caps.fs
+                              .read(artifact(issue, "-tamper.md")(using cfg))}",
+                          st3
+                        )(
+                          applied = patch => cycle(p + 1, st3.copy(currentPatch = Some(patch))),
+                          stopped = finalState => finish(p, finalState)
+                        )
+            }
+          )
 
-          // Review, the Node (issue #35): `Runner.Ledger(1)`, not the shared `ledger` Gate/Repair
-          // draw from, a fresh one, built and discarded right here, per call. `Review`'s own doc has
-          // the full reasoning; the short version is that a real dispatch is charged for real
-          // regardless of declared `Cost`, and every `self-repair: budget now N` golden line only
-          // holds if a review dispatch never touches the counter that line reads.
-          //
-          // Deliberate stopgap, not the shape #37 leaves behind. Minting a fresh `Runner.Ledger` and
-          // re-entering `Runner.step` with it is exactly what `Ledger`'s `private[litterbox]`
-          // constructor exists to discourage (`src/Kit.scala`, issue #32 review finding 2c); this
-          // call site does it anyway because review spend must not compete with the repair budget the
-          // `self-repair: budget now N` golden lines read, and this issue forbids moving goldens to
-          // fix that the clean way. The cost of the shortcut: it sidesteps the single-ledger
-          // discipline the rest of this method follows, and it makes `Review`'s declared
-          // `Cost.OneDispatch` unfalsifiable at this site, since nothing here can ever observe this
-          // throwaway `Ledger` running short. Issue #37, where `Runner.run` walks the whole graph
-          // against one shared `Ledger`, is where this gets closed for good.
-          //
-          // The `Cost` half above is only half of what this call site leaves unobserved (round two
-          // of issue #35's review): `Review`'s declared `Timeout.Unbounded` and `probe = _ => None`
-          // (`Review`'s own doc, above) are exactly as unfalsifiable here, for the same root cause.
-          // `ScenarioSpec` proves #33's `Implement` and #34's `Gate`/`Repair` are genuinely wired as
-          // nodes by asserting on their declared `Timeout`/`probe` behaviour end to end; no
-          // equivalent coverage exists for `Review` here, so if this call site were reverted to a
-          // plain, un-costed `runReview(...)` call tomorrow, nothing in this suite would fail. #37
-          // inherits closing this gap too, not only the `Cost` one.
-          Runner.step(
-            Review,
-            ReviewInput(cur, issue, p, bodyFile, reviewFile, currentPatch)
-          )(using caps, faulting, Runner.Ledger(1)) match
-            case NodeOutcome.Stopped(exit) =>
-              // Practically unreachable, same reasoning as `Gate`'s own `Stopped` arm above:
-              // `Review`'s `run` never constructs `Stopped` itself (its only early exits raise
-              // through `Fault`, which never returns here), and its dedicated, freshly built
-              // `Runner.Ledger(1)` always affords its own `Cost.OneDispatch`. Routed as data, not
-              // thrown, for the same forward-compatibility reason (issue #34 review finding F2,
-              // carried forward).
-              Left(exit)
-            case NodeOutcome.Done(judged) =>
-              reviewed = true
-              // `.value` unwraps the token here, at the point the verdict is actually matched on,
-              // not inside `Review`'s own `run` (issue #35 review finding 2): everything upstream of
-              // this line, `runReview`, `Review`, `Runner.step`'s own `NodeOutcome.Done`, carries
-              // `AgentDispatch.Judged[Verdict]`, so `Judged` appears in every signature between the
-              // mint site and here instead of being discarded one call early.
-              val verdict = judged.value
-              verdict match
-                case Verdict.Approve =>
-                  outcome = Some(Outcome.Success)
-                  Right(())
-                case Verdict.RequestChanges =>
-                  // REQUEST_CHANGES spends from the same shared budget as gate-RED. `tamperFile`'s
-                  // path is recomputed, not carried on `Verdict` the way `GateVerdict.Red` carries
-                  // `gateLog`: unlike `gateLog`, it is never `pass`-suffixed (`runReview`'s own
-                  // `artifact(issue, "-tamper.md")` call), so recomputing the identical literal here
-                  // cannot drift the way a `pass`-suffixed path could.
-                  failureKind = Some(FailureKind.ReviewChanges)
-                  attemptRepair(
-                    p,
-                    FailureKind.ReviewChanges,
-                    s"## The independent reviewer requested changes\n\n${fs.read(reviewFile)}\n\n${fs
-                        .read(artifact(issue, "-tamper.md"))}"
-                  ) match
-                    case Left(exit)     => Left(exit)
-                    case Right(applied) => if applied then runCycle(p + 1) else Right(())
+        // `finish` is the former `terminal`, folded into the graph (issue #37): the point where the
+        // implement/gate/repair/review cycle decides its `Outcome` becomes the edge into
+        // `RouteDecision`, and every one of `terminal`'s own later node calls (`CommitAndPush`,
+        // `OpenPr`, and, on the auto-merge route, `CiWait`/`Merge`/`PostMergeCleanup`) becomes a
+        // further `Next.Goto` edge, ending in `Next.Finish(exit)`. The four non-node segments
+        // `terminal` used to own, the `EmptyFix` marker/`git.add`/`git.addAll`/`anythingStaged` guard,
+        // the whole `Route.Parked` block, the `NeedsHuman` notify, and the PR body render/`fs.write`,
+        // keep their exact former positions relative to these node calls (constraint D3 of this
+        // issue's own design), living inside the `Next.Goto` closures between the edges they always
+        // sat next to: that is the correct home for hand-written glue in a graph, not a reason to move
+        // them.
+        def finish(p: Int, state: CycleState): Next =
+          // A fixer that produced no diff left the tree pristine (stagePatch reset to origin/main
+          // before it saw the empty patch), so the "nothing staged" guard below would otherwise fire
+          // first and mask the routing. Stage a small tracked marker so the needs-human audit PR
+          // still opens. In the cumulative-patch model an empty fix reverts all prior work, so this
+          // branch legitimately holds only the marker.
+          if state.failureKind.contains(FailureKind.EmptyFix) then
+            caps.fs.write(
+              "FIX-EMPTY.md",
+              s"""# Fixer produced no diff
+                 |
+                 |The self-repair fixer returned an empty patch. In the cumulative-patch model that
+                 |reverts all prior work on this branch, so the loop routed the issue to human review
+                 |instead of re-gating an empty tree. Opened for the audit trail ONLY; do NOT merge.
+                 |""".stripMargin
+            )
+            caps.git.add("FIX-EMPTY.md")
+          caps.git.addAll()
+          if !caps.git.anythingStaged() then
+            caps.logger.log("nothing staged at terminal — unexpected; leaving in-progress")
+            Next.Finish(LoopExit.NothingMade)
+          else
+            val outcome     = state.outcome.getOrElse(Outcome.Fail) // unreachable in practice; see `CycleState`'s own doc on `outcome`
+            val outcomeText = if outcome == Outcome.Success then "SUCCESS" else "FAIL"
+            val kindText    = state.failureKind.map(_.text).getOrElse("?")
 
-    val cycleResult = if outcome.isEmpty then runCycle(1) else Right(())
-    cycleResult match
-      case Left(exit) => return ImplementAndRepair.StoppedEarly(exit)
-      case Right(())  => ()
+            Next.Goto(
+              RouteDecision,
+              RouteInput(outcome, isClass1, state.failureKind),
+              (route: Route) =>
+                val (label, commitTag, prNote) =
+                  route match
+                    case Route.AutoMergeCandidate =>
+                      // no flip: the auto-merge path owns the issue's fate
+                      (
+                        "",
+                        s"reviewer APPROVE, gate ${state.gateStatus}",
+                        s"**Reviewer: APPROVE** · gate ${state.gateStatus} · class-1 — v4 auto-merge candidate: the loop merges after the required CI check goes green."
+                      )
+                    case Route.NeedsReview =>
+                      (
+                        "needs-review",
+                        s"reviewer APPROVE, gate ${state.gateStatus}",
+                        s"**Reviewer: APPROVE** · gate ${state.gateStatus} (containerized in-memory FAST tier green; the real-PG IT tier is judged by CI on this PR). Not class-1, so not auto-merged: a human reviews and merges."
+                      )
+                    case Route.Parked =>
+                      // `label`, `commitTag` and `prNote` are never read on this route: the
+                      // `Route.Parked` branch below skips both the commit and the PR entirely
+                      // (issue #28 review finding 1, round 2, park writes nothing to git). Kept as
+                      // an empty tuple only so this match stays one shape across all four `Route`
+                      // cases; the log line below builds its own text from `kindText` directly
+                      // instead.
+                      ("", "", "")
+                    case Route.NeedsHuman =>
+                      if state.failureKind.contains(FailureKind.ProtectedPath) || state.failureKind
+                          .contains(FailureKind.OversizedPatch)
+                      then
+                        (
+                          "needs-human",
+                          s"patch guard rejection ($kindText), gate ${state.gateStatus}",
+                          s"**Needs human** — the patch guard rejected the agent's patch ($kindText: a CI workflow / harness / docs / control-or-constitution file, or a patch over the size cap). The rejected change was NOT applied; this branch holds only a rejection marker and must NOT be merged."
+                        )
+                      else if state.failureKind.contains(FailureKind.EmptyFix) then
+                        (
+                          "needs-human",
+                          s"fixer produced no diff (empty-fix), gate ${state.gateStatus}",
+                          s"**Needs human**: the self-repair fixer produced no diff. In the cumulative-patch model that reverts all prior work, so this branch holds only an audit marker (the prior implementation is NOT on it). Opened for the audit trail; do NOT merge."
+                        )
+                      else
+                        (
+                          "needs-human",
+                          s"self-repair budget exhausted ($kindText), gate ${state.gateStatus}",
+                          s"**Needs human** — self-repair budget of ${cfg.repairBudget} exhausted on $kindText (last gate ${state.gateStatus}). Opened for the audit trail; do NOT merge without review."
+                        )
 
-    // `outcome.getOrElse(Outcome.Fail)`: unreachable in practice; see `Ready`'s scaladoc.
-    ImplementAndRepair.Ready(pass, outcome.getOrElse(Outcome.Fail), gateStatus, failureKind, reviewed, reviewFile)
+                // Post the marker, THEN flip the labels, and reset the tree only once both have
+                // succeeded (issue #28 review finding 5, round 3): the original order reset first,
+                // so a marker-post failure infra-faulted having ALREADY discarded the staged failed
+                // work, for no benefit, since the whole point of faulting instead of completing the
+                // park is to let the next tick try again with something still to work from. Guards
+                // run before the side effect they guard.
+                //
+                // No PR either: a parked issue is not an audit trail waiting on review, it is a
+                // wait state. Marker comment, label flip, reset, done; no notify (parking is not an
+                // alert, see `Route`'s scaladoc), UNLESS a step fails, in which case `infraFault`
+                // leaves the issue `in-progress` (no further label mutation, no reset), so the next
+                // tick just tries the whole iteration again rather than settling into a broken
+                // parked state.
+                if route == Route.Parked then
+                  if !caps.gh.issueComment(issue, ParkBody) then
+                    infraFault(
+                      s"could not post the park marker comment on #$issue (gh issue comment failed), infra fault, issue stays in-progress rather than becoming parked with no marker"
+                    )(using caps.logger, caps.notifier)(using faulting)
+                  if !caps.gh.editLabels(issue, add = List(cfg.labels.parked), remove = List(cfg.labels.active))
+                  then
+                    // `gh issue edit ... --add-label parked` fails as a unit when the `parked`
+                    // label does not exist yet, which is every consumer repo's state on upgrade
+                    // (`parkOnExhaustion` defaults to true; the README only starts telling operators
+                    // to create the label in this change). Completing anyway would return rc 60
+                    // with the issue still `in-progress` and no marker read-back possible, so the
+                    // next tick redoes the whole IMPL from scratch, exhausts budget, and parks
+                    // again, forever, one more marker comment each time. Faulting instead leaves the
+                    // issue `in-progress` for a human to notice.
+                    infraFault(
+                      s"could not flip #$issue to parked (gh issue edit failed, does the '${cfg.labels.parked}' label exist?), infra fault, issue stays in-progress"
+                    )(using caps.logger, caps.notifier)(using faulting)
+                  // `stagePatch` leaves the failed work STAGED in the index (that is what the
+                  // "nothing staged" guard above just found), and `pickAndSetup`'s
+                  // `git.statusClean()` check on the very next tick, which may resume this same
+                  // issue or pick a different one, would trip on a dirty tree if this route left
+                  // one behind. Discarding is also the honest choice: the staged work is exactly
+                  // what failed the gates.
+                  caps.git.resetHardCleanToOriginMain()
+                  emit(cur, "PARK", "ok", detail = s"issue=$issue")(using caps.status)
+                  caps.logger.log(s"issue #$issue -> parked ($kindText, gate ${state.gateStatus}), waiting on a human reply")
+                  Next.Finish(LoopExit.Parked)
+                else
+                  // `NeedsHuman`'s notify fires BEFORE the commit, same position as every other route
+                  // (issue #28 review finding 9, round 3).
+                  if route == Route.NeedsHuman then
+                    caps.notifier.notify(s"harness: #$issue needs-human ($kindText, gate ${state.gateStatus})")
+
+                  Next.Goto(
+                    CommitAndPush,
+                    CommitPushInput(
+                      branch,
+                      s"""feat(US-$issue): autonomous iteration — $commitTag
+                         |
+                         |Refs #$issue. Loop iteration $n, $p gate pass(es). Outcome: $outcomeText.
+                         |This commit was produced by an unattended claude -p iteration (harness v2).
+                         |
+                         |Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>""".stripMargin
+                    ),
+                    (_: Unit) =>
+                      // The PR body render + `fs.write`, BETWEEN `CommitAndPush` and `OpenPr` (issue
+                      // #28's own former position, kept exactly by this issue's D3).
+                      val prBody = StringBuilder()
+                      prBody ++= s"Autonomous harness (v2) iteration $n for #$issue.\n\n"
+                      prBody ++= s"$prNote\n\n"
+                      if state.reviewed then
+                        prBody ++= s"<details><summary>Independent reviewer output</summary>\n\n```\n${caps.fs
+                            .read(reviewFile)}\n```\n\n</details>\n\n"
+                      if route == Route.AutoMergeCandidate then
+                        prBody ++= "v4 auto-merge: class-1 + reviewer APPROVE — the loop merges once the required CI check is green.\n\n"
+                      else
+                        prBody ++= "Not auto-merged (v4 merges class-1 + APPROVE only): a human reviews and merges.\n\n"
+                      prBody ++= s"Closes #$issue\n"
+                      caps.fs.write(artifact(issue, ".pr-body.md")(using cfg), prBody.toString)
+
+                      Next.Goto(
+                        OpenPr,
+                        OpenPrInput(
+                          cur,
+                          issue,
+                          branch,
+                          s"US-$issue: autonomous iteration ($outcomeText, gate ${state.gateStatus})",
+                          prBody.toString,
+                          outcomeText,
+                          resumedFromInProgress
+                        ),
+                        (prNum: Int) =>
+                          route match
+                            case Route.AutoMergeCandidate =>
+                              Next.Goto(
+                                CiWait,
+                                CiWaitInput(cur, issue, prNum, carriesParked),
+                                (_: Unit) =>
+                                  Next.Goto(
+                                    Merge,
+                                    MergeInput(cur, issue, prNum),
+                                    (_: Unit) =>
+                                      Next.Goto(
+                                        PostMergeCleanup,
+                                        PostMergeCleanupInput(cur, issue, prNum, carriesParked),
+                                        (_: Unit) => Next.Finish(LoopExit.Success)
+                                      )
+                                  )
+                              )
+                            case Route.NeedsReview | Route.NeedsHuman =>
+                              // A failed flip here (issue #50 review, round 3, finding B) used to be
+                              // silently discarded: the tick would still return
+                              // `Success`/`NeedsHuman` with #issue left `in-progress` and no
+                              // terminal label at all, and the driver would re-pick it next tick and
+                              // burn a second full dispatch on work that already finished. Warn,
+                              // like `editLabels`'s Boolean return exists to let every OTHER call
+                              // site in this file do.
+                              if !caps.gh.editLabels(
+                                  issue,
+                                  add = List(label),
+                                  remove = activeAndParked(carriesParked)(using cfg)
+                                )
+                              then caps.logger.log(s"WARNING: could not flip #$issue to $label (flip by hand)")
+                              caps.logger.log(s"issue #$issue -> $label")
+                              Next.Finish(if route == Route.NeedsReview then LoopExit.Success else LoopExit.NeedsHuman)
+                            case Route.Parked =>
+                              // Unreachable: the `route == Route.Parked` branch above always finishes
+                              // before this match is ever reached. Kept explicit, not a wildcard, so
+                              // the compiler's own exhaustivity check is what notices a future `Route`
+                              // case added without a `Next` here too.
+                              throw IllegalStateException("unreachable: Route.Parked finishes before this point")
+                      )
+                  )
+            )
+
+        // Initial dispatch: a resumed parked issue (issue #28) skips the IMPL worker entirely and goes
+        // straight to a FIX round over the human's reply, with `currentPatch` left `None`, same as the
+        // ordinary first dispatch below. See `Repair`'s own doc (issue #34 review finding F4) for why
+        // that resumed FIX is this SAME `Repair` node rather than a third, uncharged dispatch site.
+        resumeAuthors match
+          case Some(authors) =>
+            val failFile = artifact(issue, "-resume.failure.md")(using cfg)
+            // HARNESS-AUTHORED ONLY: see `resumeFailureBody`'s own scaladoc for why the human's words
+            // must never land in this file (issue #28 review finding 2).
+            caps.fs.write(failFile, resumeFailureBody(authors))
+            val budgetAfter = ledger.remainingDispatches - 1
+            cur.budget = budgetAfter
+            caps.logger.log(
+              s"issue #$issue: resuming from parked with a human reply, dispatching FIX (budget now $budgetAfter)"
+            )
+            Next.Goto(
+              Repair(cfg),
+              RepairInput(cur, issue, 0, failFile, bodyFile, None),
+              {
+                case StageVerdict.Applied(patch) =>
+                  cycle(
+                    1,
+                    CycleState(outcome = None, gateStatus = "", failureKind = None, currentPatch = Some(patch), reviewed = false)
+                  )
+                case StageVerdict.Rejected(kind) =>
+                  // No gate ever ran before this rejection, same reason the ordinary IMPL branch
+                  // below sets the same value on its own rejection (issue #28 review finding 4,
+                  // round 3): `gateStatus` must not render as "gate " with nothing after it.
+                  finish(
+                    0,
+                    CycleState(
+                      outcome = Some(Outcome.Fail),
+                      gateStatus = "SKIPPED",
+                      failureKind = Some(kind),
+                      currentPatch = None,
+                      reviewed = false
+                    )
+                  )
+              }
+            )
+          case None =>
+            Next.Goto(
+              Implement(cfg),
+              ImplementInput(n, cur, issue, workerPromptFile),
+              {
+                case StageVerdict.Applied(patch) =>
+                  cycle(
+                    1,
+                    CycleState(outcome = None, gateStatus = "", failureKind = None, currentPatch = Some(patch), reviewed = false)
+                  )
+                case StageVerdict.Rejected(kind) =>
+                  finish(
+                    0,
+                    CycleState(
+                      outcome = Some(Outcome.Fail),
+                      gateStatus = "SKIPPED",
+                      failureKind = Some(kind),
+                      currentPatch = None,
+                      reviewed = false
+                    )
+                  )
+              }
+            )
+    )
 
   /** The labels a terminal route removes when it flips an issue away from `in-progress`: always
     * `active`, plus `parked` ONLY when `carriesParked`, i.e. only when `issue` currently carries
@@ -1859,8 +2033,9 @@ object Machine:
     * crash-resume flip a few screens up already sends `--remove-label ready` on issues that
     * provably lack `ready`, and the loop already depends on that succeeding as a no-op. The reason
     * is narrower and specific to `parked`: the label may not exist AT ALL in a consumer repo, the
-    * same "every consumer repo's state on upgrade" gap `Route.Parked`'s own label flip below
-    * documents, where a nonexistent label fails the whole `gh issue edit` call as a unit. `ready`
+    * same "every consumer repo's state on upgrade" gap `Route.Parked`'s own label flip, in
+    * `shippedWorkflow`'s `finish`, documents, where a nonexistent label fails the whole `gh issue
+    * edit` call as a unit. `ready`
     * has shipped with every consumer repo's setup from the start; `parked` has not. An
     * unconditional removal here would risk turning a healthy completion into an infra fault on
     * exactly the repos that gap describes.
@@ -1868,7 +2043,7 @@ object Machine:
   private def activeAndParked(carriesParked: Boolean)(using cfg: Config): List[String] =
     cfg.labels.active :: (if carriesParked then List(cfg.labels.parked) else Nil)
 
-  /** `RouteDecision`'s input (issue #36): the three values `terminal`'s own route decision has ever
+  /** `RouteDecision`'s input (issue #36): the three values `decideRoute`'s own route decision has ever
     * read (`Outcome`, `isClass1`, `failureKind`); `cfg.parkOnExhaustion` reaches the node's `run`
     * through the ambient `Caps`, the same way every other capability a node's body needs does,
     * rather than travelling as a fourth field here.
@@ -1892,9 +2067,10 @@ object Machine:
     * (already the name the enum's own generated companion object holds in this scope) rather than
     * `Route`. `cost = Cost.NoDispatch`, `timeout = Timeout.Unbounded`: this node calls no capability
     * at all, `decideRoute` is pure, so both are trivially true rather than a claim about real work
-    * this node skips. It is still a `Node`, not a plain call inside `terminal`, so that the dispatch
-    * immediately after it (which node runs next, `CommitAndPush`/`OpenPr` either way, then
-    * `autoMerge` or the needs-review/needs-human flip) is chosen from THIS node's own OUTPUT, the
+    * this node skips. It is still a `Node`, not a plain inline call the way this decision used to sit
+    * inside `terminal`, so that the dispatch immediately after it (which node runs next,
+    * `CommitAndPush`/`OpenPr` either way, then the `CiWait`/`Merge`/`PostMergeCleanup` auto-merge
+    * chain or the needs-review/needs-human flip) is chosen from THIS node's own OUTPUT, the
     * same shape every other transition in this graph already takes (`Kit.Node`'s own checklist).
     *
     * `probe = _ => None`: a route is a fact about `outcome`/`isClass1`/`failureKind`, all already
@@ -2060,258 +2236,6 @@ object Machine:
           openPr(input.cur, input.issue, input.branch, input.title, input.body, input.outcomeText)
         )
     )
-
-  /** The third and last of the phase extractions `iterate` is being split into (issue #31 / RFC #26
-    * decision 12). Unlike `pickAndSetup` and `implementAndRepair`, there is nothing left in `iterate`
-    * after this phase runs, so its result IS `iterate`'s result: a plain `LoopExit`, not a
-    * `StoppedEarly`/`Ready` sum type invented for symmetry with the other two. A sum type here would
-    * have no second case to distinguish.
-    *
-    * `caps`/`ledger` are plain parameters, not `using` (issue #36, the same reasoning
-    * `implementAndRepair`'s own doc gives for its identical pair): they exist only so the six
-    * `Node`s this phase now runs (`RouteDecision`, `CommitAndPush`, `OpenPr`, and, inside
-    * `autoMerge`, `CiWait`/`Merge`/`PostMergeCleanup`) can go through `Runner.step`, and a `using
-    * caps: Caps` here would risk the exact silent-shadowing trap `implementAndRepair`'s doc
-    * describes for its own capabilities. `hostGates`/`clock`, which `autoMerge` used to need as
-    * individual `using` parameters threaded through this function for no other reason, are gone from
-    * this signature entirely now that `caps` (which already carries both) is what `autoMerge`
-    * receives instead.
-    *
-    * The terminal route is decided ONCE, here, and threaded to every downstream site instead of
-    * being re-tested: see `Route`'s own scaladoc for why that property matters.
-    */
-  private def terminal(
-      n: Int,
-      cur: Cursor,
-      issue: Int,
-      isClass1: Boolean,
-      branch: String,
-      pass: Int,
-      outcome: Outcome,
-      gateStatus: String,
-      failureKind: Option[FailureKind],
-      reviewed: Boolean,
-      reviewFile: String,
-      carriesParked: Boolean,
-      resumedFromInProgress: Boolean,
-      caps: Caps,
-      ledger: Runner.Ledger
-  )(using
-      cfg: Config,
-      gh: GitHub,
-      git: Git,
-      fs: HarnessFs,
-      log: StatusLog,
-      notify: Notify,
-      logger: Log
-  )(using faulting: Faulting): LoopExit =
-    // A fixer that produced no diff left the tree pristine (stagePatch reset to origin/main
-    // before it saw the empty patch), so the "nothing staged" guard below would otherwise fire
-    // first and mask the routing. Stage a small tracked marker so the needs-human audit PR
-    // still opens. In the cumulative-patch model an empty fix reverts all prior work, so this
-    // branch legitimately holds only the marker.
-    if failureKind.contains(FailureKind.EmptyFix) then
-      fs.write(
-        "FIX-EMPTY.md",
-        s"""# Fixer produced no diff
-           |
-           |The self-repair fixer returned an empty patch. In the cumulative-patch model that
-           |reverts all prior work on this branch, so the loop routed the issue to human review
-           |instead of re-gating an empty tree. Opened for the audit trail ONLY; do NOT merge.
-           |""".stripMargin
-      )
-      git.add("FIX-EMPTY.md")
-    git.addAll()
-    if !git.anythingStaged() then
-      logger.log("nothing staged at terminal — unexpected; leaving in-progress")
-      return LoopExit.NothingMade
-
-    val outcomeText = if outcome == Outcome.Success then "SUCCESS" else "FAIL"
-    val kindText    = failureKind.map(_.text).getOrElse("?")
-
-    // THE decision site for the terminal route; see `Route`'s scaladoc for why it is decided once.
-    // `Route.Parked` (issue #28) is deliberately narrow: only the GENERIC budget-exhaustion
-    // sub-case (gate-RED or REQUEST_CHANGES) parks. A guard rejection (protected-path, oversized)
-    // or an empty fix produced no usable work and is not "waiting on guidance"; those keep going
-    // to `Route.NeedsHuman` exactly as before, regardless of `cfg.parkOnExhaustion`. Runs through
-    // `RouteDecision` (issue #36), a `Node` only so this decision's OUTPUT is what the rest of this
-    // function's own dispatch reads (`Kit.Node`'s own checklist: "`Next.Goto` picks the next edge
-    // from the node's OUTPUT"), not because it touches any capability, see that node's own doc.
-    val route = Runner.step(RouteDecision, RouteInput(outcome, isClass1, failureKind))(using
-      caps,
-      faulting,
-      ledger
-    ) match
-      case NodeOutcome.Done(r)       => r
-      case NodeOutcome.Stopped(exit) =>
-        // Unreachable: `RouteDecision.run` only ever returns `NodeOutcome.Done` (see its own doc).
-        return exit
-
-    val (label, commitTag, prNote) =
-      route match
-        case Route.AutoMergeCandidate =>
-          // no flip: the auto-merge path owns the issue's fate
-          (
-            "",
-            s"reviewer APPROVE, gate $gateStatus",
-            s"**Reviewer: APPROVE** · gate $gateStatus · class-1 — v4 auto-merge candidate: the loop merges after the required CI check goes green."
-          )
-        case Route.NeedsReview =>
-          (
-            "needs-review",
-            s"reviewer APPROVE, gate $gateStatus",
-            s"**Reviewer: APPROVE** · gate $gateStatus (containerized in-memory FAST tier green; the real-PG IT tier is judged by CI on this PR). Not class-1, so not auto-merged: a human reviews and merges."
-          )
-        case Route.Parked =>
-          // `label`, `commitTag` and `prNote` are never read on this route: the early return below
-          // skips both the commit and the PR entirely (issue #28 review finding 1, round 2, park
-          // writes nothing to git). Kept as an empty tuple only so this match stays one shape
-          // across all four `Route` cases; the log line below builds its own text from `kindText`
-          // directly instead.
-          ("", "", "")
-        case Route.NeedsHuman =>
-          if failureKind.contains(FailureKind.ProtectedPath) || failureKind.contains(
-              FailureKind.OversizedPatch
-            )
-          then
-            (
-              "needs-human",
-              s"patch guard rejection ($kindText), gate $gateStatus",
-              s"**Needs human** — the patch guard rejected the agent's patch ($kindText: a CI workflow / harness / docs / control-or-constitution file, or a patch over the size cap). The rejected change was NOT applied; this branch holds only a rejection marker and must NOT be merged."
-            )
-          else if failureKind.contains(FailureKind.EmptyFix) then
-            (
-              "needs-human",
-              s"fixer produced no diff (empty-fix), gate $gateStatus",
-              s"**Needs human**: the self-repair fixer produced no diff. In the cumulative-patch model that reverts all prior work, so this branch holds only an audit marker (the prior implementation is NOT on it). Opened for the audit trail; do NOT merge."
-            )
-          else
-            (
-              "needs-human",
-              s"self-repair budget exhausted ($kindText), gate $gateStatus",
-              s"**Needs human** — self-repair budget of ${cfg.repairBudget} exhausted on $kindText (last gate $gateStatus). Opened for the audit trail; do NOT merge without review."
-            )
-
-    // Parked (issue #28) writes NOTHING to git: no commit, no push, and returns before the commit
-    // below ever runs (issue #28 review finding 1, round 2, which reverses round one's design of
-    // committing the failed work locally and reading it back on resume). Two independent reasons: a
-    // `git diff origin/main HEAD` read back on resume is a two-dot, tree-to-tree diff against
-    // whatever `origin/main` was AT PARK TIME, and a human reply can arrive long after `origin/main`
-    // has moved, so that diff would carry deletion hunks for everything `main` gained since,
-    // silently reverting other people's merged work through a green gate and an APPROVE; and the
-    // parked commit was machine-local state a resume's correctness depended on, stranded by a crash,
-    // a fresh clone or a different runner, with no log line saying so. The ticket's own words for
-    // the route are "label it, leave it".
-    if route == Route.Parked then
-      // Post the marker, THEN flip the labels, and reset the tree only once both have succeeded
-      // (issue #28 review finding 5, round 3): the original order reset first, so a marker-post
-      // failure infra-faulted having ALREADY discarded the staged failed work, for no benefit,
-      // since the whole point of faulting instead of completing the park is to let the next tick
-      // try again with something still to work from. Guards run before the side effect they guard.
-      //
-      // No PR either: a parked issue is not an audit trail waiting on review, it is a wait state.
-      // Marker comment, label flip, reset, done; no notify (parking is not an alert, see `Route`'s
-      // scaladoc), UNLESS a step fails, in which case `infraFault` leaves the issue `in-progress`
-      // (no further label mutation, no reset), so the next tick just tries the whole iteration
-      // again rather than settling into a broken parked state.
-      if !gh.issueComment(issue, ParkBody) then
-        // A silently failed marker post would leave the issue `parked` with no marker at all, and
-        // the next tick's resume probe would then read the issue's entire comment history as "the
-        // reply" (issue #28 review finding 8).
-        infraFault(
-          s"could not post the park marker comment on #$issue (gh issue comment failed), infra fault, issue stays in-progress rather than becoming parked with no marker"
-        )
-      if !gh.editLabels(issue, add = List(cfg.labels.parked), remove = List(cfg.labels.active)) then
-        // `gh issue edit ... --add-label parked` fails as a unit when the `parked` label does not
-        // exist yet, which is every consumer repo's state on upgrade (`parkOnExhaustion` defaults
-        // to true; the README only starts telling operators to create the label in this change).
-        // Completing anyway would return rc 60 with the issue still `in-progress` and no marker
-        // read-back possible, so the next tick redoes the whole IMPL from scratch, exhausts budget,
-        // and parks again, forever, one more marker comment each time. Faulting instead leaves the
-        // issue `in-progress` for a human to notice.
-        infraFault(
-          s"could not flip #$issue to parked (gh issue edit failed, does the '${cfg.labels.parked}' label exist?), infra fault, issue stays in-progress"
-        )
-      // `stagePatch` leaves the failed work STAGED in the index (that is what the "nothing staged"
-      // guard above just found), and `pickAndSetup`'s `git.statusClean()` check on the very next
-      // tick, which may resume this same issue or pick a different one, would trip on a dirty tree
-      // if this route left one behind. Discarding is also the honest choice: the staged work is
-      // exactly what failed the gates.
-      git.resetHardCleanToOriginMain()
-      emit(cur, "PARK", "ok", detail = s"issue=$issue")
-      logger.log(s"issue #$issue -> parked ($kindText, gate $gateStatus), waiting on a human reply")
-      return LoopExit.Parked
-
-    // NeedsHuman's notify fires BEFORE the commit, same position as every other route in this
-    // function: an observable side effect kept where it always was rather than moved for no stated
-    // reason (issue #28 review finding 9, round 3).
-    if route == Route.NeedsHuman then
-      notify.notify(s"harness: #$issue needs-human ($kindText, gate $gateStatus)")
-
-    Runner.step(
-      CommitAndPush,
-      CommitPushInput(
-        branch,
-        s"""feat(US-$issue): autonomous iteration — $commitTag
-           |
-           |Refs #$issue. Loop iteration $n, $pass gate pass(es). Outcome: $outcomeText.
-           |This commit was produced by an unattended claude -p iteration (harness v2).
-           |
-           |Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>""".stripMargin
-      )
-    )(using caps, faulting, ledger) match
-      case NodeOutcome.Done(())      => ()
-      case NodeOutcome.Stopped(exit) =>
-        // Unreachable: `CommitAndPush.run` only ever returns `NodeOutcome.Done` (see its own doc).
-        return exit
-
-    val prBody = StringBuilder()
-    prBody ++= s"Autonomous harness (v2) iteration $n for #$issue.\n\n"
-    prBody ++= s"$prNote\n\n"
-    if reviewed then
-      prBody ++= s"<details><summary>Independent reviewer output</summary>\n\n```\n${fs.read(reviewFile)}\n```\n\n</details>\n\n"
-    if route == Route.AutoMergeCandidate then
-      prBody ++= "v4 auto-merge: class-1 + reviewer APPROVE — the loop merges once the required CI check is green.\n\n"
-    else
-      prBody ++= "Not auto-merged (v4 merges class-1 + APPROVE only): a human reviews and merges.\n\n"
-    prBody ++= s"Closes #$issue\n"
-    fs.write(artifact(issue, ".pr-body.md"), prBody.toString)
-
-    val prNum = Runner.step(
-      OpenPr,
-      OpenPrInput(
-        cur,
-        issue,
-        branch,
-        s"US-$issue: autonomous iteration ($outcomeText, gate $gateStatus)",
-        prBody.toString,
-        outcomeText,
-        resumedFromInProgress
-      )
-    )(using caps, faulting, ledger) match
-      case NodeOutcome.Done(n)       => n
-      case NodeOutcome.Stopped(exit) =>
-        // Unreachable: `OpenPr.run` only ever returns `NodeOutcome.Done` (see its own doc); its
-        // only early exit is `infraFault`, which never returns a value for this case to carry.
-        return exit
-
-    route match
-      case Route.AutoMergeCandidate => autoMerge(issue, prNum, cur, carriesParked, caps, ledger)
-      case Route.NeedsReview | Route.NeedsHuman =>
-        // A failed flip here (issue #50 review, round 3, finding B) used to be silently discarded:
-        // the tick would still return `Success`/`NeedsHuman` with #issue left `in-progress` and no
-        // terminal label at all, and the driver would re-pick it next tick and burn a second full
-        // dispatch on work that already finished. Warn, like `editLabels`'s Boolean return exists
-        // to let every OTHER call site in this file do.
-        if !gh.editLabels(issue, add = List(label), remove = activeAndParked(carriesParked)) then
-          logger.log(s"WARNING: could not flip #$issue to $label (flip by hand)")
-        logger.log(s"issue #$issue -> $label")
-        if route == Route.NeedsReview then LoopExit.Success else LoopExit.NeedsHuman
-      case Route.Parked =>
-        // Unreachable: the `route == Route.Parked` branch above always returns before this match is
-        // ever reached. Kept as an explicit case (rather than a wildcard) so the compiler's own
-        // exhaustivity check is what notices a future `Route` case added without a return here too.
-        throw IllegalStateException("unreachable: Route.Parked returns before this point")
 
   /** `CiWait`'s input (issue #36): the values `ciWait` needs. `carriesParked` travels here, not
     * just to `PostMergeCleanup` below, because the CI-RED branch flips the SAME `activeAndParked`
@@ -2511,7 +2435,7 @@ object Machine:
     * `probe = _ => None`, and deliberately so, not from an oversight, but NOT for the reason `CiWait`
     * gives (issue #36 review, MAJOR 3): a probe checking `gh.issueLabels(issue)` for `in-progress`'s
     * absence would indeed be dead code, but not because `in-progress` presence is what gates a second
-    * visit here. The load-bearing fact is `terminal`'s own PR body, which always carries `Closes
+    * visit here. The load-bearing fact is the PR body `finish` renders, which always carries `Closes
     * #$issue`, and `Merge` only ever reaches this node after its own `gh.prState(prNum) ==
     * "MERGED"` verification passed: a genuinely merged PR with that body closes the issue on GitHub
     * as a side effect of the merge itself, and `LiveGitHub.inProgressIssue` (`Live.scala:842-854`)
@@ -2539,37 +2463,6 @@ object Machine:
         postMergeCleanup(input.cur, input.issue, input.prNum, input.carriesParked)
         NodeOutcome.Done(())
     )
-
-  /** v4 auto-merge (class-1 + APPROVE only): wait-appear -> watch -> merge -> VERIFY the PR state
-    * is MERGED (unverified = infra fault) -> drop in-progress -> flip blocked -> fetch -> notify.
-    * CI red after green local gates = needs-human WITHOUT self-repair: the loop never repairs
-    * against the independent check.
-    *
-    * Three `Runner.step` calls, one per chain node (issue #36), replacing what used to be one
-    * straight-line function: `CiWait` can end the chain early (`NodeOutcome.Stopped(NeedsHuman)`),
-    * which this function threads straight back out; `Merge` and `PostMergeCleanup` never do (see
-    * each node's own doc), so their `Stopped` arms are unreachable, kept only for exhaustivity, the
-    * same shape `terminal`'s own `CommitAndPush`/`OpenPr` call sites use.
-    */
-  private def autoMerge(issue: Int, prNum: Int, cur: Cursor, carriesParked: Boolean, caps: Caps, ledger: Runner.Ledger)(using
-      faulting: Faulting
-  ): LoopExit =
-    Runner.step(CiWait, CiWaitInput(cur, issue, prNum, carriesParked))(using caps, faulting, ledger) match
-      case NodeOutcome.Stopped(exit) => return exit
-      case NodeOutcome.Done(())      => ()
-
-    Runner.step(Merge, MergeInput(cur, issue, prNum))(using caps, faulting, ledger) match
-      case NodeOutcome.Stopped(exit) => return exit // unreachable: see `Merge`'s own doc
-      case NodeOutcome.Done(())      => ()
-
-    Runner.step(
-      PostMergeCleanup,
-      PostMergeCleanupInput(cur, issue, prNum, carriesParked)
-    )(using caps, faulting, ledger) match
-      case NodeOutcome.Stopped(exit) => return exit // unreachable: see `PostMergeCleanup`'s own doc
-      case NodeOutcome.Done(())      => ()
-
-    LoopExit.Success
 
   /** Poll the rollup length until > 0, bounded by ciAppearTimeout. True once >=1 check is
     * registered, false on timeout.
@@ -2608,19 +2501,20 @@ object Machine:
             logger.log(s"WARNING: could not flip #$b $blocked -> $ready (flip by hand)")
     }
 
-  /** What `pickAndSetup` concluded: either `iterate` stops immediately with the carried `LoopExit`
+  /** What `pickAndSetup` concluded: either `runOnce` stops immediately with the carried `LoopExit`
     * (manual stop, idle, dry run, parked; issue #50 review adds three more `Parked` exit sites to
-    * the ones that already existed), or the phase ran to completion and everything the rest of
-    * `iterate` needs is here.
+    * the ones that already existed), or the phase ran to completion and everything the rest of the
+    * tick, `runOnce`'s own `shippedWorkflow` walk, needs is here.
     *
     * A sum type rather than, say, an `Option` of a result tuple plus a separate exit code: the two
-    * cases really do have different shapes, and naming both is what lets `iterate` read as "call the
+    * cases really do have different shapes, and naming both is what lets `runOnce` read as "call the
     * phase, then branch" instead of re-deriving the early-exit condition at the call site (issue #29
     * / RFC #26 decision 12 — extract the phase first, so the later node conversion is a reshape).
     */
   private enum PickAndSetup:
     /** The phase stopped on its own before dispatching any work or touching git; `exit` is what
-      * `iterate` must return unchanged. `exit` is never `LoopExit.InfraFault`: an infra fault goes
+      * `runOnce` must return unchanged (`Runner.step(Pick, ...)`'s own `NodeOutcome.Stopped` arm).
+      * `exit` is never `LoopExit.InfraFault`: an infra fault goes
       * through `infraFault`, not through this case, because routing it here would skip the fault
       * log line and the notify that `infraFault` is responsible for.
       *
@@ -2633,12 +2527,18 @@ object Machine:
       */
     case StoppedEarly(exit: LoopExit)
 
-    /** So the call site reads as plain names instead of `setup.foo` accessors, the field names are
-      * the ones `iterate` imports them as.
+    /** The field names match, one for one, the local `val`s `pickAndSetup`'s own construction site
+      * (`PickAndSetup.Ready(issue, bodyFile, workerPromptFile, ...)`, positional, eight fields) already
+      * carries, so that call reads as a plain list of already-named locals rather than a positional
+      * wall of values a reader has to cross-reference against this case class to identify. `runOnce`,
+      * the consumer, DOES read them back through `setup.issue`, `setup.bodyFile`, `setup.resumeAuthors`
+      * and so on (its own `ShippedStart` construction), an ordinary case-class accessor read, not
+      * something this naming avoids; the naming's payoff is at the CONSTRUCTION site above, not the
+      * consumption site here.
       *
       * `resumeAuthors` is `Some` only when `issue` was picked off the parked queue, or off an
       * in-progress issue that is ALSO parked, with a freshly ACCEPTED human reply THIS tick (issue
-      * #28): `implementAndRepair` reads it to skip the initial IMPL dispatch and go straight to a
+      * #28): `shippedWorkflow`'s own `start` reads it to skip the initial IMPL dispatch and go straight to a
       * FIX round instead, and to name the reply's authors in the harness-authored failure body it
       * writes (issue #28 review finding 3, round 2; the field used to carry the reply TEXT and
       * nothing ever read it back, see finding 6).
@@ -2652,8 +2552,9 @@ object Machine:
       * fault landing between `Route.Parked`'s marker post and its own label flip on an earlier
       * tick. (THIS tick's own `gh.parkedIssues()` read failing is not one of these gap cases: that
       * always infra-faults the whole tick above, before `Ready` is ever constructed, per review
-      * round 3's reversal of an earlier degrade, see the fault site's own scaladoc.) `terminal`
-      * (via `activeAndParked`) reads `carriesParked`, not `resumeAuthors.isDefined`, to decide
+      * round 3's reversal of an earlier degrade, see the fault site's own scaladoc.) The
+      * route-completion logic (`finish`, `CiWait`'s CI-RED branch, `PostMergeCleanup`, all via
+      * `activeAndParked`) reads `carriesParked`, not `resumeAuthors.isDefined`, to decide
       * whether to remove `parked` on completion, which is what actually clears the gap instead of
       * stranding the label on a finished issue forever.
       *
@@ -2692,60 +2593,16 @@ object Machine:
         resumedFromInProgress: Boolean
     )
 
-  /** What `implementAndRepair` concluded: either the initial IMPL patch was empty and `iterate`
-    * stops immediately with the carried `LoopExit`, or the phase ran to completion (the initial
-    * dispatch, zero or more repair passes, and a final gate/review outcome) and everything
-    * `terminal` reads is here.
-    *
-    * Same shape as `PickAndSetup` and for the same reason (issue #30 / RFC #26 decision 12): the
-    * two cases genuinely differ, so naming both lets `iterate` read as "call the phase, then
-    * branch" instead of re-deriving the early-exit condition at the call site.
+  /** The two-value domain outcome the implement/gate/repair/review cycle settles on, read by
+    * `shippedWorkflow`'s own `finish` to decide `RouteInput`'s `outcome` field. Not `LoopExit`: an
+    * exhausted-budget or `Rejected` stop is `Outcome.Fail`, and a reviewer `Approve` is
+    * `Outcome.Success`, neither of which decides the real `LoopExit` on its own (that is `RouteDecision`
+    * plus everything downstream of it, `Route`'s own doc).
     */
-  private enum ImplementAndRepair:
-    /** The only early stop in this phase: an empty initial IMPL patch. `exit` is always
-      * `LoopExit.NothingMade` in practice; kept as `LoopExit` rather than hardcoded so this case
-      * has the same shape as `PickAndSetup.StoppedEarly`. Never `LoopExit.InfraFault`, for the
-      * same reason as `PickAndSetup.StoppedEarly`: a fault goes through `infraFault`'s `break`,
-      * which never returns here at all.
-      */
-    case StoppedEarly(exit: LoopExit)
-
-    /** The values that used to be mutable locals declared before the initial dispatch and read by
-      * `iterate` long after this phase returned, plus `reviewFile`. Remaining budget and
-      * `currentPatch` are not here. `currentPatch` is pure bookkeeping internal to the repair loop,
-      * never read once this function returns. The remaining budget (no longer a local `var` at all,
-      * issue #34 review finding F3; read straight off `ledger.remainingDispatches`) leaves through
-      * the shared `cur.budget`, which `emit` copies into every `StatusEvent`; it does not leave
-      * through this return value, so there is no local copy to carry here either. Field names match
-      * what `iterate` imports them as, same convention as `PickAndSetup.Ready`.
-      *
-      * `outcome` is `Outcome`, not `Option[Outcome]`. `runCycle` above returns (`Right(())`) only
-      * from two places, and both have already set `outcome` to `Some` before returning: the
-      * `Verdict.Approve` arm (`outcome = Some(Outcome.Success)`) and either `attemptRepair`
-      * `Right(false)` arm reached with `outcome` already `Some` (gate-RED or REQUEST_CHANGES budget
-      * exhaustion, both set inside `attemptRepair` before it returns `Right(false)`). The only other
-      * way to reach this `Ready` is the initial-patch rejection path above `runCycle`, which already
-      * set `Some(Outcome.Fail)` before `outcome.isEmpty` is even tested. So `None` was never
-      * reachable here; this is the one field where the explicit result type discharges that
-      * invariant for free instead of carrying a case nothing produces. The construction collapses it with
-      * `outcome.getOrElse(Outcome.Fail)`, which is exactly what the terminal used to do by reading
-      * `outcome.contains(Outcome.Success)`: a `None` there already meant `Fail`, so the collapse
-      * changes no observable behaviour. `failureKind` stays `Option[FailureKind]`: that one
-      * genuinely can be `None` (a clean gate GREEN plus a reviewer APPROVE never sets it).
-      */
-    case Ready(
-        pass: Int,
-        outcome: Outcome,
-        gateStatus: String,
-        failureKind: Option[FailureKind],
-        reviewed: Boolean,
-        reviewFile: String
-    )
-
   private enum Outcome:
     case Success, Fail
 
-  /** The terminal route for a US, decided once in `terminal` and threaded to every downstream site
+  /** The terminal route for a US, decided once in `decideRoute` and threaded to every downstream site
     * (label, notify, PR note, auto-merge dispatch, exit code) instead of re-tested at each one: a
     * second decision site is where the label, the notify text, the PR note, the auto-merge
     * dispatch, and the exit code could drift out of agreement with each other.
@@ -2754,6 +2611,11 @@ object Machine:
     * loop posts the marker comment and flips the label directly instead. It stays a case of this
     * same enum rather than a parallel decision because the choice of whether to park still has to
     * be made at the same single site as everything else.
+    *
+    * `Parked` is deliberately narrow: only the GENERIC budget-exhaustion sub-case (gate-RED or
+    * REQUEST_CHANGES) parks. A guard rejection (protected-path, oversized) or an empty fix produced
+    * no usable work and is not "waiting on guidance"; those keep going to `NeedsHuman` regardless of
+    * `cfg.parkOnExhaustion`. See `decideRoute` for where that distinction is made.
     */
   private enum Route:
     case AutoMergeCandidate, NeedsReview, NeedsHuman, Parked
