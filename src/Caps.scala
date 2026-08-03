@@ -336,9 +336,18 @@ final case class HostGateRunner(runner: GateRunner):
 
 /** status.jsonl appender. Pure observability: a wrong event is a wrong banner, never a wrong merge.
   * Sanitization/normalization happens in Machine before the event reaches here.
+  *
+  * `declare` (issue #40) is a second, separate method rather than a special `StatusEvent` shape:
+  * `phaseSeq`/`phaseStateSeq` (`test/Recorder.scala`) and every scenario that reads `events` walk
+  * `StatusEvent`s only, so a stage declaration that travelled through `append` would either grow a
+  * phase string those helpers were never meant to see, or need a filter added at every one of their
+  * call sites. A second method keeps the existing event stream untouched and gives the declaration
+  * its own, honestly typed shape (`StageSet`) instead of overloading `StatusEvent`'s fields to carry
+  * data they were not designed for.
   */
 trait StatusLog:
   def append(event: StatusEvent): Unit
+  def declare(stages: StageSet): Unit
 
 /** Notify seam. Fires on exactly: needs-human terminals, rc-50 exits, successful auto-merges. A
   * dead channel must never change loop behavior (live handler swallows).

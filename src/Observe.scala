@@ -3,11 +3,16 @@ package in.rcard.litterbox
 /** The observability scripts: the live run monitor and the stream-json log follower.
   *
   * These ship for the same reason the sandbox scripts do (#15), and for one more that is stronger.
-  * `watch.sh` PARSES `status.jsonl` — `phase`, `state`, `pass`, `budget`, `logfile`, `pid` — a schema
-  * written by `LiveStatusLog`. A scaffolded copy would silently misread a renamed field in every repo
-  * that ever ran `init`, with no way to push the fix. And unlike `Dockerfile` or `allowlist` there is
-  * nothing project-specific in them: no build tool, no JDK, no domain, so a consumer has no reason to
-  * edit them. They fail the configuration test on both halves, which makes them protocol.
+  * `watch.sh` PARSES `status.jsonl`: `run`, `phase`, `state`, `pass`, `budget`, `logfile`, `pid` off
+  * an ordinary event line (`LiveStatusLog.append`), plus, since issue #40, `kind`, `anchor`,
+  * `terminal` and `stages` (an array of `{phase, chip, row, badge}`) off the `"kind":"stages"`
+  * declaration line a run writes once per tick, ahead of that tick's own first event
+  * (`LiveStatusLog.declare`), so the declaration always sits inside `banner.sh`'s own
+  * `tail -n 5000` read window no matter how long the run has been going. That schema is written by
+  * `LiveStatusLog`. A scaffolded copy would silently misread a renamed field in every repo that ever
+  * ran `init`, with no way to push the fix. And unlike `Dockerfile` or `allowlist` there is nothing
+  * project-specific in them: no build tool, no JDK, no domain, so a consumer has no reason to edit
+  * them. They fail the configuration test on both halves, which makes them protocol.
   *
   * A SECOND TREE rather than four more entries in [[Sandbox]], deliberately. `resources/sandbox/` is
   * the Docker sandbox: the thing the loop builds images from and runs containers in. Nothing here

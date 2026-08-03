@@ -142,6 +142,144 @@ class LiveSpec extends AnyFlatSpec with Matchers:
     Files.exists(defaultStatusFile(root)) shouldBe false
   }
 
+  // ---- LiveStatusLog.declare (issue #40) -----------------------------------------------------
+
+  "LiveStatusLog.declare" should "write a single well formed JSON line with kind:\"stages\"" in {
+    val root = tempRoot()
+    val log  = LiveStatusLog(root, "1234567890")
+
+    log.declare(
+      StageSet(
+        stages = List(Stage("PICK", "pick", row = 1), Stage("FIX", "fix", row = 1, badge = true)),
+        anchor = Some("PICK"),
+        terminal = Some("DONE")
+      )
+    )
+
+    val lines = readLines(defaultStatusFile(root))
+    lines should have size 1
+    val pattern =
+      ("""\{"ts":(\d+),"pid":(\d+),"run":"1234567890","kind":"stages","anchor":"PICK","terminal":"DONE","stages":\[""" +
+        """\{"phase":"PICK","chip":"pick","row":1,"badge":false\},""" +
+        """\{"phase":"FIX","chip":"fix","row":1,"badge":true\}\]\}""").r
+    pattern.matches(lines.head) shouldBe true
+  }
+
+  it should "leave append's own output shape unaffected: the two methods write to the same file " +
+    "without either one's line shape leaking into the other's" in {
+      val root = tempRoot()
+      val log  = LiveStatusLog(root, "1")
+
+      log.declare(StageSet(List(Stage("PICK", "pick", row = 1)), Some("PICK"), Some("DONE")))
+      log.append(StatusEvent(0, "1", "PICK", "ok", 0, 0, "", ""))
+
+      val lines = readLines(defaultStatusFile(root))
+      lines should have size 2
+      lines.head should include(""""kind":"stages"""")
+      lines(1) should not include "\"kind\""
+      lines(1) should include(""""phase":"PICK","state":"ok"""")
+    }
+
+  it should "declare an empty stage set (no anchor, no terminal) without crashing" in {
+    val root = tempRoot()
+    val log  = LiveStatusLog(root, "1")
+
+    log.declare(StageSet(Nil, None, None))
+
+    val line = readLines(defaultStatusFile(root)).head
+    line should include(""""anchor":null""")
+    line should include(""""terminal":null""")
+    line should include(""""stages":[]""")
+  }
+
+  it should "sanitize phase/chip/anchor/terminal the same way append sanitizes detail: strip " +
+    "backslashes, strip double quotes, collapse newlines to spaces" in {
+      val root = tempRoot()
+      val log  = LiveStatusLog(root, "1")
+
+      log.declare(
+        StageSet(
+          stages = List(Stage("""a\b"c""" + "\n" + "d", """x\y"z""", row = 1)),
+          anchor = Some("""p\i"ck"""),
+          terminal = None
+        )
+      )
+
+      val line = readLines(defaultStatusFile(root)).head
+      line should include(""""phase":"abc d"""")
+      line should include(""""chip":"xyz"""")
+      line should include(""""anchor":"pick"""")
+      line should not include "\\"
+    }
+
+  it should "strip carriage returns and every other C0 control character from phase/chip/anchor, " +
+    "not merely backslash, quote and newline (issue #40 review MINOR 6)" in {
+      val root = tempRoot()
+      val log  = LiveStatusLog(root, "1")
+
+      // Carriage return, tab and bell (\u0007) are all C0 control characters `clean` used to
+      // leave untouched. A raw carriage return in particular is the one that matters most:
+      // `chip` is printed straight into banner.sh's pinned chip rows with no second scrub at
+      // the read end (unlike `detail`, whose one caller in banner.sh runs it through its own
+      // gsub before printing), so a stray carriage return reaching a real terminal there would
+      // move the cursor back to the start of the line on every redraw and corrupt whatever
+      // watch.sh painted.
+      log.declare(
+        StageSet(
+          stages = List(Stage("PI\r\tCK", "pi\u0007ck", row = 1)),
+          anchor = Some("PI\rCK"),
+          terminal = None
+        )
+      )
+
+      val line = readLines(defaultStatusFile(root)).head
+      line should include(""""phase":"PICK"""")
+      line should include(""""chip":"pick"""")
+      line should include(""""anchor":"PICK"""")
+      line should not include "\r"
+      line should not include "\t"
+      line should not include "\u0007"
+    }
+
+  it should "strip DEL and the C1 range 0x80-0x9F, not just C0 control characters " +
+    "(issue #40 review round 2, MINOR 3)" in {
+      val root = tempRoot()
+      val log  = LiveStatusLog(root, "1")
+
+      // DEL (0x7F) sits right after the C0 range `filterNot(_ < ' ')` already covered, and the
+      // C1 range 0x80-0x9F sits right after DEL; neither is less than ' ' (0x20), so the old
+      // predicate let both through untouched. U+009B in particular is CSI, the byte a terminal
+      // that recognizes 8-bit C1 codes treats as equivalent to the two-byte escape sequence
+      // introducer ESC '[', so it is the closest thing to an ANSI injection this single
+      // character filter can be asked to stop: a `chip` carrying it would reach banner.sh's
+      // pinned chip rows with no second scrub at the read end, on a terminal that acts on it,
+      // the same corruption MINOR 6's carriage-return case already closed for C0.
+      log.declare(
+        StageSet(
+          stages = List(Stage("PICK", "pick\u007fck", row = 1)),
+          anchor = Some("PICK\u009bCK"),
+          terminal = None
+        )
+      )
+
+      val line = readLines(defaultStatusFile(root)).head
+      line should include(""""phase":"PICK"""")
+      line should include(""""chip":"pickck"""")
+      line should include(""""anchor":"PICKCK"""")
+      line should not include "\u007f"
+      line should not include "\u009b"
+    }
+
+  it should "not throw when the status.jsonl parent path is blocked by a file" in {
+    val root    = tempRoot()
+    val blocked = Paths.get(Config().logDir).getName(0).toString
+    Files.write(root.resolve(blocked), "blocked".getBytes)
+    val log = LiveStatusLog(root, "1")
+
+    noException should be thrownBy log.declare(StageSet(Nil, None, None))
+    Files.exists(defaultStatusFile(root)) shouldBe false
+  }
+
   // ---- LiveNotify ---------------------------------------------------------------------------
 
   "LiveNotify" should "run the NOTIFY_CMD bash stub with $msg exported, verbatim bash-suite shape" in {

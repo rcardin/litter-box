@@ -92,3 +92,99 @@ class ShippedWorkflowSpec extends AnyFlatSpec with Matchers:
       world.callCount("gate FAST") shouldBe 1
       world.callCount("dispatch REVIEW") shouldBe 1
     }
+
+  // ---- declared stage set (issue #40) --------------------------------------------------------
+
+  it should "carry the exact shipped stage set as its own stages field, not a second hand " +
+    "maintained list watch.sh would have to be trusted to match" in {
+      val world = TestWorld()
+      val caps  = buildCaps(world)
+
+      val result = withFaulting:
+        val ledger = Runner.Ledger(3)
+        Machine.shippedWorkflow(Config(), caps, summon[Faulting], ledger).stages
+
+      result shouldBe Right(Machine.shippedStages)
+    }
+
+  // ---- issue #40 review MAJOR 3: the declaration reads Workflow.stages, not the module constant ---
+  //
+  // The test above and `Machine.declareStages`'s own production call site both drive
+  // `shippedWorkflow`, so on their own they can only catch a MISSING declare call, never a WRONG
+  // stage set: a `declareStages` that ignored its argument entirely and always logged
+  // `Machine.shippedStages` by name would still pass both. This test drives `declareStages` with a
+  // `Workflow` whose `stages` genuinely differs from the shipped set, so it can only pass if the
+  // declaration really is read off the argument.
+
+  "Machine.declareStages" should "declare the given workflow's own stages field, not the shipped " +
+    "one, when the two differ" in {
+      val world = TestWorld()
+
+      val customStages = StageSet(
+        stages = List(Stage("FOO", "foo", row = 1)),
+        anchor = Some("FOO"),
+        terminal = None
+      )
+      val fakeWorkflow = Workflow[Unit]("fake", start = _ => Next.Finish(LoopExit.Success), stages = customStages)
+
+      Machine.declareStages(fakeWorkflow)(using world.status, world.logger)
+
+      world.declaredStages shouldBe List(customStages)
+      customStages should not be Machine.shippedStages
+    }
+
+  // ---- issue #40 review round 2, MINOR 4: an invalid row is visible, not silently dropped ------
+
+  it should "log one line naming a stage whose row is neither 1 nor 2, since banner.sh silently " +
+    "drops it from both chip rows instead of crashing" in {
+      val world = TestWorld()
+
+      val badRowStages = StageSet(
+        stages = List(Stage("FOO", "foo", row = 3)),
+        anchor = None,
+        terminal = None
+      )
+      val fakeWorkflow =
+        Workflow[Unit]("fake", start = _ => Next.Finish(LoopExit.Success), stages = badRowStages)
+
+      Machine.declareStages(fakeWorkflow)(using world.status, world.logger)
+
+      world.logLines should have size 1
+      world.logLines.head should include("FOO")
+      world.logLines.head should include("row 3")
+    }
+
+  it should "log nothing when every declared stage's row is 1 or 2, the only rows banner.sh " +
+    "ever draws" in {
+      val world = TestWorld()
+
+      val goodRowStages = StageSet(
+        stages = List(Stage("FOO", "foo", row = 1), Stage("BAR", "bar", row = 2)),
+        anchor = None,
+        terminal = None
+      )
+      val fakeWorkflow =
+        Workflow[Unit]("fake", start = _ => Next.Finish(LoopExit.Success), stages = goodRowStages)
+
+      Machine.declareStages(fakeWorkflow)(using world.status, world.logger)
+
+      world.logLines shouldBe empty
+    }
+
+  "Machine.shippedStages" should "declare row 1 (PICK, IMPL, FAST_GATE, plus FIX as a badge), row 2 " +
+    "(REVIEW, PR, CI_WAIT, MERGE), anchor PICK and terminal DONE, reproducing today's banner" in {
+      Machine.shippedStages shouldBe StageSet(
+        stages = List(
+          Stage("PICK", "pick", row = 1, badge = false),
+          Stage("IMPL", "impl", row = 1, badge = false),
+          Stage("FAST_GATE", "fast", row = 1, badge = false),
+          Stage("FIX", "fix", row = 1, badge = true),
+          Stage("REVIEW", "rev", row = 2, badge = false),
+          Stage("PR", "pr", row = 2, badge = false),
+          Stage("CI_WAIT", "ci", row = 2, badge = false),
+          Stage("MERGE", "merge", row = 2, badge = false)
+        ),
+        anchor = Some("PICK"),
+        terminal = Some("DONE")
+      )
+    }

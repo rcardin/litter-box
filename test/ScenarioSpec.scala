@@ -81,6 +81,42 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     w.called("gh issue view 999") shouldBe false
   }
 
+  // ---- issue #40 review MAJOR 1: every tick declares, before ITS OWN first status event --------
+  //
+  // `banner.sh` reads only the last `tail -n 5000` lines of status.jsonl (its own doc), so a
+  // declaration written once per PROCESS scrolls out of that window on a long MAX_ITERS run and
+  // both chip rows go permanently blank. The real invariant is per tick, not per process: a
+  // declaration precedes the first status event of EVERY tick, and every declaration carries the
+  // same stage set (`runOnce` always declares off `shippedWorkflow(...).stages`, which
+  // `ShippedWorkflowSpec` separately pins as always equal to `Machine.shippedStages`).
+
+  it should "declare the shipped stage set before every tick's own first status event, every " +
+    "declaration carrying the same stage set" in {
+      val w = TestWorld()
+
+      w.runLoop(iteration = 1)
+
+      w.declaredStages shouldBe List(Machine.shippedStages)
+      w.declaredBeforeAnyEvent shouldBe List(true)
+      w.events should not be empty // PICK ok is this tick's own first status event
+
+      w.events.clear() // isolate the second tick's own "before any event" check to itself
+      w.runLoop(iteration = 2)
+
+      w.declaredStages shouldBe List(Machine.shippedStages, Machine.shippedStages)
+      w.declaredBeforeAnyEvent shouldBe List(true, true)
+    }
+
+  it should "declare on a tick numbered above 1 with no prior iteration 1 in this world, proving " +
+    "the declaration is a per tick fact now, never gated on n == 1" in {
+      val w = TestWorld()
+
+      w.runLoop(iteration = 2)
+
+      w.declaredStages shouldBe List(Machine.shippedStages)
+      w.declaredBeforeAnyEvent shouldBe List(true)
+    }
+
   // ---- Scenario DRY: DRY_RUN renders the worker prompt, no mutation ------------------------
 
   it should "stop at DryRun (rc 20) with the worker prompt rendered and zero mutations" in {

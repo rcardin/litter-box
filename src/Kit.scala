@@ -444,8 +444,24 @@ final case class Shape(entry: List[Node[?, ?]], transitions: List[Transition])
   * `shape` argument at all is EXPLICITLY UNVALIDATED, not proven safe by an empty result: `validate`
   * finding no violation on `Shape(Nil, Nil)` means nothing was walked, not that nothing is wrong.
   * `Machine.shippedWorkflow` is the one caller that supplies a real one.
+  *
+  * `stages` (issue #40) is the same spirit as `shape`: data a consumer of the graph reads, never
+  * control flow the walk itself branches on. `Runner.run`/`Runner.step` never look at it; it exists
+  * so a caller that owns a `StatusLog` (`Machine.runOnce`) can declare, once per tick (issue #40
+  * review, MAJOR 1: a declaration always has to sit inside `banner.sh`'s own `tail -n 5000` read
+  * window, so it is written ahead of every tick's own first status event, not once per process),
+  * what `watch.sh` should render for THIS graph, without the renderer or this file needing to
+  * agree on a fixed vocabulary of phase names ahead of time. Defaults to an empty `StageSet`, the
+  * same reasoning `shape`'s own
+  * default gives: a `Workflow` built with no `stages` argument is a graph that has declared nothing
+  * about how it should be rendered, not one proven to render some particular way.
   */
-final case class Workflow[I](name: String, start: I => Next, shape: Shape = Shape(Nil, Nil))
+final case class Workflow[I](
+    name: String,
+    start: I => Next,
+    shape: Shape = Shape(Nil, Nil),
+    stages: StageSet = StageSet(Nil, None, None)
+)
 
 /** Executes a `Workflow` (or, via `step`, a single `Node`) against the capabilities in scope,
   * owning every concern a node itself is not allowed to own: whether a `probe` already answered the
