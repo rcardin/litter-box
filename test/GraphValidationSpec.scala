@@ -532,7 +532,7 @@ class GraphValidationSpec extends AnyFlatSpec with Matchers:
     // Pins `Machine.shippedShape`'s own declared data as a literal (issue #38 review finding 1c): a
     // `Shape` is hand-declared DATA describing the same graph the `Next.Goto` closures encode
     // (`Kit.scala`'s own doc on `Shape`), and nothing stops the two from drifting apart. This test
-    // does not prove they agree, only `ShippedWorkflowSpec`/`ScenarioSpec` walk the real closures , 
+    // does not prove they agree, only `ShippedWorkflowSpec`/`ScenarioSpec` walk the real closures,
     // it proves that a future edit to this declaration itself shows up as a failing assertion.
     val shape = Machine.shippedShape(Config())
 
