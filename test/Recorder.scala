@@ -46,6 +46,20 @@ final class TestWorld:
   val events: mutable.ArrayBuffer[StatusEvent]   = mutable.ArrayBuffer.empty
   val files: mutable.Map[String, String]         = mutable.Map.empty
 
+  /** Every `StatusLog.declare` call a scenario's `runLoop` calls made, in order (issue #40). A
+    * separate buffer from `events`, the same split `StatusLog` itself draws between `append` and
+    * `declare`: a scenario asserting "declared once per tick" reads this one, never `events`, so
+    * neither buffer has to grow a filter to answer a question the other already answers cleanly.
+    */
+  val declaredStages: mutable.ArrayBuffer[StageSet] = mutable.ArrayBuffer.empty
+
+  /** Whether `events` was still empty at the moment each `declare` call in `declaredStages` landed,
+    * same index for same index. A scenario proving "the declaration is written before the first
+    * status event" reads this rather than inferring order from two buffers that carry no shared
+    * sequence number of their own.
+    */
+  val declaredBeforeAnyEvent: mutable.ArrayBuffer[Boolean] = mutable.ArrayBuffer.empty
+
   /** Everything the machine wrote to the operator log stream, in order. */
   val logLines: mutable.ArrayBuffer[String] = mutable.ArrayBuffer.empty
 
@@ -359,6 +373,9 @@ final class TestWorld:
 
   val status: StatusLog = new StatusLog:
     def append(event: StatusEvent): Unit = events += event
+    def declare(stages: StageSet): Unit =
+      declaredBeforeAnyEvent += events.isEmpty
+      declaredStages += stages
 
   val notifier: Notify = new Notify:
     def notify(msg: String): Unit = { record(s"notify $msg"); notifications += msg }

@@ -136,6 +136,38 @@ final case class StatusEvent(
     detail: String
 )
 
+/** One phase's rendering data for the banner (issue #40), the thing `watch.sh` used to know by
+  * hardcoded name instead of by reading it off the run. `phase` is the status.jsonl phase string a
+  * `StatusEvent` carries; `chip` is the short label the banner prints next to its symbol; `row` says
+  * which of the banner's two chip rows the phase belongs to (1 or 2, `banner.sh`'s own two fixed
+  * chip lines); `badge` marks a phase rendered as a counted badge (the `fix N` counter) rather than
+  * as an ordinary chip, so the renderer knows to count its `start` events instead of drawing a
+  * symbol for its latest state.
+  *
+  * `row` is a plain `Int`, not a two case enum closed over 1 and 2, deliberately (issue #40 review
+  * round 2, MINOR 4): `banner.sh` only ever draws two chip rows, but that is a fact about the
+  * renderer, not about every `Stage` a graph could ever declare, so this type stays open rather
+  * than baking the renderer's own current limit into the data every future consumer graph has to
+  * construct. A stage declaring a row other than 1 or 2 does not crash; `Machine.declareStages`
+  * logs one line naming it instead, which is what makes the renderer quietly dropping that stage
+  * visible rather than a silent surprise the next time someone reads the banner.
+  */
+final case class Stage(phase: String, chip: String, row: Int, badge: Boolean = false)
+
+/** The whole declared stage set for one run, written once per TICK to status.jsonl before that
+  * tick's own first `StatusEvent` (issue #40 review, MAJOR 1: `banner.sh` reads only the last
+  * `tail -n 5000` lines of status.jsonl, so a declaration written once per PROCESS eventually
+  * scrolls out of that window on a long MAX_ITERS run; writing one ahead of every tick keeps a
+  * declaration always inside it) so `banner.sh` can render a graph it has never seen the shape
+  * of. `anchor` is the
+  * phase that starts one iteration, the same phase the banner used to scope its chips to by literal
+  * name ("PICK"); `terminal` is the phase whose event ends the run, the same phase the banner used to
+  * treat as "the run is over" by literal name ("DONE"). Both are optional because a consumer graph
+  * may have neither: `banner.sh` falls back to scoping over the whole run when `anchor` is absent,
+  * and to liveness alone (no terminal line) when `terminal` is absent.
+  */
+final case class StageSet(stages: List[Stage], anchor: Option[String], terminal: Option[String])
+
 /** The four issue labels the loop drives its own state machine with (`issues.labels`). Named rather
   * than a bare `Map[String, String]` so a caller cannot ask for a key that does not exist, and so
   * "which label does crash-resume query" has one answer (`active`) instead of a string lookup.

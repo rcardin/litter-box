@@ -211,10 +211,7 @@ class ShippedSpec extends AnyFlatSpec with Matchers:
     val dir = Files.createTempDirectory("shipped-spec")
     Observe.extract(dir)
 
-    assume(
-      Main.findOnPath(sys.env.getOrElse("PATH", ""), "jq", p => Files.isExecutable(Path.of(p))).isDefined,
-      "jq not found on PATH (required for banner rendering)"
-    )
+    assume(jqOnPath, "jq not found on PATH (required for banner rendering)")
 
     val script = s"""set -eu
                     |. "$$1/lib/banner.sh"
@@ -230,3 +227,124 @@ class ShippedSpec extends AnyFlatSpec with Matchers:
       out should include("no run yet")
     }
   }
+
+  // ---- issue #40 review MINOR 8: the WRITER/READER contract, end to end, inside scala-cli test . --
+  //
+  // Every other test touching `render_banner` is either pure-Scala over `LiveStatusLog`'s OWN output
+  // shape (`LiveSpec`) or pure-bash over hand-rolled JSON fixtures (`sandbox/test/watch-test.sh`,
+  // manual only per CONVENTIONS.md, never wired into the gate). Nothing in `scala-cli test .` ever
+  // pipes a REAL `LiveStatusLog` write through a REAL `render_banner` call, which is exactly how
+  // finding 2 of this review (`chip_name` resolving a badge stage too, so a loop killed mid repair
+  // rendered "STALE (loop died in fix)" instead of "STALE (loop died in FIX)") survived a fully
+  // green run: the writer side never disagreed with itself, and the renderer side was never asked
+  // to read the writer's actual bytes. The three tests below close that gap, following `ShippedSpec`'s
+  // own test just above (same jq-on-PATH guard via `jqOnPath`, same skip behaviour when it is
+  // absent, same extracted-tree/bash-child shape) rather than inventing a second way to shell out.
+
+  /** Whether `jq` is on `PATH`, executable: the one guard every `render_banner` test in this file
+    * shares, factored out so each test states its own skip reason without re-deriving the check.
+    */
+  private def jqOnPath: Boolean =
+    Main.findOnPath(sys.env.getOrElse("PATH", ""), "jq", p => Files.isExecutable(Path.of(p))).isDefined
+
+  /** Writes `declaration` (if any) and `events` through the REAL `LiveStatusLog`, never a hand
+    * rolled JSON string, unlike `sandbox/test/watch-test.sh`'s own fixtures, into a fresh
+    * status.jsonl, then shells out to `render_banner` off the extracted tree exactly like this
+    * file's own banner test above, returning its stdout split into lines. Driving the write through
+    * the real production writer is what lets a test here catch a genuine break BETWEEN the writer
+    * and the reader, not merely a break in either one considered alone.
+    */
+  private def renderShippedBanner(
+      declaration: Option[StageSet],
+      events: List[StatusEvent],
+      alive: Int
+  ): List[String] =
+    val dir = Files.createTempDirectory("shipped-spec")
+    Observe.extract(dir)
+
+    val statusRoot = Files.createTempDirectory("shipped-spec-status")
+    val log        = LiveStatusLog(statusRoot, "4711")(using Config())
+    declaration.foreach(log.declare)
+    events.foreach(log.append)
+    val statusFile = statusRoot.resolve(Config().logDir).resolve("status.jsonl")
+
+    val script = s"""set -eu
+                    |. "$$1/lib/banner.sh"
+                    |render_banner "$$2" $alive
+                    |""".stripMargin
+    val pb = new ProcessBuilder("bash", "-c", script, "bash", dir.toString, statusFile.toString)
+    pb.redirectErrorStream(true)
+    val proc = pb.start()
+    val out  = new String(proc.getInputStream.readAllBytes(), StandardCharsets.UTF_8)
+
+    withClue(out) { proc.waitFor() shouldBe 0 }
+    out.linesIterator.toList
+
+  "render_banner, fed a real LiveStatusLog write" should
+    "render the shipped declaration plus a representative event stream into the expected four " +
+    "banner lines" in {
+      assume(jqOnPath, "jq not found on PATH (required for banner rendering)")
+
+      val lines = renderShippedBanner(
+        declaration = Some(Machine.shippedStages),
+        events = List(
+          StatusEvent(1, "5", "PICK", "ok", 0, 2, "", ""),
+          StatusEvent(1, "5", "IMPL", "ok", 0, 2, "issue-5.impl.log", ""),
+          StatusEvent(1, "5", "FAST_GATE", "start", 1, 2, "issue-5.gate.log", "")
+        ),
+        alive = 1
+      )
+
+      lines should have size 4
+      lines.head shouldBe "US-5 · iter 1 · pass 1 · budget 2"
+      // The elapsed suffix on the running chip depends on real wall clock time between the write
+      // above and render_banner's own `date +%s`, so only the prefix, not the exact elapsed text,
+      // is pinned here; `sandbox/test/watch-test.sh` Fixture A pins the elapsed text exactly, off a
+      // fixed `now`.
+      lines(1) should startWith("✓ pick  ✓ impl  ▶ fast")
+      lines(2) shouldBe "· rev  · pr  · ci  · merge"
+      // `pid` is `LiveStatusLog`'s own `ProcessHandle.current().pid()`, this JVM's real pid, not a
+      // scriptable value, so only the shape, not an exact number, is pinned here.
+      lines(3) should fullyMatch regex "RUNNING \\(pid \\d+\\)"
+    }
+
+  it should "render STALE with the raw phase name, not its lowercase chip label, when the loop " +
+    "dies mid repair (issue #40 review MAJOR 2)" in {
+      assume(jqOnPath, "jq not found on PATH (required for banner rendering)")
+
+      val lines = renderShippedBanner(
+        declaration = Some(Machine.shippedStages),
+        events = List(
+          StatusEvent(1, "5", "PICK", "ok", 0, 2, "", ""),
+          StatusEvent(1, "5", "IMPL", "ok", 0, 2, "", ""),
+          StatusEvent(1, "5", "FAST_GATE", "red", 1, 2, "", ""),
+          StatusEvent(1, "5", "FIX", "start", 1, 1, "", "")
+        ),
+        alive = 0
+      )
+
+      lines(3) shouldBe "STALE (loop died in FIX)"
+    }
+
+  it should "render a custom declared stage set with its own chips and its own terminal prefix " +
+    "(issue #40 review MAJOR 4)" in {
+      assume(jqOnPath, "jq not found on PATH (required for banner rendering)")
+
+      val customStages = StageSet(
+        stages = List(Stage("BUILD", "build", row = 1), Stage("DEPLOY", "deploy", row = 2)),
+        anchor = Some("BUILD"),
+        terminal = Some("SHIP")
+      )
+      val lines = renderShippedBanner(
+        declaration = Some(customStages),
+        events = List(
+          StatusEvent(1, "42", "BUILD", "ok", 0, 0, "", ""),
+          StatusEvent(1, "42", "SHIP", "end", 0, 0, "", "rc=0")
+        ),
+        alive = 1
+      )
+
+      lines(1) should startWith("✓ build")
+      lines(2) shouldBe "· deploy"
+      lines(3) shouldBe "SHIP rc=0"
+    }

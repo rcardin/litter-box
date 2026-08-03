@@ -395,6 +395,33 @@ object Machine:
       // clause of its own for it.
       val faulting: Faulting = summon[Faulting]
 
+      // The stage declaration (issue #40 review, MAJOR 1) is written on EVERY tick, before this
+      // tick's own first status event, never gated on `n == 1`. The old `n == 1` gate assumed
+      // `banner.sh` reads the whole of status.jsonl, so one declaration on the process's first tick
+      // would still be on file for its thousandth; `banner.sh` actually reads only the last
+      // `tail -n 5000` lines (its own doc), so on a long-running MAX_ITERS process the tick-1
+      // declaration eventually scrolls out of that window and both chip rows go permanently blank
+      // even though the run is perfectly healthy. Writing one before every tick's own first status
+      // event, rather than once per process, keeps a declaration inside whatever window `banner.sh`
+      // happens to be reading, no matter how long the run has been going, at the cost of one extra
+      // small append per tick.
+      //
+      // Read off `declareStages`, which takes the `Workflow` value itself (issue #40 review, MAJOR
+      // 3), not `shippedStages` named directly: `Workflow.stages` was dead data at runtime before
+      // this, since `runOnce` reached past the field for the module constant instead of reading the
+      // value it actually carries. Declaring off the value means a caller driving some OTHER
+      // `Workflow`, one carrying its own `StageSet`, gets that set declared honestly instead of this
+      // file's own shipped one (`ShippedWorkflowSpec` proves the shipped case with a custom
+      // `StageSet` directly against `declareStages`). Built here against a throwaway `Ledger(0)`, the
+      // same affordance `Pick`'s own dispatch a few lines down already relies on (that node declares
+      // `Cost.NoDispatch` and its own `using` clause carries no `AgentDispatch` at all, so nothing
+      // about a placeholder ledger is ever observable there either): `stages` is fixed data assigned
+      // once inside `Workflow`'s own construction and never reads the ledger's remaining budget, so a
+      // throwaway one answers `.stages` identically to the real, resume-aware one this tick's actual
+      // walk spends against, minted below only once `Pick`'s own output (`setup.resumeAuthors`) is
+      // known.
+      declareStages(shippedWorkflow(cfg, caps, faulting, Runner.Ledger(0)))
+
       // Hoisted here, before `Pick` runs (issue #38 review, MAJOR 3): a violation is a fact about
       // `shippedShape(cfg)`'s own declared data, true before any node in the tick has executed, so
       // checking it any later would let a full node's worth of real side effects (`Pick`'s own
@@ -2049,7 +2076,8 @@ object Machine:
                   )
               }
             ),
-      shape = shippedShape(cfg)
+      shape = shippedShape(cfg),
+      stages = shippedStages
     )
 
   /** The declared `Shape` of `shippedWorkflow` (issue #38, RFC #26 decision 16's cheap half),
@@ -2121,6 +2149,82 @@ object Machine:
         Transition(Merge, PostMergeCleanup)
       )
     )
+
+  /** The shipped pipeline's declared stage set (issue #40), the one and only place its eight status
+    * phase strings, PICK through MERGE (the strings `emit`'s call sites pass, a separate vocabulary
+    * from the `Node.name`s `shippedShape` above declares: `Implement`/`Repair`/`Review`/... name
+    * graph nodes, PICK/IMPL/FAST_GATE/... name status.jsonl phases, and the two sets are not meant to
+    * line up one to one), are paired with the chip label and row `watch.sh` used to hardcode by
+    * literal string. `shippedWorkflow`'s own `stages` field reads THIS value, never a second, hand
+    * copied list, so the two can never drift the way a shell script and a Scala file editing the same
+    * fact in two places always eventually do; `runOnce`'s declare call, in turn, reads `shippedWorkflow(...).stages`
+    * through `declareStages` (below), never this val by name, which is what makes a consumer graph's
+    * own `StageSet` reachable the same way (that function's own doc has the reason).
+    *
+    * Order and content reproduce today's banner byte for byte: row 1 carries PICK, IMPL, FAST_GATE in
+    * that order, with FIX declared on row 1 too but as a badge, not a chip, exactly the position the
+    * old hardcoded `↺ fix N` suffix rendered in; row 2 carries REVIEW, PR, CI_WAIT, MERGE in that
+    * order. `anchor = PICK` is the phase `banner.sh` used to scope the running iteration's chips to
+    * by literal name; `terminal = DONE` is the phase it used to treat as "the run is over" the same
+    * way.
+    */
+  private[litterbox] val shippedStages: StageSet = StageSet(
+    stages = List(
+      Stage("PICK", "pick", row = 1),
+      Stage("IMPL", "impl", row = 1),
+      Stage("FAST_GATE", "fast", row = 1),
+      Stage("FIX", "fix", row = 1, badge = true),
+      Stage("REVIEW", "rev", row = 2),
+      Stage("PR", "pr", row = 2),
+      Stage("CI_WAIT", "ci", row = 2),
+      Stage("MERGE", "merge", row = 2)
+    ),
+    anchor = Some("PICK"),
+    terminal = Some("DONE")
+  )
+
+  /** Declares `workflow`'s own `stages` field to `log` (issue #40 review, MAJOR 3): reads
+    * `Workflow.stages` at runtime, off the value itself, rather than a caller reaching past it for a
+    * module constant it merely happens to equal today. `runOnce` is this file's only production
+    * caller, always over `shippedWorkflow(cfg, caps, faulting, Runner.Ledger(0))`, so the shipped run
+    * declares exactly `shippedStages` (`ShippedWorkflowSpec` pins `shippedWorkflow(...).stages shouldBe
+    * shippedStages`, so that equality itself stays proven); this function is what lets a test, or a
+    * future caller driving some other `Workflow`, prove the declaration follows THAT workflow's own
+    * `StageSet` instead, by calling this directly with one that carries a different `StageSet` and
+    * reading it back off `log`.
+    *
+    * `Stage.row` (`Domain.scala`) is a plain `Int`, documented as "1 or 2" but not constrained to
+    * it, because `banner.sh`'s own two chip rows are the only rows that will ever exist to draw
+    * into; a third row is not a shape the renderer could grow to support without a design change of
+    * its own. A stage declaring any other row does not crash anything (`row($r)` in `banner.sh`
+    * simply never selects it), it just silently never renders on either chip row, which a consumer
+    * graph could go a long time not noticing (issue #40 review round 2, MINOR 4). Logging one line
+    * per such stage here, right where the declaration is about to be sent, is what makes that
+    * outcome visible instead of silent, without narrowing `Stage.row`'s type and forcing every
+    * caller (including a future consumer graph this file has never seen) through an enum closed
+    * over exactly the rows `banner.sh` happens to draw today.
+    *
+    * This warning now fires once per TICK, not once per process, for the same reason the
+    * declaration itself does (`runOnce`'s own doc): `declareStages` runs again every tick, so a
+    * bad row keeps getting declared again every tick too, and every one of those declarations
+    * degrades that tick's banner the same way. Logging the finding once per declaration, rather
+    * than once ever, is deliberate, not an unnoticed side effect of that move: this stream is
+    * stderr, watched live (`LiveLog`'s own doc), not a bounded `tail -n 5000` window like
+    * status.jsonl, so a developer iterating on a broken consumer graph gets a standing reminder
+    * on every tick instead of one line that scrolls out of a long-running terminal within
+    * minutes. The check itself is a handful of `Int` comparisons over a short, fixed `stages`
+    * list, so paying it again every tick costs nothing worth trading that visibility away for.
+    */
+  private[litterbox] def declareStages(workflow: Workflow[?])(using log: StatusLog, logger: Log): Unit =
+    workflow.stages.stages
+      .filterNot(s => s.row == 1 || s.row == 2)
+      .foreach(s =>
+        logger.log(
+          s"declareStages: stage ${s.phase} declares row ${s.row}, but banner.sh only ever draws " +
+            "rows 1 and 2; it will not render on either chip row"
+        )
+      )
+    log.declare(workflow.stages)
 
   /** The labels a terminal route removes when it flips an issue away from `in-progress`: always
     * `active`, plus `parked` ONLY when `carriesParked`, i.e. only when `issue` currently carries

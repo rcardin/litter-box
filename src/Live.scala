@@ -132,6 +132,64 @@ final class LiveStatusLog(root: Path, runId: String)(using cfg: Config) extends 
       ()
     catch case NonFatal(_) => ()
 
+  /** One `kind":"stages"` line, `banner.sh`'s only source of stage identity now (issue #40). Same
+    * fire and forget contract as `append`: a dropped declaration degrades the banner to its four
+    * line, empty chip fallback, never the loop itself, so the whole write path swallows exceptions
+    * here too.
+    *
+    * Sanitized the same way `append` sanitizes `detail`, field by field rather than once over the
+    * whole line, because a phase/chip string sits inside a JSON array element here, not a single
+    * top level string value; stripping backslashes and quotes and collapsing newlines still keeps
+    * every field from breaking out of its own JSON string regardless of where in the line it sits.
+    *
+    * `clean` also strips every remaining C0 control character (issue #40 review, MINOR 6),
+    * including the carriage return `append`'s own `detail` scrub never had to name (`detail` only
+    * ever needed backslash/quote/newline stripped): `banner.sh` prints a chip's own `chip` label
+    * straight into the banner's pinned chip rows with no second scrub at the read end, unlike
+    * `detail`, whose one caller (the terminal status line) runs it through its own
+    * `gsub("[\r\n]+"; " ")` before printing. A raw carriage return reaching that pinned row would
+    * move the terminal cursor back to the start of the line on every redraw, corrupting whatever
+    * `watch.sh` painted there; stripping it (and every other C0 control character) at the one place
+    * this data is ever written closes that off at the source instead of leaning on a scrub the read
+    * side does not actually have for this field.
+    *
+    * `clean` also strips DEL (0x7F) and the whole C1 range (0x80-0x9F), not just C0 (issue #40
+    * review round 2, MINOR 3): `filterNot(_ < ' ')` alone stops at 0x1F, so DEL and C1 both passed
+    * through untouched, including U+009B, the 8-bit encoding of CSI, the same escape-sequence
+    * introducer a 7-bit `ESC [` collapses to on a terminal that recognizes 8-bit C1 codes. Left
+    * unclosed, that gap kept the threat model above from actually holding: a `chip` carrying CSI
+    * would still reach the pinned banner rows with no second scrub at the read end, the exact
+    * corruption the C0 stripping above exists to prevent.
+    */
+  def declare(stages: StageSet): Unit =
+    try
+      val ts    = System.currentTimeMillis() / 1000
+      val pid   = ProcessHandle.current().pid()
+      def clean(s: String): String =
+        s.replace("\\", "")
+          .replace("\"", "")
+          .replace("\n", " ")
+          .filterNot(c => c < ' ' || (c >= '\u007f' && c <= '\u009f'))
+      val stageJson = stages.stages
+        .map { s =>
+          s"""{"phase":"${clean(s.phase)}","chip":"${clean(s.chip)}","row":${s.row},"badge":${s.badge}}"""
+        }
+        .mkString("[", ",", "]")
+      val anchorJson   = stages.anchor.map(a => s""""${clean(a)}"""").getOrElse("null")
+      val terminalJson = stages.terminal.map(t => s""""${clean(t)}"""").getOrElse("null")
+      val line =
+        s"""{"ts":$ts,"pid":$pid,"run":"$runId","kind":"stages","anchor":$anchorJson,"terminal":$terminalJson,"stages":$stageJson}""" + "\n"
+      LiveFiles.ensureParentDir(statusFile)
+      Files.write(
+        statusFile,
+        line.getBytes(java.nio.charset.StandardCharsets.UTF_8),
+        StandardOpenOption.CREATE,
+        StandardOpenOption.WRITE,
+        StandardOpenOption.APPEND
+      )
+      ()
+    catch case NonFatal(_) => ()
+
 /** Notify seam (loop.sh:373-382). Three-way branch, every branch swallows failure: a dead
   * notification channel must never change loop behavior.
   */
