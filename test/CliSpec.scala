@@ -17,6 +17,24 @@ class CliSpec extends AnyFlatSpec with Matchers:
   it should "accept --dry-run" in:
     Cli.parse(List("--dry-run")) shouldBe Right(Command.Loop(dryRun = true))
 
+  it should "accept run as an alias for the bare loop invocation, with and without --dry-run" in:
+    // A stranger who just installed the binary reaches for a verb; the bare form reads as a no-op
+    // at a shell prompt. `run` means exactly what no argument at all means, never a second Command.
+    Cli.parse(List("run")) shouldBe Right(Command.Loop(dryRun = false))
+    Cli.parse(List("run", "--dry-run")) shouldBe Right(Command.Loop(dryRun = true))
+
+  it should "reject an unknown flag on run the same way the bare form does" in:
+    val result = Cli.parse(List("run", "--wat"))
+    result.isLeft shouldBe true
+    result.left.toOption.get should include("--wat")
+
+  it should "accept run --help and run -h as help, the same as every other spelling" in:
+    // Quickstart in the README teaches `litter-box run`, so the verb it teaches has to be able to
+    // ask for help too. Before this, `flagsOnly(rest, "--dry-run")` rejected `--help` outright,
+    // since it is not the one flag `run` otherwise recognizes.
+    Cli.parse(List("run", "--help")) shouldBe Right(Command.Help)
+    Cli.parse(List("run", "-h")) shouldBe Right(Command.Help)
+
   it should "accept init with and without --force" in:
     Cli.parse(List("init")) shouldBe Right(Command.Init(force = false))
     Cli.parse(List("init", "--force")) shouldBe Right(Command.Init(force = true))
@@ -119,4 +137,5 @@ class CliSpec extends AnyFlatSpec with Matchers:
     Cli.Usage should include("init")
     Cli.Usage should include("eject")
     Cli.Usage should include("--dry-run")
+    Cli.Usage should include("litter-box run")
     ObserveTool.values.foreach(tool => Cli.Usage should include(tool.subcommand))

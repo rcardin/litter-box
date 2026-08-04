@@ -12,7 +12,7 @@
 #
 # No ENTRYPOINT: all three runners override it. The gate runs `gate.fast` through `bash -c`, so the
 # tool below has to be on PATH for the `gate` user and nothing more.
-ARG BASE_IMAGE=ghcr.io/rcardin/litter-box-base:0.1.0
+ARG BASE_IMAGE=ghcr.io/rcardin/litter-box-base:0.1.1
 FROM ${BASE_IMAGE}
 
 USER root

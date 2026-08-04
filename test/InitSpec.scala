@@ -188,6 +188,35 @@ class InitSpec extends AnyFlatSpec with Matchers:
       }
     }
 
+  it should "pin the base image tag to this binary's own version, never a stale copy" in:
+    // Asserted against LitterBox.BaseImage, not against a hand-copied literal (the bug this test
+    // exists for): a 0.1.1 binary that scaffolds a Dockerfile pointing at 0.1.0 has silently
+    // drifted, and a test quoting the same stale string back would agree with the drift forever.
+    //
+    // `include` alone is too weak here: a template carrying both a correctly rendered
+    // `ARG BASE_IMAGE=` line AND a leftover hardcoded one would still contain the rendered value as
+    // a substring, so `include` would pass over a scaffold docker actually reads the WRONG line
+    // from (an earlier `ARG BASE_IMAGE=` in the file wins, since docker keeps the last assignment
+    // before FROM, which is not necessarily the one this assertion found). Two checks close that:
+    // no `{{` marker survives rendering at all, and exactly one line starts with `ARG BASE_IMAGE=`.
+    //
+    // Still not enough on its own (review round two, MINOR): the splice value passed to
+    // `Machine.renderTemplate` already carries the `ARG BASE_IMAGE=` prefix, so a hypothetical
+    // future `renderTemplate` that substitutes the `{{BASE_IMAGE}}` marker IN PLACE of just
+    // replacing the whole line would double it into `ARG BASE_IMAGE=ARG BASE_IMAGE=...`, and every
+    // check above would still pass: `include` finds the wanted string as a substring of the doubled
+    // one, no `{{` marker survives, and the doubled line still starts with `ARG BASE_IMAGE=` and is
+    // the only one. An exact whole line match is the one assertion a doubled prefix cannot satisfy.
+    everyRepo.foreach { d =>
+      withClue(s"Dockerfile scaffolded for $d: ") {
+        val dockerfile = scaffolded(d, ".litter-box/Dockerfile")
+        dockerfile should include(s"ARG BASE_IMAGE=${LitterBox.BaseImage}")
+        dockerfile should not include "{{"
+        dockerfile.linesIterator.count(_.startsWith("ARG BASE_IMAGE=")) shouldBe 1
+        dockerfile.linesIterator.count(_ == s"ARG BASE_IMAGE=${LitterBox.BaseImage}") shouldBe 1
+      }
+    }
+
   it should "leave the project layer a TODO instead of installing anything" in:
     // The defect this exists for (issue #13): a detected `build.sbt` bought a curl-and-untar block
     // pinning an sbt version nobody confirmed this project wants. Detection is not verification, so

@@ -57,6 +57,7 @@ object Cli:
   val Usage: String =
     """usage:
       |  litter-box [--dry-run]        run the loop (default)
+      |  litter-box run [--dry-run]    same as above, spelled as a verb
       |  litter-box init [--force]     scaffold .litter-box/ in this repo
       |  litter-box eject <prompt> [--force]
       |                                copy a built-in prompt to .litter-box/prompts/ to override it
@@ -71,6 +72,17 @@ object Cli:
   def parse(args: List[String]): Either[String, Command] = args match
     case Nil                                => Right(Command.Loop(dryRun = false))
     case ("--help" | "-h" | "help") :: Nil  => Right(Command.Help)
+    // Checked ahead of the general `run` case below: `flagsOnly(rest, "--dry-run")` only ever
+    // recognizes the one flag it is told to, so `run --help` reached it and came back an
+    // "unexpected argument", the one verb the README's own Quickstart teaches unable to ask for
+    // help while `litter-box --help` on its own answered fine.
+    case "run" :: ("--help" | "-h") :: Nil  => Right(Command.Help)
+    // `run` means exactly what no argument at all means, never a second `Command`: a stranger who
+    // just installed the binary reaches for a verb, and the bare form reads as a no-op at a shell
+    // prompt with nothing there to reach for. Sharing `flagsOnly` with the bare-flags case below
+    // keeps the two forms answering unknown flags identically rather than by two hand-written rules
+    // that could drift.
+    case "run" :: rest                      => flagsOnly(rest, "--dry-run").map(Command.Loop.apply)
     case "init" :: rest                     => flagsOnly(rest, "--force").map(Command.Init.apply)
     case "eject" :: what :: rest if !what.isBlank && !what.startsWith("-") =>
       flagsOnly(rest, "--force").map(Command.Eject(what, _))
