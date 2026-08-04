@@ -387,17 +387,28 @@ object Machine:
     * `Ledger` exactly as before, then hands the rest of the tick to `Runner.run` over
     * `shippedWorkflow`.
     *
-    * `Runner.validate(shippedShape(cfg))` runs FIRST, before `Pick` is even stepped (issue #38
+    * `Runner.validate(graph.shape(cfg))` runs FIRST, before `Pick` is even stepped (issue #38
     * review, MAJOR 3): `Runner.run` already refuses to walk an invalid `Shape` (its own doc), but by
     * the time this method reaches that call, `Pick` has already run, a branch created, labels
     * flipped, prompt files written, real, observable work a bad graph declaration has no business
-    * causing. `shippedShape(cfg)` needs only `cfg`, already in scope here, so this check costs
+    * causing. `graph.shape(cfg)` needs only `cfg`, already in scope here, so this check costs
     * nothing this method did not already have. `Runner.run` still validates the same shape again,
     * for its own reason (a consumer calling it directly, bypassing `runOnce` entirely, must stay
     * covered too), so a valid graph pays for `validate` at most twice per tick and, either way,
     * `validate` returning `Nil` emits nothing at all: no golden log moves.
+    *
+    * `graph` (issue #43) defaults to `LitterBox.shipped`, so every call site and every test that
+    * predates the public `LoopGraph` boundary keeps compiling and keeps walking the exact pipeline
+    * it always did, unchanged. This method reads `graph.workflow`/`graph.shape` instead of naming
+    * `shippedWorkflow`/`shippedShape` directly, so that a caller-supplied graph would take effect
+    * rather than merely type-check as a parameter nothing inside reads. No test in this suite, or
+    * outside it, can confirm that it actually does: `LoopGraph` is `sealed` (`LitterBox`'s own doc
+    * has the reason), and `LitterBox.shipped` is its only inhabitant today, so nothing outside this
+    * file can build a second `LoopGraph` to pass here and observe a different walk. This parameter
+    * is untested plumbing until a later issue widens `LoopGraph` far enough for a second inhabitant
+    * to exist; the seal is exactly what makes it untestable now, not an oversight in this change.
     */
-  def runOnce(n: Int)(using
+  def runOnce(n: Int, graph: LoopGraph = LitterBox.shipped)(using
       cfg: Config,
       gh: GitHub,
       git: Git,
@@ -450,20 +461,29 @@ object Machine:
       // once inside `Workflow`'s own construction and never reads the ledger's remaining budget, so a
       // throwaway one answers `.stages` identically to the real, resume-aware one this tick's actual
       // walk spends against, minted below only once `Pick`'s own output (`setup.resumeAuthors`) is
-      // known.
-      declareStages(shippedWorkflow(cfg, caps, faulting, Runner.Ledger(0)))
+      // known. Kept as a `val`, not inlined into the `declareStages` call below, so its own `.name`
+      // is available a few lines down for the shape violation message (issue #43 review MINOR): that
+      // message used to hardcode the literal `"shipped"`, one line after `graph.shape(cfg)` made the
+      // graph itself a parameter the caller supplies, so a future graph other than the shipped one
+      // would have faulted with a name that did not match what actually ran. Reading `.name` off the
+      // SAME `Workflow` value `declareStages` already reads is what keeps the two in agreement
+      // without adding a new member to `LoopGraph` itself for it: `Workflow.name` is already a fact
+      // this method computes once per tick, for the shipped graph today `"shipped"`, so no golden log
+      // line moves.
+      val workflow = graph.workflow(cfg, caps, faulting, Runner.Ledger(0))
+      declareStages(workflow)
 
       // Hoisted here, before `Pick` runs (issue #38 review, MAJOR 3): a violation is a fact about
-      // `shippedShape(cfg)`'s own declared data, true before any node in the tick has executed, so
+      // `graph.shape(cfg)`'s own declared data, true before any node in the tick has executed, so
       // checking it any later would let a full node's worth of real side effects (`Pick`'s own
       // branch/label/prompt-file work) happen first on a graph this method was always going to
       // reject. Goes through the same `infraFault` every other fault in this file already uses, and
       // `Runner.invalidShapeMessage` (issue #38 review findings 7 and 8) is the SAME one-sentence
       // builder `Runner.run`'s own check calls, not a second, hand-copied wording, so this reads
       // identically whichever of the two call sites catches a bad `Shape`.
-      val shapeViolations = Runner.validate(shippedShape(cfg))
+      val shapeViolations = Runner.validate(graph.shape(cfg))
       if shapeViolations.nonEmpty then
-        infraFault(Runner.invalidShapeMessage("shipped", shapeViolations))
+        infraFault(Runner.invalidShapeMessage(workflow.name, shapeViolations))
 
       // `pickAndSetup`'s own `using` clause carries no `AgentDispatch` at all, so nothing inside it
       // can call `agents.*` regardless of what `Cost` `Pick` declares or what `Ledger` it runs under;
@@ -514,7 +534,7 @@ object Machine:
           val ledger = Runner.Ledger(ledgerSeed)
 
           Runner.run(
-            shippedWorkflow(cfg, caps, faulting, ledger),
+            graph.workflow(cfg, caps, faulting, ledger),
             ShippedStart(
               n = n,
               cur = cur,
@@ -1685,6 +1705,15 @@ object Machine:
     * exposes something equivalent to `shippedWorkflow` outside this package, is not part of this
     * issue and is not attempted here. `Review`'s `Cost`/probe stay unfalsifiable at this one call site
     * for the reason above.
+    *
+    * Issue #43 is what builds that public entry point, later, and every fact this paragraph states
+    * is still true after it: `shippedWorkflow` is still `private[litterbox]`, and so are `Faulting`
+    * and `Runner.Ledger`'s constructor, unchanged. What #43 adds is `LitterBox.shipped`
+    * (`src/LitterBox.scala`), a `LoopGraph` whose own two members delegate to `shippedWorkflow`/
+    * `shippedShape` and stay `private[litterbox]` themselves, reachable by a consumer only as an
+    * opaque value passed to `LitterBox.run`, never as a way to call either function by name from
+    * outside this package. `LitterBox.scala`'s own doc has the reasoning for why `LoopGraph` is
+    * `sealed` and what that guarantee does and does not buy.
     *
     * `shape` (issue #38, RFC #26 decision 16's cheap half) is now `shippedShape(cfg)`, hoisted to its
     * own function (issue #38 review finding 3) so `Machine.runOnce` can validate it before `Pick`

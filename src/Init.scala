@@ -135,9 +135,15 @@ object Init:
 
   /** Every file `init` writes, as repo-relative path to content. Total: there is no detection
     * result for which this returns a partial scaffold, and since #13 no detection result for which
-    * it returns a DIFFERENT one either. Every repo gets the same six files, with the two
+    * it returns a DIFFERENT one either. Every repo gets the same seven files, with the two
     * project-shaped holes (the Dockerfile's install layer and `gate.fast`) filled by a TODO that
     * quotes what was detected rather than by a command nobody has run.
+    *
+    * `loop.scala` (issue #43) carries the shipped pipeline as one visible value, the same for every
+    * repo regardless of what detection found. It is one of five entries below that `d` has nothing
+    * to say about, alongside `allowlist`, `prompts/conventions.md`, `.env.example` and `.gitignore`,
+    * each a bare `resource(...)` read that never touches `d`; only `config.conf` and `Dockerfile`
+    * are shaped by `d` at all.
     */
   def plan(d: Detected): List[(String, String)] =
     List(
@@ -146,7 +152,8 @@ object Init:
       s"$Dir/allowlist"              -> resource("allowlist"),
       s"$Dir/prompts/conventions.md" -> resource("conventions.md"),
       s"$Dir/.env.example"           -> resource("env.example"),
-      s"$Dir/.gitignore"             -> resource("gitignore")
+      s"$Dir/.gitignore"             -> resource("gitignore"),
+      s"$Dir/loop.scala"             -> loopScala
     )
 
   /** The gate command, which is always the loud absence of one.
@@ -237,6 +244,33 @@ object Init:
          |# inside this image.""".stripMargin
     Machine.renderTemplate(resource("Dockerfile"), "PROJECT_LAYER" -> layer)
 
+  /** The scaffolded loop entry point (issue #43). One hole, `{{USING_DEP}}`, filled with the whole
+    * `//> using dep` line rendered off `LitterBox.Coordinate`, the same hole mechanism `configConf`/
+    * `dockerfile` above already use for a fact the template itself cannot hardcode: the published
+    * coordinate lives in exactly one place, `LitterBox.Coordinate`, and this is the only other
+    * reader of it in `src/` (`test/InitSpec.scala` and `test/ScaffoldedLoopBoundarySpec.scala` both
+    * read it too, deliberately, to pin the scaffold against the same constant), never a second,
+    * hand-copied literal that could drift from it.
+    *
+    * Independent of `Detected`, like four of the other six entries `plan` writes (`allowlist`,
+    * `prompts/conventions.md`, `.env.example`, `.gitignore`): the shipped pipeline is the same value
+    * for every repo regardless of what `detect` found, so there is nothing here for a build tool, a
+    * remote or a JDK version to change. Only `configConf` and `dockerfile`, above, read `d` at all.
+    *
+    * The resource on disk is `loop.scala.txt`, not `loop.scala`, the same "written name differs from
+    * the scaffolded one" trick `resource("gitignore")` (written as `.gitignore`) already relies on,
+    * for a reason specific to THIS file: this project's own build scans every `.scala` file under
+    * the repo root as a compilation input, `resourceDir` notwithstanding, and a literal
+    * `{{USING_DEP}}` placeholder is not valid Scala, so a resource actually named `loop.scala` would
+    * fail litter-box's own build rather than merely litter-box's own `scala-cli test .`. The `.txt`
+    * extension is a build affordance, not something a consumer of the scaffolded file ever sees.
+    */
+  private def loopScala: String =
+    Machine.renderTemplate(
+      resource("loop.scala.txt"),
+      "USING_DEP" -> s"//> using dep ${LitterBox.Coordinate}"
+    )
+
   /** What went unanswered, in the operator's words. Printed to stderr after a successful `init`,
     * because every one of these is a thing that will otherwise fail on iteration one.
     *
@@ -257,7 +291,14 @@ object Init:
       }
     ).flatten
 
-  /** Printed on success. The three things a fresh scaffold cannot do for itself. */
+  /** Printed on success. The three things a fresh scaffold cannot do for itself.
+    *
+    * `loop.scala` (issue #43) earns no fourth line here: every other file in this list needs an
+    * ACTION only the operator can take (write prose, copy a credential, create a label), and there
+    * is no analogous action to ask for. An unpublished coordinate is not something an operator can
+    * fix by editing a file; the scaffold says so about itself, in its own comment, rather than being
+    * named a second time in prose the operator reads once and the file itself never repeats.
+    */
   def nextSteps(d: Detected): List[String] =
     List(
       s"fill in $Dir/prompts/conventions.md — it is spliced into every prompt and is the highest-value file here",

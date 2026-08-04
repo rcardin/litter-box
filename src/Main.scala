@@ -344,8 +344,15 @@ object Main:
     * Returns the process exit code the caller must `sys.exit` with; `sys.exit` itself stays out of
     * this function (and out of `driverAction`/`driverLog`) so the mapping logic is callable and
     * testable without terminating the JVM.
+    *
+    * `graph` (issue #43) is threaded straight through to `Machine.runOnce`, unchanged per tick: this
+    * function has no opinion of its own about which pipeline runs, only about how many ticks to run
+    * it for and what to do with each one's exit code, so it is not this function's job to default the
+    * argument either. `runLoop` is the one caller, always with `LitterBox.shipped` today (`lb` itself
+    * has never had a second graph to offer), and `LitterBox.run` is the other door into the same
+    * wiring, for a caller-supplied one.
     */
-  private def runDriver(maxIters: Int)(using
+  private def runDriver(maxIters: Int, graph: LoopGraph)(using
       Config,
       GitHub,
       Git,
@@ -360,7 +367,7 @@ object Main:
   ): Int =
     var i = 1
     while i <= maxIters do
-      val exit = Machine.runOnce(i)
+      val exit = Machine.runOnce(i, graph)
       LiveLog.log(driverLog(i, exit, summon[Config].stopFile))
       driverAction(exit) match
         case DriverAction.Continue   => i += 1
@@ -423,7 +430,7 @@ object Main:
 
   /** `litter-box init`. Runs before every preflight the loop does: a repo with no config is the
     * whole reason to run this, so requiring one would be circular, and there is no reason to insist
-    * on Docker or a credential to write six files.
+    * on Docker or a credential to write seven files.
     */
   private def runInit(force: Boolean): Int =
     liveRepoRoot() match
@@ -551,7 +558,17 @@ object Main:
         pb.inheritIO()
         pb.start().waitFor()
 
-  @main def litterBoxLoop(args: String*): Unit =
+  /** Everything `litter-box` (the `lb` binary) does with one `argv`, against one `LoopGraph` (issue
+    * #43). `private[litterbox]`, not `private`: `LitterBox.run` (`src/LitterBox.scala`) is a second
+    * caller, in a different top-level object of this same package, standing in for a consumer who
+    * owns none of the wiring below and wants to run a `LoopGraph` through it, a graph its caller
+    * chose, which today can only be `LitterBox.shipped`.
+    * Splitting this out of `litterBoxLoop` rather than duplicating its body is the whole point: `lb`
+    * itself and a consumer calling `LitterBox.run` walk through the identical parse, the identical
+    * preflight, and the identical Live wiring, so the two can never drift into two different
+    * definitions of what running this loop means.
+    */
+  private[litterbox] def dispatch(graph: LoopGraph, args: Seq[String]): Unit =
     Cli.parse(args.toList) match
       case Left(msg) =>
         LiveLog.log(s"FATAL: $msg")
@@ -563,10 +580,16 @@ object Main:
       case Right(Command.Init(force))           => sys.exit(runInit(force))
       case Right(Command.Eject(what, force))    => sys.exit(runEject(what, force))
       case Right(Command.Observe(tool, target)) => sys.exit(runObserve(tool, target))
-      case Right(Command.Loop(dryRun))          => runLoop(dryRun)
+      case Right(Command.Loop(dryRun))          => runLoop(dryRun, graph)
 
-  /** The loop, which is everything this file did before there were subcommands. */
-  private def runLoop(dryRunFlag: Boolean): Unit =
+  @main def litterBoxLoop(args: String*): Unit = dispatch(LitterBox.shipped, args)
+
+  /** The loop, which is everything this file did before there were subcommands. `graph` (issue #43)
+    * is what `runDriver` hands `Machine.runOnce` every tick; `dispatch` is this function's only
+    * caller, always with a graph its caller chose, which today can only be `LitterBox.shipped`,
+    * whether that caller is `litterBoxLoop` or a consumer calling `LitterBox.run`.
+    */
+  private def runLoop(dryRunFlag: Boolean, graph: LoopGraph): Unit =
     val ambient = sys.env
 
     // 1. root = the git work tree the process was launched inside. Everything downstream is
@@ -723,4 +746,4 @@ object Main:
       s"v2 loop start (MAX_ITERS=${parsed.maxIters}, ITER_TIMEOUT=${parsed.cfg.iterTimeout}s, REPAIR_BUDGET=${parsed.cfg.repairBudget}, DRY_RUN=${if parsed.cfg.dryRun then "1" else "0"})"
     )
 
-    sys.exit(runDriver(parsed.maxIters))
+    sys.exit(runDriver(parsed.maxIters, graph))

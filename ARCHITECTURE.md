@@ -92,9 +92,24 @@ configuration**, so they live under `resources/` and travel inside the jar
   `litter-box watch` / `litter-box tail` (`ObserveTool` in `Cli.scala`, `Main.runObserve`), because
   nobody types a content digest. They ship rather than scaffold because `watch.sh` parses the
   `status.jsonl` schema `LiveStatusLog` writes, so a consumer-side copy would rot silently.
-- `src/Init.scala` — `litter-box init` scaffolds six files from `resources/scaffold/` into
-  `.litter-box/`. A consumer owns only `Dockerfile`, `allowlist`, `config.conf` and
-  `prompts/conventions.md`.
+- `src/Init.scala` — `litter-box init` scaffolds seven files from `resources/scaffold/` into
+  `.litter-box/`. A consumer owns only `Dockerfile`, `allowlist`, `config.conf`,
+  `prompts/conventions.md` and `loop.scala` (the file that names which graph runs; editing the graph
+  itself is not yet available).
+- `src/LitterBox.scala`: the public front door (`LitterBox`, `LoopGraph`), issue #43: the coordinate
+  a consumer depends on, the one graph this issue ships (`LitterBox.shipped`, delegating to
+  `Machine.shippedWorkflow`/`Machine.shippedShape`), and `LitterBox.run`, which reuses `Main`'s own
+  Live wiring rather than duplicating it. A consumer can pass `shipped` but cannot implement a
+  `LoopGraph` of their own, and the load bearing reason is that the trait is `sealed`, plus
+  `workflow`'s own return type: `sealed` restricts extending this trait to code in the same file, and
+  `Workflow[Machine.ShippedStart]` names a type that is itself `private[litterbox]`, so a foreign
+  implementation cannot even write a matching return type. Naming `Faulting` or `Runner.Ledger` in a
+  signature does not do this work: `Faulting` dealiases to the public
+  `scala.util.boundary.Label[LoopExit]`, and `Runner.Ledger` is a public type with only its
+  constructor marked `private[litterbox]`, so a foreign class can name both in the shape this trait
+  requires. A foreign `extends LoopGraph` is rejected on two independent grounds today (the seal,
+  `Machine.ShippedStart` inaccessible); `src/LitterBox.scala`'s own doc on `LoopGraph` has the fuller
+  reasoning.
 
 ### The log contract
 
