@@ -100,7 +100,8 @@ class InitSpec extends AnyFlatSpec with Matchers:
       ".litter-box/allowlist",
       ".litter-box/prompts/conventions.md",
       ".litter-box/.env.example",
-      ".litter-box/.gitignore"
+      ".litter-box/.gitignore",
+      ".litter-box/loop.scala"
     )
 
   it should "produce a config the slice-2 loader accepts" in:
@@ -369,6 +370,50 @@ class InitSpec extends AnyFlatSpec with Matchers:
     )
     Init.run(root, sbtRepo, force = true).isRight shouldBe true
     readString(root.resolve(".litter-box/prompts/conventions.md")) should not be "MINE"
+
+  "the scaffolded loop.scala" should "carry the //> using dep line rendered from LitterBox.Coordinate, never a duplicated literal" in:
+    // Asserted against the CONSTANT, not against the literal string "in.rcard::litter-box:0.1.1"
+    // (issue #43): a version bumped in `LitterBox.Version` and left stale here would otherwise pass
+    // this test right up until a consumer's own `scala-cli run` disagreed with it.
+    val loopScala = scaffolded(sbtRepo, ".litter-box/loop.scala")
+    loopScala should include(s"//> using dep ${LitterBox.Coordinate}")
+
+  it should "carry that //> using line and no other, so a consumer's launcher resolves exactly one directive" in:
+    // Issue #43 review round two, MAJOR: the test above only proved the coordinate line is PRESENT,
+    // never that it is the ONLY `//> using` line. `ScaffoldedLoopBoundarySpec`'s drift guard strips
+    // every `//> using` line before comparing the rest of the file byte for byte, so a second,
+    // unreviewed directive added anywhere in loop.scala.txt (a stray dependency, a pinned compiler
+    // version) would leave that guard green too. This is the count that guard cannot take the place
+    // of.
+    val loopScala = scaffolded(sbtRepo, ".litter-box/loop.scala")
+    loopScala.linesIterator.filter(_.trim.startsWith("//> using")).toList shouldBe
+      List(s"//> using dep ${LitterBox.Coordinate}")
+
+  it should "name LitterBox.shipped" in:
+    scaffolded(sbtRepo, ".litter-box/loop.scala") should include("LitterBox.shipped")
+
+  it should "be the same file for every detection result, since the shipped pipeline is not a function of what init detected" in:
+    val rendered = everyRepo.map(d => scaffolded(d, ".litter-box/loop.scala"))
+    rendered.distinct should have size 1
+
+  it should "say the coordinate is not resolvable yet, and point at the issue that makes it so" in:
+    val loopScala = scaffolded(sbtRepo, ".litter-box/loop.scala")
+    loopScala.toLowerCase should include("not resolvable")
+    loopScala should include("#41")
+
+  it should "settle no knob that .litter-box/config.conf can also settle" in:
+    // The executable form of the acceptance criterion "no knob is settable in both config.conf and
+    // loop.scala": every key path Settings.Reference's own schema declares (issue #43) must not
+    // appear in the scaffolded loop.scala at all, or the same fact would be settable from either
+    // file with no rule saying which one wins for THAT particular knob.
+    val loopScala = scaffolded(sbtRepo, ".litter-box/loop.scala")
+    val knobKeys  = Settings.referenceOnly.entrySet().asScala.map(_.getKey).toList
+    knobKeys should not be empty
+    knobKeys.foreach { key =>
+      withClue(s"knob key '$key' must not appear in the scaffolded loop.scala: ") {
+        loopScala should not include key
+      }
+    }
 
   "detect" should "recognise sbt by build.sbt at the root" in:
     val root = tempRoot()

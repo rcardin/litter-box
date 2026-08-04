@@ -34,7 +34,7 @@ java -jar /path/to/lb init
 ```
 
 `init` detects your GitHub remote (via `gh`), whether `build.sbt` is present, and your JDK version,
-then writes six files under `.litter-box/`:
+then writes seven files under `.litter-box/`:
 
 | File | Purpose |
 |---|---|
@@ -44,6 +44,7 @@ then writes six files under `.litter-box/`:
 | `prompts/conventions.md` | the one file you own — spliced into every prompt as `{{CONVENTIONS}}` |
 | `.env.example` | the credential the sandboxed worker needs, and any other variable from [Running it](#running-it); meant to be copied to `.env`, never committed |
 | `.gitignore` | ignores `logs/` and `.env` inside `.litter-box/` |
+| `loop.scala` | names which pipeline this run walks, through the public `LitterBox`/`LoopGraph` API; editing that pipeline is not yet possible, and running the file is not either, since it names a coordinate this project does not publish until [#41](https://github.com/rcardin/litter-box/issues/41) |
 
 It refuses to overwrite an existing `.litter-box/` unless you pass `--force`, and the check happens
 before the first file is written, so a refused `init` never leaves a half scaffold.

@@ -1,0 +1,24 @@
+{{USING_DEP}}
+
+// `litter-box init` scaffolds this file so the pipeline you actually run starts out visible, not
+// hidden behind a binary you only configure through flags (issue #43).
+//
+// Two things worth saying once here, rather than left for you to assume:
+//
+// - this dependency is not resolvable yet. Nothing this project publishes reaches Maven Central
+//   today; issue #41 is what makes it real. Until then, `scala-cli run` on this file fails at
+//   dependency resolution, before a single line below it ever compiles.
+// - `graph` below names which pipeline this run walks. `LitterBox.shipped` is the only `LoopGraph`
+//   that exists today, so this line is where a future graph choice will be made, not a value you can
+//   edit yet: `LoopGraph`'s own members stay closed to code outside the library until a later issue
+//   widens them, so swapping a node, reordering an edge, or building your own `Workflow` for
+//   `LitterBox.run` to accept is not possible yet. This file states the SHAPE of a run; shape lives
+//   here. Everything about how any one run of that shape actually behaves lives in
+//   `.litter-box/config.conf` instead: nothing expressible there is expressible here, and nothing
+//   expressible here is expressible there.
+
+import in.rcard.litterbox.{LitterBox, LoopGraph}
+
+val graph: LoopGraph = LitterBox.shipped
+
+@main def loop(args: String*): Unit = LitterBox.run(graph, args)
