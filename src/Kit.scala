@@ -301,6 +301,56 @@ enum Guard:
   case Open
   case RequiresReview
 
+/** A marker a `Node`'s own INPUT type extends to state, at the type level, that reaching this node
+  * legitimately requires a review to have already happened on the same path (issue #39, RFC #26
+  * decision 16's compile time half). `Guard` alone (above) cannot be read off a `Ref`'s own static
+  * type: `guard` is an ordinary constructor argument on `Node.apply`, invisible to anything that only
+  * sees `Node[I, O]`, the same limit `Guard`'s own doc already names. This marker is what
+  * `KitMacro.checkShapeImpl` (`KitMacro.scala`) reads instead, through a plain subtype test against a
+  * node reference's own INPUT type, since that type is visible in the AST even though the value
+  * `Node.apply` was called with is not.
+  *
+  * A `given GuardOf[I]` mirroring `TrustOf`'s own derivation was the first design tried here, and the
+  * PARTICULAR shape tried, `Node.apply` reading `guard`'s default from `summon[GuardOf[I]].guard`
+  * written directly as that parameter's own default VALUE, was dropped after it proved unsound,
+  * confirmed by writing the exact failure rather than merely suspecting it (issue #39 review, MAJOR
+  * 1): a DEFAULT PARAMETER value is compiled once, as its own generic method over `Node.apply`'s own
+  * type parameters, and typechecked (implicit search included) at THAT point, against the parameter's
+  * own unbound `I`, never resolved again per call site. Every call therefore received the SAME
+  * implicit answer, the one that matches an unconstrained `I` (`LowPriorityGuardOf`'s own fallback
+  * would have been that answer, always, regardless of what the caller's own `I` extended), never the
+  * one bounded by `RequiresReviewInput`.
+  *
+  * An ORDINARY `using` clause, one Scala resolves at each call site against that call's own concrete
+  * type argument rather than one folded into a shared default expression, does NOT share that
+  * unsoundness (confirmed the same way, by writing both forms side by side and observing what each
+  * one actually returns for a concrete `I`): a plain `def f[I](x: Int)(using GuardOf[I])` genuinely
+  * answers `Guard.RequiresReview` for one caller's `I` and `Guard.Open` for another's, in the same
+  * single compilation. What that sound mechanism cannot do, though, is stand in for `guard`'s
+  * existing DEFAULT while `guard` keeps its current position: Scala only lets a default expression
+  * see a `using` instance declared textually BEFORE it in the parameter list, so wiring one in here
+  * would mean moving `guard` into its OWN parameter section, after that `using` clause, which breaks
+  * every call site across this codebase that names `guard` inline alongside `name`/`cost`/`timeout`/
+  * `probe`/`run` in one argument list (`GraphValidationSpec`'s own `plainNode`/`reviewedNode`, among
+  * others). That is a real call site compatibility cost, not a soundness one, and this issue leaves it
+  * unpaid rather than pay it as a side effect of a compile time macro: `Node.apply`'s `guard` stays a
+  * hand written, overridable default exactly as it was before this issue: `guard =
+  * Guard.RequiresReview` still has to be written by hand at a node's own definition site, and this
+  * marker is a SEPARATE, ADDITIONAL fact a node author states about the same node, read only by the
+  * macro, not by `Node.apply` itself. The two can therefore diverge, a node passing `guard =
+  * Guard.RequiresReview` without extending this marker is invisible to the macro, exactly the residual
+  * gap `Guard`'s own doc already names for the constructor argument alone; a node meant to be caught
+  * by the compile time macro needs BOTH written consistently, its input type extending this marker AND
+  * its `guard` argument set to match. A node relying on `guard` alone, with no marker, is covered by
+  * `Runner.validate` at runtime only, exactly as it always was before this issue. The reverse
+  * divergence, a marker present while `guard` was deliberately left `Guard.Open` (`Machine.OpenPr`/
+  * `Machine.Merge` are the concrete, deliberate case this issue leaves alone, their own doc has the
+  * reason), would make the macro reject a path `Runner.validate` accepts; that is exactly why NEITHER
+  * of those two nodes extends this marker at all (`Machine.shippedShape`'s own doc has the restated
+  * reason).
+  */
+trait RequiresReviewInput
+
 /** One step of a graph: a name for logs/errors, its budget `cost` and wall-clock `timeout` (both
   * enforced by the `Runner`, never by the node itself), a `probe` that answers from the outside
   * world whether this step's work is already done, and the `run` that does the work when `probe`
@@ -342,7 +392,9 @@ enum Guard:
   * reaches a `Done`). In a codebase whose thesis is distrust, claiming more than that here would be
   * a false structural guarantee, worse than none at all. `guard` stays an ordinary, defaulted
   * parameter on that same `apply`, because (see `Guard`'s own doc) it is not derivable from `O` at
-  * all.
+  * all, and `RequiresReviewInput`'s own doc (issue #39) has the concrete reason a derivation from `I`
+  * was tried and dropped: a default parameter value cannot see the caller's own concrete `I`, so it
+  * cannot stand in for this hand written argument either.
   */
 final case class Node[I, O] private (
     name: String,
@@ -404,11 +456,17 @@ final case class Transition(from: Node[?, ?], to: Node[?, ?])
   *
   * Hand declaring this alongside the closures it describes is the acknowledged weakness of this
   * issue's cheap half: nothing here stops a `Shape` from drifting out of sync with what its own
-  * closures actually do, the same way a stale comment can drift from the code beside it. Issue
-  * #39's compile time macro, extracting the literal graph straight from the real `Next` values, is
-  * what removes that gap; this issue only narrows it, by giving the drift somewhere concrete to be
-  * caught. A wrong `Shape` still lets a bad graph pass validation, but a right one genuinely rejects
-  * one, which is strictly more than no check at all.
+  * closures actually do, the same way a stale comment can drift from the code beside it. Issue #39's
+  * compile time macro, `checkedShape` below, does NOT close this gap (issue #39 review, MAJOR 5,
+  * correcting an earlier, aspirational version of this paragraph): it walks the SAME hand written
+  * `Shape` literal `Runner.validate` reads, at compile time instead of at startup, never the `Next`
+  * closures themselves, for the identical reason `Runner.validate` cannot either (this paragraph's own
+  * reasoning above still holds, `O` erased, `andThen` opaque, running one for real fires side
+  * effects). What `checkedShape` buys is finding the SAME declared violation earlier, before `scala-cli
+  * package` even finishes, not a stronger guarantee about which declaration is the true one. A `Shape`
+  * that drifted from its own closures and a `Shape` that never drifted at all are equally invisible to
+  * it; only a wrong `Shape` that ALSO happens to violate its own declared reachability rule is ever
+  * caught, by either check.
   *
   * A second limit sits beside that drift risk, not caused by it: a `Transition` names two `Node`s,
   * nothing about which VALUE of the `from` node's output chose that edge (`Transition`'s own doc).
@@ -418,11 +476,76 @@ final case class Transition(from: Node[?, ?], to: Node[?, ?])
   * upstream node reaches the same downstream nodes `Merge` sits behind, without a reviewer). A
   * `Shape` walk cannot tell those two cases apart; it only sees that an edge exists, never which
   * output value it was chosen for. `Machine.shippedWorkflow`'s own doc on its `Merge`/`OpenPr` nodes
-  * is the concrete case this limit is not hypothetical for. Issue #39's macro would still have to
-  * read the actual branch a running `andThen` took to close this, the same way it closes the drift
-  * risk above; naming the limit here is what stops it being silently rediscovered as a fresh bug.
+  * is the concrete case this limit is not hypothetical for; NEITHER check, `Runner.validate` nor
+  * `checkedShape`, can see which output VALUE chose an edge, so neither is the tool for that job, and
+  * `Machine.shippedWorkflow` deliberately does not extend `RequiresReviewInput` on either node's own
+  * input type for exactly this reason (`Machine.shippedShape`'s own doc has the restated reason).
   */
 final case class Shape(entry: List[Node[?, ?]], transitions: List[Transition])
+
+/** The compile time half of RFC #26 decision 16 (issue #39). Restated plainly, correcting an earlier,
+  * too strong version of this paragraph (issue #39 review, MAJOR 5): this does NOT narrow the drift
+  * gap `Shape`'s own doc names above, between a declared `Shape` and the `Next` closures it claims to
+  * describe; `KitMacro.checkShapeImpl` (`KitMacro.scala`) reads the exact SAME hand written `Shape`
+  * literal `Runner.validate` already reads, never the closures, for the identical reason
+  * `Runner.validate` cannot either. What this genuinely buys is finding the SAME declared violation
+  * `Runner.validate` would find at startup, earlier, at compile time: a `Shape` value written as a
+  * literal `Shape(entry = ..., transitions = ...)` expression right here, at the call site, naming its
+  * nodes directly rather than through a variable or a function call, gets walked by
+  * `KitMacro.checkShapeImpl`, over the same BFS `Runner.validate` runs, restated at compile time,
+  * reading a node's identity and its `trust` the identical way `Runner.validate` reads them too
+  * (`KitMacro.checkShapeImpl`'s own doc, `KitMacro.scala`, has the two respects in which the two walks
+  * still are not identical, neither one by oversight), and compilation aborts, through
+  * `quotes.reflect.report.errorAndAbort`, naming the offending path and the guarded node it reaches,
+  * the moment it finds a path into a node whose input type extends `RequiresReviewInput` (above) that
+  * never crosses a `Trust.Reviewed` one first.
+  *
+  * `inline shape: Shape` is what lets the macro see the literal at all: an ordinary, non inline
+  * parameter would already be a runtime value, an opaque `Shape` reference, by the time any macro
+  * ran. Passing anything that is not a literal `Shape(...)` call written at the call site itself,
+  * a variable holding a `Shape`, the result of a function, `Machine.shippedShape(cfg)`, is not an
+  * error: `KitMacro.checkShapeImpl`'s own doc states plainly that failing to recognise the shape this
+  * way falls back to returning it unchanged, so the graph is simply left for `Runner.validate` to
+  * catch at startup instead, exactly as it always was before this issue.
+  *
+  * The one way this CAN still reject a literal `Runner.validate` would have accepted (issue #39
+  * review, MAJOR 2, stated here rather than left for a consumer to discover): the macro reads whether
+  * a node requires a review off its input type extending `RequiresReviewInput` alone
+  * (`RequiresReviewInput`'s own doc has the reason it cannot instead read the SAME hand written
+  * `guard` field `Runner.validate` reads), so a node whose input type extends that marker while its
+  * own `guard` argument was deliberately left `Guard.Open`, an inconsistency `RequiresReviewInput`'s
+  * own doc already names as a residual gap, is read as guarded here even though `Runner.validate`
+  * would read it as not. Writing the marker and `guard` inconsistently is what causes this, never
+  * ordinary use: neither `Machine.OpenPr` nor `Machine.Merge`, the two shipped nodes with a genuine,
+  * data dependent reason to leave `guard` at `Guard.Open`, extends this marker at all
+  * (`Machine.shippedShape`'s own doc has the restated reason), precisely so this residual case never
+  * fires on the graph this loop actually ships. Restated once more, correcting an "ONLY" claim three
+  * earlier rounds of review each found a hole in (issue #39 review round 3, M6): this is the one path
+  * left after actually attacking the claim against THIS round's own fixes, not an assumption carried
+  * forward from an earlier round. Each fix this round made, the node identity rule keying on a
+  * receiver as well as a member (`KitMacro.checkShapeImpl`'s own doc, `KitMacro.scala`, has B1 and
+  * B2), the varargs check confirming the callee really is `List.apply` (M1), and the trust check
+  * declining a third given rather than reading it as `Trust.Plain` (M2), only ever makes the macro
+  * FALL BACK more often, never rejects a literal it previously accepted; none of the three opens a new
+  * way to reject a graph `Runner.validate` accepts. That leaves the guard/marker inconsistency above
+  * as the one surviving path, checked directly rather than assumed. Stated as a claim about the code
+  * as it stands today, not a promise about every future change to it: a future change to
+  * `identifyRef`, `nodeFacts`, or `literalListElements` could reopen a false rejection the same way
+  * three earlier rounds each did, so "ONLY" here means the one gap this paragraph's own author could
+  * find after attacking the claim directly, not a proof that no other gap could ever exist.
+  *
+  * Issue #39's own acceptance criterion, "an unreviewed graph fails to compile", is delivered by this
+  * function for a CONSUMER authored `Shape` literal that marks its own review-requiring nodes with
+  * `RequiresReviewInput` (issue #39 review round 2, M2, stated here rather than left for a reader to
+  * work out from the shipped call site alone): that is what lets the walk above find a path worth
+  * rejecting in the first place. `Machine.shippedShape` does not call this function at all (issue #39
+  * review round 3, M3, `Machine.shippedShape`'s own doc has the full reason): its graph declares no
+  * node whose input type extends `RequiresReviewInput`, so this function could never find a path
+  * worth rejecting there either way, and wrapping its literal would have proven only that the
+  * expression stayed macro parseable, nothing about review reachability for that graph. The criterion
+  * still holds for the shipped pipeline; `Runner.validate`, unchanged, is what discharges it there.
+  */
+inline def checkedShape(inline shape: Shape): Shape = ${ KitMacro.checkShapeImpl('shape) }
 
 /** A named graph: `start` computes the first `Next` from the workflow's own input. The user (whoever
   * builds a `Workflow` value) owns every transition `start`/`andThen` describe; only the `Runner`

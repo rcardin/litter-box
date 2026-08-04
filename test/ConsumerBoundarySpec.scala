@@ -200,3 +200,86 @@ class ConsumerBoundarySpec extends AnyFlatSpec with Matchers:
     val messages = errors.map(_.message).mkString("\n")
     messages should include("constructor LiveAgentDispatch")
   }
+
+  it should "typecheck a consumer's own literal Shape whose only path into a guarded node crosses a reviewer first, spliced through checkedShape" in {
+    // Issue #39 review round 3, M7: every `checkedShape` case in `GraphMacroSpec`
+    // (`test/GraphMacroSpec.scala`) typechecks inside `package in.rcard.litterbox` itself, the
+    // identical trap this file's own doc, above, spends its first paragraphs establishing for
+    // `AgentDispatch`: a snippet run from a file in that package is unavoidably LIBRARY code, no
+    // matter what it claims to be, so nothing outside `GraphMacroSpec` pinned that a CONSUMER, in a
+    // package this library does not own, can even splice `checkedShape` at all. This is that proof,
+    // positive half, a genuine consumer facing use: a literal `Shape` written here, in
+    // `com.example.consumer`, whose only path into its one guarded node crosses a reviewer first,
+    // compiles clean through `checkedShape`.
+    val errors = scala.compiletime.testing.typeCheckErrors(
+      """
+        |import in.rcard.litterbox._
+        |import in.rcard.litterbox.Caps.given
+        |
+        |case class PrInput() extends RequiresReviewInput
+        |
+        |val Pick: Node[Unit, Unit] = Node(
+        |  name = "Pick", cost = Cost.NoDispatch, timeout = Timeout.Unbounded,
+        |  probe = _ => None, run = _ => NodeOutcome.Done(())
+        |)
+        |val Review: Node[Unit, AgentDispatch.Judged[Unit]] = Node(
+        |  name = "Review", cost = Cost.NoDispatch, timeout = Timeout.Unbounded,
+        |  probe = _ => None,
+        |  run = _ => NodeOutcome.Done(summon[AgentDispatch].review("prompt", "review-file").map(_ => ()))
+        |)
+        |val OpenPr: Node[PrInput, Unit] = Node(
+        |  name = "OpenPr", cost = Cost.NoDispatch, timeout = Timeout.Unbounded,
+        |  probe = _ => None, run = _ => NodeOutcome.Done(()), guard = Guard.RequiresReview
+        |)
+        |
+        |val shape = checkedShape(
+        |  Shape(
+        |    entry = List(Pick),
+        |    transitions = List(Transition(Pick, Review), Transition(Review, OpenPr))
+        |  )
+        |)
+        |""".stripMargin
+    )
+
+    errors shouldBe empty
+  }
+
+  it should "refuse to typecheck a consumer's own literal Shape whose only path into a guarded node has no reviewer anywhere on it, spliced through checkedShape" in {
+    // The rejecting half of the same M7 proof: a consumer, outside the library's own package, writing
+    // the identical unreviewed shape `GraphMacroSpec`'s own negative case rejects from inside
+    // `in.rcard.litterbox`, to pin that the rejection itself, not only the acceptance above, crosses
+    // the package boundary.
+    val errors = scala.compiletime.testing.typeCheckErrors(
+      """
+        |import in.rcard.litterbox._
+        |import in.rcard.litterbox.Caps.given
+        |
+        |case class PrInput() extends RequiresReviewInput
+        |
+        |val Pick: Node[Unit, Unit] = Node(
+        |  name = "Pick", cost = Cost.NoDispatch, timeout = Timeout.Unbounded,
+        |  probe = _ => None, run = _ => NodeOutcome.Done(())
+        |)
+        |val Implement: Node[Unit, Unit] = Node(
+        |  name = "Implement", cost = Cost.NoDispatch, timeout = Timeout.Unbounded,
+        |  probe = _ => None, run = _ => NodeOutcome.Done(())
+        |)
+        |val OpenPr: Node[PrInput, Unit] = Node(
+        |  name = "OpenPr", cost = Cost.NoDispatch, timeout = Timeout.Unbounded,
+        |  probe = _ => None, run = _ => NodeOutcome.Done(()), guard = Guard.RequiresReview
+        |)
+        |
+        |val shape = checkedShape(
+        |  Shape(
+        |    entry = List(Pick),
+        |    transitions = List(Transition(Pick, Implement), Transition(Implement, OpenPr))
+        |  )
+        |)
+        |""".stripMargin
+    )
+
+    errors should not be empty
+    val messages = errors.map(_.message).mkString("\n")
+    messages should include("Pick -> Implement -> OpenPr")
+    messages should include("'OpenPr'")
+  }

@@ -2215,10 +2215,22 @@ object Machine:
     * review-reachability walk can never fire on THIS graph; what it actually checks here is
     * declaration hygiene alone (an empty `entry`, two nodes disagreeing on a shared name, an orphan
     * node `transitions` names but no `entry` reaches), real, but a strictly narrower guarantee than
-    * "no guarded node is reachable without a review". Issue #39's compile time macro, reading the
-    * literal graph the `Next.Goto` closures encode instead of this hand-declared `Shape`, is what
-    * would let a genuine `Merge`/`OpenPr` guard be stated and checked honestly; until then, this
-    * `Shape` is hygiene-checked only.
+    * "no guarded node is reachable without a review".
+    *
+    * `checkedShape` (issue #39, `Kit.scala`) does NOT wrap this literal (issue #39 review round 3,
+    * M3, correcting a version of this file that did and read the wrap as protection). No node
+    * declared in this `Shape` extends `RequiresReviewInput` at all, on purpose, the identical fact
+    * the paragraph above already gives for `Runner.validate`: `OpenPr`'s and `Merge`'s own real
+    * guarantee, that `Merge` never runs without a genuine review behind it, is a DATA fact about
+    * `Route.AutoMergeCandidate`, never a reachability property, so no reachability walk over this
+    * `Shape`, macro or runtime, could ever express it, and neither check is asked to. A macro wrapper
+    * around a `Shape` that declares no node its own walk could ever reject is provably inert, not
+    * merely unexercised, confirmed directly rather than assumed: giving `MergeInput` the marker as an
+    * experiment still left this project compiling clean, because `entry` itself, `Implement(cfg)` and
+    * `Repair(cfg)`, is not a stable path or an inline `Node.apply` call (`identifyRef`'s own doc,
+    * `KitMacro.scala`), so the walk falls back before it ever reaches `Merge` regardless of what
+    * `Merge`'s own input type extends. This graph stays runtime checked only, by
+    * `Runner.validate(shippedShape(cfg))` at the top of `runOnce` (below).
     */
   private[litterbox] def shippedShape(cfg: Config): Shape =
     Shape(
