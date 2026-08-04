@@ -263,6 +263,24 @@ final class TestWorld:
       record(s"gh issue comment $issue")
       if issueCommentSucceeds then
         postedIssueComments = postedIssueComments :+ (issue -> body)
+        // Fold the post back into the thread `issueComments` reads (issue #44 review, MAJOR, round
+        // 2): a fake that records a write but never lets a later read see it cannot prove any WORLD
+        // fact property, and `AskHuman`'s whole design rests on one (RFC #26 decision 6: parking is
+        // never a stored position, always re-derived from what `gh` reports). `Live.scala`'s own
+        // `commentsJqProgram` format, `"@login (association):\n<body>"`: `viewerLoginAnswer`, not a
+        // second knob, names the login, because the account that can post a comment at all and the
+        // account `gh api user` answers with are the SAME authenticated token in real life; falling
+        // back to the same default that login defaults to (`"litter-box"`) when a scenario has
+        // scripted `viewerLoginAnswer = None` keeps every entry well-formed even though that field
+        // models a SEPARATE `gh` call (`viewerLogin()`) that a scenario is free to fail independently
+        // of comment posting. `"OWNER"` is hardcoded, not a second scriptable field: every existing
+        // scenario's own hand-written `markerEntry` already assumes the harness posts as `OWNER`
+        // (this file's own `markerEntry`, `ScenarioSpec.scala`), so a harness-authored entry folded in
+        // here has to carry the same association or it would silently stop matching what those
+        // scenarios already assert by hand.
+        val login = viewerLoginAnswer.getOrElse("litter-box")
+        val entry = s"@$login (OWNER):\n$body"
+        issueCommentBodies = issueCommentBodies.updated(issue, issueCommentBodies.getOrElse(issue, Nil) :+ entry)
       issueCommentSucceeds
     def prComments(pr: Int): Option[List[String]] =
       record(s"gh pr view $pr --json comments")

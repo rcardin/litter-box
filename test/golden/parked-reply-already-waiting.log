@@ -1,0 +1,9 @@
+iteration 1 -> issue #999
+FAST gate RED (pass 1, see .litter-box/logs/issue-999-pass1.gate.log)
+self-repair: budget now 1 — dispatching FIX for gate-RED
+issue #999: third-party comments were spliced into the FIX prompt
+FAST gate RED (pass 2, see .litter-box/logs/issue-999-pass2.gate.log)
+self-repair: budget now 0 — dispatching FIX for gate-RED
+issue #999: third-party comments were spliced into the FIX prompt
+FAST gate RED (pass 3, see .litter-box/logs/issue-999-pass3.gate.log)
+issue #999: a human reply (alice) is already waiting but this tick's repair budget is already exhausted (gate-RED, gate RED); re-parking without a new marker so the same reply is spent with a fresh budget on the next tick

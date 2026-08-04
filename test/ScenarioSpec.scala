@@ -721,6 +721,12 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
 
     exit shouldBe LoopExit.Parked
     exit.rc shouldBe 60
+    // The other of the two park paths through `parkBookkeeping` (issue #44 review, MAJOR F1, round
+    // 3): this one reaches it via `parkIssue`'s own probe-miss branch, the sibling test above (the
+    // one this fix's own F1 target names) pins the SAME event on the probe-hit branch via
+    // `reparkKeepingReply`, so between the two, deleting `emit(cur, "PARK", ...)` from
+    // `parkBookkeeping` itself is caught regardless of which caller reached it.
+    w.phaseSeq should contain("PARK")
     w.called("gh pr create") shouldBe false // no PR: parking is a wait state, not an audit trail
     w.called("gh issue comment 999") shouldBe true
     w.postedIssueComments.last shouldBe (999 -> Machine.ParkBody)
@@ -758,6 +764,242 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     exit shouldBe LoopExit.NeedsHuman
     w.called("gh issue comment 999") shouldBe false
   }
+
+  // ---- issue #44: Route.Parked is a real AskHuman edge, not an inline terminal ----------------
+
+  it should "leave the world exactly as parked-consistent when a reply is already waiting the moment " +
+    "the issue parks as when no reply ever arrives, EXCEPT the marker: label flip, reset tree, PARK " +
+    "event and rc 60 all still happen, but no fresh marker is posted over the reply (issue #44 " +
+    "review MAJOR, round 2: posting one here was the actual bug)" in {
+      // `AskHuman` is reached exactly when `attemptRepairNext` has already found the shared ledger
+      // exhausted (`decideRoute`'s own doc): every edge into `Repair` from a probe hit therefore
+      // shares that same drained ledger (`finish`'s own `Route.Parked` doc has the full reasoning),
+      // so a probe hit here can never spend the reply on a real repair round. What this test proves
+      // is that the world still ends up parked-consistent on every axis EXCEPT the one that must now
+      // differ from a probe miss: no fresh marker, so the reply survives untouched for the next tick
+      // (`reparkKeepingReply`'s own doc has the full reasoning; the two-tick test below proves the
+      // payoff: the SAME reply actually gets spent, with a fresh budget, on that next tick).
+      val w = TestWorld()
+      w.gateResults = List(GateResult.Red, GateResult.Red, GateResult.Red)
+      w.fixScripts = List(
+        WorkerScript.Produces("1\t0\tsrc/main/scala/Fix1.scala"),
+        WorkerScript.Produces("1\t0\tsrc/main/scala/Fix2.scala")
+      )
+      w.issueCommentBodies = Map(
+        999 -> List(
+          s"@litter-box (OWNER):\n${Machine.ParkMarker}\nparked, awaiting a reply",
+          "@alice (OWNER):\ntry using a HashMap instead"
+        )
+      )
+
+      val exit = w.runLoop()
+
+      exit shouldBe LoopExit.Parked
+      exit.rc shouldBe 60
+      // The PARK status event fires on this path exactly as it does on an ordinary probe-miss park
+      // (issue #44 review, MAJOR F1, round 3): `reparkKeepingReply` reaches it through the SAME
+      // `parkBookkeeping` a probe miss also calls, so deleting the `emit` inside `parkBookkeeping`
+      // would silently drop the PARK event on every parked exit, probe hit and probe miss alike, and
+      // nothing before this line would have noticed on the probe-hit path this test drives.
+      w.phaseSeq should contain("PARK")
+      // The fix, restated as a positive (issue #44 review MAJOR, round 2): NO comment is posted on
+      // this path at all, so alice's reply is still the newest thing after the newest marker.
+      w.postedIssueComments shouldBe empty
+      w.called("gh issue edit 999 --add-label parked --remove-label in-progress") shouldBe true
+      // IMPL + two FIX rounds + the park route's own reset = 4; no staged index survives this route.
+      w.callCount("git reset --hard origin/main && git clean -fd") shouldBe 4
+      w.staged shouldBe false
+      // The false "dispatching FIX" line is gone, and so is round 1's own fix, which claimed the
+      // reply would NOT be spent ("rather than spending it") while its own next line buried it under
+      // a fresh marker, the exact opposite. The truthful replacement says the reply is KEPT.
+      w.logged("issue #999: a human already replied while parked, dispatching FIX") shouldBe false
+      w.logged(
+        "issue #999: a human replied while parked (alice) but the repair budget was already exhausted; re-parking rather than spending it"
+      ) shouldBe false
+      w.logged(
+        "issue #999: a human reply (alice) is already waiting but this tick's repair budget is already exhausted (gate-RED, gate RED); re-parking without a new marker so the same reply is spent with a fresh budget on the next tick"
+      ) shouldBe true
+      w.logged("node 'Repair' parked: dispatch budget exhausted before it could run") shouldBe false
+    }
+
+  it should "resume off the SAME reply on the very next tick, with that tick's own fresh repair " +
+    "budget, after parking through the probe-hit path with no new reply in between (issue #44 fix, " +
+    "E1: the reply must be spent, never silently discarded; also the wedge regression, issue #44 " +
+    "review BLOCKER: a second tick must not throw and must not hit \"working tree not clean\")" in {
+      // Before this fix, tick 1 reposted the marker over alice's reply; tick 2's own `pickAndSetup`
+      // then found nothing left to resume on (the reply was buried behind the fresh marker) and
+      // dispatched nothing at all, while the world stayed staged from tick 1's own failed rounds,
+      // wedging every later tick's `git.statusClean()` guard. Both symptoms are the same bug seen two
+      // ways: the reply must survive, and survive READABLE, or the loop silently wedges forever.
+      val w = TestWorld()
+      w.gateResults = List(GateResult.Red, GateResult.Red, GateResult.Red)
+      w.fixScripts = List(
+        WorkerScript.Produces("1\t0\tsrc/main/scala/Fix1.scala"),
+        WorkerScript.Produces("1\t0\tsrc/main/scala/Fix2.scala")
+      )
+      w.issueCommentBodies = Map(
+        999 -> List(
+          s"@litter-box (OWNER):\n${Machine.ParkMarker}\nparked, awaiting a reply",
+          "@alice (OWNER):\ntry using a HashMap instead"
+        )
+      )
+
+      val first = w.runLoop()
+
+      first shouldBe LoopExit.Parked
+      // `resetHardCleanToOriginMain()` genuinely ran on the probe-hit path (`parkBookkeeping`'s own
+      // call, not merely `stagePatch`'s dispatch-time resets): the FAKE's own `staged` flag is what
+      // proves it, since `git.statusClean()` below is a separately scripted knob (`cleanTree`) the
+      // fake cannot derive from `staged` on its own.
+      w.staged shouldBe false
+      w.postedIssueComments shouldBe empty // the fix: nothing posted, alice's reply survives untouched
+
+      // Tick 2: model what a real `gh` now reports after tick 1's own label flip (`TestWorld`'s
+      // `parked`/`inProgress` are independently scripted, never derived from `editLabels` calls, the
+      // same manual update every other tick-boundary scenario in this file already needs). The
+      // comment thread itself needs NO manual update at all (issue #44 review MAJOR, round 2, and E2
+      // of the fix): tick 1 posted nothing, so `issueCommentBodies` is exactly what it always was,
+      // alice's ORIGINAL reply still the newest thing after the original marker.
+      w.inProgress = None
+      w.ready = None
+      w.parked = List(999)
+      w.fixScripts = List(WorkerScript.Produces("1\t0\tsrc/main/scala/Fix3.scala"))
+
+      val second = w.runLoop()
+
+      second shouldBe LoopExit.Success
+      w.callCount("dispatch FIX") shouldBe 3 // two from tick 1, one more from tick 2's genuine resume
+      w.logged(
+        "issue #999: resuming from parked with a human reply, dispatching FIX (budget now 1)"
+      ) shouldBe true
+    }
+
+  it should "also resume correctly when a SECOND, later reply arrives before the next tick: both " +
+    "replies count, combined, because no marker was ever reposted between them" in {
+      val w = TestWorld()
+      w.gateResults = List(GateResult.Red, GateResult.Red, GateResult.Red)
+      w.fixScripts = List(
+        WorkerScript.Produces("1\t0\tsrc/main/scala/Fix1.scala"),
+        WorkerScript.Produces("1\t0\tsrc/main/scala/Fix2.scala")
+      )
+      w.issueCommentBodies = Map(
+        999 -> List(
+          s"@litter-box (OWNER):\n${Machine.ParkMarker}\nparked, awaiting a reply",
+          "@alice (OWNER):\ntry using a HashMap instead"
+        )
+      )
+
+      val first = w.runLoop()
+
+      first shouldBe LoopExit.Parked
+      w.postedIssueComments shouldBe empty
+
+      // A second, genuinely new reply lands on the thread before the next tick, still under the SAME
+      // original marker (nothing reposted one in between, unlike round 1 of this fix): the earlier
+      // "not wedge" test used to fabricate exactly this shape to arrange its own conclusion (issue #44
+      // review MAJOR: the fabricated reply is what hid the finding fixed above), so this variant
+      // writes the thread by hand rather than relying on any fold, to keep that distinction visible.
+      //
+      // The second reply is from a DIFFERENT login, bob, not a second entry from alice (issue #44
+      // review, MINOR F4, round 3): `authors` dedupes by login (`askHumanReply`'s own doc), so two
+      // entries from the SAME author collapse to one name either way, and `{{COMMENTS}}` splices
+      // every comment's TEXT regardless of who wrote it, so neither assertion below could actually
+      // distinguish "one reply counted" from "both replies counted" with alice replying twice; only
+      // the identity of the SECOND author can.
+      w.inProgress = None
+      w.ready = None
+      w.parked = List(999)
+      w.issueCommentBodies = Map(
+        999 -> List(
+          s"@litter-box (OWNER):\n${Machine.ParkMarker}\nparked, awaiting a reply",
+          "@alice (OWNER):\ntry using a HashMap instead",
+          "@bob (COLLABORATOR):\nok, try this instead"
+        )
+      )
+      w.fixScripts = List(WorkerScript.Produces("1\t0\tsrc/main/scala/Fix3.scala"))
+
+      val second = w.runLoop()
+
+      second shouldBe LoopExit.Success
+      w.callCount("dispatch FIX") shouldBe 3
+      // Both replies genuinely counted, combined, restated as a positive that can actually tell one
+      // accepted author from two: `resumeFailureBody` names both logins in the harness-authored
+      // failFile (issue #28 review finding 3, round 2, extended here to a second author).
+      val failFile = w.files(s"$logDir/issue-999-resume.failure.md")
+      failFile should include("@alice")
+      failFile should include("@bob")
+    }
+
+  it should "post BOTH the reply-consumed marker and a fresh park marker in the SAME tick when a " +
+    "resumed dispatch spends the reply and then exhausts the budget again before ever reaching " +
+    "AskHuman's probe (issue #44 review MINOR: two harness comments can land in one tick; the E1 fix " +
+    "does not change this path, the probe genuinely misses here because the reply really was spent)" in {
+      val w = TestWorld()
+      w.inProgress = None
+      w.ready = None
+      w.parked = List(999)
+      w.issueCommentBodies = Map(
+        999 -> List(
+          s"@litter-box (OWNER):\n${Machine.ParkMarker}\nparked, awaiting a reply",
+          "@alice (OWNER):\ntry using a HashMap instead"
+        )
+      )
+      w.fixScripts = List(WorkerScript.Produces("1\t0\tsrc/main/scala/Fix1.scala"))
+      w.gateResults = List(GateResult.Red) // the resumed dispatch's only round, then budget is spent
+
+      val exit = w.runLoop(Config(repairBudget = 1))
+
+      exit shouldBe LoopExit.Parked
+      // `ReplyConsumedBody` first (the resumed dispatch genuinely spends alice's reply), THEN
+      // `ParkBody` (the budget is gone, `AskHuman`'s own probe now genuinely finds nothing after the
+      // fresher marker `ReplyConsumedBody` just posted, so `askHumanRun` parks exactly as if there
+      // had never been a reply at all).
+      w.postedIssueComments.map(_._2) shouldBe List(Machine.ReplyConsumedBody, Machine.ParkBody)
+    }
+
+  it should "never let a later tick replay a reply a resumed dispatch already consumed (issue #44 " +
+    "review MAJOR: ReplyConsumedBody was asserted by no test, provable only once TestWorld folds a " +
+    "posted comment back into later reads, E2 of the fix)" in {
+      val w = TestWorld()
+      w.inProgress = None
+      w.ready = None
+      w.parked = List(999)
+      w.issueCommentBodies = Map(
+        999 -> List(
+          s"@litter-box (OWNER):\n${Machine.ParkMarker}\nparked, awaiting a reply",
+          "@alice (OWNER):\ntry using a HashMap instead"
+        )
+      )
+      w.fixScripts = List(WorkerScript.Produces("1\t0\tsrc/main/scala/Fix1.scala"))
+      // The resumed FIX succeeds and its verdict is genuinely consumed (`ReplyConsumedBody` posts)
+      // BEFORE the gate that follows it times out: an infra fault that leaves BOTH `parked` and
+      // `in-progress` set (issue #50: parked survives the whole tick), the shape the review's own
+      // MAJOR finding needs to prove non-replay against a LATER tick, not merely the same one.
+      w.gateResults = List(GateResult.Timeout)
+
+      val first = w.runLoop(Config(repairBudget = 2))
+
+      first shouldBe LoopExit.InfraFault
+      w.postedIssueComments should contain(999 -> Machine.ReplyConsumedBody)
+
+      // Tick 2: model what `gh` now reports (issue #50's own merge case: #999 is BOTH in-progress,
+      // from tick 1's own pick-time flip, AND still parked, since only a successful terminal removes
+      // it). The comment thread needs no manual update at all: `TestWorld.issueComment`'s own fold
+      // (E2) already put `ReplyConsumedBody` after alice's reply during tick 1.
+      w.inProgress = Some(999)
+      w.labels = List("parked", "in-progress")
+      w.implScript = WorkerScript.Produces("1\t0\tsrc/main/scala/Fix2.scala")
+
+      val second = w.runLoop(Config(repairBudget = 2))
+
+      second shouldBe LoopExit.Success
+      // The consumed reply is never spent again: tick 2 dispatches a fresh IMPL, not another FIX
+      // carrying alice's old guidance, and "resuming from parked with a human reply" never fires a
+      // second time across the two ticks.
+      w.callCount("dispatch FIX") shouldBe 1
+      w.callCount("dispatch IMPL") shouldBe 1
+      w.logLines.count(_.contains("resuming from parked with a human reply")) shouldBe 1
+    }
 
   // ---- issue #28: pickAndSetup resumes a parked issue with a reply, or re-parks with none -----
 

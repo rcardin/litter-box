@@ -202,21 +202,52 @@ object Machine:
           .mkString("\n")
         s"@$login ($assoc):\n$escapedBody"
 
-  /** The marker comment `shippedWorkflow`'s own `finish` posts (its `Route.Parked` branch) on an
-    * issue it parks, and the exact substring `pickAndSetup`'s reply probe (`replySince`) searches
-    * for on a later tick. GitHub holds it, not a local file: a human who resets the branch or
-    * deletes the comment changes the answer the very next tick, which is the point (issue #28 / RFC
-    * #26 decision 6: parking is the terminal state of ONE tick, never a stored position).
+  /** The substring `pickAndSetup`'s reply probe (`replySince`) and `AskHuman`'s own probe
+    * (`askHumanReply`) both search for on a later tick, to tell the harness's own bookkeeping
+    * comments apart from ordinary conversation. GitHub holds it, not a local file: a human who
+    * resets the branch or deletes the comment changes the answer the very next tick, which is the
+    * point (issue #28 / RFC #26 decision 6: parking is the terminal state of ONE tick, never a
+    * stored position).
+    *
+    * Two call sites post a comment starting with this marker (issue #44 fix, round 2, replacing an
+    * earlier version of this doc that named a single one): `parkIssue`'s own probe-miss path
+    * (`askHumanRun` below), posting `ParkBody`; and `start`'s own `resumeAuthors` branch, posting
+    * `ReplyConsumedBody` the moment a resumed dispatch genuinely spends a reply. `finish`'s own
+    * `Route.Parked` closure reaches `AskHuman` too, but on a probe HIT it calls `reparkKeepingReply`,
+    * not `parkIssue`, and posts no marker at all (that function's own doc has the reason): posting one
+    * there would bury a reply nobody ever got to spend behind a boundary this marker's own probes
+    * never look past again. `askHumanRun`'s OWN probe-miss path reaches `reparkKeepingReply` too, not
+    * only `parkIssue` (issue #44 review, MAJOR F2): a `gh` read that fails while re-checking the world
+    * is not the same fact as a genuine no-reply, and posting a fresh marker over an UNKNOWN answer
+    * would risk burying a reply the failed read simply could not see (`askHumanRun`'s own doc has the
+    * full reasoning).
     */
   private[litterbox] val ParkMarker = "<!-- litter-box:parked -->"
 
-  /** The comment body `finish`'s `Route.Parked` branch posts through `GitHub.issueComment` when it
-    * parks an issue.
+  /** The comment body `askHumanRun`'s own probe-miss path posts, through `parkIssue`, the first time
+    * an issue reaches `Route.Parked` with no reply already waiting (`ParkMarker`'s own doc has the
+    * full list of what posts what). `finish`'s own `Route.Parked` closure never posts this directly:
+    * it only ever reaches `AskHuman`, and a probe HIT on that edge posts nothing at all.
     */
   private[litterbox] val ParkBody: String =
     s"""$ParkMarker
        |Repair budget exhausted. Parked, waiting on a human. Comment on this issue with guidance and the
        |next tick will resume with a FIX.""".stripMargin
+
+  /** The comment body `shippedWorkflow`'s own `start` posts (its `resumeAuthors` branch) the moment a
+    * resumed reply is genuinely consumed by a dispatch that ran to completion (issue #44 fix, D2):
+    * starts with `ParkMarker`, like `ParkBody`, so `isMarkerEntry`/`replySince` read it as the SAME
+    * kind of boundary a park does, closing off the reply that came before it from ever being read as
+    * "the reply" again, without claiming the issue is parked (it is not; the loop is actively
+    * running a repair attempt over that reply when this posts). A distinct body from `ParkBody`
+    * rather than reusing it verbatim: reusing wording that says "Parked, waiting on a human" at the
+    * exact moment the loop is doing neither would read as a lie to anyone watching the issue thread.
+    */
+  private[litterbox] val ReplyConsumedBody: String =
+    s"""$ParkMarker
+       |A human reply was accepted; the loop is running a repair attempt over it now. This marker
+       |keeps that reply from being read as new guidance again. Comment again if this attempt does
+       |not resolve things.""".stripMargin
 
   /** The `-resume.failure.md` content `shippedWorkflow`'s own `start` writes when it dispatches a FIX over a
     * parked issue's human reply. HARNESS-AUTHORED ONLY, containing no comment text whatsoever
@@ -1692,11 +1723,18 @@ object Machine:
         caps.fs.write(reviewFile, "") // empty until the first review
 
         // Shared shape of both repair triggers (gate-RED, REQUEST_CHANGES): out of budget finalizes
-        // the tick with `Outcome.Fail` SILENTLY (constraint 2 of this issue's own design: never
-        // delegated to `Runner.step`'s own `canAfford` guard, which would log a `node 'Repair'
-        // parked: ...` line no golden pins and return `Stopped(LoopExit.Parked)`, a different exit
-        // code), otherwise writes the fail file with the stage-specific content and dispatches a FIX
-        // round through `Repair`, a genuine `Next.Goto` edge. `applied`/`stopped` are what used to be
+        // the tick with `Outcome.Fail` SILENTLY (constraint 2 of this issue's own design: THIS
+        // dispatch site never delegates to `Runner.step`'s own `canAfford` guard, which would log a
+        // `node 'Repair' parked: ...` line and return `Stopped(LoopExit.Parked)`, a different exit
+        // code from the one this function's own `finish` produces for the same budget-exhausted
+        // fact). `finish`'s own `Route.Parked` branch (below) is the ONE place in this file that
+        // deliberately DOES let a dispatch attempt reach `Runner.step`'s budget check honestly
+        // (issue #44's `AskHuman` probe-miss path, `askHumanRun`), and it never reaches `Repair` at
+        // all doing so, so no golden anywhere in this suite pins a `node 'Repair' parked: ...` line;
+        // a `node 'AskHuman' parked: ...` line is equally unreachable, since `AskHuman` declares
+        // `Cost.NoDispatch` (its own doc has the reason). Otherwise writes the fail file with the
+        // stage-specific content and dispatches a FIX round through `Repair`, a genuine `Next.Goto`
+        // edge. `applied`/`stopped` are what used to be
         // `Right(true)`/`Right(false)` at this same call site: `applied` receives the fresh patch and
         // decides what the NEXT `Next` is (always another `cycle` at `p + 1`, below), `stopped`
         // receives the finalized `CycleState` (`outcome` always `Some` by the time either callback
@@ -1884,47 +1922,57 @@ object Machine:
                           s"**Needs human** — self-repair budget of ${cfg.repairBudget} exhausted on $kindText (last gate ${state.gateStatus}). Opened for the audit trail; do NOT merge without review."
                         )
 
-                // Post the marker, THEN flip the labels, and reset the tree only once both have
-                // succeeded (issue #28 review finding 5, round 3): the original order reset first,
-                // so a marker-post failure infra-faulted having ALREADY discarded the staged failed
-                // work, for no benefit, since the whole point of faulting instead of completing the
-                // park is to let the next tick try again with something still to work from. Guards
-                // run before the side effect they guard.
+                // `Route.Parked` becomes a real edge into `AskHuman` (issue #44), not the inline
+                // marker-post/label-flip/reset block that used to sit here (moved verbatim into
+                // `askHumanRun`, see that function's own doc). `decideRoute` only ever produces
+                // `Route.Parked` once `attemptRepairNext` has already found
+                // `ledger.remainingDispatches <= 0` (that function's own doc), and that fact never
+                // reverses (`Runner.Ledger.chargeDispatch` only ever decrements, never refunds), so
+                // by the time ANY walk reaches this edge the shared `Ledger` this whole tick draws
+                // from is provably empty: a probe hit here can never be followed by a `Repair` round
+                // that actually runs, only by `Runner.step`'s own silent, bookkeeping-free auto-park
+                // (issue #44 review, BLOCKER: exactly the wedge that produced this fix).
                 //
-                // No PR either: a parked issue is not an audit trail waiting on review, it is a
-                // wait state. Marker comment, label flip, reset, done; no notify (parking is not an
-                // alert, see `Route`'s scaladoc), UNLESS a step fails, in which case `infraFault`
-                // leaves the issue `in-progress` (no further label mutation, no reset), so the next
-                // tick just tries the whole iteration again rather than settling into a broken
-                // parked state.
+                // A probe hit and a probe miss still converge on identical bookkeeping (`parkBookkeeping`:
+                // the label flip, the tree reset, the `PARK` status event, `LoopExit.Parked`), but NOT on
+                // the marker post (issue #44 review, MAJOR, round 2 of this fix): a probe miss posts a
+                // fresh one through `parkIssue` (`askHumanRun`'s own doc), while a probe hit here calls
+                // `reparkKeepingReply` instead, which posts none at all. Posting one on a probe hit was
+                // the actual bug this round fixes: `ParkBody` starts with `ParkMarker`, so posting it over
+                // a reply the probe just found buries that reply behind a boundary `replySince` never
+                // looks past again, silently discarding guidance a human already gave, while the log line
+                // this branch used to write claimed the opposite ("rather than spending it") of what the
+                // world now showed. Leaving the reply exactly where it is means the NEXT tick's ordinary
+                // `pickAndSetup` resume check finds it fresh, with that tick's own full repair budget to
+                // spend it against, precisely the property `AskHumanSpec`'s round-2 test drives end to
+                // end. `AskHuman` itself stays honestly generic (a probe hit hands the reply on to
+                // whatever the caller's `andThen` decides, `AskHumanReply`'s own doc), and a CONSUMER
+                // graph with real spare budget left at this point would route the value onward for real
+                // (`AskHumanSpec`'s own probe-hit test, and `RunnerSpec`'s consumer-graph test, both
+                // drive that path directly); it is a fact about THIS graph's own `decideRoute` invariant,
+                // not about `AskHuman`, that the edge can never be genuinely spent here.
                 if route == Route.Parked then
-                  if !caps.gh.issueComment(issue, ParkBody) then
-                    infraFault(
-                      s"could not post the park marker comment on #$issue (gh issue comment failed), infra fault, issue stays in-progress rather than becoming parked with no marker"
-                    )(using caps.logger, caps.notifier)(using faulting)
-                  if !caps.gh.editLabels(issue, add = List(cfg.labels.parked), remove = List(cfg.labels.active))
-                  then
-                    // `gh issue edit ... --add-label parked` fails as a unit when the `parked`
-                    // label does not exist yet, which is every consumer repo's state on upgrade
-                    // (`parkOnExhaustion` defaults to true; the README only starts telling operators
-                    // to create the label in this change). Completing anyway would return rc 60
-                    // with the issue still `in-progress` and no marker read-back possible, so the
-                    // next tick redoes the whole IMPL from scratch, exhausts budget, and parks
-                    // again, forever, one more marker comment each time. Faulting instead leaves the
-                    // issue `in-progress` for a human to notice.
-                    infraFault(
-                      s"could not flip #$issue to parked (gh issue edit failed, does the '${cfg.labels.parked}' label exist?), infra fault, issue stays in-progress"
-                    )(using caps.logger, caps.notifier)(using faulting)
-                  // `stagePatch` leaves the failed work STAGED in the index (that is what the
-                  // "nothing staged" guard above just found), and `pickAndSetup`'s
-                  // `git.statusClean()` check on the very next tick, which may resume this same
-                  // issue or pick a different one, would trip on a dirty tree if this route left
-                  // one behind. Discarding is also the honest choice: the staged work is exactly
-                  // what failed the gates.
-                  caps.git.resetHardCleanToOriginMain()
-                  emit(cur, "PARK", "ok", detail = s"issue=$issue")(using caps.status)
-                  caps.logger.log(s"issue #$issue -> parked ($kindText, gate ${state.gateStatus}), waiting on a human reply")
-                  Next.Finish(LoopExit.Parked)
+                  Next.Goto(
+                    AskHuman(cfg),
+                    AskHumanInput(cur, issue, ParkMarker, ParkBody, kindText, state.gateStatus),
+                    (reply: AskHumanReply) =>
+                      Next.Finish(
+                        reparkKeepingReply(
+                          cur,
+                          issue,
+                          s"issue #$issue: a human reply (${reply.authors
+                              .mkString(", ")}) is already waiting but this tick's repair budget is already exhausted " +
+                            s"($kindText, gate ${state.gateStatus}); re-parking without a new marker so the same " +
+                            "reply is spent with a fresh budget on the next tick"
+                        )(using
+                          caps.gh,
+                          caps.git,
+                          cfg,
+                          caps.status,
+                          caps.logger
+                        )(using faulting, caps.notifier)
+                      )
+                  )
                 else
                   // `NeedsHuman`'s notify fires BEFORE the commit, same position as every other route
                   // (issue #28 review finding 9, round 3).
@@ -2031,27 +2079,64 @@ object Machine:
             Next.Goto(
               Repair(cfg),
               RepairInput(cur, issue, 0, failFile, bodyFile, None),
-              {
-                case StageVerdict.Applied(patch) =>
-                  cycle(
-                    1,
-                    CycleState(outcome = None, gateStatus = "", failureKind = None, currentPatch = Some(patch), reviewed = false)
-                  )
-                case StageVerdict.Rejected(kind) =>
-                  // No gate ever ran before this rejection, same reason the ordinary IMPL branch
-                  // below sets the same value on its own rejection (issue #28 review finding 4,
-                  // round 3): `gateStatus` must not render as "gate " with nothing after it.
-                  finish(
-                    0,
-                    CycleState(
-                      outcome = Some(Outcome.Fail),
-                      gateStatus = "SKIPPED",
-                      failureKind = Some(kind),
-                      currentPatch = None,
-                      reviewed = false
+              (verdict: StageVerdict) =>
+                // D2 (issue #44 fix): the reply this dispatch just spent must never be readable as
+                // "the reply" again, neither by THIS tick's own later `AskHuman` probe if it goes on
+                // to re-park (`AskHumanInput`'s own doc had a `resumedThisTick` flag for exactly this
+                // shape, deleted by this fix: a fresh, world-observable marker replaces it, RFC #26
+                // decision 6) nor by a LATER tick's own resume check reading the same stale reply
+                // forever (the review's own MAJOR finding at this file's `AskHuman` doc). Posted
+                // HERE, once `Repair`'s own node has genuinely returned a `StageVerdict`, never
+                // earlier: an attempt that infra-faults mid-dispatch (a timed-out FIX worker, say)
+                // abandons the walk through `boundary.break` before this closure is ever reached at
+                // all (`Kit.scala`'s own doc on `Next.Goto`), so an aborted attempt leaves the reply
+                // exactly as available as it always was, which `ScenarioSpec`'s own "keep parked
+                // through an infra fault mid-resume" regression (issue #50) requires: that test's own
+                // second tick resumes off the SAME unmoved marker specifically because no fresher one
+                // was ever posted on the tick that aborted.
+                //
+                // Not covered by that guarantee (issue #44 review, MINOR): a human comment posted
+                // WHILE this dispatch is actually running lands, in comment order, BEFORE this marker
+                // once it posts, so it is masked the same way the reply this closure just spent is,
+                // permanently, even though nothing ever read it or acted on it. The window is real and
+                // left open rather than papered over: closing it needs a probe that can tell "posted
+                // before this dispatch started" apart from "posted during it", a distinction nothing in
+                // this file reads today (`GitHub.issueComments` carries no timestamp), not a one-line
+                // fix.
+                //
+                // A failed post below infra-faults with `verdict` already `Applied` and its patch
+                // already staged in the index (issue #44 review, MINOR): the tick abandons with a dirty
+                // tree, so the next tick's `pickAndSetup` own `git.statusClean()` guard throws rather
+                // than returning a `LoopExit`. Not new behaviour, an existing gate-timeout fault already
+                // leaves the same dirty tree behind a staged patch; naming it here so a reader does not
+                // have to rediscover it.
+                if !caps.gh.issueComment(issue, ReplyConsumedBody) then
+                  infraFault(
+                    s"could not post the reply-consumed marker comment on #$issue (gh issue comment failed) after resuming from parked, infra fault, the accepted reply could be replayed on a later tick"
+                  )(using caps.logger, caps.notifier)(using faulting)
+                caps.logger.log(
+                  s"issue #$issue: reply marker refreshed, the accepted reply cannot be replayed on a later tick"
+                )
+                verdict match
+                  case StageVerdict.Applied(patch) =>
+                    cycle(
+                      1,
+                      CycleState(outcome = None, gateStatus = "", failureKind = None, currentPatch = Some(patch), reviewed = false)
                     )
-                  )
-              }
+                  case StageVerdict.Rejected(kind) =>
+                    // No gate ever ran before this rejection, same reason the ordinary IMPL branch
+                    // below sets the same value on its own rejection (issue #28 review finding 4,
+                    // round 3): `gateStatus` must not render as "gate " with nothing after it.
+                    finish(
+                      0,
+                      CycleState(
+                        outcome = Some(Outcome.Fail),
+                        gateStatus = "SKIPPED",
+                        failureKind = Some(kind),
+                        currentPatch = None,
+                        reviewed = false
+                      )
+                    )
             )
           case None =>
             Next.Goto(
@@ -2083,7 +2168,7 @@ object Machine:
   /** The declared `Shape` of `shippedWorkflow` (issue #38, RFC #26 decision 16's cheap half),
     * factored out to its own function (issue #38 review finding 3) so `Machine.runOnce` can validate
     * it BEFORE `Pick` ever runs: every identifier this function closes over (`Implement`, `Gate`,
-    * `Repair`, `Review`, `RouteDecision`, `CommitAndPush`, `OpenPr`, `CiWait`, `Merge`,
+    * `Repair`, `Review`, `RouteDecision`, `AskHuman`, `CommitAndPush`, `OpenPr`, `CiWait`, `Merge`,
     * `PostMergeCleanup`) needs nothing but `cfg` to build, no `Caps`, no `Faulting`, no `Ledger`, so
     * this is pure to call from `runOnce`'s very first line, before a single capability or a real
     * `Ledger` exists for the tick.
@@ -2092,12 +2177,18 @@ object Machine:
     * resumed-parked FIX) into `Gate`, `Gate`'s own RED retry into `Repair` and back, `Gate`'s GREEN
     * edge into `Review`, `Review`'s own REQUEST_CHANGES retry into `Repair` and its APPROVE edge
     * into `RouteDecision`, then the straight run `RouteDecision` to `CommitAndPush` to `OpenPr` to
-    * `CiWait` to `Merge` to `PostMergeCleanup`. `Gate` to `Review` and `Review` to `RouteDecision`
-    * are declared here even though `Review` is never a literal `Next.Goto` edge in the closures
-    * above (D1's own doc, above, has the reason it stays a direct `Runner.step` call against its own
-    * `Ledger`): the declared `Shape` is the honest statement of the TRUST flow this graph is meant
-    * to have, which is exactly what `Runner.validate` needs to see, not a literal transcription of
-    * which calls are, mechanically, a `Next.Goto` versus a plain method call.
+    * `CiWait` to `Merge` to `PostMergeCleanup`, plus `RouteDecision`'s own `Route.Parked` edge into
+    * `AskHuman` (issue #44). No further declared edge out of `AskHuman`: a probe hit on THIS graph
+    * never dispatches `Repair` for real (`finish`'s own `Route.Parked` closure has the invariant
+    * that makes that provable, not merely usual), it re-parks through `reparkKeepingReply` instead
+    * (that function's own doc), so the honest declared shape stops at `AskHuman` rather than naming an
+    * edge no execution of this graph ever walks. `Gate` to `Review` and
+    * `Review` to `RouteDecision` are declared here even though `Review` is never a literal
+    * `Next.Goto` edge in the closures above (D1's own doc, above, has the reason it stays a direct
+    * `Runner.step` call against its own `Ledger`): the declared `Shape` is the honest statement of
+    * the TRUST flow this graph is meant to have, which is exactly what `Runner.validate` needs to
+    * see, not a literal transcription of which calls are, mechanically, a `Next.Goto` versus a plain
+    * method call.
     *
     * Three more edges are declared here that an earlier version of this `Shape` omitted (issue #38
     * review, BLOCKER 1): `finish` (above) is also reached three other ways that skip `Gate`/`Review`
@@ -2143,6 +2234,15 @@ object Machine:
         Transition(Review, Repair(cfg)),
         Transition(Review, RouteDecision),
         Transition(RouteDecision, CommitAndPush),
+        // The one new edge issue #44 adds: `Route.Parked` into `AskHuman`, the same fact `finish`'s
+        // own `Route.Parked` branch now encodes as a real `Next.Goto` value (that code's own doc has
+        // the full reasoning). No `AskHuman -> Repair` transition: a probe hit on THIS graph never
+        // actually dispatches `Repair` (`finish`'s own doc has the invariant that makes that
+        // provable), it re-parks through `reparkKeepingReply` instead, so declaring an edge here that
+        // no execution ever walks would be exactly the "shape curated to look complete rather than a
+        // true statement of the graph" this function's own doc warns against for the three edges
+        // above it.
+        Transition(RouteDecision, AskHuman(cfg)),
         Transition(CommitAndPush, OpenPr),
         Transition(OpenPr, CiWait),
         Transition(CiWait, Merge),
@@ -2287,6 +2387,348 @@ object Machine:
       timeout = Timeout.Unbounded,
       probe = _ => None,
       run = input => NodeOutcome.Done(decideRoute(input.outcome, input.isClass1, input.failureKind))
+    )
+
+  /** `AskHuman`'s input (issue #44): `body` is the question comment `run` posts when no reply has
+    * arrived yet. A plain `String` field, not a fixed reference to `ParkBody`, is what makes this
+    * node describe "a workflow can hand control to a human and wait for a reply", the general
+    * capability the RFC sketch names, rather than one hard coded to the shipped pipeline's own
+    * wording; `finish` (below) is the one caller that happens to always pass `ParkBody`.
+    * `kindText`/`gateStatus` exist only so `run`'s own terminal log line can read exactly as the
+    * inline code it replaces did; a consumer node built the same way is free to pass whatever detail
+    * its own log line needs, or none at all.
+    *
+    * `marker` is likewise a plain `String`, not a fixed reference to `Machine.ParkMarker` (issue #44
+    * review, MAJOR: the probed marker must come from the node's own input, never a hardcoded
+    * constant, so a consumer graph posting its own question under its own marker gets a probe that
+    * hunts for THAT marker, never this file's). The real contract this type cannot enforce at compile
+    * time (issue #44 review, MINOR): the caller must build `body` so it genuinely contains `marker`,
+    * the way `ParkBody` genuinely starts with `ParkMarker` below; nothing here checks that at runtime
+    * either (`CONVENTIONS.md`: no `require` standing in for a real fix). A caller that gets the two
+    * out of sync still type-checks and runs, it just posts a question `probe` can never recognise as
+    * its own later, parking forever on what looks like an ordinary probe miss every tick after.
+    * `finish` (below) is the one caller that happens to always pass `Machine.ParkMarker` alongside
+    * `Machine.ParkBody`, which genuinely satisfies that contract (`ParkBody`'s own doc).
+    *
+    * No `resumedThisTick` field (issue #44 review, MAJOR; RFC #26 decision 6): a stored fact about
+    * which tick a caller happened to be on is exactly the "stored position" decision 6 forbids a
+    * probe to lean on. The replacement is a WORLD fact instead, but only on the path that genuinely
+    * SPENDS a reply: `start`'s own `resumeAuthors` branch posts `ReplyConsumedBody`, a fresh marker,
+    * the moment a resumed dispatch actually consumes one (that value's own doc). `finish`'s own
+    * `Route.Parked` closure below reaches this node too, but a probe hit on THAT edge can never spend
+    * the reply for real (that closure's own doc has the ledger invariant that makes this provable), so
+    * it deliberately posts no marker at all (`reparkKeepingReply`, not `parkIssue`; that function's own
+    * doc has the reason): the reply stays exactly where it was, so the NEXT tick's ordinary resume
+    * check finds it fresh, with a fresh budget, instead of a stale boundary silently discarding
+    * guidance nobody ever acted on (issue #44 review, MAJOR, round 2: the bug this fix replaces).
+    */
+  final case class AskHumanInput(
+      cur: Cursor,
+      issue: Int,
+      marker: String,
+      body: String,
+      kindText: String,
+      gateStatus: String
+  )
+
+  /** `AskHuman`'s output on a probe hit (issue #44 review, MAJOR: acceptance criterion 3, "comment
+    * text available to the next node", was met only on paper by the former `List[String]` of author
+    * logins alone). `text` is the accepted entries' own bodies, run through the SAME
+    * escape/defuse/truncate pipeline `runFixRound` already applies before splicing third-party
+    * comment text into a prompt (`escapeEntryGrammar`, then `defuseFenceCloser`, then
+    * `truncateEntry` at `commentShareChars`, joined by the same `\n\n---\n\n` separator): reusing
+    * that exact pipeline, rather than handing back raw comment bodies, is what keeps a consumer
+    * node's own splice from becoming an injection vector the same way `runFixRound`'s own doc
+    * explains for its `{{COMMENTS}}` slot (untrusted text must not become an instruction merely
+    * because it now arrives through a different node). `authors` is kept alongside `text`, not
+    * replaced by it: `resumeFailureBody` and this file's own log lines still need the accepted
+    * logins alone, without re-deriving them by re-parsing `text`.
+    */
+  final case class AskHumanReply(authors: List[String], text: String)
+
+  /** The three distinct answers one probe of `issue` against `marker` can reach (issue #44 review,
+    * MAJOR F2): `Node.probe`'s own type, fixed by `Kit.scala` (`I => Option[O]`), has no third case
+    * to carve out for "the world could not be read", so `AskHuman`'s own `probe` field folds
+    * `NoReply` and `Unreadable` into the SAME `None`. `askHumanRun` (below) re-derives THIS richer
+    * three-way answer on its own probe miss, specifically so its one decision that genuinely needs
+    * the distinction, whether posting a fresh marker is safe, can still tell the two apart even
+    * though `Runner.step`'s probe/run pair carries no channel to pass either the value or the reason
+    * from one call to the other (`Node`'s own doc: neither field can reach a fact the other
+    * computed). Paying for a second `gh` read on the rare tick that is genuinely unreadable is the
+    * honest cost of that design, not a stored position smuggled around it: RFC #26 decision 6's whole
+    * point is that nothing here ever carries a fact from one call to another, and an outage is rare
+    * and cheap to ask about twice, not a hot path worth bending this file's own architecture to shave
+    * a single read from.
+    */
+  private enum AskHumanProbe:
+    case Answered(reply: AskHumanReply)
+    case NoReply
+    case Unreadable(detail: String)
+
+  /** The pure half of "has a human already answered `AskHuman`'s own question on `issue`", read
+    * fresh from GitHub every call (RFC #26 decision 6: parking is the terminal state of ONE tick,
+    * never a stored position), with no logging of its own so a caller re-deriving the same answer a
+    * second time within one tick (`askHumanRun`'s own doc) never re-emits a line the first call
+    * already wrote. Reuses `isMarkerEntry`/`replySince`/`entryCountsAsReply`/`authorLogin`
+    * (`pickAndSetup`'s own predicate for "does this comment count as an accepted human reply")
+    * unchanged, rather than a second copy that could drift from it: there is exactly one
+    * implementation of that question in the whole codebase. `marker` travels as a parameter (issue
+    * #44 review, MAJOR), never `Machine.ParkMarker` read directly, so this answers exactly the
+    * question `AskHumanInput.marker` poses, whichever caller built it.
+    *
+    * `replySince`'s own fallback, "no marker anywhere means every comment counts as the reply", is
+    * safe at `pickAndSetup`'s call site only because that call site is already gated on `issue`
+    * currently carrying the `parked` label, external state that proves a marker was posted at some
+    * point (`replySince`'s own doc). This function carries no such gate: it is reached the FIRST time
+    * ANY issue reaches `Route.Parked`, before a marker has ever been posted for it, so trusting that
+    * fallback here would read an issue's ordinary, unrelated accepted-association discussion as the
+    * reply to a question nobody asked yet. `comments.exists(isMarkerEntry(...))` is checked first,
+    * and this answers `NoReply` unconditionally the moment it finds no marker at all, never falling
+    * into `replySince`'s "everything counts" arm.
+    */
+  private def askHumanProbeResult(issue: Int, marker: String)(using gh: GitHub): AskHumanProbe =
+    gh.viewerLogin() match
+      case None =>
+        AskHumanProbe.Unreadable(
+          "could not read the harness's own GitHub login (gh api user failed), cannot verify a reply against the park marker"
+        )
+      case Some(viewer) =>
+        gh.issueComments(issue) match
+          case None =>
+            AskHumanProbe.Unreadable("could not read comments to check for a human reply (gh failed)")
+          case Some(comments) =>
+            if !comments.exists(isMarkerEntry(marker, viewer, _)) then AskHumanProbe.NoReply
+            else
+              val accepted = replySince(marker, viewer, comments).filter(entryCountsAsReply)
+              if accepted.isEmpty then AskHumanProbe.NoReply
+              else
+                val share = commentShareChars(accepted.size)
+                val text = accepted
+                  .map(e => truncateEntry(defuseFenceCloser(escapeEntryGrammar(e)), share))
+                  .mkString("\n\n---\n\n")
+                AskHumanProbe.Answered(AskHumanReply(accepted.flatMap(authorLogin).distinct, text))
+
+  /** `AskHuman`'s own `probe` field body: `askHumanProbeResult` narrowed to the `Option[O]` shape
+    * `Node.probe` requires, with the one piece `askHumanProbeResult` deliberately does not do, the
+    * logging, done HERE instead, exactly once per tick (issue #44 review, MAJOR: a failed
+    * `gh.viewerLogin()` or `gh.issueComments()` must never silently read as "no reply", matching the
+    * discipline `pickAndSetup`'s own `ReplyCheck.UnreadableComments` holds itself to, `Machine.scala`'s
+    * own doc there). `askHumanRun`'s own re-derivation of `askHumanProbeResult` (its own doc) never
+    * logs a second time: `Runner.step` always calls `probe` before it ever calls `run` on the SAME
+    * node value (`Kit.scala`'s own `step`), so by the time `run` re-checks, this line has already
+    * been written once, for real, the only time it needs to be.
+    */
+  private def askHumanReply(issue: Int, marker: String)(using gh: GitHub, logger: Log): Option[AskHumanReply] =
+    askHumanProbeResult(issue, marker) match
+      case AskHumanProbe.Answered(reply) => Some(reply)
+      case AskHumanProbe.NoReply         => None
+      case AskHumanProbe.Unreadable(detail) =>
+        logger.log(
+          s"issue #$issue: $detail; parking without posting a fresh marker, since a marker would risk burying a reply this read could not see"
+        )
+        None
+
+  /** The park bookkeeping every genuine exit through `Route.Parked` performs regardless of whether a
+    * fresh marker comes with it (issue #44 review, MAJOR, round 2 of the fix): flips `issue` from
+    * `active` to `parked`, discards whatever the failed attempt staged, and emits the `PARK` status
+    * event. Factored out of what used to be one function, `parkIssue` (issue #44 review, BLOCKER): a
+    * probe HIT and a probe MISS both need every one of these three things, but only a probe miss may
+    * post a fresh marker (`parkIssue` below, `ParkMarker`'s own doc has the full reasoning), so the
+    * one part they must share is no longer entangled with the one part they must not.
+    */
+  private def parkBookkeeping(cur: Cursor, issue: Int)(using
+      gh: GitHub,
+      git: Git,
+      cfg: Config,
+      log: StatusLog,
+      logger: Log
+  )(using Faulting, Notify): Unit =
+    if !gh.editLabels(issue, add = List(cfg.labels.parked), remove = List(cfg.labels.active)) then
+      infraFault(
+        s"could not flip #$issue to parked (gh issue edit failed, does the '${cfg.labels.parked}' label exist?), infra fault, issue stays in-progress"
+      )
+    git.resetHardCleanToOriginMain()
+    emit(cur, "PARK", "ok", detail = s"issue=$issue")
+
+  /** The park bookkeeping a PROBE MISS performs (issue #44 review, BLOCKER, D1 of the original fix):
+    * posts `body` as a fresh marker comment (closing the reply boundary a later probe reads against,
+    * the same reasoning `ReplyConsumedBody`'s own doc gives for the OTHER consumption site in this
+    * file), then `parkBookkeeping`. Order (marker, then label, then reset) unchanged from the block
+    * this replaces (issue #28 review finding 5, round 3): a marker-post failure infra-faults having
+    * discarded nothing, so the next tick can still try again from whatever the failed attempt staged.
+    *
+    * Called from `askHumanRun`'s own probe-miss path below ONLY (issue #44 review, MAJOR, round 2 of
+    * the fix): a probe HIT reaching `Route.Parked` calls `reparkKeepingReply` instead, never this
+    * function, because posting a fresh marker here is exactly what would destroy a reply a probe hit
+    * just found (the review's own driven repro: `body` starts with `ParkMarker`, so `replySince` on
+    * every later tick finds nothing after it, silently discarding guidance a human already gave).
+    */
+  private def parkIssue(cur: Cursor, issue: Int, body: String, kindText: String, gateStatus: String)(using
+      gh: GitHub,
+      git: Git,
+      cfg: Config,
+      log: StatusLog,
+      logger: Log
+  )(using Faulting, Notify): LoopExit =
+    if !gh.issueComment(issue, body) then
+      infraFault(
+        s"could not post the park marker comment on #$issue (gh issue comment failed), infra fault, issue stays in-progress rather than becoming parked with no marker"
+      )
+    parkBookkeeping(cur, issue)
+    logger.log(s"issue #$issue -> parked ($kindText, gate $gateStatus), waiting on a human reply")
+    LoopExit.Parked
+
+  /** The park bookkeeping every path that must NOT post a fresh marker performs (issue #44 review,
+    * MAJOR, round 2 of the fix, the actual fix for the BLOCKER the review drove end to end, widened
+    * by round 3's F2 to a second caller): `parkBookkeeping` alone, plus a caller-built log line,
+    * deliberately posting no marker. Two distinct situations reach this function, never `parkIssue`
+    * (`ParkMarker`'s own doc has the full split): `finish`'s own `Route.Parked` closure, on a probe
+    * HIT, where `AskHuman`'s own probe already found a human reply sitting after the newest marker,
+    * and this specific graph can never spend it for real (that closure's own doc has the ledger
+    * invariant that makes that provable); and `askHumanRun`'s own probe-miss path, when the world
+    * itself could not be read (that function's own doc), where NEITHER "a reply is waiting" NOR "no
+    * reply is waiting" is a fact this tick can prove, so posting a marker would be exactly as
+    * dangerous as it is on the probe-hit path, for a different reason. Both share the one property
+    * that makes posting nothing the only honest move: whatever is or is not sitting after the newest
+    * marker stays exactly where it was, so the NEXT tick's ordinary resume check (`pickAndSetup`'s own
+    * `acceptedReplyAuthors`) reads it fresh, with that tick's own full repair budget to spend against
+    * it, the same as if this tick had never touched the issue at all. `logLine` is built by each
+    * caller, in full, rather than assembled here from shared fragments (issue #44 review round 2 had
+    * this take an `authors: List[String]` instead): the two callers' own reasons for re-parking
+    * without a marker are genuinely different sentences, not the same sentence with one word swapped,
+    * and forcing them through one shared template was what made the probe-hit wording ("a human reply
+    * ... is already waiting") silently wrong the moment a second, unrelated caller needed to reuse
+    * this function for a situation where no reply is known to exist at all.
+    */
+  private def reparkKeepingReply(cur: Cursor, issue: Int, logLine: String)(using
+      gh: GitHub,
+      git: Git,
+      cfg: Config,
+      log: StatusLog,
+      logger: Log
+  )(using Faulting, Notify): LoopExit =
+    parkBookkeeping(cur, issue)
+    logger.log(logLine)
+    LoopExit.Parked
+
+  /** `finish`'s former `Route.Parked` block, relocated verbatim then factored into `parkIssue`
+    * (issue #44): posts the question comment, flips `issue` to `parked`, discards the failed work and
+    * finishes with `LoopExit.Parked`. `notify: Notify` reaches this function through the ambient
+    * `Caps` this node's `run` body carries (`Caps.given`, imported file-wide), the same way every
+    * other capability `askHumanRun`'s own `using` clause names already does; `parkIssue` needs it for
+    * its own `infraFault` calls, and recovering a raw `Faulting` from `fault.label` (the same
+    * shortcut `Machine.Pick`'s own adapter takes, that value's own doc has the reason it is safe here)
+    * is what lets this function hand `parkIssue` the SAME fault channel `Fault.raise` would have used
+    * directly.
+    *
+    * Re-derives `askHumanProbeResult` before deciding which park path to take (issue #44 review,
+    * MAJOR F2): `Runner.step` already called `AskHuman`'s own `probe` field once this tick and got
+    * `None` back, or `run` would never have been reached at all, but `None` alone cannot tell "no
+    * reply yet" apart from "the world could not be read", the exact distinction `probe`'s own `Option`
+    * return type has no room to carry (`AskHumanProbe`'s own doc). A genuinely unreadable world takes
+    * the SAME no-marker path a probe HIT does, `reparkKeepingReply`, not `parkIssue`: posting `body`
+    * (which starts with `marker`) over an UNKNOWN answer would risk burying a reply this read simply
+    * failed to see, the identical hazard `finish`'s own `Route.Parked` closure already avoids on a
+    * genuine probe hit, for a different reason. Only a genuine, verified `NoReply` still reaches
+    * `parkIssue`: that is the one case where posting `body` is provably safe, because the read that
+    * would have found a reply, had one existed, actually succeeded and found none.
+    */
+  private def askHumanRun(
+      cur: Cursor,
+      issue: Int,
+      marker: String,
+      body: String,
+      kindText: String,
+      gateStatus: String
+  )(using
+      gh: GitHub,
+      git: Git,
+      cfg: Config,
+      log: StatusLog,
+      logger: Log,
+      notify: Notify
+  )(using fault: Fault): NodeOutcome[AskHumanReply] =
+    given Faulting = fault.label
+    askHumanProbeResult(issue, marker) match
+      case AskHumanProbe.Unreadable(_) =>
+        NodeOutcome.Stopped(
+          reparkKeepingReply(
+            cur,
+            issue,
+            s"issue #$issue: the world could not be re-verified for a human reply this tick (a GitHub " +
+              s"read failed); re-parking without a new marker in case a reply is already waiting behind " +
+              s"the newest one ($kindText, gate $gateStatus)"
+          )
+        )
+      case AskHumanProbe.NoReply | AskHumanProbe.Answered(_) =>
+        // `Answered` is unreachable here in practice (`probe` would have returned `Some` and `run`
+        // would never run), kept as a case rather than a wildcard so a future change to that
+        // invariant fails to compile here instead of silently posting a marker over a reply this
+        // very call just found (the same exhaustivity discipline `Route.Parked`'s own dead branch,
+        // above, is kept explicit for).
+        NodeOutcome.Stopped(parkIssue(cur, issue, body, kindText, gateStatus))
+
+  /** AskHuman, the node issue #44 adds: a workflow hands control to a human and waits, the one shape
+    * the RFC found the fixed pipeline could not run at all before the kit existed. `cost =
+    * Cost.NoDispatch`, load bearing, not merely honest: `Runner.step`'s own ledger check
+    * (`Kit.scala`) auto parks a `Cost.OneDispatch` node the moment the ledger is exhausted, with a
+    * DIFFERENT log line than `askHumanRun`'s own ("node 'AskHuman' parked: dispatch budget
+    * exhausted..." instead of "issue #N -> parked (...)"), a line that can therefore never appear in
+    * any golden this suite pins. `timeout = Timeout.Unbounded`: the code this node's `run` relocates
+    * carried no node level bound of its own either, only the ordinary `gh`/`git` calls it always
+    * made.
+    *
+    * `guard` stays the default, `Guard.Open`, correctly (this node never publishes outward, `Guard`'s
+    * own doc, `Kit.scala`), but "it posts a comment and waits" understates what a probe MISS actually
+    * does (issue #44 review, MAJOR F3): `askHumanRun` (its own doc) hard resets the consumer's
+    * working tree (`git.resetHardCleanToOriginMain()`, inside `parkBookkeeping`), mutates
+    * `cfg.labels.parked`/`cfg.labels.active` via `gh.editLabels`, and emits a `PARK` status event
+    * absent from any `StageSet` a consumer graph declares of its own (`shippedStages`'s own doc has
+    * the reason `banner.sh` only ever draws two chip rows; a foreign phase string simply never
+    * renders on either). A consumer wiring this node in gets ALL three side effects on every probe
+    * miss, not merely a comment: `RunnerSpec`'s own probe-MISS consumer test (issue #44 review F3)
+    * exercises this path from outside `Machine.shippedWorkflow` and asserts each one directly, so a
+    * reader of that test, not only this doc, sees the full shape.
+    *
+    * `probe` and `run` are two different questions answered from GitHub, never a stored position
+    * (`AskHumanProbe`'s own doc): whether a reply already arrived, and, only when it has not, posting
+    * the question and parking (or, on a world that could not be read at all, re-parking without a
+    * question, `askHumanRun`'s own doc). A probe hit therefore skips `askHumanRun` entirely, so none
+    * of the paragraph above happens INSIDE THIS NODE on that path; a caller whose own graph still has
+    * spare budget routes the value on to real work, and a caller like `finish` below, reached only
+    * once its own graph's budget is already known exhausted, calls `reparkKeepingReply` directly
+    * instead of this node's own `run` (that function's own doc has the reason the two paths post a
+    * marker differently), so the two paths still converge on identical label/tree/status bookkeeping
+    * without `AskHuman` itself having to guess which situation it is in.
+    *
+    * What a consumer graph can do with this node TODAY stops short of running it outside this library
+    * (issue #44 review, MAJOR, widened by round 3's F5): `AskHuman`, `AskHumanInput` and
+    * `AskHumanReply` are all public and type-check from a foreign package (`ConsumerBoundarySpec`'s
+    * own pin), so a consumer can name this node and wire it into their own `Workflow` right now, but
+    * actually walking that `Workflow` through `Runner.run` needs a `Runner.Ledger` AND a `Caps`, and
+    * NEITHER is buildable outside this package: `Ledger`'s own constructor stays `private[litterbox]`
+    * (RFC #26 decision 9: budget ownership belongs to the runner, not something this ticket reopens),
+    * and `Caps.agents` needs an `AgentDispatch`, itself `sealed` with its only living implementation's
+    * constructor `private[litterbox]` too (`Caps.scala`'s own doc on `LiveAgentDispatch`). This is a
+    * kit-wide, pre-existing gap, not something specific to `AskHuman`: every OTHER node in this file
+    * would hit the identical wall if it were public, `AskHuman` is simply the first one this ticket
+    * makes public enough to notice it. Closing that gap is deliberately left to the publishing
+    * tickets (#41, #43), not this one.
+    *
+    * Public, unlike every sibling node in this file (`Gate`, `Repair`, `Review`, ..., all `private`
+    * or `private[litterbox]`): issue #44's own acceptance criterion 1 is that `AskHuman` is usable in
+    * a CONSUMER graph, outside this package entirely, and every sibling node stays `Machine`-internal
+    * because nothing about them needs proving, or naming, from outside `shippedWorkflow`'s own edges.
+    * `AskHumanInput`/`AskHumanReply` are public for the same reason: a consumer graph naming `AskHuman`
+    * has to be able to name its input and output types too.
+    */
+  def AskHuman(cfg: Config): Node[AskHumanInput, AskHumanReply] =
+    Node(
+      name = "AskHuman",
+      cost = Cost.NoDispatch,
+      timeout = Timeout.Unbounded,
+      probe = input => askHumanReply(input.issue, input.marker),
+      run = input => askHumanRun(input.cur, input.issue, input.marker, input.body, input.kindText, input.gateStatus)
     )
 
   /** `CommitAndPush`'s input (issue #36): the two values `commitAndPush` needs. */
