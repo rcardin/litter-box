@@ -20,14 +20,12 @@ what each subcommand does. A tagged release publishes a binary, a sandbox base i
 homebrew formula together, from one `.github/workflows/release.yml`; see
 [#6](https://github.com/rcardin/litter-box/issues/6) for the packaging work that made that true.
 
-What is still missing: until the first release under this workflow is cut, and `rcardin/homebrew-tap`
-(the repository the formula publishes to) exists, there is no formula to install. Check the
+[Install](#install) is the fastest path to a working binary. Check the
 [releases page](https://github.com/rcardin/litter-box/releases) and the
 [ghcr package page](https://github.com/rcardin/litter-box/pkgs/container/litter-box-base) for what
-is actually published right now rather than trusting a snapshot written here. [Install](#install)
-becomes the fastest path to a working binary once both are true; until then, build from source with
-scala-cli (`scala-cli --power package . -o lb --assembly`, see this repo's own CLAUDE.md for the
-full command reference).
+is published right now rather than trusting a version number written here. Building from source with
+scala-cli stays the contributor path (`scala-cli --power package . -o lb --assembly`, see this
+repo's own CLAUDE.md for the full command reference).
 
 ### Version policy
 
@@ -38,18 +36,28 @@ and read a release's notes before bumping past it.
 
 ## Install
 
-Live from the first tagged release under this workflow onward, and only once `rcardin/homebrew-tap`
-exists; see [docs/homebrew-tap-setup.md](docs/homebrew-tap-setup.md) for the manual setup that
-repository and its push credential still need. Until both are done, `brew tap rcardin/tap` 404s;
-check the [releases page](https://github.com/rcardin/litter-box/releases) for whether a tag has
-been cut and `gh repo view rcardin/homebrew-tap` for whether the tap exists, rather than trusting a
-snapshot written here. The commands below are what a consumer runs once both are true.
+Every published version is on the [releases page](https://github.com/rcardin/litter-box/releases);
+the formula in `rcardin/homebrew-tap` tracks whichever one is newest. See
+[docs/homebrew-tap-setup.md](docs/homebrew-tap-setup.md) for how that tap and its push credential
+are set up, which matters if you are forking this project rather than installing it.
 
 ```bash
 brew tap rcardin/tap
+brew trust rcardin/tap
 brew install litter-box
 litter-box init
 ```
+
+The `trust` line is not optional and not a workaround. Homebrew 6 refuses to load a formula from any
+tap outside the official ones until you say so explicitly, failing with `Refusing to load formula
+rcardin/tap/litter-box from untrusted tap rcardin/tap`. A formula is Ruby that brew executes on your
+machine with your permissions, and a tap is a GitHub repository whose owner can change that Ruby at
+any time, so brew is asking you to decide whether you trust this project with that. It is the same
+question this project asks about the code its own agents write, which is why the answer belongs to
+you and the step is documented here rather than hidden inside an install script. Trusting is
+recorded once per machine in `~/.homebrew/trust.json`, or under `$XDG_CONFIG_HOME/homebrew` if that
+is set. `brew trust --formula rcardin/tap/litter-box` narrows the decision to this one formula
+instead of the whole tap, and is the tighter choice if you want it.
 
 Bare `brew install litter-box`, without the `tap` line first, resolves against `homebrew-core`, the
 tap brew searches by default, and litter-box is not in it: `homebrew-core` has its own review bar for
