@@ -196,8 +196,9 @@ class InitSpec extends AnyFlatSpec with Matchers:
     // `include` alone is too weak here: a template carrying both a correctly rendered
     // `ARG BASE_IMAGE=` line AND a leftover hardcoded one would still contain the rendered value as
     // a substring, so `include` would pass over a scaffold docker actually reads the WRONG line
-    // from (an earlier `ARG BASE_IMAGE=` in the file wins, since docker keeps the last assignment
-    // before FROM, which is not necessarily the one this assertion found). Two checks close that:
+    // from (the last `ARG BASE_IMAGE=` line before FROM is the one docker actually reads, so a
+    // leftover duplicate placed after the correct line would win, and that is not necessarily the
+    // one this assertion found). Two checks close that:
     // no `{{` marker survives rendering at all, and exactly one line starts with `ARG BASE_IMAGE=`.
     //
     // Still not enough on its own (review round two, MINOR): the splice value passed to

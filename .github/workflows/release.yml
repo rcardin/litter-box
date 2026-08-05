@@ -257,8 +257,30 @@ jobs:
           # $tap_dir entirely, and is what a `git reset --hard` inside $tap_dir can never touch.
           formula_src="$PWD/litter-box.rb"
 
+          # The token used to sit directly inside the clone URL (flagged in review): that put it in
+          # the process argv of every git invocation, baked itself permanently into $tap_dir's own
+          # .git/config as part of the origin remote, and risked surfacing in git's own stderr on a
+          # failed clone, three places a redacted secrets log does nothing to protect. GIT_ASKPASS
+          # is the fix: git calls this helper only at the moment it actually needs a credential, the
+          # helper reads TAP_TOKEN from the environment GitHub Actions already exported for this
+          # step and prints it straight to git over a pipe, so the token never appears in a URL, a
+          # command argument, or a file on disk. The askpass script's own path is not a secret, only
+          # what it prints is, so a plain mktemp file is fine for it, and the username alone in the
+          # clone URL below is not a secret either, it is the password that askpass supplies.
+          askpass="$(mktemp)"
+          cat > "$askpass" <<'EOF'
+          #!/usr/bin/env bash
+          exec printf %s "$TAP_TOKEN"
+          EOF
+          chmod +x "$askpass"
+          export GIT_ASKPASS="$askpass"
+          # Without this, a git built to fall back to an interactive prompt when GIT_ASKPASS still
+          # left it wanting a credential would hang the job against a terminal that will never
+          # answer, instead of failing fast the way a CI run should.
+          export GIT_TERMINAL_PROMPT=0
+
           tap_dir="$(mktemp -d)"
-          if ! git clone --depth 1 "https://x-access-token:${TAP_TOKEN}@github.com/rcardin/homebrew-tap.git" "$tap_dir" 2>clone.err; then
+          if ! git clone --depth 1 "https://x-access-token@github.com/rcardin/homebrew-tap.git" "$tap_dir" 2>clone.err; then
             cat clone.err >&2
             if grep -qi "not found\|404" clone.err; then
               echo "::error::rcardin/homebrew-tap does not exist yet, or this token cannot see it (git clone reported it missing). See docs/homebrew-tap-setup.md for the manual setup this job depends on." >&2
