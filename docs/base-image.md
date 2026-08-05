@@ -1,7 +1,9 @@
 # `ghcr.io/rcardin/litter-box-base`
 
 The part of the litter-box gate sandbox that is not about any one project. Built from
-`resources/sandbox/base.Dockerfile`, published on tag by `.github/workflows/base-image.yml`.
+`resources/sandbox/base.Dockerfile`, published on tag by the `image` job in
+`.github/workflows/release.yml`, which also builds the binary and the homebrew formula from that
+same tag (issue #6).
 
 ## What it guarantees
 
@@ -30,7 +32,7 @@ The part of the litter-box gate sandbox that is not about any one project. Built
 ## Using it
 
 ```dockerfile
-ARG BASE_IMAGE=ghcr.io/rcardin/litter-box-base:0.1.0
+ARG BASE_IMAGE=ghcr.io/rcardin/litter-box-base:0.1.1
 FROM ${BASE_IMAGE}
 
 USER root
@@ -38,6 +40,15 @@ USER root
 USER gate
 WORKDIR /workspace
 ```
+
+The tag above matches this binary's own version (`LitterBox.Version`), and becomes pullable once
+that version is released, not before. Until the matching tag is cut, whatever `image` last
+published under an earlier tag stays live under `latest`; check the
+[ghcr package page](https://github.com/rcardin/litter-box/pkgs/container/litter-box-base) for the
+tags actually published right now rather than trusting a snapshot written here. This does not
+block a normal run either way: as the next paragraph explains, `build-image.sh` overrides
+`BASE_IMAGE` with a locally built tag, so `ghcr.io` is never consulted on that path regardless of
+which tags exist there yet.
 
 `litter-box init` writes exactly this file to `.litter-box/Dockerfile` (skeleton written, middle
 left to you), and `build-image.sh` builds the gate image from it, that file, with no fallback. The

@@ -1,0 +1,28 @@
+class LitterBox < Formula
+  # Kept under 80 characters because `brew audit --strict` rejects a longer one, and a formula that
+  # cannot pass audit is one that can never move to a wider tap later.
+  desc "Distrustful autonomous coding loop: sandbox a worker, gate it, cold review it"
+  homepage "https://github.com/rcardin/litter-box"
+  url "{{URL}}"
+  sha256 "{{SHA256}}"
+  version "{{VERSION}}"
+  license "MIT"
+
+  # The published binary is a self-executing jar (a scala-cli --assembly artifact): its own header
+  # execs `java`, off JAVA_HOME if set and off PATH otherwise. openjdk@21 is keg-only in Homebrew,
+  # so nothing puts it on PATH by itself, and the install step below points JAVA_HOME at it
+  # explicitly rather than depending on whatever `java` a user's shell happens to resolve first.
+  depends_on "openjdk@21"
+
+  def install
+    libexec.install "litter-box"
+    chmod 0755, libexec/"litter-box"
+    (bin/"litter-box").write_env_script libexec/"litter-box", JAVA_HOME: Formula["openjdk@21"].opt_prefix
+  end
+
+  test do
+    # `--help` is the one subcommand that touches no repo, no Docker and no credential, so it is
+    # the whole of what a formula test can assert without faking a GitHub remote.
+    assert_match "usage:", shell_output("#{bin}/litter-box --help")
+  end
+end

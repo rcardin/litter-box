@@ -24,9 +24,12 @@ object Init:
     *
     * It is a constant because the fact is asserted here in five places and DECIDED in neither: the
     * base image is built `FROM eclipse-temurin:21-jdk` in `resources/sandbox/base.Dockerfile`, and
-    * the tag consumers pin lives in `resources/scaffold/Dockerfile` as `ARG BASE_IMAGE`. Bump those
-    * and this line together; leaving them apart is the #13 defect in miniature, a fact restated in
-    * more places than it is known, with no compiler to notice the drift. A test does: `InitSpec`'s
+    * the tag consumers pin, `ARG BASE_IMAGE` in `resources/scaffold/Dockerfile.txt`, is rendered from
+    * `LitterBox.BaseImage` (issue #6) rather than hardcoded there, so THAT drift is closed by
+    * construction; the JDK major version is not, since nothing derives `21` from the image's own
+    * `FROM` line. Bump the image and this line together; leaving them apart is the #13 defect in
+    * miniature, a fact restated in more places than it is known, with no compiler to notice the
+    * drift. A test does: `InitSpec`'s
     * "be measured against the JDK the base image actually ships" reads the `FROM` line of
     * `resources/sandbox/base.Dockerfile` back and asserts this constant still agrees with it, so a
     * bumped base image goes red there instead of shipping a scaffold that quotes a JDK the image no
@@ -210,6 +213,14 @@ object Init:
     * an ENTRYPOINT here would be dead, and the sbt preset's `ENTRYPOINT ["sbt"]` was worse than
     * dead: `run-fast-gate.sh` appended sbt's own flags to whatever it was, which put the build-tool
     * coupling straight back one layer below where #4 removed it.
+    *
+    * The resource on disk is `Dockerfile.txt`, not `Dockerfile`: the same reason `loopScala`, below,
+    * reads `loop.scala.txt` rather than `loop.scala`. This file was never valid Dockerfile syntax to
+    * begin with, `{{PROJECT_LAYER}}` alone, sitting on its own line as an unknown instruction, made
+    * it so long before `{{BASE_IMAGE}}` existed as a second hole; adding that hole does not change
+    * what was already true. A name that claimed this were a real `Dockerfile` would invite a hand-run
+    * `docker build` against the artifact resource itself, unrendered holes and all, rather than
+    * against what `init` actually writes to `.litter-box/Dockerfile`.
     */
   private def dockerfile(d: Detected): String =
     val jdkNote = d.jdk match
@@ -242,7 +253,11 @@ object Init:
          |# Pin every version exactly so an image rebuild is reproducible, and make sure whatever you
          |# install lands on PATH for the non-root `gate` user, because gate.fast runs as that user
          |# inside this image.""".stripMargin
-    Machine.renderTemplate(resource("Dockerfile"), "PROJECT_LAYER" -> layer)
+    Machine.renderTemplate(
+      resource("Dockerfile.txt"),
+      "PROJECT_LAYER" -> layer,
+      "BASE_IMAGE"    -> s"ARG BASE_IMAGE=${LitterBox.BaseImage}"
+    )
 
   /** The scaffolded loop entry point (issue #43). One hole, `{{USING_DEP}}`, filled with the whole
     * `//> using dep` line rendered off `LitterBox.Coordinate`, the same hole mechanism `configConf`/

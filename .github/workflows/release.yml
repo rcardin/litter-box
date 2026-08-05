@@ -1,0 +1,360 @@
+name: release
+
+# Tag triggered only, same rule the base image build always followed: a release is a published
+# artifact other people depend on, so a branch push never cuts one, only a tag does.
+#
+# This workflow folds what used to be the separate base-image.yml into itself (issue #6). The
+# binary and the sandbox image have to move together on one tag, since a scaffolded Dockerfile now
+# pins the image tag straight off the binary's own LitterBox.Version (see src/LitterBox.scala). Two
+# workflows both firing on push tags: ["v*"] were two independent releases that happened to share a
+# trigger, with nothing to stop them landing at different times or one failing silently while the
+# other shipped.
+on:
+  push:
+    tags: ["v*"]
+
+# Two tags pushed close together must not interleave: the `formula` job below reads and pushes to
+# an external repository it does not own the history of, and two runs racing there can leave the
+# tap on the older version even though both pushes individually succeeded. `cancel-in-progress:
+# false` on purpose: cancelling the older run mid image publish or mid formula push would leave
+# ghcr or the tap in a half finished state, worse than the two runs simply queueing.
+#
+# What this does NOT buy: GitHub keeps only one PENDING run per concurrency group, not an unbounded
+# queue. Three tags pushed in quick succession run the first, queue the third, and CANCEL the
+# second outright while it waits, no image, no release and no formula for it, with nothing louder
+# than a grey cancelled badge on the run to say so. Space tags out; see docs/homebrew-tap-setup.md.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+# Every job starts with no token permissions at all and opts into exactly what it needs. A tag push
+# workflow is the highest leverage target in this repo: it is the one that can publish a binary, an
+# image and a release under the project's name, so the default here is the opposite of ci.yml's.
+permissions: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      sha256: ${{ steps.hash.outputs.sha256 }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: coursier/setup-action@039f736548afa5411c1382f40a5bd9c2d30e0383 # v1.3.9
+        with:
+          jvm: temurin:21
+          apps: scala-cli
+
+      # The gate before anything ships: a release cut off a red suite is worse than no release at
+      # all. Every other job that can publish something public (`image`, `release`, `formula`)
+      # names this job in its own `needs:`, which is what makes "before a tag's artifacts go
+      # anywhere public" a guarantee GitHub Actions enforces rather than a fact stated in a comment
+      # and left to the job graph to happen to agree with.
+      - run: scala-cli test .
+
+      # LitterBox.Version and the pushed tag are two statements of one fact: this constant is what
+      # a scaffolded Dockerfile's ARG BASE_IMAGE and a rendered homebrew formula's version both come
+      # from, so the binary's copy of the fact is the one every consumer inherits, not the tag. Tag
+      # and constant have drifted before in this repo. Failing here, before anything is packaged,
+      # keeps that drift from ever reaching a published artifact again.
+      - name: tag must match LitterBox.Version
+        run: |
+          src_version="$(sed -n 's/.*val Version: String = "\(.*\)".*/\1/p' src/LitterBox.scala)"
+          tag_version="${GITHUB_REF_NAME#v}"
+          if [ "$src_version" != "$tag_version" ]; then
+            echo "::error::tag v$tag_version does not match LitterBox.Version \"$src_version\" in src/LitterBox.scala. Bump the constant, or fix the tag, so the two agree before releasing." >&2
+            exit 1
+          fi
+
+      - run: scala-cli --power package . --assembly -o litter-box --force
+
+      - id: hash
+        run: echo "sha256=$(sha256sum litter-box | cut -d ' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: litter-box
+          path: litter-box
+          if-no-files-found: error
+
+  smoke:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    # Deliberately a job of its own rather than a step appended to build: build's runner has
+    # scala-cli on PATH from coursier/setup-action, so a "./litter-box --help" that passed there
+    # would prove nothing about what issue #6 actually asks for, that the shipped binary runs on a
+    # machine carrying only a JDK, with no compile step and no scala-cli anywhere on PATH. setup-java
+    # here installs that JDK and nothing else, which is what makes this the literal check the issue
+    # names rather than a restatement of build's own success.
+    steps:
+      - uses: actions/setup-java@d7793b545071e98d581d3bf084a51c3213318a07 # v4.9.0
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: litter-box
+
+      - run: chmod +x litter-box
+
+      # A nonzero exit here fails this step, and a failed step fails the job, so a run that does not
+      # exit 0 stops the release right here. Nothing further is needed to assert it.
+      - run: ./litter-box --help
+
+      # `--help` reads no embedded resource at all (Main.scala handles Command.Help before any
+      # resource read, config load or filesystem touch), so a smoke test that stopped there would
+      # stay green even if `resources/` fell out of the packaged classpath entirely, and every
+      # `brew install && litter-box init` would fail with nothing here to have caught it. `init`
+      # is the one subcommand that reads scaffold/*, so running it against a fresh directory and
+      # asserting the scaffold actually landed is what closes that gap.
+      - name: litter-box init in a fresh directory
+        run: |
+          bin="$PWD/litter-box"
+          work="$(mktemp -d)"
+          cd "$work"
+          git init -q .
+          "$bin" init
+          test -f .litter-box/config.conf
+          test -f .litter-box/Dockerfile
+          test -f .litter-box/loop.scala
+          test -f .litter-box/prompts/conventions.md
+          test -f .litter-box/allowlist
+          test -f .litter-box/.env.example
+          test -f .litter-box/.gitignore
+          # `litter-box run --dry-run` is issue #6's own Done criterion alongside `init`, and is
+          # deliberately NOT exercised here. Main.scala's runLoop preflight requires a `claude`
+          # binary on PATH and a real CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY before it can
+          # reach its own dry-run stop point, neither of which this runner has or should be given
+          # one for a smoke test. Faking either would prove nothing about the packaged assembly
+          # that a mocked environment did not already assert in `test/`, so this step stops at
+          # what it can check honestly rather than faking the rest.
+
+  image:
+    # Gated on `build` and `smoke` rather than merely triggered alongside them: before this
+    # `needs:` existed, `image` ran in parallel with `build`, so a red test suite in `build` did
+    # not stop `image` from still publishing `ghcr.io/rcardin/litter-box-base:<version>` and moving
+    # `:latest`, leaving a published image with no corresponding release at all. Waiting on the
+    # same two jobs `release` already waits on keeps the ghcr publish behind the identical gate the
+    # binary and the formula are.
+    needs: [build, smoke]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
+        with:
+          images: ghcr.io/rcardin/litter-box-base
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: resources/sandbox
+          file: resources/sandbox/base.Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  release:
+    needs: [build, smoke, image]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: litter-box
+
+      # softprops/action-gh-release is the highest leverage target in this repo: the only step
+      # anywhere in this workflow granted `contents: write`, on a job that runs off a tag push
+      # nobody has to approve. `body:` below is a YAML input the action reads as text and posts as
+      # the release description; it is not a `run:` shell body, so `github.ref_name` reaching it
+      # through `${{ }}` is a string substitution GitHub performs before the action ever runs, not
+      # a shell interpolation a crafted ref name could break out of the way it could inside `run:`.
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          files: litter-box
+          body: |
+            litter-box ${{ github.ref_name }}
+
+            Version policy: this project ships 0.x. No stability promise holds until 1.0, so a
+            breaking change can land in any 0.x release. Pin an exact version if that matters to
+            you, and read the release notes before bumping.
+
+            sha256 (litter-box): ${{ needs.build.outputs.sha256 }}
+
+  formula:
+    # `release` and `build` both, and both `needs.*` references below are read from `build`: job
+    # outputs are not transitively visible, so declaring `needs: release` alone would make
+    # `needs.build.outputs.*` unresolved even though `release` itself depends on `build`. `release`
+    # stays in the list for ordering, not for its outputs: the formula's URL points at a GitHub
+    # release asset, so the release has to exist before the formula is worth publishing, even
+    # though nothing here reads a `release` output.
+    needs: [release, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # Fails loudly rather than silently skipping: an `if:` guard on the job would leave a tag
+      # pushed with a binary and an image but no updated formula, and nothing in the run's own
+      # status would say why. A missing secret is an operator problem to fix, not a reason to let
+      # the tap quietly fall behind.
+      - name: require HOMEBREW_TAP_TOKEN
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -z "$TAP_TOKEN" ]; then
+            echo "::error::HOMEBREW_TAP_TOKEN is not set. The formula for this release was not pushed to rcardin/homebrew-tap. Add the secret and re-run this job. See docs/homebrew-tap-setup.md." >&2
+            exit 1
+          fi
+
+      # sha256 and version are read from `needs.build.outputs`, the same job `release` read them
+      # from, rather than recomputed here against a freshly downloaded copy of the artifact: one
+      # fact stated once. This job no longer downloads the binary at all, since nothing below needs
+      # its bytes, only the sha256 `build` already hashed them into.
+      - name: render the formula
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+          SHA256: ${{ needs.build.outputs.sha256 }}
+          REPO: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          url="https://github.com/${REPO}/releases/download/${REF_NAME}/litter-box"
+          sed -e "s#{{VERSION}}#$VERSION#g" \
+              -e "s#{{URL}}#$url#g" \
+              -e "s#{{SHA256}}#$SHA256#g" \
+              .github/formula/litter-box.rb.template > litter-box.rb
+
+      - name: push the rendered formula to rcardin/homebrew-tap
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          # Captured before the only `cd` below, so it stays valid however many times the loop
+          # further down reuses it: the rendered formula lives in the job's own checkout, outside
+          # $tap_dir entirely, and is what a `git reset --hard` inside $tap_dir can never touch.
+          formula_src="$PWD/litter-box.rb"
+
+          # The token used to sit directly inside the clone URL (flagged in review): that put it in
+          # the process argv of every git invocation, baked itself permanently into $tap_dir's own
+          # .git/config as part of the origin remote, and risked surfacing in git's own stderr on a
+          # failed clone, three places a redacted secrets log does nothing to protect. GIT_ASKPASS
+          # is the fix: git calls this helper only at the moment it actually needs a credential, the
+          # helper reads TAP_TOKEN from the environment GitHub Actions already exported for this
+          # step and prints it straight to git over a pipe, so the token never appears in a URL, a
+          # command argument, or a file on disk. The askpass script's own path is not a secret, only
+          # what it prints is, so a plain mktemp file is fine for it, and the username alone in the
+          # clone URL below is not a secret either, it is the password that askpass supplies.
+          askpass="$(mktemp)"
+          cat > "$askpass" <<'EOF'
+          #!/usr/bin/env bash
+          exec printf %s "$TAP_TOKEN"
+          EOF
+          chmod +x "$askpass"
+          export GIT_ASKPASS="$askpass"
+          # Without this, a git built to fall back to an interactive prompt when GIT_ASKPASS still
+          # left it wanting a credential would hang the job against a terminal that will never
+          # answer, instead of failing fast the way a CI run should.
+          export GIT_TERMINAL_PROMPT=0
+
+          tap_dir="$(mktemp -d)"
+          if ! git clone --depth 1 "https://x-access-token@github.com/rcardin/homebrew-tap.git" "$tap_dir" 2>clone.err; then
+            cat clone.err >&2
+            if grep -qi "not found\|404" clone.err; then
+              echo "::error::rcardin/homebrew-tap does not exist yet, or this token cannot see it (git clone reported it missing). See docs/homebrew-tap-setup.md for the manual setup this job depends on." >&2
+            else
+              echo "::error::git clone of rcardin/homebrew-tap failed for a reason other than a missing repository; see the log above." >&2
+            fi
+            exit 1
+          fi
+          cd "$tap_dir"
+          git config user.name "litter-box-release"
+          git config user.email "actions@users.noreply.github.com"
+
+          # The push target below reads the tap's own default branch off the remote rather than
+          # assuming the `main` docs/homebrew-tap-setup.md tells a human to create by hand (review
+          # round two, MAJOR): that document is a one time setup instruction, not something this job
+          # verifies against, so a tap whose default branch ended up different from `main` would
+          # otherwise get every formula pushed to a branch nobody reads while `brew tap` keeps
+          # cloning the real default, unchanged, with no failing job anywhere to say so.
+          branch="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##')"
+          if [ -z "$branch" ]; then
+            branch="$(git remote show origin 2>/dev/null | sed -n 's/^ *HEAD branch: //p')"
+          fi
+          if [ -z "$branch" ] || [ "$branch" = "(unknown)" ]; then
+            # The one case a real default genuinely does not exist yet to read: a brand new tap
+            # repository with no commits at all has nothing for the remote to advertise as HEAD.
+            # `main` is only a fallback for that, matching what docs/homebrew-tap-setup.md tells a
+            # human to create, never a stand in for an answer this job could otherwise have read.
+            branch="main"
+          fi
+
+          mkdir -p Formula
+          cp "$formula_src" "Formula/litter-box.rb"
+          git add Formula/litter-box.rb
+          if git diff --cached --quiet; then
+            echo "formula unchanged, nothing to push"
+            exit 0
+          fi
+          git commit -m "litter-box ${REF_NAME}"
+
+          # Two tags landing close together race here: both `formula` runs start from the same tip,
+          # and the loser's push is rejected as not a fast forward. Rebase used to be the recovery,
+          # and always died on it (review round two, MAJOR): the formula is a GENERATED file, not
+          # one with a real merge to resolve, so two runs both rewriting the same `version` and
+          # `sha256` lines hand rebase an actual conflict on those exact lines every single time,
+          # which is the retry loop failing on attempt one against the precise race it exists to
+          # survive. Reset is the right primitive instead: a retry throws away the loser's stale
+          # base entirely, catches up to the winner's tip, and reapplies the one change this job
+          # ever makes by copying the already rendered formula back in from `$formula_src`, which
+          # `git reset --hard` cannot touch because it never lived inside `$tap_dir` to begin with.
+          #
+          # Pushing to an explicit ref, not a bare `git push`, is also what lets the very first push
+          # of a brand new tap succeed: before its first commit the clone above lands on an unborn
+          # branch with nothing to track, and a bare `git push` fails with "The current branch has
+          # no upstream branch" regardless of how correctly `branch` was resolved.
+          attempt=1
+          max_attempts=5
+          until git push origin "HEAD:$branch"; do
+            if [ "$attempt" -ge "$max_attempts" ]; then
+              echo "::error::could not push to rcardin/homebrew-tap after $max_attempts attempts, most likely still racing another release" >&2
+              exit 1
+            fi
+            git fetch origin "$branch"
+            git reset --hard "origin/$branch"
+            # A tap whose tip predates its first ever formula push has no Formula/ directory at
+            # all, and `git reset --hard` just pruned it back out of the working tree along with
+            # everything else origin doesn't have yet: the `cp` right below needs it to exist.
+            mkdir -p Formula
+            cp "$formula_src" "Formula/litter-box.rb"
+            git add Formula/litter-box.rb
+            if git diff --cached --quiet; then
+              echo "formula on origin/$branch already matches this release after catching up, nothing left to push"
+              exit 0
+            fi
+            git commit -m "litter-box ${REF_NAME}"
+            attempt=$((attempt + 1))
+            sleep $((attempt * 2))
+          done

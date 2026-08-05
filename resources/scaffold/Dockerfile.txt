@@ -20,7 +20,7 @@
 #
 # BASE_IMAGE is overridden to a locally built tag when litter-box builds this file, so a run never
 # needs the registry; the default below is what a hand-run `docker build` gets.
-ARG BASE_IMAGE=ghcr.io/rcardin/litter-box-base:0.1.0
+ARG BASE_IMAGE={{BASE_IMAGE}}
 FROM ${BASE_IMAGE}
 
 # root for the install below only. The image MUST end back on `gate`: the fast gate runs as that

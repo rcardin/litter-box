@@ -5,17 +5,72 @@ on:
     branches: [main]
   pull_request:
 
+# Neither job below writes anything back (no push, no release, no registry, no PR comment), so both
+# read contents only from the top rather than inheriting the repository default, which is commonly
+# read and write on contents and would hand that scope to the assembly smoke job's freshly built
+# binary for no reason it needs.
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # The suite runs entirely over the in-memory handlers in test/Recorder.scala: no Docker, no
       # `gh`, no Claude credentials. The Docker-dependent scripts under sandbox/test/ stay manual.
-      - uses: coursier/setup-action@v1
+      - uses: coursier/setup-action@039f736548afa5411c1382f40a5bd9c2d30e0383 # v1.3.9
         with:
           jvm: temurin:21
           apps: scala-cli
 
       - run: scala-cli test .
+
+  assembly-smoke:
+    runs-on: ubuntu-latest
+    # `.github/workflows/release.yml` is the one place `--assembly` used to be built at all, and a
+    # tag push is the one path in this whole pipeline that cannot simply be retried: a release cut
+    # from a broken assembly needs the tag deleted and recreated to try again. Building and smoke
+    # testing the assembly on every PR catches that class of break while it is still cheap to fix,
+    # at the cost of one extra `scala-cli --power package` per PR. Kept cheap on purpose: this runs
+    # on the same scala-cli equipped runner as `test`, unlike release.yml's own `smoke` job, which
+    # goes further and proves the binary runs on a machine with only a JDK on PATH; that stronger
+    # claim stays release-only, since it is the tag path this job exists to protect, not restate.
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: coursier/setup-action@039f736548afa5411c1382f40a5bd9c2d30e0383 # v1.3.9
+        with:
+          jvm: temurin:21
+          apps: scala-cli
+
+      - run: scala-cli --power package . --assembly -o litter-box --force
+
+      - run: chmod +x litter-box
+
+      - run: ./litter-box --help
+
+      # `--help` reads no embedded resource (Main.scala answers Command.Help before any resource
+      # read touches the classpath); `init` is the subcommand that actually reads scaffold/*, so
+      # running it against a fresh directory and asserting the scaffold landed is what would catch
+      # `resources/` falling out of the packaged jar, the way `--help` alone could not.
+      - name: litter-box init in a fresh directory
+        run: |
+          bin="$PWD/litter-box"
+          work="$(mktemp -d)"
+          cd "$work"
+          git init -q .
+          "$bin" init
+          test -f .litter-box/config.conf
+          test -f .litter-box/Dockerfile
+          test -f .litter-box/loop.scala
+          test -f .litter-box/prompts/conventions.md
+          test -f .litter-box/allowlist
+          test -f .litter-box/.env.example
+          test -f .litter-box/.gitignore
+          # `litter-box run --dry-run` is not exercised here either, for the same reason
+          # release.yml's own `smoke` job gives: it needs a real `claude` binary on PATH and a
+          # real credential before Main.scala's preflight lets it reach its own dry-run stop
+          # point, and faking either would not prove anything the in-memory test suite has not
+          # already asserted.

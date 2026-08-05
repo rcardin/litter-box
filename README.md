@@ -14,14 +14,85 @@ for the design record.
 
 ## Status
 
-`litter-box init`, `litter-box eject`, `litter-box watch` and `litter-box tail` exist and work — see
-[Getting started](#getting-started) and [Watching a run](#watching-a-run).
-What is still missing is a published binary: there is no `brew install litter-box` yet, so for now
-you build one from a checkout. Tracked as [#6](https://github.com/rcardin/litter-box/issues/6).
+`litter-box init`, `litter-box eject`, `litter-box run`, `litter-box watch` and `litter-box tail`
+exist and work; see [Getting started](#getting-started) and [Watching a run](#watching-a-run) for
+what each subcommand does. A tagged release publishes a binary, a sandbox base image and a
+homebrew formula together, from one `.github/workflows/release.yml`; see
+[#6](https://github.com/rcardin/litter-box/issues/6) for the packaging work that made that true.
+
+What is still missing: until the first release under this workflow is cut, and `rcardin/homebrew-tap`
+(the repository the formula publishes to) exists, there is no formula to install. Check the
+[releases page](https://github.com/rcardin/litter-box/releases) and the
+[ghcr package page](https://github.com/rcardin/litter-box/pkgs/container/litter-box-base) for what
+is actually published right now rather than trusting a snapshot written here. [Install](#install)
+becomes the fastest path to a working binary once both are true; until then, build from source with
+scala-cli (`scala-cli --power package . -o lb --assembly`, see this repo's own CLAUDE.md for the
+full command reference).
+
+### Version policy
+
+litter-box ships `0.x`. No stability promise holds until `1.0`: the CLI grammar, the config schema,
+the scaffolded files, the base image contract and the log format can all change in a `0.x` release
+without a deprecation cycle. Pin an exact version if a change landing under you would be a problem,
+and read a release's notes before bumping past it.
+
+## Install
+
+Live from the first tagged release under this workflow onward, and only once `rcardin/homebrew-tap`
+exists; see [docs/homebrew-tap-setup.md](docs/homebrew-tap-setup.md) for the manual setup that
+repository and its push credential still need. Until both are done, `brew tap rcardin/tap` 404s;
+check the [releases page](https://github.com/rcardin/litter-box/releases) for whether a tag has
+been cut and `gh repo view rcardin/homebrew-tap` for whether the tap exists, rather than trusting a
+snapshot written here. The commands below are what a consumer runs once both are true.
+
+```bash
+brew tap rcardin/tap
+brew install litter-box
+litter-box init
+```
+
+Bare `brew install litter-box`, without the `tap` line first, resolves against `homebrew-core`, the
+tap brew searches by default, and litter-box is not in it: `homebrew-core` has its own review bar for
+what it accepts, and a `0.x` project that changes its own grammar between releases with no stability
+promise (see [Version policy](#version-policy) above) is not a fit for that bar today. `brew tap
+rcardin/tap` points brew at `github.com/rcardin/homebrew-tap` instead, so the second command
+resolves the name there. The repository is named with the `homebrew-` prefix because that is brew's
+own naming convention for a tap; typing `rcardin/tap` (the short form) is what makes brew look for
+`rcardin/homebrew-tap` in the first place, so the two spellings are not a typo, they are the same
+rule applied at two different points.
+
+The formula depends on `openjdk@21` and installs a single self-executing jar as `litter-box`; see
+`.github/formula/litter-box.rb.template` for exactly what it does, and
+[.github/workflows/release.yml](.github/workflows/release.yml) for how a tag turns into a published
+formula, binary and base image together.
+
+### Quickstart
+
+From a fresh install, in the repo you want to run the loop against:
+
+```bash
+litter-box init
+```
+
+This writes `.litter-box/` and prints warnings and next steps naming exactly what it could not
+answer for you; see the file table under [Getting started](#getting-started) for what each file is
+and [Configuration](#configuration) for `config.conf`. Fill in the TODOs it printed (a real
+`gate.fast` command, a credential in `.litter-box/.env`, the build tool layer in
+`.litter-box/Dockerfile`), then take it for a first spin without touching a real issue:
+
+```bash
+litter-box run --dry-run
+```
+
+`run` is a plain alias for the bare `litter-box` invocation; either spelling starts the loop. Drop
+`--dry-run` once you trust what it would do, and see [Running it](#running-it) for what the flag
+actually skips.
 
 ## Getting started
 
-There is no published binary yet, so build one from a checkout of this repo:
+The contributor path: building a binary from a checkout of this repo, for anyone working on
+litter-box itself or who wants one ahead of the next tagged release. If you just want to run
+litter-box against your own project, [Install](#install) above is faster.
 
 ```bash
 scala-cli --power package . -o lb --assembly
@@ -108,8 +179,9 @@ whole of what litter-box claims to know about your build.
 BASE_IMAGE`, so the scaffolded `ARG BASE_IMAGE=ghcr.io/rcardin/litter-box-base:…` default only
 applies when you run `docker build` against that Dockerfile by hand. The cost of that choice is a
 local Claude-CLI install; what it buys is a sandbox that doesn't depend on pulling a prebuilt base
-from ghcr or any registry credentials. Nothing has been published to ghcr yet either — the first
-publish happens when a tag is cut. See
+from ghcr or any registry credentials. `ghcr.io/rcardin/litter-box-base:0.1.0` is already
+published, from the `v0.1.0` tag; a normal run still never pulls it, for the reason above, and
+each further tag publishes the next version alongside it. See
 [docs/base-image.md](docs/base-image.md) for the full contract the image guarantees.
 
 ## Configuration

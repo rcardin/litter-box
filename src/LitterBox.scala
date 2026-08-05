@@ -64,6 +64,23 @@ object LitterBox:
     */
   val Coordinate: String = s"in.rcard::litter-box:$Version"
 
+  /** The tag of the sandbox base image a scaffolded repo pins in `.litter-box/Dockerfile`'s
+    * `ARG BASE_IMAGE=` default. Lives beside [[Version]] rather than beside `Init` or the release
+    * workflow, because the whole point of building both from one tag (issue #6) is that the image
+    * and the binary version MOVE TOGETHER: `.github/workflows/release.yml` cuts `litter-box-base`
+    * and `litter-box` from the same `v$Version` push, so a `0.1.1` binary that scaffolds a
+    * `0.1.0` image default would be a release process that shipped two things under one tag and
+    * pointed them at each other's past. That the pushed tag actually IS `v$Version`, and not some
+    * other version bumped here and not there, is enforced by a guard step in `release.yml`'s
+    * `build` job, which fails before anything is packaged if the tag and this constant disagree;
+    * without that step this paragraph would describe an invariant nothing checked. Rendered into
+    * the scaffold through the same `Machine.renderTemplate` hole mechanism [[Coordinate]] already
+    * uses for `loop.scala`;
+    * `InitSpec` asserts the scaffolded Dockerfile against THIS constant, never a second, hand-copied
+    * literal that could drift the way the one it replaces did.
+    */
+  val BaseImage: String = s"ghcr.io/rcardin/litter-box-base:$Version"
+
   /** The shipped pipeline (`Machine.shippedWorkflow`/`Machine.shippedShape`), as the one publicly
     * reachable `LoopGraph` this issue ships. Delegates rather than reimplements: this is the exact
     * same graph `Machine.runOnce` has always walked, not a second copy of it built for the public
