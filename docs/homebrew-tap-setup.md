@@ -4,9 +4,17 @@ The `formula` job in `.github/workflows/release.yml` renders a Homebrew formula 
 release and pushes it to `rcardin/homebrew-tap`. That repository, and the credential the job
 authenticates with, are both manual, one time steps a workflow cannot do for itself: nothing in
 this repository's own automation is allowed to create a repository or set a secret on your behalf.
-Until both are done, `brew tap rcardin/tap` 404s; run `gh repo view rcardin/homebrew-tap` (or check
-the releases page and the ghcr package page, which do not depend on this repository existing at
-all) to see what is actually live today rather than trusting a snapshot written here.
+Both are done for `rcardin/litter-box` itself; this document is what you follow to stand the same
+thing up in a fork. Run `gh repo view rcardin/homebrew-tap` (or check the releases page and the ghcr
+package page, which do not depend on that repository existing at all) to see what is actually live
+rather than trusting a snapshot written here.
+
+One thing setting this up does NOT do for a consumer: Homebrew 6 refuses to load a formula from any
+unofficial tap until that person runs `brew trust rcardin/tap` on their own machine, and no amount
+of correct publishing on this side removes that step. It is a per machine decision about executing
+your Ruby, deliberately not delegable to the tap owner, so README.md's Install section documents it
+alongside `brew tap` rather than leaving a stranger to hit `Refusing to load formula ... from
+untrusted tap` and read it as a broken formula.
 
 ## 1. Create the tap repository
 
