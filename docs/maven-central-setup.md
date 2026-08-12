@@ -21,10 +21,18 @@ the scala version, the dependency list and a non standard source layout (`src/`,
 `resources/`) in a second file that nothing keeps in step with `project.scala`, and the first
 divergence would ship rather than fail.
 
-Everything sbt-ci-release contributes is a directive or a flag here instead. The publishing metadata
-Central requires (organization, name, license, url, vcs, description, developer) lives in
-`project.scala` as `//> using publish.*` lines; the credentials and the signing key arrive as CLI
-flags in the workflow.
+Everything sbt-ci-release contributes is a flag here instead. The publishing metadata Central
+requires (organization, name, license, url, vcs, description, developer), the target repository, the
+version computation, the credentials and the signing key are all arguments to the single
+`scala-cli publish` invocation in that job.
+
+That is worth one note, because `project.scala` is where a reader would expect to find at least the
+metadata, as `//> using publish.*` directives. Those directives are still marked experimental by
+scala-cli, and an experimental directive fails any invocation that does not pass `--power`.
+Directives are read on every command, not only on `publish`, so a single `//> using publish.name` in
+`project.scala` makes plain `scala-cli test .` fail with `directive is experimental`, taking the
+`build` job, `ci.yml` and the command CLAUDE.md documents down with it. The flags cost nothing
+anywhere else, so the configuration lives entirely in the job that uses it.
 
 ## 1. Claim the `in.rcard` namespace
 
@@ -32,8 +40,8 @@ Sign in at <https://central.sonatype.com> and verify the `in.rcard` namespace. V
 domain-shaped namespace is a DNS TXT record on `rcard.in`; Sonatype's UI tells you the exact token
 to publish. A namespace stays verified once done, so this is genuinely a one time step.
 
-If you are working in a fork under a namespace you do not own, `//> using publish.organization` in
-`project.scala` and `LitterBox.Coordinate` in `src/LitterBox.scala` both have to change, and
+If you are working in a fork under a namespace you do not own, the `--organization` flag in the
+`publish` job and `LitterBox.Coordinate` in `src/LitterBox.scala` both have to change, and
 `InitSpec` asserts the scaffold against the constant rather than a literal, so the scaffold follows
 automatically.
 
@@ -44,7 +52,7 @@ credentials. Store them as the repository secrets `SONATYPE_USERNAME` and `SONAT
 
 These are Central Portal tokens, not the old OSSRH ones. OSSRH reached end of life on 30 June 2025
 and `oss.sonatype.org` no longer accepts deployments; a token minted before the migration will fail
-authentication. `project.scala` sets `//> using publish.repository central`, which since scala-cli
+authentication. The job passes `--publish-repository central`, which since scala-cli
 1.8.4 resolves to the Portal's OSSRH Staging API at `https://ossrh-staging-api.central.sonatype.com`.
 The aliases `central-legacy` and `central-s01` still name the dead hosts, so neither is what this
 project wants.

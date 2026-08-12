@@ -53,7 +53,7 @@ object LitterBox:
 
   /** The Maven coordinate this library ships under. Real since issue #41: `.github/workflows/
     * release.yml`'s `publish` job runs `scala-cli publish` against the Sonatype Central Portal on
-    * every `v*` tag, off the `//> using publish.*` directives in `project.scala`, so every version
+    * every `v*` tag, configured entirely by that job's own flags, so every version
     * this constant can name is a version that tag actually pushed to Central. Versions released
     * before that job existed published no library and resolve nowhere; the tag guard in that same
     * workflow's `build` job is what keeps [[Version]] from ever naming one of them by accident.

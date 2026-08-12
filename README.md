@@ -483,7 +483,7 @@ git diff test/golden          # read this. it IS the contract change.
 Scala 3.8.3 on JDK 21 LTS, built with scala-cli. Deliberately **not** sbt: the threat model
 distrusts agent-authored build files, so the loop never couples to the build of the project it is
 working on. That rule holds for publishing too, which is why releases go to Maven Central through
-`scala-cli publish` and its `//> using publish.*` directives in `project.scala`, rather than through
+`scala-cli publish`, configured by flags on the release workflow's own `publish` job, rather than through
 sbt-ci-release and a `build.sbt` that would restate this project's dependencies and layout a second
 time; [docs/maven-central-setup.md](docs/maven-central-setup.md) has the full reasoning and the
 operator steps.

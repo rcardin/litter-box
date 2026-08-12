@@ -148,6 +148,14 @@ jobs:
     # carries the reasoning; the short version is that this repository has no sbt build and must not
     # grow one. The four secrets are the same ones sbt-ci-release wants, under the same names.
     #
+    # Every publish setting is a FLAG on the command below rather than a `//> using publish.*`
+    # directive in project.scala, which is where a reader would expect to find it. Those directives
+    # are still experimental in scala-cli, and directives are read on every command, not just this
+    # one: with them in project.scala, plain `scala-cli test .` fails with "directive is
+    # experimental", taking the `build` job above, ci.yml and the command CLAUDE.md documents down
+    # with it. project.scala says the same thing at more length, at the point a reader looking for
+    # this configuration would actually look.
+    #
     # Same gate as `image`: nothing public ships off a red suite. There is one asymmetry worth
     # knowing about before re-running this job by hand. ghcr and the homebrew tap both accept being
     # written twice, so `image` and `formula` are safely retryable; Maven Central is not, a released
@@ -226,11 +234,30 @@ jobs:
             args="--secret-key-password env:PGP_PASSPHRASE"
           fi
 
-          # `--power` because `publish` is still an experimental scala-cli command; without it the
-          # command refuses to run non interactively. The repository is `central` (set in
-          # project.scala), which since scala-cli 1.8.4 means the Central Portal's OSSRH Staging API,
-          # not the `oss.sonatype.org` host that shut down on 30 June 2025.
+          # `--power` because `publish` is itself an experimental scala-cli command, and because the
+          # metadata flags below are the experimental publish settings in their command line form.
+          #
+          # `--publish-repository central` is an ALIAS, not a URL. Since scala-cli 1.8.4 it resolves
+          # to the Sonatype Central Portal's OSSRH Staging API at
+          # `https://ossrh-staging-api.central.sonatype.com`, not to the `oss.sonatype.org` host that
+          # reached end of life on 30 June 2025. The aliases `central-legacy` and `central-s01` still
+          # name those dead hosts; neither is what this project wants.
+          #
+          # `--compute-version git:tag` reads the version out of the git history rather than taking
+          # it from a flag: the `build` job above already fails a tag whose name disagrees with
+          # `LitterBox.Version`, so the tag and that constant cannot describe different versions of
+          # one release, and passing an explicit `--version` here would be a third statement of the
+          # one fact, the first of the three to go stale.
           scala-cli --power publish . \
+            --organization in.rcard \
+            --name litter-box \
+            --compute-version git:tag \
+            --publish-repository central \
+            --license MIT \
+            --url https://github.com/rcardin/litter-box \
+            --vcs github:rcardin/litter-box \
+            --description "A distrustful autonomous coding loop: one labelled issue at a time, implemented in a sandbox, gated, independently reviewed, and merged only if CI agrees." \
+            --developer "rcardin|Riccardo Cardin|https://github.com/rcardin" \
             --user env:SONATYPE_USERNAME \
             --password env:SONATYPE_PASSWORD \
             --secret-key env:PGP_SECRET_ARMORED \
