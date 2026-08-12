@@ -49,7 +49,7 @@ object LitterBox:
     * bumped in one place and quoted stale in another is the #13 defect in miniature this codebase
     * already gave a name to, for a different pair of facts.
     */
-  val Version: String = "0.1.1"
+  val Version: String = "0.2.0"
 
   /** The Maven coordinate this library ships under. Real since issue #41: `.github/workflows/
     * release.yml`'s `publish` job runs `scala-cli publish` against the Sonatype Central Portal on
