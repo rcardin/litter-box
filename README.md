@@ -72,7 +72,14 @@ rule applied at two different points.
 The formula depends on `openjdk@21` and installs a single self-executing jar as `litter-box`; see
 `.github/formula/litter-box.rb.template` for exactly what it does, and
 [.github/workflows/release.yml](.github/workflows/release.yml) for how a tag turns into a published
-formula, binary and base image together.
+formula, binary, base image and library together.
+
+The same tag also publishes `in.rcard::litter-box` to Maven Central. You do not install that half:
+`litter-box init` scaffolds a `.litter-box/loop.scala` that opens with `//> using dep
+in.rcard::litter-box:<version>`, pinned to the exact version of the binary that scaffolded it, and
+`scala-cli` fetches it on the first run. See
+[docs/maven-central-setup.md](docs/maven-central-setup.md) for how that publishing is set up, which
+again matters if you are forking rather than installing.
 
 ### Quickstart
 
@@ -475,7 +482,11 @@ git diff test/golden          # read this. it IS the contract change.
 
 Scala 3.8.3 on JDK 21 LTS, built with scala-cli. Deliberately **not** sbt: the threat model
 distrusts agent-authored build files, so the loop never couples to the build of the project it is
-working on.
+working on. That rule holds for publishing too, which is why releases go to Maven Central through
+`scala-cli publish` and its `//> using publish.*` directives in `project.scala`, rather than through
+sbt-ci-release and a `build.sbt` that would restate this project's dependencies and layout a second
+time; [docs/maven-central-setup.md](docs/maven-central-setup.md) has the full reasoning and the
+operator steps.
 
 ## License
 

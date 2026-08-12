@@ -20,12 +20,14 @@ import java.nio.file.{Files, Path, Paths}
   * foreign package, not about what a speculative retype says it would do.
   *
   * `scala-cli test .` cannot go further than that and actually resolve `//> using dep
-  * in.rcard::litter-box:0.1.1`: nothing this project publishes reaches Maven Central yet (issue
-  * #41), so the ONE line of the real scaffold this file cannot reproduce is its own `//> using dep`
-  * header, the line that would make `scala-cli run .litter-box/loop.scala` fetch a coordinate that
-  * does not exist. What is left, and what this file actually proves, is that every line AFTER that
-  * header, the whole body a consumer reads, type checks against the real
-  * public API from outside this library's own package.
+  * in.rcard::litter-box:$Version`. That coordinate does reach Maven Central now (issue #41), but it
+  * only reaches it once the tag naming that exact version has been pushed and `release.yml`'s
+  * `publish` job has run, which is strictly AFTER this suite runs on the commit that will become
+  * that tag; resolving it here would also make the suite hit the network, which TEST.md forbids
+  * outright. So the ONE line of the real scaffold this file cannot reproduce stays its own
+  * `//> using dep` header. What is left, and what this file actually proves, is that every line
+  * AFTER that header, the whole body a consumer reads, type checks against the real public API from
+  * outside this library's own package.
   *
   * Nothing here pins the two copies together with a THIRD, independently hand typed string. The
   * block below, between the two `BEGIN`/`END SCAFFOLD BODY` markers, is REAL code the build compiles;
@@ -42,7 +44,9 @@ import java.nio.file.{Files, Path, Paths}
   * Deliberately NOT invoked (TEST.md: everything under `test/` stays Docker free, network free and
   * credential free): `@main def loop` below is declared, never called, and `graph`/`LitterBox.run`
   * are never reached at runtime by anything in this file. Compiling the declaration is the whole
-  * proof; running it is exactly the part `scala-cli run` cannot do until issue #41 lands.
+  * proof; running it is exactly the part this suite cannot do, since a real run resolves the
+  * published coordinate over the network and then walks a pipeline that wants Docker, `gh` and
+  * Claude credentials, none of which anything under `test/` is allowed to touch.
   */
 
 // ---- BEGIN SCAFFOLD BODY (must stay byte identical to resources/scaffold/loop.scala.txt, minus its
@@ -53,9 +57,12 @@ import java.nio.file.{Files, Path, Paths}
 //
 // Two things worth saying once here, rather than left for you to assume:
 //
-// - this dependency is not resolvable yet. Nothing this project publishes reaches Maven Central
-//   today; issue #41 is what makes it real. Until then, `scala-cli run` on this file fails at
-//   dependency resolution, before a single line below it ever compiles.
+// - this dependency comes from Maven Central, published by the very tag that built the `litter-box`
+//   you ran `init` with (issue #41), so the version pinned above and that binary are always one
+//   release rather than two things you have to keep in step yourself. Nothing to install or
+//   configure for it: `scala-cli` fetches it on the first run of this file. Releases cut before
+//   issue #41 landed published no library at all, so pinning one of those older versions here
+//   resolves nowhere.
 // - `graph` below names which pipeline this run walks. `LitterBox.shipped` is the only `LoopGraph`
 //   that exists today, so this line is where a future graph choice will be made, not a value you can
 //   edit yet: `LoopGraph`'s own members stay closed to code outside the library until a later issue

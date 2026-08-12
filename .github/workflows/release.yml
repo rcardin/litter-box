@@ -138,6 +138,104 @@ jobs:
           # that a mocked environment did not already assert in `test/`, so this step stops at
           # what it can check honestly rather than faking the rest.
 
+  publish:
+    # Maven Central, issue #41. This is what makes the `//> using dep in.rcard::litter-box:<version>`
+    # line at the top of every scaffolded `.litter-box/loop.scala` resolve: without this job the
+    # `init` scaffold names a coordinate that exists nowhere, and a consumer's first `scala-cli run`
+    # dies at dependency resolution before compiling a line.
+    #
+    # `scala-cli publish`, not `sbt ci-release` (the sibling `yaes` project's route). project.scala
+    # carries the reasoning; the short version is that this repository has no sbt build and must not
+    # grow one. The four secrets are the same ones sbt-ci-release wants, under the same names.
+    #
+    # Same gate as `image`: nothing public ships off a red suite. There is one asymmetry worth
+    # knowing about before re-running this job by hand. ghcr and the homebrew tap both accept being
+    # written twice, so `image` and `formula` are safely retryable; Maven Central is not, a released
+    # version is immutable there and a second attempt at the same version is rejected. A publish that
+    # fails PART WAY, after the deployment was validated, needs the Portal UI, not a re-run. See
+    # docs/maven-central-setup.md.
+    needs: [build, smoke]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # `fetch-depth: 0` unlike every other checkout in this file: `//> using publish.computeVersion
+      # git:tag` reads the version out of the git history itself, and the default shallow, tagless
+      # checkout leaves it nothing to read, so the artifact would go out under a computed SNAPSHOT
+      # version instead of the tag's.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+
+      - uses: coursier/setup-action@039f736548afa5411c1382f40a5bd9c2d30e0383 # v1.3.9
+        with:
+          jvm: temurin:21
+          apps: scala-cli
+
+      # Fails loudly rather than skipping, the same call the `formula` job makes below and for the
+      # same reason: a tag that shipped a binary, an image and a GitHub release but silently no
+      # library leaves the scaffold it generates pointing at a coordinate nobody can resolve, with
+      # nothing louder than a green run to say so.
+      - name: require the Sonatype and PGP secrets
+        env:
+          SONATYPE_USERNAME: ${{ secrets.SONATYPE_USERNAME }}
+          SONATYPE_PASSWORD: ${{ secrets.SONATYPE_PASSWORD }}
+          PGP_SECRET: ${{ secrets.PGP_SECRET }}
+        run: |
+          # `if` blocks rather than `[ -z "$X" ] && missing=...`: GitHub runs every `run:` step under
+          # `bash -e`, where a `&&` chain whose test comes back false is a failed command and kills
+          # the step. Every secret PRESENT is exactly that false test, so the short form would abort
+          # this check on the healthy path and never reach the error message it exists to print.
+          missing=""
+          if [ -z "$SONATYPE_USERNAME" ]; then missing="$missing SONATYPE_USERNAME"; fi
+          if [ -z "$SONATYPE_PASSWORD" ]; then missing="$missing SONATYPE_PASSWORD"; fi
+          if [ -z "$PGP_SECRET" ]; then missing="$missing PGP_SECRET"; fi
+          if [ -n "$missing" ]; then
+            echo "::error::missing secret(s):$missing. Nothing was published to Maven Central for this release. See docs/maven-central-setup.md." >&2
+            exit 1
+          fi
+
+      - name: publish to Maven Central
+        env:
+          SONATYPE_USERNAME: ${{ secrets.SONATYPE_USERNAME }}
+          SONATYPE_PASSWORD: ${{ secrets.SONATYPE_PASSWORD }}
+          PGP_SECRET: ${{ secrets.PGP_SECRET }}
+          PGP_PASSPHRASE: ${{ secrets.PGP_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+
+          # sbt-ci-release's own convention is that PGP_SECRET holds the ASCII armored private key
+          # base64 encoded a second time, so it survives being pasted into a secrets box as a single
+          # line; scala-cli's `--secret-key` wants the armored bytes themselves. Both encodings are
+          # accepted here rather than one documented and the other left to fail deep inside Bouncy
+          # Castle with an error that names neither: a key exported straight with `gpg --armor
+          # --export-secret-keys` already begins with the armor header and is passed through
+          # untouched, anything else is treated as the base64 wrapper and decoded.
+          case "$PGP_SECRET" in
+            -----BEGIN*) PGP_SECRET_ARMORED="$PGP_SECRET" ;;
+            *)           PGP_SECRET_ARMORED="$(printf %s "$PGP_SECRET" | base64 -d)" ;;
+          esac
+          export PGP_SECRET_ARMORED
+
+          # An unset passphrase and an empty one are different things to Bouncy Castle, and a key
+          # generated without one is a perfectly ordinary setup: passing `--secret-key-password` with
+          # an empty value fails such a key rather than using it, so the flag is only added when
+          # there is actually a passphrase to add.
+          args=""
+          if [ -n "${PGP_PASSPHRASE:-}" ]; then
+            args="--secret-key-password env:PGP_PASSPHRASE"
+          fi
+
+          # `--power` because `publish` is still an experimental scala-cli command; without it the
+          # command refuses to run non interactively. The repository is `central` (set in
+          # project.scala), which since scala-cli 1.8.4 means the Central Portal's OSSRH Staging API,
+          # not the `oss.sonatype.org` host that shut down on 30 June 2025.
+          scala-cli --power publish . \
+            --user env:SONATYPE_USERNAME \
+            --password env:SONATYPE_PASSWORD \
+            --secret-key env:PGP_SECRET_ARMORED \
+            $args
+
   image:
     # Gated on `build` and `smoke` rather than merely triggered alongside them: before this
     # `needs:` existed, `image` ran in parallel with `build`, so a red test suite in `build` did
@@ -176,7 +274,12 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
 
   release:
-    needs: [build, smoke, image]
+    # `publish` joins this list for the same reason `image` did: everything cut from one tag moves
+    # together, or the tag ships a set of artifacts that disagree about what version they are. A
+    # GitHub release whose binary scaffolds `//> using dep in.rcard::litter-box:$VERSION` while that
+    # coordinate never reached Central is exactly that disagreement, and it is the release notes,
+    # not the failed job, that a consumer would find first.
+    needs: [build, smoke, image, publish]
     runs-on: ubuntu-latest
     permissions:
       contents: write

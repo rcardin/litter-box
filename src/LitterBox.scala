@@ -51,10 +51,17 @@ object LitterBox:
     */
   val Version: String = "0.1.1"
 
-  /** The Maven coordinate this library will ship under, once it ships. NOT resolvable today: nothing
-    * in this repository publishes to Maven Central yet, issue #41 is what makes it real, and the
-    * scaffolded `loop.scala` says so in a comment rather than letting a reader discover it the hard
-    * way, from a failed dependency resolution with no explanation attached.
+  /** The Maven coordinate this library ships under. Real since issue #41: `.github/workflows/
+    * release.yml`'s `publish` job runs `scala-cli publish` against the Sonatype Central Portal on
+    * every `v*` tag, off the `//> using publish.*` directives in `project.scala`, so every version
+    * this constant can name is a version that tag actually pushed to Central. Versions released
+    * before that job existed published no library and resolve nowhere; the tag guard in that same
+    * workflow's `build` job is what keeps [[Version]] from ever naming one of them by accident.
+    *
+    * Deliberately NOT sbt-ci-release, which is how the sibling `yaes` project publishes: this
+    * repository has no sbt build and must not grow one (see the header of `project.scala`), and an
+    * sbt build added purely to publish would restate the scala version, the dependencies and a non
+    * standard source layout in a second file nothing keeps in step with the first.
     *
     * Rendered into that scaffold's own `//> using dep` line through `Machine.renderTemplate`, the
     * same hole mechanism `Init.configConf`/`Init.dockerfile` already use for a fact neither of those

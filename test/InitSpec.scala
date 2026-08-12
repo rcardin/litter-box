@@ -426,10 +426,17 @@ class InitSpec extends AnyFlatSpec with Matchers:
     val rendered = everyRepo.map(d => scaffolded(d, ".litter-box/loop.scala"))
     rendered.distinct should have size 1
 
-  it should "say the coordinate is not resolvable yet, and point at the issue that makes it so" in:
+  it should "say where the coordinate is resolved from, and never claim it resolves nowhere" in:
+    // The inverse of what this test asserted before issue #41: while nothing was published, the
+    // scaffold had to warn that its own header could not resolve. Now that `release.yml` publishes
+    // the library on every tag, the stale warning would be worse than no comment at all, sending a
+    // consumer off to debug a resolution failure that is not happening. Asserting the ABSENCE of the
+    // old phrasing, not just the presence of the new one, is what makes this test notice a
+    // half-finished edit that adds the sentence and leaves the contradiction sitting under it.
     val loopScala = scaffolded(sbtRepo, ".litter-box/loop.scala")
-    loopScala.toLowerCase should include("not resolvable")
+    loopScala should include("Maven Central")
     loopScala should include("#41")
+    loopScala.toLowerCase should not include "not resolvable"
 
   it should "settle no knob that .litter-box/config.conf can also settle" in:
     // The executable form of the acceptance criterion "no knob is settable in both config.conf and
