@@ -1,5 +1,5 @@
 ![Made for Scala 3](https://img.shields.io/badge/Scala%203-%23de3423.svg?logo=scala&logoColor=white)
-[GitHub Workflow Status (with branch)](https://img.shields.io/github/actions/workflow/status/rcardin/litter-box/ci.yml?branch=main)
+![GitHub Workflow Status (with branch)](https://img.shields.io/github/actions/workflow/status/rcardin/litter-box/ci.yml?branch=main)
 ![Maven Central](https://img.shields.io/maven-central/v/in.rcard/litter-box_3)
 ![GitHub release (latest by date)](https://img.shields.io/github/v/release/rcardin/litter-box)
 [![javadoc](https://javadoc.io/badge2/in.rcard/litter-box_3/javadoc.svg)](https://javadoc.io/doc/in.rcard/litter-box_3)
