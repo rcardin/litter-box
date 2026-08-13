@@ -300,8 +300,8 @@ object LitterBox:
     * `Guard.Open`, exactly the shape every shipped `OpenPr`/`Merge`-style node takes, with no backstop
     * at all: not at compile time (the lenient macro fell back silently) and, at the time, not at
     * runtime either (`Runner.validate` read `guard`, never the marker, so it found nothing wrong with
-    * that graph). That specific absence of a backstop is closed now (`Kit.scala`'s own doc on `GuardOf`
-    * and `Node.apply` has the mechanism): `Node.apply` derives `Guard.RequiresReview` on the real
+    * that graph). That specific absence of a backstop is closed now (`Kit.scala`'s own doc on
+    * `markerRequiresReview` and `Node.apply` has the mechanism): `Node.apply` derives `Guard.RequiresReview` on the real
     * constructed `Node` whenever its input type carries the marker, so `Runner.validate` correctly
     * flags that identical graph too. `checkedShapeStrict` still refuses to compile a non-literal
     * `shape` here regardless (`checkedShapeStrict`'s own doc, `Kit.scala`, has the two reasons that

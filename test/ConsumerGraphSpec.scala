@@ -1119,7 +1119,7 @@ class ConsumerGraphSpec extends AnyFlatSpec with Matchers:
   // ---- key differently here regardless, and there is no way to notice the alias without evaluating -----
   // ---- exactly the code this macro is built never to run. What makes this residual SURVIVABLE, not -----
   // ---- merely accepted, is issue #43 review round 4's own Tier 2 (`Kit.scala`'s own doc on -------------
-  // ---- GuardOf/Node.apply): Runner.validate reads the REAL, already-resolved Node values, where -------
+  // ---- markerRequiresReview/Node.apply): Runner.validate reads the REAL, already-resolved Node values, --
   // ---- n19Start and n19Same are not two facts to reconcile, only one value read twice, so it still -----
   // ---- finds this violation even though the macro cannot.
 
@@ -1186,4 +1186,36 @@ class ConsumerGraphSpec extends AnyFlatSpec with Matchers:
 
     errors should not be empty
     errors.map(_.message).mkString("\n") should include("rejected at compile time")
+  }
+
+  // ---- 30: the marker fact, derived in a REAL, separately compiled foreign package -------------------
+  // ---- (issue #26 PR review). Everything above this line is a `typeCheckErrors` snippet, and TEST.md --
+  // ---- is explicit that a snippet resolves imports and package paths differently from a real file, ----
+  // ---- which is why two earlier rounds of this review sequence each found a BLOCKER a snippet-only -----
+  // ---- pass had missed. The suppression this fix closes was a fact read off a `using GuardOf[I]` -------
+  // ---- clause a call site could pass its own argument for, so the thing worth proving is that a --------
+  // ---- foreign package writing down every argument `Node.apply` still accepts, in a genuinely ----------
+  // ---- separately compiled unit, cannot move the derived guard: `GraphValidationSpec` pins the ---------
+  // ---- negative half (the old suppression no longer compiles at all) through snippets, and this ---------
+  // ---- pins the positive half for real.
+
+  /** A consumer's own input type carrying the marker, declared at bare top level of this class rather
+    * than inside the test body, so it is an ordinary, separately compiled type in a package this
+    * library does not own, exactly what a real consumer would write.
+    */
+  private final case class ConsumerMarkerInput() extends in.rcard.litterbox.RequiresReviewInput
+
+  it should "stamp Guard.RequiresReview on a foreign package's own marker-input node even when that call site writes guard = Guard.Open and supplies Node.apply's one remaining using argument by hand" in {
+    import in.rcard.litterbox._
+
+    val node = Node[ConsumerMarkerInput, Unit](
+      name = "ConsumerSuppressionAttempt",
+      cost = Cost.NoDispatch,
+      timeout = Timeout.Unbounded,
+      probe = _ => None,
+      run = _ => NodeOutcome.Done(()),
+      guard = Guard.Open
+    )(using TrustOf.plain[Unit])
+
+    node.guard shouldBe Guard.RequiresReview
   }

@@ -20,7 +20,8 @@ The identical source state compiled with `scala-cli test . --server=false`, whic
 entirely and recompiles from scratch, correctly reported one violation throughout. A clean-looking test
 run against a macro change is therefore worthless evidence unless it ran with the daemon off: **pass
 `--server=false` on every `scala-cli compile`/`scala-cli test` invocation while verifying a change to
-`KitMacro.scala`, `Kit.scala`'s macro-adjacent code (`checkedShape`/`checkedShapeStrict`/`GuardOf`), or
+`KitMacro.scala`, `Kit.scala`'s macro-adjacent code (`checkedShape`/`checkedShapeStrict`/`markerRequiresReview`,
+and `Node.apply` itself, which is an `inline def` reading that last one), or
 anything else a macro reads**, and prefer real, separately compiled top-level consumer files in a scratch
 `package com.example.consumer` over `scala.compiletime.testing.typeCheckErrors` snippets when confirming
 a fix closes a hole: round 3 and round 4 of that review sequence each found BLOCKERs that a snippet-only

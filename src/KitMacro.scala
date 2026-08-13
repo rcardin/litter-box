@@ -52,7 +52,12 @@ private[litterbox] object KitMacro:
     * `LowPriorityTrustOf.plain` answers. `guard` is read the same OR `Node.apply` itself computes, off
     * the reference's own input type extending `RequiresReviewInput` and off an explicit
     * `guard = Guard.RequiresReview` argument (`nodeFacts`'s and `explicitRequiresReviewGuard`'s own
-    * docs below have the mechanism and the reason both halves are needed).
+    * docs below have the mechanism and the reason both halves are needed), with one asymmetry worth
+    * knowing before trusting what this walk reports: the marker half reads a STATIC TYPE, so it fires
+    * for every reference form this walk can key at all, while the argument half reads SOURCE TEXT that
+    * only an inline `Node.apply` written at the shape's own call site still carries, so an explicit
+    * `guard` on a node built elsewhere and referenced by a stable path is invisible here and left to
+    * `Runner.validate` alone (`explicitRequiresReviewGuard`'s own doc below has that scope in full).
     *
     * One respect this walk is NOT `Runner.validate`'s, by design rather than by oversight: three
     * DECLARATION level checks `Runner.validate` also runs have no AST level analogue here at all
@@ -63,6 +68,23 @@ private[litterbox] object KitMacro:
     * (`checkReconciled`'s own doc has the full reasoning, including the residual alias this check
     * cannot catch).
     */
+  /** The implementation behind `markerRequiresReview` (`Kit.scala`), which `Node.apply`'s own `inline`
+    * body reads to decide the marker half of a node's `guard`. One line, and every line of that
+    * function's own doc is about why it has to be this line and not a given: `TypeRepr.of[I] <:<
+    * TypeRepr.of[RequiresReviewInput]` is the compiler's own subtype relation over the type argument
+    * the caller already wrote down, so there is no implicit to shadow, no priority to accident into
+    * and no parameter for a call site to answer with (issue #26 PR review closed a suppression that
+    * the previous `using GuardOf[I]` shape allowed).
+    *
+    * Deliberately the SAME expression `nodeFacts` below runs on a node reference's own captured `i`,
+    * and deliberately in the same file: `Node.apply`'s runtime `guard` field and this macro's compile
+    * time structural read are one rule with one implementation, so no future edit can move one without
+    * the other being right there to move with it.
+    */
+  def markerRequiresReviewImpl[I: Type](using Quotes): Expr[Boolean] =
+    import quotes.reflect.*
+    Expr(TypeRepr.of[I] <:< TypeRepr.of[RequiresReviewInput])
+
   def checkShapeImpl(shapeExpr: Expr[Shape], strict: Boolean)(using Quotes): Expr[Shape] =
     import quotes.reflect.*
 
@@ -492,6 +514,23 @@ private[litterbox] object KitMacro:
       * so the hand written, documented form has to earn a compile time check of its own, not only the
       * marker-derived one.
       *
+      * INLINE is the operative word, and it is the whole scope of this function: an explicit `guard`
+      * argument is source text, never a fact on a type, so the only reference form that still carries it
+      * by the time this walk sees it is a `Node.apply` call written straight into the shape. A node
+      * declared as `val Guarded = Node(..., guard = Guard.RequiresReview)` and then used as `Guarded`
+      * presents this function with the REFERENCE, whose tree says nothing whatever about the argument
+      * list on the far side of the binding, so this answers `false` and the marker test in `nodeFacts`
+      * below is the only half that runs for it. On an input type that carries no `RequiresReviewInput`
+      * marker, that node reads `Guard.Open` at compile time and is caught by `Runner.validate` alone
+      * (`RequiresReviewInput`'s own doc, `Kit.scala`, states this asymmetry as the published scope of
+      * issue #43 review round 5, and `test/GraphValidationSpec.scala`'s own round 5 tests write every
+      * node inline for exactly this reason). Reading through the binding is not impossible in principle,
+      * `parseTransition` below does exactly that for a `val`-bound `Transition`, but its own doc records
+      * how narrow that mechanism actually is: `Symbol.tree` yields a populated `rhs` for a LOCAL `val`
+      * declared in the same block and nothing at all for a `class`/`object` MEMBER, which is the form
+      * almost every real node is declared in, so the reach bought would be small, the second, differently
+      * limited source of one fact would be real, and `Runner.validate` already covers the whole of it.
+      *
       * Reads every element of the call's own first, non `using`, argument list, named or positional,
       * looking for one that names the literal `Guard.RequiresReview` case, rather than trying to prove
       * WHICH parameter position or name it bound to.
@@ -507,8 +546,8 @@ private[litterbox] object KitMacro:
       * relied on could never fire, and a purely positional `guard = Guard.RequiresReview` argument
       * compiled clean under `checkedShape` with no violation ever reported. `Node.apply` has exactly one
       * parameter of type `Guard`, `guard` itself (`name`/`cost`/`timeout` are `String`/`Cost`/`Timeout`,
-      * `probe`/`run` are function types, and the trailing `using` clause carries `TrustOf[O]`/
-      * `GuardOf[I]`, neither a `Guard`), so ANY main argument that names the literal
+      * `probe`/`run` are function types, and the trailing `using` clause carries `TrustOf[O]` alone,
+      * not a `Guard`), so ANY main argument that names the literal
       * `Guard.RequiresReview` case, wherever it sits and however it was written, can only ever be that
       * one parameter: no position or name test is needed to be sure which parameter answered, which is
       * what this version reads instead of relying on the unchecked `isInstanceOf`.
@@ -529,18 +568,68 @@ private[litterbox] object KitMacro:
       fn.symbol.exists && fn.symbol.owner == nodeModuleClass &&
         argss.headOption.getOrElse(Nil).exists(isRequiresReviewLiteral)
 
+    /** Whether `t` is a call whose callee resolves into `Node`'s own companion, the same test
+      * `identifyRef` and `explicitRequiresReviewGuard` above both already run to decide they are
+      * looking at `Node.apply` itself rather than at some other factory. Factored out only because
+      * `unwrapRef` below has to ask it about a tree neither of those two would otherwise reach.
+      */
+    def isNodeApplyCall(t: Term): Boolean =
+      val (fn, _) = uncurry(t)
+      fn.symbol.exists && fn.symbol.owner == nodeModuleClass
+
+    /** `unwrap` (top of this file) for a NODE REFERENCE specifically, and the difference is the whole
+      * reason it exists: `Node.apply` is an `inline def` (`Kit.scala`, issue #26 PR review, which is
+      * what took the marker fact out of an overridable `using` clause and into a macro read of `I`), so
+      * an inline `Node(name = "Pick", ...)` construction written straight into a `Shape` literal reaches
+      * this macro already EXPANDED, as `Inlined(Some(originalCall), bindings, expansion)`. Neither half
+      * of that tree is what the rest of this file wants: `unwrap` peels an `Inlined` with no bindings
+      * down to the EXPANSION, which is `Node.make(...)` over synthetic proxy vals, where the literal
+      * `name` argument and any literal `guard = Guard.RequiresReview` argument have both stopped being
+      * literals sitting in an argument list. The `call` an `Inlined` carries alongside it is the
+      * original, fully applied `Node.apply[I, O](...)` tree, written exactly as the author wrote it, so
+      * that is what this returns instead, and `identifyRef`/`explicitRequiresReviewGuard` go on reading
+      * the same source text they always read.
+      *
+      * Only for a call this file can confirm IS `Node.apply` (`isNodeApplyCall` above). Any other
+      * inline expansion, a consumer's own `inline def myNode(...): Node[I, O]` helper, say, keeps the
+      * pre-existing `unwrap` behaviour of peeling to the expansion, so nothing this walk used to read
+      * one way starts being read another way because of a change that was only ever about `Node.apply`.
+      */
+    def unwrapRef(t: Term): Term = t match
+      // `Inlined.call` is typed `Option[Tree]`, so the `: Term` narrowing is a real type test, not the
+      // erased, always-true one `explicitRequiresReviewGuard`'s own TRAP paragraph above warns about:
+      // that one was an `isInstanceOf` against an abstract type member, which erases to its bound;
+      // this is a PATTERN, so it goes through the `TypeTest[Tree, Term]` the reflection API itself
+      // provides and genuinely narrows.
+      case Inlined(Some(call: Term), _, _) if isNodeApplyCall(call) => call
+      case Inlined(_, Nil, body)                                    => unwrapRef(body)
+      case Typed(body, _)                                           => unwrapRef(body)
+      case Block(Nil, body)                                         => unwrapRef(body)
+      case _                                                        => t
+
     /** Reads `trust`/`guard` off a node reference's own static type `Node[I, O]`, and, for `guard`
       * alone, off the reference's own SOURCE TEXT too, never off a value (`checkShapeImpl`'s own doc
       * has the reason no value exists yet to read). `I` extending `RequiresReviewInput` is one half of
-      * `guard` (`RequiresReviewInput`'s own doc, `Kit.scala`, has the reason this cannot instead be read
-      * off `Node.apply`'s own hand written argument alone, a Scala parameter section ordering rule, not
-      * an implicit resolution one): a subtype test against the reference's own concrete `I` reads it
-      * without needing a runtime value. The other half, `explicitRequiresReviewGuard` above, reads any
+      * `guard` (`RequiresReviewInput`'s own doc, `Kit.scala`, has the reason a node author's own hand
+      * written argument cannot be the only half read, and `markerRequiresReview`'s own doc has the
+      * identical subtype test `Node.apply` itself runs on the real value): a subtype test against the
+      * reference's own concrete `I` reads it without needing a runtime value. The other half, `explicitRequiresReviewGuard` above, reads any
       * main argument that names the literal `Guard.RequiresReview` case, named or positional, so a node
       * author who wrote the documented, hand declared form (`Guard`'s own scaladoc, `Kit.scala`, calls
       * declaring it "the node author's own job") gets a real compile time check too, not only the marker
       * one. The two halves combine with an OR, matching the identical combination `Node.apply`
       * (`Kit.scala`) performs on the real constructed value.
+      *
+      * They do NOT have the same reach, and that asymmetry is deliberate rather than an oversight
+      * waiting to be tidied up. The marker half reads the reference's own static type, which a stable
+      * path carries exactly as an inline construction does, so it answers for every form `identifyRef`
+      * can key at all. The argument half has only source to read, and a stable path's source is the
+      * reference, not the construction, so it answers only for an inline `Node.apply` written at the
+      * shape's own call site (`unwrapRef` below recovers that call from its own expansion; it recovers
+      * a CALL, never the right hand side of some `val` the reference names). A node built as `val
+      * Guarded = Node(..., guard = Guard.RequiresReview)` on an unmarked input type therefore still
+      * reads `Guard.Open` here, and `Runner.validate` remains its only check, the same lenient
+      * direction every other shape this file cannot read already takes.
       *
       * TRAP for a future editor: `trust` is read by SUMMONING `TrustOf[o]` right here, inside the
       * macro, and asking WHICH given answered, `TrustOf.judged` or `LowPriorityTrustOf.plain` (issue
@@ -576,7 +665,7 @@ private[litterbox] object KitMacro:
       * with. Handled inline below, immediately before the fact it would otherwise corrupt.
       */
     def nodeFacts(t: Term): Option[NodeRef] =
-      val real = unwrap(t)
+      val real = unwrapRef(t)
       real.tpe.widen.dealias.asType match
         case '[Node[i, o]] =>
           // A WIDENED reference (`val OpenPr: Node[?, ?] = Node[PrInput, Unit](...)`) still matches
@@ -755,7 +844,7 @@ private[litterbox] object KitMacro:
       * that happen to canonicalise differently, which is exactly what it is, two different symbols, so
       * there is nothing dishonest about the silence, only a real limit of a walk that reasons over
       * SYMBOLS, never over the VALUES those symbols happen to alias. What makes this residue SURVIVABLE
-      * rather than a silent hole (`Node.apply`'s own doc, `Kit.scala`, `GuardOf`'s own doc alongside
+      * rather than a silent hole (`Node.apply`'s own doc, `Kit.scala`, `markerRequiresReview`'s own doc alongside
       * `TrustOf`, `Kit.scala`): `Runner.validate` now derives the identical `Guard.RequiresReview` this
       * walk derives, off the SAME `RequiresReviewInput` marker, on the constructed `Node` value itself,
       * not merely off a hand-written field a node author could forget to set to match; so a graph this
@@ -897,7 +986,7 @@ private[litterbox] object KitMacro:
         // remains the backstop (`checkedShape`'s own doc, `Kit.scala`, has the reasoning). The strict
         // path (`strict = true`, `checkedShapeStrict`'s own only caller, `LitterBox.graph`): the
         // identical situation is a hard error instead (issue #43 review). `Node.apply` (`Kit.scala`,
-        // `GuardOf`'s own doc) derives `Guard.RequiresReview` on the real `Node` whenever a node's own
+        // `markerRequiresReview`'s own doc) derives `Guard.RequiresReview` on the real `Node` whenever a node's own
         // input type extends `RequiresReviewInput`, even if its `guard` argument was left at the
         // default `Guard.Open`, so `Runner.validate` catches that case too; erroring here remains
         // correct regardless (`checkedShapeStrict`'s own doc, `Kit.scala`, has the two reasons that

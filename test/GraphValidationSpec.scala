@@ -119,8 +119,9 @@ class GraphValidationSpec extends AnyFlatSpec with Matchers:
     )
 
   /** A marker input, so a `Node[MarkerInput, Unit]` built here is exactly the shape issue #43 review
-    * round 4's Tier 2 is about: its own input type extends `RequiresReviewInput`, so `GuardOf[MarkerInput]`
-    * resolves to `GuardOf.reviewRequired` (`Kit.scala`), never `LowPriorityGuardOf.open`.
+    * round 4's Tier 2 is about: its own input type extends `RequiresReviewInput`, so
+    * `markerRequiresReview[MarkerInput]` (`Kit.scala`) answers `true` and `Node.apply` stamps
+    * `Guard.RequiresReview` on the constructed value whatever else the call site wrote.
     */
   private final case class MarkerInput() extends RequiresReviewInput
 
@@ -194,9 +195,9 @@ class GraphValidationSpec extends AnyFlatSpec with Matchers:
 
   it should "be RequiresReview, from the hand written argument alone, when guard was written explicitly but the input type does NOT extend the marker" in {
     // `Node.apply`'s own combination (`Kit.scala`, issue #43 review round 5, FINDING 2) never discards
-    // the hand written argument in favour of `GuardOf[I]`: absent the marker, `g.requiresReview` is
-    // `false`, so the OR reduces to exactly what the author wrote, `Guard.RequiresReview` preserved
-    // unchanged rather than downgraded to `Guard.Open` for lack of a marker.
+    // the hand written argument in favour of the marker fact: absent the marker,
+    // `markerRequiresReview[I]` is `false`, so the OR reduces to exactly what the author wrote,
+    // `Guard.RequiresReview` preserved unchanged rather than downgraded to `Guard.Open`.
     plainNode("Guarded", guard = Guard.RequiresReview).guard shouldBe Guard.RequiresReview
   }
 
@@ -745,6 +746,75 @@ class GraphValidationSpec extends AnyFlatSpec with Matchers:
     plainNode("ArgumentOnly", guard = Guard.RequiresReview).guard shouldBe Guard.RequiresReview // marker false, argument true
     markerNode("Both", guard = Guard.RequiresReview).guard shouldBe Guard.RequiresReview // marker true, argument true
     plainNode("Neither").guard shouldBe Guard.Open // marker false, argument default Open
+  }
+
+  // ---- the marker half of that combination is no longer a fact a CALL SITE can answer for ----------
+  // ---- (issue #26 PR review). It used to be: `Node.apply` read it off a `using g: GuardOf[I]` -------
+  // ---- clause, and `GuardOf.open[I]`, the fallback that answers "no marker" for EVERY `I`, was a ----
+  // ---- public, nameable given inherited into `object GuardOf`, so passing it explicitly built a -----
+  // ---- node stamped `Guard.Open` whose own input type extended `RequiresReviewInput`, leaving -------
+  // ---- `Runner.validate` nothing to find and putting it back into exactly the disagreement with -----
+  // ---- `KitMacro.checkShapeImpl`'s own structural read that Tier 2 existed to end. The fact now -----
+  // ---- comes from `markerRequiresReview[I]` (`Kit.scala`), a macro over the type argument alone, ----
+  // ---- inside an `inline def apply`, so there is no argument position left to hand it anything. -----
+
+  it should "no longer offer any GuardOf given for a call site to pass, the exact suppression that used to compile and stamp Guard.Open on a marker input node" in {
+    // The reproduction verbatim, kept as source rather than described in prose, so a future editor who
+    // reintroduces a `using`-shaped derivation for this fact finds out here rather than in review.
+    val errors = scala.compiletime.testing.typeCheckErrors(
+      """
+        |import in.rcard.litterbox._
+        |
+        |case class SuppressedInput() extends RequiresReviewInput
+        |
+        |val suppressed: Node[SuppressedInput, Unit] = Node[SuppressedInput, Unit](
+        |  name = "Suppressed", cost = Cost.NoDispatch, timeout = Timeout.Unbounded,
+        |  probe = _ => None, run = _ => NodeOutcome.Done(())
+        |)(using summon[TrustOf[Unit]], GuardOf.open[SuppressedInput])
+        |""".stripMargin
+    )
+
+    errors should not be empty
+    errors.map(_.message).mkString("\n") should include("GuardOf")
+  }
+
+  it should "leave Node.apply exactly one using argument position, so a call site has nowhere to put a second one whatever it names" in {
+    // The narrower half of the test above: even a caller who does not name `GuardOf` at all, and
+    // simply hands a second `using` argument of any type whatsoever, is rejected, so this pins the
+    // SHAPE of the parameter list rather than the absence of one particular given.
+    val errors = scala.compiletime.testing.typeCheckErrors(
+      """
+        |import in.rcard.litterbox._
+        |
+        |case class SecondSlotInput() extends RequiresReviewInput
+        |
+        |val twoArguments: Node[SecondSlotInput, Unit] = Node[SecondSlotInput, Unit](
+        |  name = "TwoArguments", cost = Cost.NoDispatch, timeout = Timeout.Unbounded,
+        |  probe = _ => None, run = _ => NodeOutcome.Done(())
+        |)(using summon[TrustOf[Unit]], summon[TrustOf[Unit]])
+        |""".stripMargin
+    )
+
+    errors should not be empty
+  }
+
+  it should "still stamp Guard.RequiresReview from the marker when the caller writes guard = Guard.Open AND supplies the one using argument Node.apply still takes, by hand" in {
+    // The positive half, and the reason it matters: `TrustOf[O]` remains an ordinary `using` parameter
+    // a call site can answer for, deliberately (`Node.apply`'s own doc, `Kit.scala`, has the reason
+    // that residual is accepted and where the runtime check that catches it lives). This proves that
+    // supplying it changes nothing about the marker fact: the caller here writes down the weakest
+    // `guard` it can and the most explicit `using` argument it can, and the constructed node is guarded
+    // anyway, because nothing in this call reaches the derivation at all.
+    val node = Node[MarkerInput, Unit](
+      name = "ExplicitlyOpened",
+      cost = Cost.NoDispatch,
+      timeout = Timeout.Unbounded,
+      probe = _ => None,
+      run = _ => NodeOutcome.Done(()),
+      guard = Guard.Open
+    )(using TrustOf.plain[Unit])
+
+    node.guard shouldBe Guard.RequiresReview
   }
 
   // ---- KitMacro reads an explicit `guard = Guard.RequiresReview` argument too, not only the ----

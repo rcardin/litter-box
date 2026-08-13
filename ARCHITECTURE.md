@@ -47,7 +47,7 @@ be stated and checked honestly.
 
 This claim was rechecked, not merely carried forward, after issue #43 review round 4's Tier 2 made
 `Node.apply` derive `Guard.RequiresReview` from a node's own input type extending
-`RequiresReviewInput` (`Kit.scala`'s own doc on `GuardOf`/`Node.apply` has the mechanism): that
+`RequiresReviewInput` (`Kit.scala`'s own doc on `markerRequiresReview`/`Node.apply` has the mechanism): that
 derivation could, in principle, have made a shipped node newly carry `Guard.RequiresReview` without
 anyone editing `Machine.shippedShape` by hand, since the derivation reads a fact of the TYPE, not of
 what a node author wrote. It does not, confirmed by grepping every shipped node's own input type for
@@ -165,7 +165,7 @@ configuration**, so they live under `resources/` and travel inside the jar
   time this was written, the reason was that `Runner.validate` was not a reliable backstop for a node
   whose input type extends `RequiresReviewInput` while its own `guard` argument was left at
   `Guard.Open`, the exact shape every shipped `OpenPr`/`Merge`-style node takes. Issue #43 review round
-  4's Tier 2 closed that specific gap (`Kit.scala`'s own doc on `GuardOf`/`Node.apply`): `Node.apply`
+  4's Tier 2 closed that specific gap (`Kit.scala`'s own doc on `markerRequiresReview`/`Node.apply`): `Node.apply`
   now derives `Guard.RequiresReview` on the real `Node` whenever the marker is present, regardless of
   what `guard` was written as, so `Runner.validate` reading that field at startup now agrees with the
   macro on that one fact. The hard error on a non-literal `shape` stays, for two reasons that survive

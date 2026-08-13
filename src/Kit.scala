@@ -1,5 +1,6 @@
 package in.rcard.litterbox
 
+import scala.annotation.publicInBinary
 import scala.annotation.tailrec
 import scala.util.boundary
 
@@ -310,56 +311,75 @@ enum Guard:
   * node reference's own INPUT type, since that type is visible in the AST even though the value
   * `Node.apply` was called with is not.
   *
-  * A `given GuardOf[I]` mirroring `TrustOf`'s own derivation was the first design tried here, and the
-  * PARTICULAR shape tried, `Node.apply` reading `guard`'s default from `summon[GuardOf[I]].guard`
-  * written directly as that parameter's own default VALUE, was dropped after it proved unsound,
-  * confirmed by writing the exact failure rather than merely suspecting it (issue #39 review, MAJOR
-  * 1): a DEFAULT PARAMETER value is compiled once, as its own generic method over `Node.apply`'s own
-  * type parameters, and typechecked (implicit search included) at THAT point, against the parameter's
-  * own unbound `I`, never resolved again per call site. Every call therefore received the SAME
-  * implicit answer, the one that matches an unconstrained `I` (`LowPriorityGuardOf`'s own fallback
-  * would have been that answer, always, regardless of what the caller's own `I` extended), never the
-  * one bounded by `RequiresReviewInput`.
+  * Two earlier designs for deriving this fact are recorded here rather than left for a future editor
+  * to rediscover, because each failed for its own reason and both failures are why the derivation that
+  * now stands looks the way it does.
   *
-  * An ORDINARY `using` clause, one Scala resolves at each call site against that call's own concrete
-  * type argument rather than one folded into a shared default expression, does NOT share that
-  * unsoundness (confirmed the same way, by writing both forms side by side and observing what each
-  * one actually returns for a concrete `I`): a plain `def f[I](x: Int)(using GuardOf[I])` genuinely
-  * answers `Guard.RequiresReview` for one caller's `I` and `Guard.Open` for another's, in the same
-  * single compilation. What that sound mechanism could not do, when this was first tried, is stand in
-  * for `guard`'s existing DEFAULT while `guard` kept its current position: Scala only lets a default
-  * expression see a `using` instance declared textually BEFORE it in the parameter list, so wiring one
-  * in as a default value would have meant moving `guard` into its OWN parameter section, after that
-  * `using` clause, breaking every call site across this codebase that names `guard` inline alongside
-  * `name`/`cost`/`timeout`/`probe`/`run` in one argument list (`GraphValidationSpec`'s own
-  * `plainNode`/`reviewedNode`, among others).
+  * The FIRST was a `given GuardOf[I]` mirroring `TrustOf`'s own derivation, with `Node.apply` reading
+  * `guard`'s default from `summon[GuardOf[I]].guard` written directly as that parameter's own default
+  * VALUE. It was dropped after it proved unsound, confirmed by writing the exact failure rather than
+  * merely suspecting it (issue #39 review, MAJOR 1): a DEFAULT PARAMETER value is compiled once, as
+  * its own generic method over `Node.apply`'s own type parameters, and typechecked (implicit search
+  * included) at THAT point, against the parameter's own unbound `I`, never resolved again per call
+  * site. Every call therefore received the SAME implicit answer, the one that matches an unconstrained
+  * `I`, never the one bounded by `RequiresReviewInput`.
+  *
+  * The SECOND was that identical given moved out of the default expression and into an ORDINARY
+  * `using` clause on `Node.apply`, read inside the method's own BODY (issue #43 review round 4, Tier
+  * 2). Scala resolves such a clause at each call site against that call's own concrete type argument,
+  * so its RESOLUTION genuinely was sound where the default expression's was not, confirmed the same
+  * way, by writing both forms side by side and observing what each one actually returns for a concrete
+  * `I`. What a `using` clause cannot do is stop the CALL SITE from answering for it (issue #26 PR
+  * review): a `using` parameter is part of the public parameter list, and the fallback given that
+  * answered "no marker" for every `I` was itself public and nameable, so
+  * `Node.apply[MarkerInput, O](...)(using summon, GuardOf.open[MarkerInput])` built a node stamped
+  * `Guard.Open` whose own input type extended this marker, left `Runner.validate` nothing to find, and
+  * put the two derivations, this one and the macro's, straight back into the disagreement Tier 2
+  * existed to end. A fact a call site can pass an argument for is a declaration wearing a derivation's
+  * clothes, and the only reason to derive this one at all is that a node author must not be able to
+  * get it wrong.
+  *
+  * So the fact is not taken through a parameter at all any more. `Node.apply` is an `inline def` whose
+  * body reads `markerRequiresReview[I]` (immediately below), a macro that asks the compiler's own
+  * subtype relation and answers a plain `Boolean`. There is no implicit search to shadow, no given to
+  * outrank, and no argument position to pass, so the only input is the type argument `I` the caller
+  * already committed to by writing the node's own input type down. Nothing about the call sites moved
+  * to buy that: `guard` keeps its position and its `Guard.Open` default, and every existing call still
+  * names it inline alongside `name`/`cost`/`timeout`/`probe`/`run` in one argument list
+  * (`GraphValidationSpec`'s own `plainNode`/`reviewedNode`, among others).
+  *
+  * What that design does NOT close, stated here rather than left for a reader to find out: an `inline`
+  * body is typechecked at the CALL site, and a body naming `Node`'s own private constructor cannot be,
+  * so the construction moved into `Node.make` (below `Node.apply`), `private[Node]` and
+  * `@publicInBinary`. No Scala source outside `object Node` can name that member, in this package or
+  * any other, but the JVM method it compiles to is public, so bytecode, reflection, or a second JVM
+  * language can still mint a `Node` carrying any `trust` and any `guard` it likes. That is the same
+  * class of residual `Trust`'s own doc already records for `TrustOf`, where a plain Scala cast is
+  * enough and no bytecode is needed at all, and it is a strictly smaller one, but it is real and it
+  * arrived with this design.
   *
   * Issue #39 accordingly left `guard` a hand written, overridable default with no derivation at all,
   * and the two facts, this marker on `I` and the hand written `guard` argument, were free to diverge in
   * BOTH directions: a node passing `guard = Guard.RequiresReview` without extending this marker was
-  * invisible to the macro (issue #43 review round 5, FINDING 1, below, closes this one too;
-  * `checkedShapeStrict`'s own doc, below, has the runtime backstop that covered it in the meantime); and
+  * invisible to the macro (issue #43 review round 5, FINDING 1, below, NARROWS this one to the case
+  * where the construction is written inline in the shape, and leaves it standing everywhere else;
+  * `checkedShapeStrict`'s own doc, below, has the runtime backstop that covered it in the meantime and
+  * still covers what round 5 does not reach); and
   * a node extending this marker while `guard` was left `Guard.Open`, `Machine.OpenPr`/`Machine.Merge`'s
   * own deliberate shape at the time (their own doc has the reason a `guard` there would reject the
   * shipped graph itself), was invisible to `Runner.validate`, which read `guard`, never this marker, a
   * gap issue #43 review round 4 found seven real files could exploit silently (`KitMacro.checkShapeImpl`'s
   * own doc has the mechanism, `stablePathKey`'s own doc names the specific families).
   *
-  * That second divergence is what issue #43 review round 4's Tier 2 closes, by moving the `using
-  * GuardOf[I]` clause the paragraph above already proved SOUND out of a default expression and into
-  * `Node.apply`'s own BODY instead (`GuardOf`'s own doc, immediately below, has the derivation;
-  * `Node.apply`'s own doc, below `Node`'s case class, has the combination with the hand written
-  * `guard` argument): a `using` clause consulted inside a method body is resolved once per call site
-  * exactly as one consulted inside a default expression's OWN unconstrained scope is not, so the
-  * unsoundness MAJOR 1 found is a property of WHERE the given was read, never of the given itself, and
-  * reading it one parameter section later, after `guard` rather than instead of it, pays none of the
-  * call site compatibility cost moving `guard` itself would have: every existing call site keeps
-  * `guard = ...` inline in the same argument list it always used. The result folds the two facts
-  * together rather than leaving them free to disagree: this marker present on `I` now FORCES
-  * `Guard.RequiresReview` on the constructed `Node` regardless of what `guard` was written as, so a
-  * node extending this marker with `guard` left at its default is caught by `Runner.validate` too, not
-  * only by the compile time macro; `Machine.OpenPr` and `Machine.Merge` are unaffected by this, since
-  * neither extends this marker at all.
+  * That second divergence is what issue #43 review round 4's Tier 2 closed, and what the macro
+  * derivation described above now delivers with nothing a call site can hand it (`markerRequiresReview`'s
+  * own doc, immediately below, has the derivation; `Node.apply`'s own doc, below `Node`'s case class,
+  * has the combination with the hand written `guard` argument). The two facts are folded together
+  * rather than left free to disagree: this marker present on `I` FORCES `Guard.RequiresReview` onto the
+  * constructed `Node`, whatever the `guard` argument was written as, so a node extending this marker
+  * with `guard` left at its default is caught by `Runner.validate` too, not only by the compile time
+  * macro; `Machine.OpenPr` and `Machine.Merge` are unaffected by this, since neither extends this
+  * marker at all.
   *
   * The FIRST divergence used to be left standing here, on the theory that a compile time
   * UNDER-approximation backstopped by a stricter runtime check was an acceptable, permanently open gap:
@@ -367,57 +387,69 @@ enum Guard:
   * type that did NOT extend this marker, walked through the compile time check as if it were unguarded,
   * even though `Runner.validate` correctly treated it as guarded. `Guard`'s own scaladoc above states
   * plainly that declaring the guard "is the node author's own job", so leaving that documented, author
-  * declared form with no compile time check of its own, only a runtime backstop, is precisely the gap
-  * issue #43 review round 5 (FINDING 1) closes: `KitMacro.checkShapeImpl`'s own `nodeFacts` now also
-  * reads a literal `guard = Guard.RequiresReview` argument straight off the reference's own source text
+  * declared form with no compile time check of its own, only a runtime backstop, is the gap issue #43
+  * review round 5 (FINDING 1) NARROWS: `KitMacro.checkShapeImpl`'s own `nodeFacts` now also reads a
+  * literal `guard = Guard.RequiresReview` argument straight off the reference's own source text
   * (`explicitRequiresReviewGuard`, `KitMacro.scala`), named or positional, since `guard` is the only
   * parameter of `Node.apply` typed `Guard` at all so nothing else a literal `Guard.RequiresReview` could
   * bind to, combined with the marker test above by an OR, the identical combination `Node.apply`'s own
-  * doc below describes. Neither direction is left open any more: the two checks can no longer disagree
-  * about a node whose input type carries the marker, nor about one whose `guard` argument alone says so.
+  * doc below describes.
+  *
+  * Narrows, not closes, and the two halves of that OR do NOT have the same reach, stated here rather
+  * than left for a reader to infer from the macro. The MARKER half is read off a node reference's own
+  * static type, which every reference form this walk can key at all already carries: a stable path (a
+  * `val`, a module member, a package qualified one) and an inline `Node(...)` construction written
+  * straight into the `Shape` are read identically, so a marker on `I` is never invisible to the compile
+  * time check because of how the node happened to be referenced. The explicit `guard` ARGUMENT half has
+  * no static type to be read off at all; it exists only as source, inside the argument list of a
+  * `Node.apply` call, so `explicitRequiresReviewGuard` can see it only where that call is written inline
+  * at the shape's own call site, the one place that argument list is still in the tree the macro walks
+  * (`unwrapRef`, `KitMacro.scala`, is what recovers the original call out of the expansion an `inline
+  * def apply` leaves behind; it recovers the CALL, never a `val` some call elsewhere was bound to). A
+  * node built as `val Guarded = Node(..., guard = Guard.RequiresReview)` and then referenced as
+  * `Guarded` in the shape therefore still reads as `Guard.Open` to the compile time check, on an input
+  * type carrying no marker, and is caught only by `Runner.validate` at startup, exactly the runtime
+  * backstop this divergence always had (`test/GraphValidationSpec.scala`'s own round 5 tests state that
+  * limit in as many words and write every node inline for precisely this reason). So the direction the
+  * marker travels is genuinely closed, and the direction the hand written argument travels is closed for
+  * an inline construction and open for every other reference form, runtime checked rather than compile
+  * time checked.
   */
 trait RequiresReviewInput
 
 /** Derives whether a `Node`'s own INPUT type `I` carries the `RequiresReviewInput` marker, so
   * `Node.apply` (below) can fold that fact into `guard` without a node author ever naming it twice
-  * (issue #43 review round 4, Tier 2). Constructed identically to `TrustOf` above, for the identical
-  * reason: `reviewRequired` sits directly on `GuardOf`'s own companion, `open` sits one level down on
-  * `LowPriorityGuardOf`, so Scala's own priority rule (a given on a type's own companion always
-  * outranks one only inherited from a parent trait, `TrustOf`'s own doc has the general statement)
-  * picks `reviewRequired` first whenever a concrete `I` satisfies both, rather than leaving the two
-  * genuinely ambiguous the way two same-priority givens both matching one `I` would be. `reviewRequired`
-  * is bounded, `[I <: RequiresReviewInput]`, not matched by exact unification the way `TrustOf.judged`
-  * matches `AgentDispatch.Judged[A]` exactly: `TrustOf`'s own doc explains why an OUTPUT type has to be
-  * matched exactly (a node whose reviewer legitimately returns something merely CONTAINING a `Judged`
-  * must not earn `Trust.Reviewed` by accident), but an INPUT type extending this marker, however many
-  * additional fields or supertypes it carries alongside it, genuinely does state "reaching this node
-  * requires a review", so a subtype bound, not an exact match, is the correct test here, mirroring the
-  * subtype test `KitMacro.checkShapeImpl`'s own `nodeFacts` already runs, `TypeRepr.of[i] <:<
-  * TypeRepr.of[RequiresReviewInput]`, so `Node.apply`'s own real `guard` field and the macro's own
-  * structural read of `I` derive the identical fact the identical way, never a second, independently
-  * drifting rule that could disagree with the first.
+  * (issue #43 review round 4, Tier 2) and without any call site being able to answer it instead (issue
+  * #26 PR review; `RequiresReviewInput`'s own doc, above, has the two earlier, parameter shaped
+  * designs and the exact way the second one was defeated).
+  *
+  * A macro rather than a given, and that IS the guarantee: this asks `quotes.reflect`'s own subtype
+  * relation, `TypeRepr.of[I] <:< TypeRepr.of[RequiresReviewInput]`, which no import, no shadowing
+  * given, no priority accident and no explicit argument at a call site can make answer anything other
+  * than the truth about `I`. Every value level shape this fact could take instead, a `using` parameter,
+  * a defaulted argument, a field on some evidence object, is something a caller can pass by hand or
+  * forge with a cast; a type argument the caller already wrote down is not.
+  *
+  * A subtype test, not the exact unification `TrustOf.judged` performs on an OUTPUT type: `TrustOf`'s
+  * own doc explains why a node whose reviewer legitimately returns something merely CONTAINING a
+  * `Judged` must not earn `Trust.Reviewed` by accident, but an INPUT type extending this marker,
+  * however many additional fields or supertypes it carries alongside it, genuinely does state
+  * "reaching this node requires a review", so a subtype bound is the correct test here.
+  *
+  * This is the SAME expression `KitMacro.checkShapeImpl`'s own `nodeFacts` runs when it reads the
+  * identical fact off a node reference's own static type at compile time, and both now live in
+  * `KitMacro.scala` for exactly that reason: the real `Node`'s own `guard` field and the macro's
+  * structural read of `I` derive one fact one way, never two independently drifting rules that could
+  * end up disagreeing.
+  *
+  * `private[litterbox]`, since nothing outside this library has any reason to ask: `Node.apply` inlines
+  * this away entirely, so a consumer's compiled code carries the answer rather than a call to this.
+  * That narrowing is naming hygiene rather than a gate, the same qualification `Faulting`'s own doc at
+  * the top of this file already makes about `private[litterbox]` generally, and it costs nothing
+  * either way, since this only ever answers the truth about `I`.
   */
-sealed trait GuardOf[I]:
-  def requiresReview: Boolean
-
-object GuardOf extends LowPriorityGuardOf:
-  given reviewRequired[I <: RequiresReviewInput]: GuardOf[I] with
-    def requiresReview: Boolean = true
-
-/** `sealed`, for the identical reason `LowPriorityTrustOf` is (that trait's own doc has the fuller
-  * reasoning): a consumer that could `extends LowPriorityGuardOf` would bring `open` into a scope
-  * where Scala's own priority rule no longer ranks it below `GuardOf.reviewRequired`, since that rule
-  * only ranks `GuardOf`'s own companion above ITS OWN parent, never above an unrelated mixin a
-  * consumer wrote; a name clash or an import order accident could then let `open` outrank
-  * `reviewRequired` for a genuine `RequiresReviewInput`-extending `I`, silently hiding a node that
-  * should have been forced into `Guard.RequiresReview` behind `Guard.Open` instead. `sealed` closes
-  * that door the same way it does for `LowPriorityTrustOf`; `object GuardOf`'s own `extends
-  * LowPriorityGuardOf` still works, since `sealed` only forbids extension from OUTSIDE the file it is
-  * declared in.
-  */
-sealed trait LowPriorityGuardOf:
-  given open[I]: GuardOf[I] with
-    def requiresReview: Boolean = false
+private[litterbox] inline def markerRequiresReview[I]: Boolean =
+  ${ KitMacro.markerRequiresReviewImpl[I] }
 
 /** One step of a graph: a name for logs/errors, its budget `cost` and wall-clock `timeout` (both
   * enforced by the `Runner`, never by the node itself), a `probe` that answers from the outside
@@ -449,7 +481,12 @@ sealed trait LowPriorityGuardOf:
   * from class Node in package in.rcard.litterbox". Neither reads "object Node does not take
   * parameters", the message a bare `Node(...)` call would get if NO `apply` resolved at all; that is
   * not this guarantee, since `Node.apply` in the companion object below always resolves for an
-  * ordinary call. That same `Node.apply` is the only way in, and it takes `trust` from nowhere a
+  * ordinary call. One Scala level route past the private constructor exists and is deliberate:
+  * `Node.make`, the member `Node.apply`'s own `inline` body expands to, which is `private[Node]` and
+  * therefore unnameable from anywhere outside `object Node` itself, at the price named in
+  * `RequiresReviewInput`'s own doc (its `@publicInBinary` makes the JVM method public, so bytecode and
+  * reflection reach what Scala source cannot). That same `Node.apply` is the only way in, and it takes
+  * `trust` from nowhere a
   * caller can name: `t.trust`, read off the
   * `given TrustOf[O]` its own `using` clause resolves, so a node author cannot write the wrong
   * `Trust` into it BY HAND, the same way `copy` cannot be used to swap it either afterward. That
@@ -459,14 +496,15 @@ sealed trait LowPriorityGuardOf:
   * mechanism; `Runner.step`'s own doc has the runtime check that catches it for every execution that
   * reaches a `Done`). In a codebase whose thesis is distrust, claiming more than that here would be
   * a false structural guarantee, worse than none at all. `guard` stays an ordinary, defaulted
-  * parameter on that same `apply`, still overridable by hand, but no longer the ONLY fact that decides
+  * parameter on that same `apply`, still writable by hand, but no longer the ONLY fact that decides
   * it (issue #43 review round 4, Tier 2, correcting an earlier version of this paragraph that said
   * `guard` "is not derivable from `O` at all" and left it there): `guard`'s own type, `O`, genuinely
   * cannot carry it, `Guard`'s own doc still has that reasoning unchanged, but `I`, the node's own INPUT
-  * type, can, and now does, through `GuardOf[I]` (`RequiresReviewInput`'s own doc has the full
-  * reasoning for why a `using` clause resolved inside `Node.apply`'s own BODY succeeds where the
-  * identical derivation folded into `guard`'s own DEFAULT expression was tried and found unsound,
-  * issue #39 review, MAJOR 1). `Node.apply`'s own doc, immediately below, has the combination.
+  * type, can, and now does, through `markerRequiresReview[I]` (`RequiresReviewInput`'s own doc has the
+  * full reasoning for why that fact is read by a macro over `I` inside an `inline` `apply` rather than
+  * through a `using` clause, a default expression, or anything else a call site could answer for). What
+  * a caller writes into `guard` can therefore only ever ADD a guard, never take the derived one away.
+  * `Node.apply`'s own doc, immediately below, has the combination.
   */
 final case class Node[I, O] private (
     name: String,
@@ -479,40 +517,75 @@ final case class Node[I, O] private (
 )
 
 object Node:
-  /** `guard`'s own hand written default, `Guard.Open`, and `GuardOf[I]`'s own derivation off the
-    * marker are combined here, in the BODY, rather than either one alone deciding `guard` (issue #43
-    * review round 4, Tier 2, `RequiresReviewInput`'s own doc has the full reasoning for why a `using
-    * g: GuardOf[I]` clause works here where the identical derivation folded into `guard`'s own DEFAULT
-    * expression, an earlier design tried and rejected, issue #39 review MAJOR 1, did not).
+  /** `guard`'s own hand written default, `Guard.Open`, and the `RequiresReviewInput` marker on `I` are
+    * combined here, in the BODY, rather than either one alone deciding `guard` (issue #43 review round
+    * 4, Tier 2; `RequiresReviewInput`'s own doc has the full reasoning for why the marker half is read
+    * by `markerRequiresReview[I]`, a macro over the type argument alone, rather than through the
+    * `using GuardOf[I]` clause an earlier version of this method carried, which a call site could pass
+    * its own argument for and did, issue #26 PR review).
     *
     * The combination rule, stated plainly (issue #43 review round 5, FINDING 2): the real `guard` is
-    * `Guard.RequiresReview` whenever EITHER `g.requiresReview` or the `guard` ARGUMENT itself says so,
+    * `Guard.RequiresReview` whenever EITHER the marker on `I` or the `guard` ARGUMENT itself says so,
     * `Guard.Open` only when both agree it need not be, and neither fact is ever silently discarded in
     * favour of the other, only OR-ed with it.
     *
-    * Concretely: whenever `g.requiresReview` is `true`, the real `guard` is `Guard.RequiresReview`
-    * regardless of what the `guard` ARGUMENT was written as, so a node whose input type extends
-    * `RequiresReviewInput` is stamped guarded even if its author left `guard` at the default, closing
-    * the reverse divergence `RequiresReviewInput`'s own doc names, the one `KitMacro.checkShapeImpl`'s
-    * compile time walk always caught but `Runner.validate` never did before issue #43 review round 4.
-    * Whenever `g.requiresReview` is `false`, the real `guard` is exactly the hand written `guard`
-    * argument, `Guard.RequiresReview` preserved unchanged when the author wrote it that way, never
-    * downgraded to `Guard.Open` for lack of a marker: `Machine.OpenPr`/`Machine.Merge` are the ordinary
-    * case of this half, since neither extends the marker (their own doc, `Machine.scala`, has the
-    * reason). `t.trust`, read the same way it always was, is untouched by any of this; the two `using`
-    * clauses are independent derivations over `O` and `I` respectively and neither reads the other.
+    * Concretely: whenever `I` extends `RequiresReviewInput`, the real `guard` is `Guard.RequiresReview`
+    * regardless of what the `guard` ARGUMENT was written as, so a node whose input type extends that
+    * marker is stamped guarded even if its author left `guard` at the default, closing the reverse
+    * divergence `RequiresReviewInput`'s own doc names, the one `KitMacro.checkShapeImpl`'s compile time
+    * walk always caught but `Runner.validate` never did before issue #43 review round 4. Whenever `I`
+    * does not extend it, the real `guard` is exactly the hand written `guard` argument,
+    * `Guard.RequiresReview` preserved unchanged when the author wrote it that way, never downgraded to
+    * `Guard.Open` for lack of a marker: `Machine.OpenPr`/`Machine.Merge` are the ordinary case of this
+    * half, since neither extends the marker (their own doc, `Machine.scala`, has the reason).
+    *
+    * `inline`, purely so that the marker half is derived from `I` at the call site and from nothing
+    * else. `t.trust` stays exactly as it always was, read off a `using TrustOf[O]` clause a caller CAN
+    * pass an explicit argument for: that forgeability is a separately documented, accepted residual
+    * (`Trust`'s own doc for the derivation's own blind spot, `Runner.step`'s own doc for the runtime
+    * check that catches it on the first `Done`), not something this method's own `inline`-ness was
+    * meant to fix, and the two facts stay independent derivations over `O` and `I` respectively,
+    * neither reading the other.
     */
-  def apply[I, O](
+  inline def apply[I, O](
       name: String,
       cost: Cost,
       timeout: Timeout,
       probe: I => (Caps, Fault) ?=> Option[O],
       run: I => (Caps, Fault) ?=> NodeOutcome[O],
       guard: Guard = Guard.Open
-  )(using t: TrustOf[O], g: GuardOf[I]): Node[I, O] =
-    val realGuard =
-      if g.requiresReview || guard == Guard.RequiresReview then Guard.RequiresReview else Guard.Open
-    new Node(name, cost, timeout, probe, run, t.trust, realGuard)
+  )(using t: TrustOf[O]): Node[I, O] =
+    make(
+      name,
+      cost,
+      timeout,
+      probe,
+      run,
+      t.trust,
+      if markerRequiresReview[I] || guard == Guard.RequiresReview then Guard.RequiresReview
+      else Guard.Open
+    )
+
+  /** The single construction site `apply` above expands to, and the only reason it exists is that
+    * `apply` is `inline`: an inline body is typechecked at the CALL site, where `Node`'s own private
+    * constructor is not accessible, so the `new Node(...)` has to sit behind a member that is.
+    * `private[Node]` is the narrowest qualifier that still lets `apply`'s own body reach it, so no
+    * Scala source anywhere, in this package or any other, can name this and hand it a `trust` or a
+    * `guard` of its own choosing; `@publicInBinary` is what the compiler requires before an inline
+    * body may call a non-public member at all, and what it costs is stated plainly rather than glossed
+    * over (`RequiresReviewInput`'s own doc, alongside the larger, already accepted `TrustOf` residual
+    * it resembles): the JVM method is public, so bytecode, reflection and other JVM languages reach
+    * what Scala source here cannot.
+    */
+  @publicInBinary private[Node] def make[I, O](
+      name: String,
+      cost: Cost,
+      timeout: Timeout,
+      probe: I => (Caps, Fault) ?=> Option[O],
+      run: I => (Caps, Fault) ?=> NodeOutcome[O],
+      trust: Trust,
+      guard: Guard
+  ): Node[I, O] = new Node(name, cost, timeout, probe, run, trust, guard)
 
 /** One edge of a `Workflow`'s graph, chosen by the PREVIOUS node's output (or, for the first node,
   * by the workflow's own input): either the run finishes here, or execution goes to another `Node`
@@ -613,7 +686,7 @@ final case class Shape(entry: List[Node[?, ?]], transitions: List[Transition])
   * own `guard` argument was deliberately left `Guard.Open` used to be read as guarded HERE even though
   * `Runner.validate` read it as not, an inconsistency between the two checks that could make this macro
   * reject a literal `Runner.validate` would have accepted. That inconsistency is closed now
-  * (`GuardOf`'s own doc, `Node.apply`'s own doc): `Node.apply` derives the real `Node`'s own `guard`
+  * (`markerRequiresReview`'s own doc, `Node.apply`'s own doc): `Node.apply` derives the real `Node`'s own `guard`
   * field off the identical marker this macro reads, whenever the marker is present, so the two checks
   * can no longer disagree about THAT fact, and this macro's own reading of it, structural, off `I`
   * alone, is now always a correct (if occasionally incomplete, see below) description of what the real
@@ -637,7 +710,7 @@ final case class Shape(entry: List[Node[?, ?]], transitions: List[Transition])
   * spurious rejection, the guard/marker inconsistency this paragraph is about, is closed by Tier 2
   * above. Stated as a claim about the code as it stands today, not a promise about every future change
   * to it, the same qualification every earlier version of this sentence already carried: a future
-  * change to `identifyRef`, `nodeFacts`, `literalListElements`, or the `GuardOf` derivation could
+  * change to `identifyRef`, `nodeFacts`, `literalListElements`, or the `markerRequiresReview` derivation could
   * reopen a false rejection the same way earlier rounds each did, so this is the state found after
   * attacking the claim directly at round 4, not a proof no future gap could ever exist. A SEPARATE,
   * already-accepted residual, not this paragraph's subject and not narrowed by Tier 2 either way
@@ -680,7 +753,7 @@ inline def checkedShape(inline shape: Shape): Shape = ${ KitMacro.checkShapeImpl
   * field, never this marker, so a graph reaching that node with no reviewer on the path passed
   * `Runner.validate` silently, forever, the moment this macro declined for an unrelated reason (`shape`
   * written as a `val` instead of a literal). That is no longer the whole story: issue #43 review round
-  * 4's Tier 2 (`RequiresReviewInput`'s own doc, `GuardOf`'s own doc alongside `TrustOf`, `Node.apply`'s
+  * 4's Tier 2 (`RequiresReviewInput`'s own doc, `markerRequiresReview`'s own doc alongside `TrustOf`, `Node.apply`'s
   * own doc) made `Node.apply` itself derive `Guard.RequiresReview` on the REAL constructed `Node`
   * whenever its input type carries this marker, regardless of what `guard` was written as, so
   * `Runner.validate`, reading that real field at startup, now correctly flags exactly the graph this

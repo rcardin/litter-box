@@ -2229,7 +2229,7 @@ object Machine:
     * node `transitions` names but no `entry` reaches), real, but a strictly narrower guarantee than
     * "no guarded node is reachable without a review". Rechecked, not merely carried forward, after
     * issue #43 review round 4's Tier 2 made `Node.apply` derive `Guard.RequiresReview` from a node's
-    * own input type extending `RequiresReviewInput` (`Kit.scala`'s own doc on `GuardOf`): that
+    * own input type extending `RequiresReviewInput` (`Kit.scala`'s own doc on `markerRequiresReview`): that
     * derivation cannot silently add a `Guard.RequiresReview` to a node here, because it fires off the
     * TYPE, and no node's input type in this `Shape` extends the marker (the paragraph below has the
     * same fact stated for the macro's own read of it), so this claim is still true for the reason it

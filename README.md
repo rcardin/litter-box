@@ -59,6 +59,29 @@ direction is again safe for `Runner.validate`, strictly more graphs get correctl
 but any code that read a `Node`'s own `guard` field back out and compared it against `Guard.Open` for a
 marker-carrying node can observe the difference; pin an exact version if that is a concern.
 
+`checkedShape` picks up a third such change as of the release that closes issue #43 review round 5: the
+walk it splices now also reads an explicit `guard = Guard.RequiresReview` argument, named or positional,
+written at an inline `Node(...)` construction inside the `Shape` itself, where before it read only the
+`RequiresReviewInput` marker on a node's own input type. A shape reaching such a node with no reviewer on
+the path used to compile and be rejected by `Runner.validate` at startup; it now fails to compile. The
+direction is again safe, strictly more checking, never less, and the scope is inline constructions only:
+a node built as a `val` elsewhere and merely referenced in the `Shape` carries no argument list the macro
+can read, so an explicit `guard` on one of those is still checked at startup and not while you compile.
+It is still a behaviour change to a published `inline def`; pin an exact version if that possibility is a
+problem for you.
+
+That same derivation is a source-breaking change of its own as of the release that closes issue #26's
+PR review. It used to be read off a `using GuardOf[I]` clause on `Node.apply`, and `GuardOf.open[I]`,
+the given that answers "no marker" for every `I`, was public and nameable, so a call site could pass it
+explicitly and get `Guard.Open` stamped onto a node whose input type extends `RequiresReviewInput`,
+defeating the derivation entirely. `Node.apply` is now an `inline def` that reads the marker off its own
+type argument through a macro, so: `GuardOf` and `LowPriorityGuardOf` are gone from the public API,
+`Node.apply`'s `using` clause takes `TrustOf[O]` alone, and code that passed either given by hand no
+longer compiles. Ordinary call sites, including every form the scaffold and this README show, are
+unaffected. `TrustOf[O]` deliberately stays an ordinary `using` parameter you can answer for yourself;
+that residual, and the runtime check that catches it, are documented on `Trust` and `Runner.step`
+(`Kit.scala`).
+
 ## Install
 
 Every published version is on the [releases page](https://github.com/rcardin/litter-box/releases);
@@ -161,18 +184,26 @@ expression right at this call site, never a `val` you build first and pass by na
 compile-time checks that every path into a node whose own input type extends `RequiresReviewInput`
 crosses a reviewer first, the same macro `checkedShape` runs, but unconditionally rather than opt in:
 pass anything other than a literal here and the call refuses to compile at all, naming what it needs
-instead, rather than silently skipping the check the way an opt-in macro would. This reads the INPUT
-TYPE, never the hand-written `guard = Guard.RequiresReview` argument you can also pass to `Node`,
-directly: a node whose `guard` you set explicitly but whose input type does not extend
-`RequiresReviewInput` is not this compile-time check's business at all, and is instead caught only by
-`Runner.validate` at startup, which reads that field the other way around (`ARCHITECTURE.md` has the
-fuller reasoning for why the two checks read different facts on purpose). The reverse used to be a real
-gap and no longer is: a node whose input type DOES extend `RequiresReviewInput` gets
-`Guard.RequiresReview` stamped onto its real `guard` field by `Node.apply` itself now, regardless of
-whether you wrote `guard = ...` at all, so both the compile-time macro (reading the marker) and
-`Runner.validate` at startup (reading the now-consistent field) catch a node like that; before this,
-only the compile-time macro could, and only if `shape` was written as a literal here. If your shape
-genuinely cannot be written as a literal (built in a loop, read from configuration, ...),
+instead, rather than silently skipping the check the way an opt-in macro would. This reads TWO facts and
+combines them with an OR, the same combination `Node.apply` performs on the real constructed value: the
+INPUT TYPE, whether it extends `RequiresReviewInput`, and the hand-written `guard =
+Guard.RequiresReview` argument you can also pass to `Node`, named or positional, in the one place the
+macro can see one. The two halves do not reach equally far, and the difference is worth knowing before
+you lean on either. The marker half is read off the reference's own static type, so it fires through a
+plain `val` reference exactly as well as through an inline construction. The explicit-argument half is
+read off the SOURCE of a `Node(name = "...", ...)` call written inline in the shape itself, so it fires
+only there: a node you bind to a `val` first and then name in `entry`/`transitions` presents this check
+with the reference alone, never the initializer that built it, so a `guard = Guard.RequiresReview` you
+wrote on that `val` stays invisible at compile time and is caught only by `Runner.validate` at startup,
+which reads the constructed node's real `guard` field rather than the source that produced it
+(`ARCHITECTURE.md` has the fuller reasoning for why the two checks read different facts on purpose).
+The reverse used to be a real gap and no longer is: a node whose input type DOES extend
+`RequiresReviewInput` gets `Guard.RequiresReview` stamped onto its real `guard` field by `Node.apply`
+itself now, regardless of whether you wrote `guard = ...` at all, so both the compile-time macro
+(reading the marker) and `Runner.validate` at startup (reading the now-consistent field) catch a node
+like that; before this, only the compile-time macro could, and only if `shape` was written as a literal
+here. If your shape genuinely cannot be written as a literal (built in a loop, read from
+configuration, ...),
 `LitterBox.graph` is not for you; compose `Runner.run` directly instead, outside the compile-time half
 of this guarantee, though `Runner.validate` still runs against whatever `Shape` you hand `Runner.run`.
 
