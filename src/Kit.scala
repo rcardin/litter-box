@@ -337,13 +337,13 @@ enum Guard:
   * Issue #39 accordingly left `guard` a hand written, overridable default with no derivation at all,
   * and the two facts, this marker on `I` and the hand written `guard` argument, were free to diverge in
   * BOTH directions: a node passing `guard = Guard.RequiresReview` without extending this marker was
-  * invisible to the macro (still true, `Guard`'s own doc above still names it, `checkedShapeStrict`'s
-  * own doc, below, has the runtime backstop for exactly that case); and a node extending this marker
-  * while `guard` was left `Guard.Open`, `Machine.OpenPr`/`Machine.Merge`'s own deliberate shape at the
-  * time (their own doc has the reason a `guard` there would reject the shipped graph itself), was
-  * invisible to `Runner.validate`, which reads `guard`, never this marker, a gap issue #43 review round
-  * 4 found seven real files could exploit silently (`KitMacro.checkShapeImpl`'s own doc has the
-  * mechanism, `stablePathKey`'s own doc names the specific families).
+  * invisible to the macro (issue #43 review round 5, FINDING 1, below, closes this one too;
+  * `checkedShapeStrict`'s own doc, below, has the runtime backstop that covered it in the meantime); and
+  * a node extending this marker while `guard` was left `Guard.Open`, `Machine.OpenPr`/`Machine.Merge`'s
+  * own deliberate shape at the time (their own doc has the reason a `guard` there would reject the
+  * shipped graph itself), was invisible to `Runner.validate`, which read `guard`, never this marker, a
+  * gap issue #43 review round 4 found seven real files could exploit silently (`KitMacro.checkShapeImpl`'s
+  * own doc has the mechanism, `stablePathKey`'s own doc names the specific families).
   *
   * That second divergence is what issue #43 review round 4's Tier 2 closes, by moving the `using
   * GuardOf[I]` clause the paragraph above already proved SOUND out of a default expression and into
@@ -359,14 +359,22 @@ enum Guard:
   * `Guard.RequiresReview` on the constructed `Node` regardless of what `guard` was written as, so a
   * node extending this marker with `guard` left at its default is caught by `Runner.validate` too, not
   * only by the compile time macro; `Machine.OpenPr` and `Machine.Merge` are unaffected by this, since
-  * neither extends this marker at all. The FIRST divergence, `guard = Guard.RequiresReview` written by
-  * hand without extending this marker, is unchanged and still real: the macro still reads this marker
-  * alone, structurally, off the reference's own static input type (`KitMacro.checkShapeImpl`'s own doc
-  * has the reason it cannot instead read the hand written field), so a node like that still walks
-  * through the compile time check as if it were unguarded even though `Runner.validate`, reading the
-  * real constructed `Node`'s own `guard` field, correctly treats it as guarded; that direction was
-  * always safe, a compile time UNDER-approximation backstopped by a stricter runtime check, never the
-  * reverse, and Tier 2 does not change which direction it runs in, only closes the OTHER one.
+  * neither extends this marker at all.
+  *
+  * The FIRST divergence used to be left standing here, on the theory that a compile time
+  * UNDER-approximation backstopped by a stricter runtime check was an acceptable, permanently open gap:
+  * a node whose own `guard` argument genuinely was `Guard.RequiresReview`, written by hand, on an input
+  * type that did NOT extend this marker, walked through the compile time check as if it were unguarded,
+  * even though `Runner.validate` correctly treated it as guarded. `Guard`'s own scaladoc above states
+  * plainly that declaring the guard "is the node author's own job", so leaving that documented, author
+  * declared form with no compile time check of its own, only a runtime backstop, is precisely the gap
+  * issue #43 review round 5 (FINDING 1) closes: `KitMacro.checkShapeImpl`'s own `nodeFacts` now also
+  * reads a literal `guard = Guard.RequiresReview` argument straight off the reference's own source text
+  * (`explicitRequiresReviewGuard`, `KitMacro.scala`), named or positional, since `guard` is the only
+  * parameter of `Node.apply` typed `Guard` at all so nothing else a literal `Guard.RequiresReview` could
+  * bind to, combined with the marker test above by an OR, the identical combination `Node.apply`'s own
+  * doc below describes. Neither direction is left open any more: the two checks can no longer disagree
+  * about a node whose input type carries the marker, nor about one whose `guard` argument alone says so.
   */
 trait RequiresReviewInput
 
@@ -475,17 +483,24 @@ object Node:
     * marker are combined here, in the BODY, rather than either one alone deciding `guard` (issue #43
     * review round 4, Tier 2, `RequiresReviewInput`'s own doc has the full reasoning for why a `using
     * g: GuardOf[I]` clause works here where the identical derivation folded into `guard`'s own DEFAULT
-    * expression, an earlier design tried and rejected, issue #39 review MAJOR 1, did not): whenever
-    * `g.requiresReview` is `true`, this `Node`'s real `guard` field is `Guard.RequiresReview`
+    * expression, an earlier design tried and rejected, issue #39 review MAJOR 1, did not).
+    *
+    * The combination rule, stated plainly (issue #43 review round 5, FINDING 2): the real `guard` is
+    * `Guard.RequiresReview` whenever EITHER `g.requiresReview` or the `guard` ARGUMENT itself says so,
+    * `Guard.Open` only when both agree it need not be, and neither fact is ever silently discarded in
+    * favour of the other, only OR-ed with it.
+    *
+    * Concretely: whenever `g.requiresReview` is `true`, the real `guard` is `Guard.RequiresReview`
     * regardless of what the `guard` ARGUMENT was written as, so a node whose input type extends
     * `RequiresReviewInput` is stamped guarded even if its author left `guard` at the default, closing
     * the reverse divergence `RequiresReviewInput`'s own doc names, the one `KitMacro.checkShapeImpl`'s
-    * compile time walk always caught but `Runner.validate` never did before this fix. Whenever
-    * `g.requiresReview` is `false`, this reduces to the hand written `guard` argument unchanged, byte
-    * for byte the behaviour every call site had before this fix, `Machine.OpenPr`/`Machine.Merge`
-    * included, since neither extends the marker (their own doc, `Machine.scala`, has the reason).
-    * `t.trust`, read the same way it always was, is untouched by this change; the two `using` clauses
-    * are independent derivations over `O` and `I` respectively and neither reads the other.
+    * compile time walk always caught but `Runner.validate` never did before issue #43 review round 4.
+    * Whenever `g.requiresReview` is `false`, the real `guard` is exactly the hand written `guard`
+    * argument, `Guard.RequiresReview` preserved unchanged when the author wrote it that way, never
+    * downgraded to `Guard.Open` for lack of a marker: `Machine.OpenPr`/`Machine.Merge` are the ordinary
+    * case of this half, since neither extends the marker (their own doc, `Machine.scala`, has the
+    * reason). `t.trust`, read the same way it always was, is untouched by any of this; the two `using`
+    * clauses are independent derivations over `O` and `I` respectively and neither reads the other.
     */
   def apply[I, O](
       name: String,
@@ -495,7 +510,8 @@ object Node:
       run: I => (Caps, Fault) ?=> NodeOutcome[O],
       guard: Guard = Guard.Open
   )(using t: TrustOf[O], g: GuardOf[I]): Node[I, O] =
-    val realGuard = if g.requiresReview then Guard.RequiresReview else guard
+    val realGuard =
+      if g.requiresReview || guard == Guard.RequiresReview then Guard.RequiresReview else Guard.Open
     new Node(name, cost, timeout, probe, run, t.trust, realGuard)
 
 /** One edge of a `Workflow`'s graph, chosen by the PREVIOUS node's output (or, for the first node,

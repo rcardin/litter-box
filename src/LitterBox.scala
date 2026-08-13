@@ -42,8 +42,8 @@ package in.rcard.litterbox
   * ever turns that number into a `Ledger` or spends against one.
   *
   * "Owns budget accounting" is a claim about WHO holds the counter, not a claim about how tightly that
-  * counter bounds a node's own spend, and the two should not be read as the same promise (issue #43
-  * review round 2, MAJOR M2): `Runner.Ledger.canAfford` (`Kit.scala`) is checked once, before a node's
+  * counter bounds a node's own spend, and the two should not be read as the same promise (issue #43):
+  * `Runner.Ledger.canAfford` (`Kit.scala`) is checked once, before a node's
   * own `probe`/`run` starts, never again while it runs, and `Cost.NoDispatch` is unconditionally
   * affordable regardless of what remains, so a `Cost.NoDispatch` node is never gated by `dispatchBudget`
   * at all, no matter how many times it actually calls `agents.*`, and a `Cost.OneDispatch` node that
@@ -61,26 +61,25 @@ sealed trait LoopGraph:
     * without ever needing to name its start type, reading `graph.workflow`/`graph.begin` off the
     * path-dependent `graph.Start` the same way regardless of which inhabitant `graph` happens to be.
     * `LitterBox.shipped` fixes this to `Machine.ShippedStart`; [[LitterBox.graph]]'s own inhabitant
-    * fixes it to whatever `I` its caller chose. `private[litterbox]` (issue #43 review, MINOR 5,
-    * correcting an earlier version of this trait that left this bare): the trait doc above claims "the
-    * seal plus every member here being `private[litterbox]`" is what keeps this shut, and a bare
-    * `type Start` with no modifier was the one member that did not actually carry one, confirmed by
-    * compiling `val s: LitterBox.shipped.Start = ???` clean from `package com.example.consumer`. Not
-    * exploitable on its own, `Start` is abstract, `LitterBox.shipped` is ascribed `: LoopGraph`, and
-    * `begin` stays `private[litterbox]`, so nothing nameable actually flows through a bare `Start`
-    * reference, but a scaladoc whose entire argument is "the guarantee rests on exactly these
-    * modifiers" owes an accurate list of them.
+    * fixes it to whatever `I` its caller chose. `private[litterbox]` (issue #43 review): the trait doc
+    * above claims "the seal plus every member here being `private[litterbox]`" is what keeps this
+    * shut, and a bare `type Start` with no modifier was, at one point, the one member that did not
+    * actually carry one, confirmed by compiling `val s: LitterBox.shipped.Start = ???` clean from
+    * `package com.example.consumer`. Not exploitable on its own, `Start` is abstract, `LitterBox
+    * .shipped` is ascribed `: LoopGraph`, and `begin` stays `private[litterbox]`, so nothing nameable
+    * actually flows through a bare `Start` reference, but a scaladoc whose entire argument is "the
+    * guarantee rests on exactly these modifiers" owes an accurate list of them.
     *
-    * Marking THIS abstract declaration `private[litterbox]` was not, on its own, the whole fix (issue
-    * #43 review round 2, MINOR m3): Scala permits a concrete OVERRIDE to WIDEN an inherited member's
-    * access back to public even when the abstract member it implements is narrower, so `LitterBox
-    * .shipped`'s own `type Start = Machine.ShippedStart` and `LitterBox.graph`'s own `type Start = I`
-    * (both below) still needed the identical modifier written explicitly on THEM, confirmed by
-    * compiling `val s: LitterBox.shipped.Start = ???` against the tree immediately after this abstract
-    * declaration alone was narrowed and finding it still compiled clean, both anonymous `LoopGraph`
-    * class bodies having carried a bare `type Start = ...` of their own the whole time. Both now write
-    * `private[litterbox] type Start = ...` explicitly; `ConsumerGraphSpec` pins that this closes it for
-    * both inhabitants, not merely for the abstract member in isolation.
+    * TRAP for a future editor: marking THIS abstract declaration `private[litterbox]` is not, on its
+    * own, the whole fix. Scala permits a concrete OVERRIDE to WIDEN an inherited member's access back
+    * to public even when the abstract member it implements is narrower, so `LitterBox.shipped`'s own
+    * `type Start = Machine.ShippedStart` and `LitterBox.graph`'s own `type Start = I` (both below) each
+    * need the identical modifier written explicitly on THEM too, confirmed by narrowing only the
+    * abstract declaration and finding `val s: LitterBox.shipped.Start = ???` still compiled clean
+    * against that tree, both anonymous `LoopGraph` class bodies having carried a bare
+    * `type Start = ...` of their own. Both now write `private[litterbox] type Start = ...` explicitly;
+    * `ConsumerGraphSpec` pins that this closes it for both inhabitants, not merely for the abstract
+    * member in isolation.
     */
   private[litterbox] type Start
 
@@ -124,8 +123,9 @@ object LoopGraph:
     */
   private[litterbox] final case class Started[S](input: S, dispatchBudget: Int)
 
-/** The library's own public front door (issue #43): the coordinate a consumer depends on, the one
-  * graph this issue ships, and the one way to run it.
+/** The library's own public front door (issue #43): the coordinate a consumer depends on,
+  * [[shipped]], the graph the binary runs, and [[graph]], the public smart constructor a consumer
+  * calls to author and run their own graph on the same runner.
   */
 object LitterBox:
 
@@ -279,59 +279,53 @@ object LitterBox:
     * (`LoopGraph`'s own doc has the full reasoning for why a factory, not a subclass, is the door).
     *
     * `inline`, and `shape` an `inline` parameter, for exactly one reason: `checkedShapeStrict`
-    * (`Kit.scala`, issue #43 review, BLOCKER 1) is itself an `inline def` whose macro reads the
-    * CALLER's own literal `Shape` expression, not a value it evaluates at runtime
-    * (`checkedShapeStrict`'s own doc, and `KitMacro.checkShapeImpl`'s own doc, `KitMacro.scala`, have
-    * the reason a macro can only ever read a literal this way). Splicing `checkedShapeStrict(shape)`
-    * inside a non-inline `graph` would have the macro read `shape` as this function's own bare
-    * PARAMETER reference, a local variable, never the literal `Shape(...)` expression the RFC sketch's
-    * caller actually wrote; every call would then hit `checkedShapeStrict`'s own hard error for a
-    * non-literal shape (below), even a caller who genuinely wrote one, through no fault of their own.
-    * Making `graph` itself `inline`, with `shape` marked `inline` too, is what lets the macro see
-    * straight through this function to the caller's own literal, the same way `checkedShape` sees
-    * straight through an ordinary local `val shape = checkedShape(Shape(...))` today. The body below
-    * is kept to exactly the one splice that needs to be inline, `checkedShapeStrict(shape)`, calling a
-    * private, non-inline `graphImpl` for everything else (issue #43 review), so inlining this function
-    * does not also inline the whole `LoopGraph` construction into every call site.
+    * (`Kit.scala`) is itself an `inline def` whose macro reads the CALLER's own literal `Shape`
+    * expression, not a value it evaluates at runtime (`checkedShapeStrict`'s own doc, and
+    * `KitMacro.checkShapeImpl`'s own doc, `KitMacro.scala`, have the reason a macro can only ever read
+    * a literal this way). Splicing `checkedShapeStrict(shape)` inside a non-inline `graph` would have
+    * the macro read `shape` as this function's own bare PARAMETER reference, a local variable, never
+    * the literal `Shape(...)` expression the caller actually wrote; every call would then hit
+    * `checkedShapeStrict`'s own hard error for a non-literal shape (below), even a caller who genuinely
+    * wrote one, through no fault of their own. Making `graph` itself `inline`, with `shape` marked
+    * `inline` too, is what lets the macro see straight through this function to the caller's own
+    * literal, the same way `checkedShape` sees straight through an ordinary local
+    * `val shape = checkedShape(Shape(...))` today. The body below is kept to exactly the one splice
+    * that needs to be inline, `checkedShapeStrict(shape)`, calling a private, non-inline `graphImpl`
+    * for everything else, so inlining this function does not also inline the whole `LoopGraph`
+    * construction into every call site.
     *
-    * `checkedShapeStrict`, not `checkedShape` (issue #43 review, BLOCKER 1, correcting the version of
-    * this function an earlier round shipped): `checkedShape`'s own lenient fallback, silently
-    * returning `shape` unchanged the moment it cannot read a literal, was reproduced against this
-    * working tree as a silent hole specific to THIS entry point. At the time this fix shipped, a node
-    * whose input type extends `RequiresReviewInput` while its own `guard` argument was left at the
-    * default `Guard.Open`, exactly the shape every shipped `OpenPr`/`Merge`-style node takes, had no
-    * runtime backstop either: `Runner.validate` read `guard`, never the marker, so it found nothing
-    * wrong with that graph, ever, confirmed by a `val myShape = Shape(...)` passed here that compiled
-    * clean, reaching `OpenPr` with no reviewer anywhere on the path, both at compile time (the lenient
-    * macro fell back silently) and at runtime (`Runner.validate` returned `List()`). That specific
-    * absence of a backstop is no longer true (issue #43 review round 4, Tier 2, `Kit.scala`'s own doc
-    * on `GuardOf` and `Node.apply` has the mechanism): `Node.apply` now derives `Guard.RequiresReview`
-    * on the real constructed `Node` whenever its input type carries the marker, so `Runner.validate`
-    * now correctly flags that identical graph too. `checkedShapeStrict` still refuses to compile a
-    * non-literal `shape` here, and still should (`checkedShapeStrict`'s own doc, `Kit.scala`, has the
-    * two reasons that survive Tier 2 unchanged: catching a violation at compile time beats catching the
-    * same one at startup, and two alias residuals exist that no widening of this walk closes, for which
-    * `Runner.validate` is not a backstop for a fact the macro read differently but the ONLY check that
-    * ever runs at all); the point corrected here is narrower, that the case this fix was originally
-    * written to close no longer illustrates "no runtime backstop exists", only "compile time is
-    * earlier and unconditional, runtime is later and still real". This is RFC #26 decision 16's own
-    * recorded consequence, "graphs cannot be assembled dynamically", made to actually bite at this one
-    * entry point rather than merely being written down: a consumer who cannot write a literal `Shape`
-    * at this call site cannot use `LitterBox.graph` at all, and has to compose `Runner.run` directly
-    * instead, outside the compile time half of this guarantee, though still inside `Runner.validate`'s
-    * own. `checkedShape` and `checkedShapeStrict` remain two separate functions, never one
-    * flag-carrying one; `checkedShapeStrict`'s own doc (`Kit.scala`) has the fuller reasoning for why
-    * that split is the right one. `checkedShape` itself is NOT, however, unchanged in what it can
-    * PARSE, a claim this paragraph made in capitals at the time this fix shipped and which turned out
-    * to be false (issue #43 review round 2, MAJOR M3, `Kit.scala`'s own doc on `checkedShape` and
-    * `checkedShapeStrict` has the full correction): the walk both functions splice was widened
-    * alongside `checkedShapeStrict`, to recognise `Nil`, `List.empty`, a `This`-prefixed stable path,
-    * out-of-order named arguments, and a local `val`-bound `Transition` as literal pieces it can read
-    * rather than silently fall back on, and that walk is shared, so a `Shape` whose only previously
-    * unreadable piece was one of those now gets fully parsed under `checkedShape` too, which means a
-    * shape that used to compile clean under `checkedShape` can newly fail to compile if what this walk
-    * can now actually read turns out to have a genuine review-reachability violation. The direction is
-    * safe, strictly more checking, never less; it is still a behaviour change to a published, public
+    * `checkedShapeStrict`, not `checkedShape` (issue #43 review): `checkedShape`'s own lenient
+    * fallback, silently returning `shape` unchanged the moment it cannot read a literal, left a node
+    * whose input type extends `RequiresReviewInput` while its own `guard` argument stayed the default
+    * `Guard.Open`, exactly the shape every shipped `OpenPr`/`Merge`-style node takes, with no backstop
+    * at all: not at compile time (the lenient macro fell back silently) and, at the time, not at
+    * runtime either (`Runner.validate` read `guard`, never the marker, so it found nothing wrong with
+    * that graph). That specific absence of a backstop is closed now (`Kit.scala`'s own doc on `GuardOf`
+    * and `Node.apply` has the mechanism): `Node.apply` derives `Guard.RequiresReview` on the real
+    * constructed `Node` whenever its input type carries the marker, so `Runner.validate` correctly
+    * flags that identical graph too. `checkedShapeStrict` still refuses to compile a non-literal
+    * `shape` here regardless (`checkedShapeStrict`'s own doc, `Kit.scala`, has the two reasons that
+    * survive: catching a violation at compile time beats catching the same one at startup, and two
+    * alias residuals exist that no widening of this walk closes, for which `Runner.validate` is the
+    * only check that ever runs at all). This is RFC #26 decision 16's own recorded consequence, "graphs
+    * cannot be assembled dynamically", made to actually bite at this one entry point rather than merely
+    * being written down: a consumer who cannot write a literal `Shape` at this call site cannot use
+    * `LitterBox.graph` at all, and has to compose `Runner.run` directly instead, outside the compile
+    * time half of this guarantee, though still inside `Runner.validate`'s own. `checkedShape` and
+    * `checkedShapeStrict` remain two separate functions, never one flag-carrying one;
+    * `checkedShapeStrict`'s own doc (`Kit.scala`) has the fuller reasoning for why that split is the
+    * right one.
+    *
+    * The set of literal forms this walk can read (a `val` member of the enclosing class referenced
+    * bare, `List.empty`, out-of-order named arguments, a local `val`-bound `Transition`, ...) is wider
+    * than earlier versions of this macro accepted, and `checkedShape` and `checkedShapeStrict` share
+    * that same parsing walk (`KitMacro.checkShapeImpl`'s own doc, and the docs on
+    * `stablePathKey`/`literalListElements`/`companionApplyArgs` it points to, have the full table and
+    * the reasoning for each form): a `Shape` whose only unreadable piece is one of those now gets fully
+    * parsed under `checkedShape` too, not only under `checkedShapeStrict`, so a shape that used to
+    * compile clean under lenient `checkedShape` can newly fail to compile if what this walk can now
+    * actually read turns out to have a genuine review-reachability violation. The direction is safe,
+    * strictly more checking, never less; it is still a behaviour change to a published, public
     * `inline def`, and `README.md`'s version policy section names it as exactly the kind of change the
     * `0.x` no-stability-promise line exists for.
     *
@@ -343,15 +337,25 @@ object LitterBox:
     * shape `Machine.runOnce`'s own `ledgerSeed` computation has always had (RFC #26 decision 17: a
     * run's BEHAVIOUR is a fact of `config.conf`, never a second fact hardcoded into the graph that
     * describes its shape), never a promise that the function has to read `cfg` at all: nothing rejects
-    * `dispatchBudget = _ => 42`, a constant is a legal, if unusual, instance of `Config => Int` (issue
-    * #43 review, MINOR 7, correcting an earlier version of this paragraph that overclaimed "never a
-    * fixed number"); the `Config =>` shape is a convention that keeps the door open to reading config,
-    * not a constraint that forbids one who does not need to.
+    * `dispatchBudget = _ => 42`, a constant is a legal, if unusual, instance of `Config => Int`; the
+    * `Config =>` shape is a convention that keeps the door open to reading config, not a constraint
+    * that forbids one who does not need to.
+    *
+    * This is the one place RFC #26 decision 17's own promise, that nothing is expressible in both
+    * `config.conf` and `loop.scala`, gets a named exception instead of a silent one: the intended form
+    * of `dispatchBudget` reads the knob out of `config.conf`, keeping the layered config the single
+    * source of the number (`cfg => cfg.repairBudget + 1`, README.md's own sketch of this call, is
+    * exactly that shape); a constant such as `dispatchBudget = _ => 42` is legal too, and writing one
+    * is the one way a graph author can still put a budget number directly into `loop.scala`, which
+    * decision 17 asks them not to do, not one that makes it impossible. Recorded once, here, rather
+    * than as five separate paraphrases: `ARCHITECTURE.md`, README.md's own "Write your own loop"
+    * section and the scaffolded `loop.scala` comment (`resources/scaffold/loop.scala.txt`) all point
+    * back to this paragraph instead of restating it.
     *
     * The number returned bounds how many `Cost.OneDispatch` nodes may START, not the total number of
-    * dispatches a graph's own nodes can make (issue #43 review round 2, MAJOR M2): `LoopGraph`'s own
-    * trait doc (above) has the precise statement and names it as a residual, alongside `Runner.Ledger`'s
-    * own doc (`Kit.scala`), which has the mechanism (`canAfford`/`chargeDispatch`).
+    * dispatches a graph's own nodes can make: `LoopGraph`'s own trait doc (above) has the precise
+    * statement of that residual, and `Runner.Ledger`'s own doc (`Kit.scala`) has the mechanism
+    * (`canAfford`/`chargeDispatch`).
     *
     * `shape` is a separate parameter from `workflow.shape`, never read off the `Workflow` value
     * itself, because `workflow.shape` is a RUNTIME field, not a literal the macro splicing this
@@ -360,63 +364,33 @@ object LitterBox:
     * `checkedShape`'s own callers, a consumer whose `shape` argument here is not, in fact, a literal
     * `Shape(entry = ..., transitions = ...)` expression written directly at this call site DOES get a
     * compile failure for that alone (BLOCKER 1 above): `checkedShapeStrict` aborts rather than falling
-    * back to whatever `Runner.validate(graph.shape(cfg))` would otherwise find at startup. That runtime
-    * check used to read a different fact entirely for the one case this fix was written to close (a
-    * marker-only-guarded node, `guard` left `Guard.Open`), and was not a reliable backstop for it
-    * (issue #43 review, BLOCKER 1); `Node.apply`'s own doc (`Kit.scala`, issue #43 review round 4, Tier
-    * 2) has the fix that makes `Runner.validate` reliable for THAT one fact now, by making the real
-    * constructed `Node`'s own `guard` field agree with the marker rather than leaving the two free to
-    * diverge. `Runner.validate` still runs every tick inside `Machine.runOnce`, unconditionally, and is
-    * now the genuine backstop for two things at once: the marker/`guard` divergence Tier 2 closed, and
-    * the two alias residuals `checkedShapeStrict`'s own doc (`Kit.scala`) names, which no widening of
-    * this macro's own walk can close, because they are facts about which SOURCE REFERENCES name the
-    * same node, not facts about a hand written field the macro reads differently. It remains true that
-    * `Runner.validate` is not this parameter's fallback for an unreadable literal, only ever a second,
-    * later check behind the compile time one: erroring here on a non-literal `shape` stays mandatory
-    * regardless of how reliable the runtime check underneath it becomes, since compile time is strictly
-    * earlier for every graph this macro CAN read.
+    * back to whatever `Runner.validate(graph.shape(cfg))` would otherwise find at startup. `Node.apply`'s
+    * own doc (`Kit.scala`) has the fix that makes `Runner.validate` a reliable backstop for a
+    * marker-only-guarded node, by making the real constructed `Node`'s own `guard` field agree with the
+    * marker rather than leaving the two free to diverge. `Runner.validate` still runs every tick inside
+    * `Machine.runOnce`, unconditionally, and is the genuine backstop for two things: that marker/`guard`
+    * agreement, and the two alias residuals `checkedShapeStrict`'s own doc (`Kit.scala`) names, which no
+    * widening of this macro's own walk can close, because they are facts about which SOURCE REFERENCES
+    * name the same node, not facts about a hand written field the macro reads differently. It remains
+    * true that `Runner.validate` is not this parameter's fallback for an unreadable literal, only ever a
+    * second, later check behind the compile time one: erroring here on a non-literal `shape` stays
+    * mandatory regardless of how reliable the runtime check underneath it becomes, since compile time is
+    * strictly earlier for every graph this macro CAN read.
     *
     * "Not a literal at all" is not the only way `checkedShapeStrict` can abort on `shape`, and the two
-    * are DELIBERATELY worded differently rather than sharing one message (issue #43 review round 2,
-    * BLOCKER B1, correcting the version of this factory an earlier round shipped, which raised the
-    * identical "write a literal Shape here" error regardless of why the macro declined): `shape` can
-    * also be a genuine literal `Shape(entry = ..., transitions = ...)` written directly here whose walk
-    * still cannot make sense of ONE piece inside it, and that failure is reported with different words,
-    * naming the exact unreadable term, so a consumer who already wrote a literal never receives advice
-    * they have already followed. `KitMacro.checkShapeImpl`'s own doc has the mechanism (`ParseFailure`)
-    * and the reasoning for keeping the two messages apart. As of this same review round, the set of
-    * forms this walk can read is wider than the earlier round shipped: a node or `Transition` referred
-    * to through a stable path now includes an unqualified reference to a `val` MEMBER OF THE ENCLOSING
-    * CLASS (`this.A`, written bare as `A`), not only a top-level `val` or an `object` member, closing
-    * the gap that used to reject a CONSUMER idiom of declaring nodes as class members and referring to
-    * them unqualified (issue #43 review round 3, MINOR 2, correcting this paragraph's own earlier
-    * attribution of that idiom to `Machine.shippedShape`: `Machine` is an `object`, not a class, so it
-    * never needed the `This`-prefix widening at all, and `shippedShape` itself (`src/Machine.scala`)
-    * declares its own `entry`/`transitions` as `def`-built nodes, `Implement(cfg)`/`Repair(cfg)` and
-    * their kin, which stay unreadable by this walk regardless, exactly as the residue paragraph below
-    * states at length; the class-member-`val` idiom this widening actually closes is a general
-    * consumer one, never the shipped graph's own); an entry or transitions list may be written
-    * `List.empty` or `List.empty[...]`, not only `List(...)` or `Nil`; `Shape`'s two named arguments
-    * may be written in either order; and a `Transition` bound to a `val` LOCAL to the same block as
-    * this call (`val t1 = Transition(A, B)` followed by `transitions = List(t1)` in the same method)
-    * is read through to its own `from`/`to`, though a `Transition` bound to a class-or-object MEMBER
-    * `val` is not, since that
-    * initialiser is compiled into the owning type's own constructor and is not recoverable through the
-    * macro reflection API this walk uses no matter how far it is widened (confirmed by inspecting
-    * exactly what `quotes.reflect.Symbol.tree` returns for each shape, not assumed).
+    * are DELIBERATELY worded differently rather than sharing one message: `shape` can also be a genuine
+    * literal `Shape(entry = ..., transitions = ...)` written directly here whose walk still cannot make
+    * sense of ONE piece inside it, and that failure is reported with different words, naming the exact
+    * unreadable term, so a consumer who already wrote a literal never receives advice they have already
+    * followed. `KitMacro.checkShapeImpl`'s own doc has the mechanism (`ParseFailure`), the reasoning for
+    * keeping the two messages apart, and the full table of forms this walk can and cannot read.
     *
-    * A THIRD strict failure, not merely the two above (issue #43 review round 3, BLOCKER 1 part 2): the
-    * identity KEY this walk deduplicates node references on used to be computed three different, mutually
-    * incompatible ways depending on which of `Ident`/`Select(This(_), _)`/`Select(qualifier, _)` a
-    * reference typed as, found to both SPLIT one `Node` into two keys, spelled two different ways in one
-    * shape, and MERGE two different `Node`s into one key, a `class`/`object` companion pair or two inline
-    * `Node(name = "...", ...)` calls sharing one literal name, spelled the same way by coincidence. One
-    * canonical function now computes every key (`KitMacro.scala`'s own `canonical`, `stablePathKey`'s own
-    * doc has the mechanism), which closes every SPLIT, and a reconciliation pass (`checkReconciled`,
-    * `KitMacro.scala`) runs before the reachability walk and hard-errors, naming both references, the
-    * instant two of them canonicalise to one key while disagreeing on whether the node they name needs
-    * review, which closes every MERGE loudly rather than letting the walk's own visited set silently keep
-    * whichever reference it happened to dequeue first.
+    * The identity KEY this walk deduplicates node references on is computed by ONE canonical function
+    * (`KitMacro.scala`'s own `canonical`, `stablePathKey`'s own doc has the mechanism and the reasoning
+    * for why a single scheme is needed), and a reconciliation pass (`checkReconciled`, `KitMacro.scala`)
+    * runs before the reachability walk and hard-errors, naming both references, the instant two of them
+    * canonicalise to one key while disagreeing on whether the node they name needs review, rather than
+    * letting the walk's own visited set silently keep whichever reference it happened to dequeue first.
     *
     * One residue is left standing on purpose, not an oversight: a node built by a `def`, including
     * `Machine.shippedShape`'s own `A(cfg)` idiom (`src/Machine.scala`, config read at node CONSTRUCTION
@@ -435,25 +409,13 @@ object LitterBox:
     * itself, never a `def` that builds a differently configured `Node` value per call.
     *
     * `graphImpl`'s own `wf.copy(shape = checked)` (below) OVERWRITES `workflow.shape` with this
-    * parameter, UNCONDITIONALLY and SILENTLY, regardless of what `workflow.shape` was set to (issue #43
-    * review, MINOR 8, and issue #43 review round 2, MAJOR M1, which is why this paragraph no longer
-    * describes the intermediate state MINOR 8's own fix landed in): a `workflow` built with `Workflow(...,
-    * shape = a)` and passed here alongside `LitterBox.graph(shape = b)` gets `b`, not `a`, with no
-    * diagnostic of any kind, because `shape` here, never `workflow.shape`, is the one parameter this
-    * factory's own macro actually checks and the one `LoopGraph.shape(cfg)` actually reports, so `b` is
-    * the only value that could ever be consistent with what `checkedShapeStrict` validated. An earlier
-    * round of this review sequence rejected the call outright instead, with a `require`, whenever
-    * `workflow.shape` was non-default; that was found, on the NEXT review round, to be the wrong trade,
-    * `graphImpl`'s own doc (below, at the site of `wf.copy`) has the full reasoning for why a thrown
-    * `IllegalArgumentException` at graph-construction time is worse than the footgun it was guarding
-    * against. Stating the overwrite plainly, here and on `Workflow.shape`'s own doc (`Kit.scala`), is
-    * this round's own answer instead: a reader who set `shape` on their own `Workflow` and wonders why
-    * it did not take effect finds the answer in a docstring at either place they might go looking,
-    * rather than either an exception a `--dry-run`/`--help` invocation could not even reach, or silence.
+    * parameter, UNCONDITIONALLY and SILENTLY, regardless of what `workflow.shape` was set to; the
+    * comment at that call site has the full reasoning for why a silent overwrite, stated plainly in the
+    * docs rather than guarded by a `require`, is the right trade here.
     *
-    * `startInput: Int => Fault ?=> I` (narrowed from `(Caps, Fault) ?=> I`, issue #43 review, BLOCKER
-    * 2, correcting the version of this function an earlier round shipped) receives the tick number and
-    * a `Fault`, wired to the same log/notify sinks the rest of this tick already uses, but no `Caps`:
+    * `startInput: Int => Fault ?=> I` (narrowed from `(Caps, Fault) ?=> I`, issue #43 review) receives
+    * the tick number and a `Fault`, wired to the same log/notify sinks the rest of this tick already
+    * uses, but no `Caps`:
     * `begin` runs before this tick's real `Ledger` exists (`LoopGraph.begin`'s own doc), so a
     * `startInput` that COULD summon `Caps` could call `agents.*` on the LIVE `AgentDispatch` from
     * there, genuinely dispatching agents, entirely outside `Runner.step`'s own `charging` decorator,
@@ -469,9 +431,7 @@ object LitterBox:
     * applies the identical reasoning to a consumer's own graph instead of leaving it the one place this
     * library's own argument did not hold for itself. A `fault.raise` inside `startInput` still aborts
     * the tick to rc 50 exactly as a fault inside any node does, since `Fault` alone is enough for that;
-    * a consumer whose first step genuinely needs a capability call puts that work in a node instead,
-    * exactly as this doc already recommended before BLOCKER 2 made it the only option rather than
-    * merely the advised one.
+    * a consumer whose first step genuinely needs a capability call puts that work in a node instead.
     */
   inline def graph[I](
       workflow: Workflow[I],
@@ -481,7 +441,7 @@ object LitterBox:
   ): LoopGraph =
     graphImpl(workflow, checkedShapeStrict(shape), dispatchBudget, startInput)
 
-  /** The non-inline half of [[graph]] (issue #43 review): everything past the one splice that has to
+  /** The non-inline half of [[graph]]: everything past the one splice that has to
     * stay inline, `checkedShapeStrict(shape)` above, lives here instead, so calling `LitterBox.graph`
     * does not also inline a whole `LoopGraph` construction, `Fault` construction and `NodeOutcome`
     * match into every call site the way inlining this entire body would. `wf`, not `workflow`, names
@@ -491,7 +451,7 @@ object LitterBox:
     * member sharing a name with a captured constructor parameter always sets.
     *
     * Making `graph` `inline` while this stays `private` makes Scala 3 synthesise a public accessor in
-    * the compiled bytecode (issue #43 review, MINOR 6), confirmed with `javap`: a `public final
+    * the compiled bytecode, confirmed with `javap`: a `public final
     * LoopGraph inline$graphImpl(Workflow, Shape, Function1, ...)` method, named after this one with an
     * `inline$` prefix. Scala source cannot name it, `private` still keeps every ordinary Scala caller
     * out, but a Java or Kotlin caller of the same jar can invoke that accessor directly, skipping
@@ -500,8 +460,8 @@ object LitterBox:
     * `Judged.mint`, a Scala COMPILE TIME guarantee only, nothing more, accepted here for the identical
     * reason: defending against a non Scala caller of the same jar is out of scope for this issue.
     *
-    * A second, related residual, not merely the same one restated (issue #43 review round 2, MINOR m5):
-    * the anonymous `new LoopGraph` this function returns compiles to its own named class on the JVM,
+    * A second, related residual, not merely the same one restated: the anonymous `new LoopGraph` this
+    * function returns compiles to its own named class on the JVM,
     * `LitterBox$$anon$2`, and `javap -p` on it shows a PUBLIC constructor and PUBLIC `workflow`/`shape`/
     * `begin` methods, `private[litterbox]` again being a Scala source concept with no JVM access
     * modifier under it. So a Java or Kotlin caller of the same jar has a second way past this
@@ -512,35 +472,32 @@ object LitterBox:
     * bytecode against a non-Scala caller who reads `javap` output and writes to it directly is out of
     * scope for it.
     *
-    * A third, unrelated residual worth naming beside these two rather than leaving implicit (issue #43
-    * review round 2, MINOR m1): `startInput`'s own signature, `Int => Fault ?=> I`, keeps `Caps` out of
-    * `startInput`'s own SCOPE, so nothing inside it can SUMMON one, but that is a claim about what this
-    * function can ask for, not about what it can be handed. A node body from a PREVIOUS tick can stash a
-    * `Caps` it summoned honestly (closing over a mutable `var` across ticks) and a LATER tick's
-    * `startInput`, reading that stashed value back, can call a real capability through it, running
-    * outside the `Ledger`, `Timeout` and shape checks that SAME tick's own walk would otherwise apply
-    * to a capability call. Materially narrower than the gap BLOCKER 2 (issue #43 review round 1) closed,
-    * since it needs a node to deliberately stash a `Caps` across a tick boundary first, and every value
-    * obtained this way was minted by a genuine dispatch, never a forged one, so this is not a reopening
-    * of that blocker, only a residual worth naming: `README.md`'s "Write your own loop" section states
-    * it in the same terms for a reader who never opens this file.
+    * A third, unrelated residual worth naming beside these two rather than leaving implicit:
+    * `startInput`'s own signature, `Int => Fault ?=> I`, keeps `Caps` out of `startInput`'s own SCOPE,
+    * so nothing inside it can SUMMON one, but that is a claim about what this function can ask for, not
+    * about what it can be handed. A node body from a PREVIOUS tick can stash a `Caps` it summoned
+    * honestly (closing over a mutable `var` across ticks) and a LATER tick's `startInput`, reading that
+    * stashed value back, can call a real capability through it, running outside the `Ledger`, `Timeout`
+    * and shape checks that SAME tick's own walk would otherwise apply to a capability call. Materially
+    * narrower than the gap `startInput`'s own narrowed signature (above) closed, since it needs a node
+    * to deliberately stash a `Caps` across a tick boundary first, and every value obtained this way was
+    * minted by a genuine dispatch, never a forged one, so this is not a reopening of that gap, only a
+    * residual worth naming: `README.md`'s "Write your own loop" section states it in the same terms for
+    * a reader who never opens this file.
     *
     * A fourth and fifth residual, both about `checkedShapeStrict`'s own node-identity walk rather than
-    * this factory itself, worth naming here too rather than left only in `KitMacro.scala` for a reader
-    * who never opens that file (issue #43 review round 4): an INSTANCE-QUALIFIED node reference
-    * (`holder.node` for an ordinary, non-singleton `holder`) is unreadable by that walk, uniformly and
-    * on purpose, because it cannot tell two distinct instances of the same class apart from one instance
-    * aliased twice (`stablePathKey`'s own doc, `KitMacro.scala`, has the full reasoning and the three
-    * sidesteps that forced this from a narrower, unsound decline rule to a blanket one). And one `Node`
-    * VALUE bound under two different top-level `val`s (`val a = mkNode(); val b = a`) is unreadable for
-    * a related but distinct reason, not an instance-qualified receiver at all: this walk keys each `val`
-    * on its own declared symbol, so `a` and `b` key differently even though they are the identical `Node`
-    * at runtime, and no widening of this walk can recover that fact without evaluating source it is
-    * built never to run (`checkReconciled`'s own doc, `KitMacro.scala`, has the mechanism). Neither is
-    * closable by keying more cleverly; both are survivable, not merely accepted, because `Runner.validate`
-    * (unconditional, every tick, `Machine.runOnce`) reads the graph's real, already-resolved `Node`
-    * values, where an aliased or instance-qualified reference is not a fact this walk has to reconstruct
-    * at all, only one value read however many times source code happened to name it.
+    * this factory itself: an INSTANCE-QUALIFIED node reference (`holder.node` for an ordinary,
+    * non-singleton `holder`) is unreadable by that walk, uniformly and on purpose, because it cannot
+    * tell two distinct instances of the same class apart from one instance aliased twice
+    * (`stablePathKey`'s own doc, `KitMacro.scala`, has the full reasoning). And one `Node` VALUE bound
+    * under two different top-level `val`s (`val a = mkNode(); val b = a`) is unreadable for a related
+    * but distinct reason: this walk keys each `val` on its own declared symbol, so `a` and `b` key
+    * differently even though they are the identical `Node` at runtime (`checkReconciled`'s own doc,
+    * `KitMacro.scala`, has the mechanism). Neither is closable by keying more cleverly; both are
+    * survivable, not merely accepted, because `Runner.validate` (unconditional, every tick,
+    * `Machine.runOnce`) reads the graph's real, already-resolved `Node` values, where an aliased or
+    * instance-qualified reference is not a fact this walk has to reconstruct at all, only one value read
+    * however many times source code happened to name it.
     */
   private def graphImpl[I](
       wf: Workflow[I],
@@ -549,15 +506,11 @@ object LitterBox:
       startInput: Int => Fault ?=> I
   ): LoopGraph =
     // `wf.copy(shape = checked)` below OVERWRITES `workflow.shape` with THIS function's own `checked`
-    // argument, unconditionally and with no diagnostic (issue #43 review, MINOR 8, and issue #43
-    // review round 2, MAJOR M1, which is the reason this paragraph no longer describes a `require`
-    // that used to guard it): an earlier round of this review sequence rejected a `workflow` whose own
-    // `shape` field was already non-default, reasoning that a silent overwrite is a live footgun for a
-    // consumer who writes `Workflow(..., shape = a)` and `LitterBox.graph(shape = b)` expecting `a` to
-    // matter. That `require` was found, on the very next review round, to be worse than the footgun it
-    // guarded against: `require` throws a bare `IllegalArgumentException` straight out of this factory,
-    // on the consumer's own thread, while `workflow` (an ordinary, non-`inline` parameter) is still
-    // being EVALUATED, which is before `LitterBox.run` is ever entered, before `Main.dispatch`'s own
+    // argument, unconditionally and with no diagnostic. A `require` guarding this, rejecting a
+    // `workflow` whose own `shape` field was already non-default, was tried and rejected (issue #43
+    // review): `require` throws a bare `IllegalArgumentException` straight out of this factory, on the
+    // consumer's own thread, while `workflow` (an ordinary, non-`inline` parameter) is still being
+    // EVALUATED, which is before `LitterBox.run` is ever entered, before `Main.dispatch`'s own
     // preflight runs, before `Config` is loaded, before `.litter-box/logs/` even exists. Concretely:
     // no `status.jsonl` event, no log line, no notify seam fired, and a JVM default exit code of 1,
     // never this codebase's own rc 50, so an operator's rc-50 alerting sees nothing at all; the same
@@ -565,18 +518,16 @@ object LitterBox:
     // is evaluated regardless of what `args` says, and `LitterBox.run` is not even reached yet. Every
     // OTHER failure in this codebase routes through the one fault channel instead (`Fault.raise` ->
     // `Machine.infraFault` -> rc 50 with a log line and a notify, `Kit.scala`'s own doc on `Fault` has
-    // the mechanism), and `require` here bypassed it entirely, untested (round 2 review found no test
-    // anywhere pinned this throw, only the source site itself). Rejecting the non-default `wf.shape`
+    // the mechanism), and `require` here bypassed it entirely. Rejecting the non-default `wf.shape`
     // cleanly turned out not to be trivial: there is no COMPILE TIME position for the check, since
     // `workflow` is an ordinary parameter, not the `inline shape` parameter the macro splices into, and
     // every RUNTIME position for it sits on the wrong side of the one fault channel, before a `Caps`,
-    // a `Fault` or even a `Config` exists to raise one through. So this reverts to the silent overwrite
-    // `graphImpl` had before MINOR 8's own fix, this time with the overwrite stated plainly rather than
-    // silently reintroduced: `LitterBox.graph`'s own scaladoc above, and `Workflow.shape`'s own doc
-    // (`Kit.scala`), both now say outright that `workflow.shape` is discarded here in favour of this
-    // factory's own `shape` parameter, so a reader who wonders what happened to a `Shape` they set on
-    // their own `Workflow` finds the answer at either place they might have gone looking, rather than
-    // an exception only a `LitterBox.graph` call, never a docstring, used to be able to tell them about.
+    // a `Fault` or even a `Config` exists to raise one through. So this stays a silent overwrite, with
+    // the overwrite stated plainly instead: `LitterBox.graph`'s own scaladoc above, and
+    // `Workflow.shape`'s own doc (`Kit.scala`), both say outright that `workflow.shape` is discarded
+    // here in favour of this factory's own `shape` parameter, so a reader who wonders what happened to
+    // a `Shape` they set on their own `Workflow` finds the answer at either place they might have gone
+    // looking, rather than silence.
     new LoopGraph:
       private[litterbox] type Start = I
 
@@ -594,9 +545,9 @@ object LitterBox:
         * the same file `Fault`'s constructor is declared in, so it can make that same call, and it
         * makes it here so `startInput` receives a genuine `Fault`, not a node body's own, wired to the
         * same log/notify sinks the rest of this tick already uses. `caps` is used ONLY to build that
-        * `Fault` (`caps.logger`, `caps.notifier`), never passed to `startInput` itself (issue #43
-        * review, BLOCKER 2, `graph`'s own doc above has the full reasoning for why `startInput` no
-        * longer receives a `Caps` at all). `math.max(0, ...)` mirrors the floor `Machine.runOnce`'s
+        * `Fault` (`caps.logger`, `caps.notifier`), never passed to `startInput` itself (`graph`'s own
+        * doc above has the full reasoning for why `startInput` no longer receives a `Caps` at all).
+        * `math.max(0, ...)` mirrors the floor `Machine.runOnce`'s
         * own `ledgerSeed` computation applies (`src/Machine.scala`), so a hostile or merely careless
         * `dispatchBudget` cannot hand `Runner.Ledger` a negative seed.
         */

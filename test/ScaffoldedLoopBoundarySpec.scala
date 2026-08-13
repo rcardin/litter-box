@@ -69,8 +69,11 @@ import java.nio.file.{Files, Path, Paths}
 //   this library keeps closed (`LoopGraph` stays sealed; see its own scaladoc for why a factory,
 //   never a subclass, is the door in). This file states the SHAPE of a run; shape lives here.
 //   Everything about how any one run of that shape actually behaves lives in
-//   `.litter-box/config.conf` instead: nothing expressible there is expressible here, and nothing
-//   expressible here is expressible there.
+//   `.litter-box/config.conf` instead (RFC #26 decision 17). One narrow exception is named, not
+//   hidden: a graph's `dispatchBudget` is a `Config => Int`, so the intended form reads the number
+//   from `config.conf`, but a constant such as `_ => 42` type checks too, the one way a budget
+//   number can still land here instead of there. `LitterBox.graph`'s own doc, `src/LitterBox.scala`,
+//   states this once and every other mention of it points back there.
 
 import in.rcard.litterbox.{LitterBox, LoopGraph}
 

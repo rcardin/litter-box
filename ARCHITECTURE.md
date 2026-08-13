@@ -111,8 +111,11 @@ configuration**, so they live under `resources/` and travel inside the jar
   `prompts/conventions.md` and `loop.scala` (the file that names which graph runs; `LitterBox.shipped`
   by default, or a consumer's own graph built through `LitterBox.graph`).
 - `src/LitterBox.scala`: the public front door (`LitterBox`, `LoopGraph`), issue #43: the coordinate
-  a consumer depends on, the shipped graph (`LitterBox.shipped`, delegating to
-  `Machine.shippedWorkflow`/`Machine.shippedShape`), the smart constructor for a consumer's own graph
+  a consumer depends on, the shipped graph (`LitterBox.shipped`, whose `workflow`/`shape` supply the
+  shipped `Machine.shippedWorkflow`/`Machine.shippedShape`, and whose `begin` runs the `Pick` step and
+  computes the resume aware dispatch budget seed that `Machine.runOnce` then turns into the `Ledger` it
+  owns, because `begin` is the graph shaped hook every graph has, so the shipped graph uses that same
+  hook rather than a special case inside `runOnce`), the smart constructor for a consumer's own graph
   (`LitterBox.graph`, RFC #26 decisions 5 and 8), and `LitterBox.run`, which reuses `Main`'s own Live
   wiring rather than duplicating it. A consumer can now author their own `LoopGraph`, but only through
   `graph`, never by writing `extends LoopGraph` themselves: `LoopGraph` stays `sealed`, so extending it
@@ -134,7 +137,10 @@ configuration**, so they live under `resources/` and travel inside the jar
   `LitterBox.graph`'s `dispatchBudget` parameter is a plain `Config => Int`, never a `Runner.Ledger`,
   whose constructor stays `private[litterbox]`; `LoopGraph.begin` is where a graph declares that number
   and its own start input, and `Machine.runOnce` is the only place that ever turns the number into a
-  real `Ledger`. Owning the counter is not the same as bounding every spend, and the two should not be
+  real `Ledger`. Decision 17 also promises nothing is expressible in both `config.conf` and
+  `loop.scala`; `LitterBox.graph`'s own doc (`src/LitterBox.scala`, on `graph`) names the one accepted
+  exception a constant `dispatchBudget` value creates and is the one place that exception is written
+  out, not repeated here. Owning the counter is not the same as bounding every spend, and the two should not be
   read as one promise (issue #43 review round 2, MAJOR M2): `Runner.Ledger.canAfford` only ever runs
   once, before a node starts, so `dispatchBudget` precisely bounds how many `Cost.OneDispatch` nodes may
   START, not the total dispatches a graph's nodes make; a `Cost.NoDispatch` node is never gated by it at

@@ -147,7 +147,7 @@ class GraphMacroSpec extends AnyFlatSpec with Matchers:
     // `KitMacro.scala`, has the reasoning), `entry` included even though `entry` itself was perfectly
     // literal: so this exact snippet compiled clean under `checkedShape` before this fix, confirmed by
     // running it against the tree immediately before issue #43 review's own `Nil` fix and finding no
-    // error at all. It fails now, under `checkedShape` itself, its lenient sibling `checkedShapeStrict`
+    // error at all. It fails now, under `checkedShape` itself, its strict sibling `checkedShapeStrict`
     // untouched by this particular test, because `Nil` recognition is not `checkedShapeStrict`-only, the
     // exact fact three doc paragraphs got wrong (`Kit.scala`'s `checkedShape`/`checkedShapeStrict` doc,
     // `LitterBox.scala`'s `LitterBox.graph` doc, `KitMacro.literalListElements`'s own doc, all corrected

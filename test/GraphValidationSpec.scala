@@ -193,10 +193,10 @@ class GraphValidationSpec extends AnyFlatSpec with Matchers:
   }
 
   it should "be RequiresReview, from the hand written argument alone, when guard was written explicitly but the input type does NOT extend the marker" in {
-    // The FIRST divergence `RequiresReviewInput`'s own doc names (`Kit.scala`) is unchanged by Tier 2,
-    // deliberately: this walk never reads the input type as anything other than `Guard.Open` absent
-    // the marker, so a hand written `guard = Guard.RequiresReview` on a plain `Unit` input is exactly
-    // as before, read only from the argument, never invented or suppressed by `GuardOf`.
+    // `Node.apply`'s own combination (`Kit.scala`, issue #43 review round 5, FINDING 2) never discards
+    // the hand written argument in favour of `GuardOf[I]`: absent the marker, `g.requiresReview` is
+    // `false`, so the OR reduces to exactly what the author wrote, `Guard.RequiresReview` preserved
+    // unchanged rather than downgraded to `Guard.Open` for lack of a marker.
     plainNode("Guarded", guard = Guard.RequiresReview).guard shouldBe Guard.RequiresReview
   }
 
@@ -727,4 +727,164 @@ class GraphValidationSpec extends AnyFlatSpec with Matchers:
     world.logLines should contain(
       Runner.invalidShapeMessage("invalid", Runner.validate(invalidShape))
     )
+  }
+
+  // ---- Node.apply's guard combination never discards either fact in favour of the other -------
+  // ---- (issue #43 review round 5, FINDING 2) ----------------------------------------------------
+
+  "Node.apply's guard combination" should "never downgrade an explicitly passed Guard.RequiresReview, whether or not the input type also carries the marker" in {
+    plainNode("ArgumentOnly", guard = Guard.RequiresReview).guard shouldBe Guard.RequiresReview
+    markerNode("MarkerAndArgument", guard = Guard.RequiresReview).guard shouldBe Guard.RequiresReview
+  }
+
+  it should "produce Guard.RequiresReview whenever EITHER the marker or the argument says so, matching the OR the scaladoc states" in {
+    // The full truth table: `Guard.Open` only when both the marker and the argument agree it need
+    // not be, `Guard.RequiresReview` in every other cell, never a case where one fact is silently
+    // discarded in favour of the other.
+    markerNode("MarkerOnly").guard shouldBe Guard.RequiresReview // marker true, argument default Open
+    plainNode("ArgumentOnly", guard = Guard.RequiresReview).guard shouldBe Guard.RequiresReview // marker false, argument true
+    markerNode("Both", guard = Guard.RequiresReview).guard shouldBe Guard.RequiresReview // marker true, argument true
+    plainNode("Neither").guard shouldBe Guard.Open // marker false, argument default Open
+  }
+
+  // ---- KitMacro reads an explicit `guard = Guard.RequiresReview` argument too, not only the ----
+  // ---- RequiresReviewInput marker on a node's own input type (issue #43 review round 5, ----
+  // ---- FINDING 1): `Guard`'s own scaladoc (`Kit.scala`) calls declaring the guard "the node ----
+  // ---- author's own job", so the documented, hand written form now earns a compile time check ----
+  // ---- of its own, the same way the marker already did, rather than only the runtime backstop ----
+  // ---- `Runner.validate` has always given it. -----------------------------------------------------
+
+  "checkedShape" should "refuse to typecheck a literal Shape reaching an inline node guarded only by its own explicit guard argument, its input type carrying no RequiresReviewInput marker at all, with no reviewer on the path" in {
+    // `nodeFacts`/`explicitRequiresReviewGuard` (`KitMacro.scala`) read the `guard` argument straight
+    // off the reference's own AST, which only exists at an INLINE `Node(...)` construction, never at a
+    // `val` reference to one built elsewhere (`identifyRef`'s own doc, `KitMacro.scala`, has the
+    // identical limit for reading a literal `name`); this test, and the two below it, accordingly
+    // write every node inline, at the point the shape uses it, matching the idiom
+    // `GraphMacroSpec.scala`'s own "inline Node.apply constructions" test already establishes for the
+    // marker-only case.
+    val errors = scala.compiletime.testing.typeCheckErrors(
+      """
+        |import in.rcard.litterbox._
+        |import in.rcard.litterbox.Caps.given
+        |
+        |val shape = checkedShape(
+        |  Shape(
+        |    entry = List(Node[Unit, Unit](
+        |      name = "Entry", cost = Cost.NoDispatch, timeout = Timeout.Unbounded,
+        |      probe = _ => None, run = _ => NodeOutcome.Done(())
+        |    )),
+        |    transitions = List(Transition(
+        |      Node[Unit, Unit](
+        |        name = "Entry", cost = Cost.NoDispatch, timeout = Timeout.Unbounded,
+        |        probe = _ => None, run = _ => NodeOutcome.Done(())
+        |      ),
+        |      Node[Unit, Unit](
+        |        name = "Guarded", cost = Cost.NoDispatch, timeout = Timeout.Unbounded,
+        |        probe = _ => None, run = _ => NodeOutcome.Done(()), guard = Guard.RequiresReview
+        |      )
+        |    ))
+        |  )
+        |)
+        |""".stripMargin
+    )
+
+    errors should not be empty
+    val messages = errors.map(_.message).mkString("\n")
+    messages should include("Entry -> Guarded")
+    messages should include("'Guarded'")
+    messages should include("review")
+  }
+
+  it should "still refuse to typecheck when the explicit guard argument is written positionally rather than named, as Node.apply's own sixth argument" in {
+    // `explicitRequiresReviewGuard` (`KitMacro.scala`) does not test WHICH position or name an argument
+    // was written with; it only asks whether ANY main argument names the literal `Guard.RequiresReview`
+    // case, which `Node.apply`'s own signature makes unambiguous, since `guard` is the only parameter of
+    // type `Guard`. This test is what caught the first version of that function actually shipped
+    // (issue #43 review round 5, second pass): it keyed on a fixed sixth POSITIONAL slot guarded by
+    // `mainArgs.exists(_.isInstanceOf[NamedArg])`, a check that silently always answered `true`, because
+    // `quotes.reflect.NamedArg` is an abstract type this macro cannot `isInstanceOf` against precisely,
+    // so the positional branch could never fire and this exact snippet compiled clean with no violation
+    // reported, `scala-cli test . --server=false` being the only way that surfaced, a `typeCheckErrors`
+    // run alone did not (`explicitRequiresReviewGuard`'s own doc has the confirmed mechanism). A NAMED
+    // `guard` written out of `Node.apply`'s own declared parameter order remains a different,
+    // pre-existing case this fix does not reach: the compiler's own synthetic-`val` rewrite for
+    // out-of-order named arguments hides the whole call from `identifyRef` too, so that reference already
+    // falls back to the marker-only test, the same safe direction every other unrecognised shape in this
+    // file takes.
+    val errors = scala.compiletime.testing.typeCheckErrors(
+      """
+        |import in.rcard.litterbox._
+        |import in.rcard.litterbox.Caps.given
+        |
+        |val shape = checkedShape(
+        |  Shape(
+        |    entry = List(Node[Unit, Unit](
+        |      name = "Entry", cost = Cost.NoDispatch, timeout = Timeout.Unbounded,
+        |      probe = _ => None, run = _ => NodeOutcome.Done(())
+        |    )),
+        |    transitions = List(Transition(
+        |      Node[Unit, Unit](
+        |        name = "Entry", cost = Cost.NoDispatch, timeout = Timeout.Unbounded,
+        |        probe = _ => None, run = _ => NodeOutcome.Done(())
+        |      ),
+        |      Node[Unit, Unit](
+        |        "Guarded", Cost.NoDispatch, Timeout.Unbounded, _ => None, _ => NodeOutcome.Done(()), Guard.RequiresReview
+        |      )
+        |    ))
+        |  )
+        |)
+        |""".stripMargin
+    )
+
+    errors should not be empty
+    val messages = errors.map(_.message).mkString("\n")
+    messages should include("'Guarded'")
+    messages should include("review")
+  }
+
+  it should "compile the identical inline shape clean once a reviewer sits on the path before the node guarded only by its explicit argument" in {
+    // The positive control for the two tests above: proves the macro is actually reading the explicit
+    // `guard` argument as a real fact that participates in the BFS, not merely rejecting every shape
+    // that reaches a node carrying one.
+    val errors = scala.compiletime.testing.typeCheckErrors(
+      """
+        |import in.rcard.litterbox._
+        |import in.rcard.litterbox.Caps.given
+        |
+        |val shape = checkedShape(
+        |  Shape(
+        |    entry = List(Node[Unit, Unit](
+        |      name = "Entry", cost = Cost.NoDispatch, timeout = Timeout.Unbounded,
+        |      probe = _ => None, run = _ => NodeOutcome.Done(())
+        |    )),
+        |    transitions = List(
+        |      Transition(
+        |        Node[Unit, Unit](
+        |          name = "Entry", cost = Cost.NoDispatch, timeout = Timeout.Unbounded,
+        |          probe = _ => None, run = _ => NodeOutcome.Done(())
+        |        ),
+        |        Node[Unit, AgentDispatch.Judged[Unit]](
+        |          name = "Reviewer", cost = Cost.NoDispatch, timeout = Timeout.Unbounded,
+        |          probe = _ => None,
+        |          run = _ => NodeOutcome.Done(summon[AgentDispatch].review("prompt", "review-file").map(_ => ()))
+        |        )
+        |      ),
+        |      Transition(
+        |        Node[Unit, AgentDispatch.Judged[Unit]](
+        |          name = "Reviewer", cost = Cost.NoDispatch, timeout = Timeout.Unbounded,
+        |          probe = _ => None,
+        |          run = _ => NodeOutcome.Done(summon[AgentDispatch].review("prompt", "review-file").map(_ => ()))
+        |        ),
+        |        Node[Unit, Unit](
+        |          name = "Guarded", cost = Cost.NoDispatch, timeout = Timeout.Unbounded,
+        |          probe = _ => None, run = _ => NodeOutcome.Done(()), guard = Guard.RequiresReview
+        |        )
+        |      )
+        |    )
+        |  )
+        |)
+        |""".stripMargin
+    )
+
+    errors shouldBe empty
   }

@@ -134,7 +134,12 @@ Your own `Node`s, `Workflow` and `Shape` are ordinary values built from the publ
 `Config => Int`, never a `Ledger` you build yourself, because the runner, not the graph, owns the
 counter and the timeout clock for every node it walks. That function shape means `dispatchBudget` CAN
 read `.litter-box/config.conf` at runtime, the way the sketch above reads `cfg.repairBudget`; it does
-not mean it must, `dispatchBudget = _ => 42` is just as legal a value.
+not mean it must, `dispatchBudget = _ => 42` is just as legal a value. That constant is the one
+accepted, named exception to decision 17's own promise that nothing is expressible in both
+`config.conf` and `loop.scala`: the intended form reads the knob from `config.conf`, and a constant is
+the one way a budget number can still land in `loop.scala` instead, something decision 17 asks a graph
+author not to do rather than something it makes impossible. `LitterBox.graph`'s own scaladoc
+(`src/LitterBox.scala`) states this once; nothing here restates it further.
 
 Precisely what `dispatchBudget` bounds, stated exactly rather than left to sound like a hard spending
 cap: it bounds how many `Cost.OneDispatch` nodes may START. A node that goes on to dispatch MORE than
