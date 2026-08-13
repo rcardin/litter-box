@@ -118,6 +118,28 @@ class GraphValidationSpec extends AnyFlatSpec with Matchers:
       run = _ => NodeOutcome.Done(null)
     )
 
+  /** A marker input, so a `Node[MarkerInput, Unit]` built here is exactly the shape issue #43 review
+    * round 4's Tier 2 is about: its own input type extends `RequiresReviewInput`, so `GuardOf[MarkerInput]`
+    * resolves to `GuardOf.reviewRequired` (`Kit.scala`), never `LowPriorityGuardOf.open`.
+    */
+  private final case class MarkerInput() extends RequiresReviewInput
+
+  /** A `Node` whose INPUT type carries the `RequiresReviewInput` marker (`MarkerInput` above), built
+    * with whatever `guard` the caller passes, defaulting to `Node.apply`'s own default `Guard.Open`
+    * exactly the way `Machine.OpenPr`/`Machine.Merge` are built (their own doc, `Machine.scala`, has
+    * the reason those two never extend the marker themselves; this helper is what a node author who
+    * DID extend it, by mistake or on purpose, looks like).
+    */
+  private def markerNode(name: String, guard: Guard = Guard.Open): Node[MarkerInput, Unit] =
+    Node[MarkerInput, Unit](
+      name = name,
+      cost = Cost.NoDispatch,
+      timeout = Timeout.Unbounded,
+      probe = _ => None,
+      run = _ => NodeOutcome.Done(()),
+      guard = guard
+    )
+
   /** A chain of `depth` diamonds, `D0 -> (A1, B1) -> D1 -> (A2, B2) -> D2 -> ... -> Dn`, `Dn` alone
     * guarded and never reviewed. Before issue #38 review finding 4's fix, a depth first walk that
     * threaded a fresh `visited` set down each path enumerated every PATH through this shape, `2^depth`
@@ -154,6 +176,72 @@ class GraphValidationSpec extends AnyFlatSpec with Matchers:
       val forged = neverReviewsNode("never-reviews", LoopExit.Idle)
       forged.trust shouldBe Trust.Reviewed
     }
+
+  // ---- Guard is derived from the input type when it carries the marker, folded with the hand ----
+  // ---- written default rather than replacing it (issue #43 review round 4, Tier 2) ---------------
+
+  "A Node's Guard" should "be RequiresReview when its input type extends RequiresReviewInput, even though the guard argument was left at its default Guard.Open" in {
+    // This is the exact shape `Machine.OpenPr`/`Machine.Merge` deliberately avoid (their own doc has
+    // the reason) and the exact shape issue #43 review round 4's own reproductions n1/n2/n12/n13
+    // reached with no reviewer on the path, undetected by `Runner.validate` before this fix because
+    // `Runner.validate` read this field, which used to stay `Guard.Open` here regardless of the marker.
+    markerNode("Marker").guard shouldBe Guard.RequiresReview
+  }
+
+  it should "still be RequiresReview when the input type extends the marker and guard was ALSO written explicitly as Guard.RequiresReview, the consistent spelling" in {
+    markerNode("Marker", guard = Guard.RequiresReview).guard shouldBe Guard.RequiresReview
+  }
+
+  it should "be RequiresReview, from the hand written argument alone, when guard was written explicitly but the input type does NOT extend the marker" in {
+    // The FIRST divergence `RequiresReviewInput`'s own doc names (`Kit.scala`) is unchanged by Tier 2,
+    // deliberately: this walk never reads the input type as anything other than `Guard.Open` absent
+    // the marker, so a hand written `guard = Guard.RequiresReview` on a plain `Unit` input is exactly
+    // as before, read only from the argument, never invented or suppressed by `GuardOf`.
+    plainNode("Guarded", guard = Guard.RequiresReview).guard shouldBe Guard.RequiresReview
+  }
+
+  it should "be Open when the input type does not extend the marker and guard was left at its default, ordinary use" in {
+    plainNode("Plain").guard shouldBe Guard.Open
+  }
+
+  it should "stay Open on Machine.OpenPr-shaped and Machine.Merge-shaped nodes: neither extends the marker, so this fix changes nothing about them" in {
+    // Stated as a positive assertion, not merely inferred from the two nodes' own source: `plainNode`
+    // here plays the role `OpenPr`/`Merge` do, a `Unit`-shaped input built with `guard` left at its
+    // default, and the derivation added by this fix has no marker to key on, so it reduces to the
+    // hand written default exactly as it always did.
+    plainNode("OpenPrShaped").guard shouldBe Guard.Open
+  }
+
+  // ---- Runner.validate is now a genuine backstop for a marker-only-guarded node (issue #43 ----
+  // ---- review round 4, Tier 2), closing the family this walk could never see before: a node ----
+  // ---- whose input type extends RequiresReviewInput while its own guard argument was left at ----
+  // ---- Guard.Open used to leave Runner.validate with nothing to find, ever, since it read only ----
+  // ---- the guard field, which stayed Guard.Open. Node.apply's own new derivation (above) means ----
+  // ---- the SAME field now genuinely is Guard.RequiresReview on the real, constructed Node, so ----
+  // ---- this walk, unchanged itself, finds the violation it always should have. ---------------------
+
+  "Runner.validate" should "report a violation for a marker-only-guarded node reached with no reviewer on the path, even though guard was never written by hand" in {
+    val guarded = markerNode("Guarded") // guard left at its default Guard.Open; the marker alone does the work now
+    val entry   = plainNode("Entry")
+    val shape   = Shape(entry = List(entry), transitions = List(Transition(entry, guarded)))
+
+    val violations = Runner.validate(shape)
+
+    violations should not be empty
+    violations.head should include("Guarded")
+  }
+
+  it should "find nothing wrong with the identical shape once a Trust.Reviewed node sits on the path before the marker-only-guarded node" in {
+    val reviewer = reviewedNode("Reviewer")
+    val guarded  = markerNode("Guarded")
+    val entry    = plainNode("Entry")
+    val shape = Shape(
+      entry = List(entry),
+      transitions = List(Transition(entry, reviewer), Transition(reviewer, guarded))
+    )
+
+    Runner.validate(shape) shouldBe empty
+  }
 
   // ---- Runner.step's runtime check on Trust.Reviewed nodes (issue #38 review, BLOCKER 2) -----
 

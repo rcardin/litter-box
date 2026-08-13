@@ -63,12 +63,12 @@ import java.nio.file.{Files, Path, Paths}
 //   configure for it: `scala-cli` fetches it on the first run of this file. Releases cut before
 //   issue #41 landed published no library at all, so pinning one of those older versions here
 //   resolves nowhere.
-// - `graph` below names which pipeline this run walks. `LitterBox.shipped` is the only `LoopGraph`
-//   that exists today, so this line is where a future graph choice will be made, not a value you can
-//   edit yet: `LoopGraph`'s own members stay closed to code outside the library until a later issue
-//   widens them, so swapping a node, reordering an edge, or building your own `Workflow` for
-//   `LitterBox.run` to accept is not possible yet. This file states the SHAPE of a run; shape lives
-//   here. Everything about how any one run of that shape actually behaves lives in
+// - `graph` below names which pipeline this run walks. `LitterBox.shipped` is the default, the exact
+//   pipeline `lb` itself runs; `LitterBox.graph(...)` is how you write your own, a factory that hands
+//   back a `LoopGraph` built from your own `Node`s, `Workflow` and `Shape` without widening anything
+//   this library keeps closed (`LoopGraph` stays sealed; see its own scaladoc for why a factory,
+//   never a subclass, is the door in). This file states the SHAPE of a run; shape lives here.
+//   Everything about how any one run of that shape actually behaves lives in
 //   `.litter-box/config.conf` instead: nothing expressible there is expressible here, and nothing
 //   expressible here is expressible there.
 

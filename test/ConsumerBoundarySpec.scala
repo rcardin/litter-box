@@ -149,13 +149,16 @@ class ConsumerBoundarySpec extends AnyFlatSpec with Matchers:
       // prove the PACKAGE BOUNDARY half, that a foreign package can even write this graph down. This
       // is that proof, following the same top-level-snippet shape every other check in this file uses.
       //
-      // Deliberately NOT a `Runner.run` call, and deliberately not attempted (issue #44 review MAJOR:
-      // do not widen `Runner.Ledger`'s constructor to paper over this): `Ledger`'s own constructor
-      // stays `private[litterbox]` (RFC #26 decision 9, budget ownership belongs to the runner), so a
-      // consumer can name and compose this exact `Workflow` today but cannot yet construct a `Ledger`
-      // to run it outside the library. That gap is left to the publishing tickets (#41, #43), not this
-      // one; `AskHuman`'s own scaladoc (`src/Machine.scala`) states the same boundary in the library's
-      // own words.
+      // Deliberately NOT a `Runner.run` call (issue #44 review MAJOR: do not widen `Runner.Ledger`'s
+      // constructor to paper over this): `Ledger`'s own constructor stays `private[litterbox]` (RFC
+      // #26 decision 9, budget ownership belongs to the runner), so this snippet still cannot build a
+      // `Ledger` BY HAND. That is no longer the same gap it was when this comment was first written,
+      // though (issue #43 review, correcting this paragraph): a consumer no longer needs to build one
+      // by hand at all, `LitterBox.graph` plus `LitterBox.run` (`src/LitterBox.scala`) hands this
+      // exact `Workflow` to `Machine.runOnce`, which builds the real `Ledger` itself off a declared
+      // `dispatchBudget: Config => Int`. This spec still proves only the type-checking half, that the
+      // `Workflow` can be NAMED and COMPOSED from a foreign package; `AskHuman`'s own scaladoc
+      // (`src/Machine.scala`) has the fuller, corrected account of what changed.
       val errors = scala.compiletime.testing.typeCheckErrors(
         """
           |import in.rcard.litterbox._

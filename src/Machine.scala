@@ -375,38 +375,45 @@ object Machine:
     * as `LoopExit.InfraFault` (rc 50), and emits the terminal DONE status event, exactly like the
     * bash driver.
     *
-    * The whole tick, `Implement` through `PostMergeCleanup`, is now one `Workflow` value
-    * (`shippedWorkflow`, issue #37), walked by `Runner.run`. `Pick` is the one node that still runs
-    * OUTSIDE that walk, and the reason is not a preference, it is what `Runner.run`'s own signature
-    * forces: it fixes its `Ledger` before the walk begins (`Kit.scala`'s own doc on `run`), and the
-    * real, shared dispatch budget this tick spends from is seeded resume-aware, off `Pick`'s own
-    * output (`resumeAuthors`), a fact this method cannot know before `Pick` has already run. So this
-    * method still dispatches `Pick` through a throwaway `Runner.Ledger(0)` first (`Pick` declares
-    * `Cost.NoDispatch` and its own `using` clause, `pickAndSetup`'s, carries no `AgentDispatch` at
-    * all, so nothing about that placeholder ledger is ever observable), mints the real, resume-aware
-    * `Ledger` exactly as before, then hands the rest of the tick to `Runner.run` over
-    * `shippedWorkflow`.
+    * The whole tick, `Implement` through `PostMergeCleanup`, is one `Workflow` value
+    * (`shippedWorkflow`, issue #37), walked by `Runner.run`. What used to be `Pick`'s own throwaway
+    * dispatch and the resume-aware `Ledger` seed, both hand written inline in this method, now live
+    * on `graph.begin` instead (issue #43, RFC #26 decision 9). `Runner.run`'s own signature is the
+    * reason a split has to exist at all, not a preference: it fixes its `Ledger` before the walk
+    * begins (`Kit.scala`'s own doc on `run`), and the real, shared dispatch budget this tick spends
+    * from is seeded resume-aware, off a fact only knowable once the graph's own pre-walk step (`Pick`,
+    * for the shipped graph) has already run. `begin` is where that whole "compute the walk's start
+    * input, and declare its dispatch budget" phase now lives, on `LoopGraph` itself rather than
+    * hard-coded here, so any `LoopGraph`, not only the shipped one, can own its own answer to both
+    * questions; `LitterBox.shipped.begin` (`src/LitterBox.scala`) is exactly the old inline `Pick`
+    * dispatch and `ledgerSeed` computation, moved there verbatim rather than rewritten. This method's
+    * own job past that call is unchanged: build the real `Ledger` from the declared budget, and hand
+    * the rest of the tick to `Runner.run`.
     *
-    * `Runner.validate(graph.shape(cfg))` runs FIRST, before `Pick` is even stepped (issue #38
+    * `Runner.validate(graph.shape(cfg))` runs FIRST, before `graph.begin` is even called (issue #38
     * review, MAJOR 3): `Runner.run` already refuses to walk an invalid `Shape` (its own doc), but by
-    * the time this method reaches that call, `Pick` has already run, a branch created, labels
-    * flipped, prompt files written, real, observable work a bad graph declaration has no business
-    * causing. `graph.shape(cfg)` needs only `cfg`, already in scope here, so this check costs
-    * nothing this method did not already have. `Runner.run` still validates the same shape again,
-    * for its own reason (a consumer calling it directly, bypassing `runOnce` entirely, must stay
-    * covered too), so a valid graph pays for `validate` at most twice per tick and, either way,
-    * `validate` returning `Nil` emits nothing at all: no golden log moves.
+    * the time this method reaches that call, the graph's own pre-walk step has already run (for the
+    * shipped graph, a branch created, labels flipped, prompt files written), real, observable work a
+    * bad graph declaration has no business causing. `graph.shape(cfg)` needs only `cfg`, already in
+    * scope here, so this check costs nothing this method did not already have. `Runner.run` still
+    * validates the same shape again, for its own reason (a consumer calling it directly, bypassing
+    * `runOnce` entirely, must stay covered too), so a valid graph pays for `validate` at most twice
+    * per tick and, either way, `validate` returning `Nil` emits nothing at all: no golden log moves.
     *
     * `graph` (issue #43) defaults to `LitterBox.shipped`, so every call site and every test that
     * predates the public `LoopGraph` boundary keeps compiling and keeps walking the exact pipeline
-    * it always did, unchanged. This method reads `graph.workflow`/`graph.shape` instead of naming
-    * `shippedWorkflow`/`shippedShape` directly, so that a caller-supplied graph would take effect
-    * rather than merely type-check as a parameter nothing inside reads. No test in this suite, or
-    * outside it, can confirm that it actually does: `LoopGraph` is `sealed` (`LitterBox`'s own doc
-    * has the reason), and `LitterBox.shipped` is its only inhabitant today, so nothing outside this
-    * file can build a second `LoopGraph` to pass here and observe a different walk. This parameter
-    * is untested plumbing until a later issue widens `LoopGraph` far enough for a second inhabitant
-    * to exist; the seal is exactly what makes it untestable now, not an oversight in this change.
+    * it always did, unchanged. This method reads `graph.workflow`/`graph.shape`/`graph.begin` instead
+    * of naming `shippedWorkflow`/`shippedShape` directly, so that a caller-supplied graph takes
+    * effect rather than merely type-checking as a parameter nothing inside reads. That claim used to
+    * be unverifiable, because `LoopGraph` was `sealed` with `LitterBox.shipped` its only inhabitant,
+    * so nothing outside this file could build a second `LoopGraph` to pass here and observe a
+    * different walk; `LitterBox.graph` (`src/LitterBox.scala`) is now a second, genuinely distinct
+    * `LoopGraph` a foreign package can build, and `test/ConsumerGraphRunSpec.scala` drives one
+    * through this very method and asserts on the ordered log lines `TestWorld` records for its nodes
+    * (issue #43 review round 2, MINOR m4, correcting an earlier version of this sentence: `TestWorld
+    * .calls`, test/Recorder.scala, is a DIFFERENT buffer from `TestWorld.logLines`, and the assertion
+    * that closes this gap reads `world.logLines`' own index ordering, never `world.calls`), closing the
+    * gap this paragraph used to describe as untested plumbing.
     */
   def runOnce(n: Int, graph: LoopGraph = LitterBox.shipped)(using
       cfg: Config,
@@ -423,11 +430,15 @@ object Machine:
   ): LoopExit =
     val cur = Cursor()
     // The `Caps` bundle `Runner.step`/`Runner.run` need, built from the individual capabilities
-    // already in this parameter list (issue #32), and reused for the whole tick, both `Pick`'s own
-    // throwaway-ledger dispatch below and the real `shippedWorkflow` walk after it. A plain `val`,
-    // never `given`: a `given Caps` here would sit in the same scope as `cfg`/`gh`/... above and make
-    // every one of `Caps.given`'s accessors ambiguous with them the moment anything below asks for
-    // one implicitly (see `Caps`'s own doc). Passed to `Runner.step`/`Runner.run` explicitly instead.
+    // already in this parameter list (issue #32), and reused for the whole tick: by `graph.begin`
+    // below, whatever pre-walk phase that particular `LoopGraph` declares (`Pick`'s own dispatch, for
+    // the shipped graph), and by the real `Runner.run` walk after it (issue #43 review, correcting
+    // this paragraph: it used to name `Pick` and `shippedWorkflow` directly, back when this method
+    // hard-coded both; it is graph-agnostic now, so neither is named here at all, only whichever
+    // `LoopGraph` this call was handed). A plain `val`, never `given`: a `given Caps` here would sit
+    // in the same scope as `cfg`/`gh`/... above and make every one of `Caps.given`'s accessors
+    // ambiguous with them the moment anything below asks for one implicitly (see `Caps`'s own doc).
+    // Passed to `Runner.step`/`Runner.run` explicitly instead.
     val caps = Caps(cfg, gh, git, agents, gates, hostGates, log, notify, fs, clock, logger)
     val exit = boundary[LoopExit]:
       // Recovered here, once, the same way every node adapter in this file recovers a `Faulting`
@@ -454,15 +465,17 @@ object Machine:
       // value it actually carries. Declaring off the value means a caller driving some OTHER
       // `Workflow`, one carrying its own `StageSet`, gets that set declared honestly instead of this
       // file's own shipped one (`ShippedWorkflowSpec` proves the shipped case with a custom
-      // `StageSet` directly against `declareStages`). Built here against a throwaway `Ledger(0)`, the
-      // same affordance `Pick`'s own dispatch a few lines down already relies on (that node declares
-      // `Cost.NoDispatch` and its own `using` clause carries no `AgentDispatch` at all, so nothing
-      // about a placeholder ledger is ever observable there either): `stages` is fixed data assigned
-      // once inside `Workflow`'s own construction and never reads the ledger's remaining budget, so a
-      // throwaway one answers `.stages` identically to the real, resume-aware one this tick's actual
-      // walk spends against, minted below only once `Pick`'s own output (`setup.resumeAuthors`) is
-      // known. Kept as a `val`, not inlined into the `declareStages` call below, so its own `.name`
-      // is available a few lines down for the shape violation message (issue #43 review MINOR): that
+      // `StageSet` directly against `declareStages`). Built here against a throwaway `Ledger(0)`
+      // (issue #43 review, correcting this paragraph: it used to point at `Pick`'s own dispatch a few
+      // lines down as the reason a throwaway ledger is safe here; that dispatch, and the
+      // `setup.resumeAuthors` fact its own comment named, both moved onto `LitterBox.shipped.begin`
+      // when the pre-walk phase became `graph.begin`, so neither exists in this method any more):
+      // `stages` is fixed data assigned once inside `Workflow`'s own construction and never reads the
+      // ledger's remaining budget, so a throwaway one answers `.stages` identically to the real,
+      // resume-aware `Ledger` this method builds a few lines down from `started.dispatchBudget`, once
+      // `graph.begin`'s own outcome is known. Kept as a `val`, not inlined into the `declareStages`
+      // call below, so its own `.name` is available a few lines down for the shape violation message
+      // (issue #43 review MINOR): that
       // message used to hardcode the literal `"shipped"`, one line after `graph.shape(cfg)` made the
       // graph itself a parameter the caller supplies, so a future graph other than the shipped one
       // would have faulted with a name that did not match what actually ran. Reading `.name` off the
@@ -485,68 +498,19 @@ object Machine:
       if shapeViolations.nonEmpty then
         infraFault(Runner.invalidShapeMessage(workflow.name, shapeViolations))
 
-      // `pickAndSetup`'s own `using` clause carries no `AgentDispatch` at all, so nothing inside it
-      // can call `agents.*` regardless of what `Cost` `Pick` declares or what `Ledger` it runs under;
-      // that signature, not `Cost.NoDispatch`, is what actually enforces "spends nothing" here, since
-      // `Cost` alone only gates whether `Runner.step` lets a node START (`Cost`'s own doc), never
-      // what it can spend once running. A throwaway `Ledger(0)` is enough to satisfy `Runner.step`'s
-      // own signature here. The REAL, shared `Ledger` cannot be built before this call returns (issue
-      // #34 review finding F4): whether the tick is a resume is `Pick`'s own OUTPUT
-      // (`resumeAuthors`), not known any earlier, and the seed below needs it.
-      Runner.step(Pick, PickInput(n, cur))(using caps, faulting, Runner.Ledger(0)) match
+      // Everything the old inline `Pick` dispatch and `ledgerSeed` computation did here now lives on
+      // `graph.begin` (issue #43): the start input the walk below runs from, and the dispatch budget
+      // the real `Ledger` gets built with, are both graph-owned facts, computed the SAME way the
+      // shipped graph always computed them (`LitterBox.shipped.begin`, `src/LitterBox.scala`, carries
+      // that reasoning verbatim, F4/`REPAIR_BUDGET=0` notes included), just no longer hard-coded into
+      // this graph-agnostic method.
+      graph.begin(n, cur, cfg, caps, faulting) match
         case NodeOutcome.Stopped(exit) => exit
-        case NodeOutcome.Done(setup) =>
-          // The shared dispatch `Ledger` every `Cost.OneDispatch` node from here on (`Implement`,
-          // `Repair`) draws from, seeded resume-aware (issue #34 review finding F4) now that
-          // `setup.resumeAuthors` is known:
-          //
-          //   - an ORDINARY tick runs `Implement` (one dispatch) and then up to `cfg.repairBudget`
-          //     `Repair` rounds, so the seed is `cfg.repairBudget + 1`;
-          //   - a RESUMED tick (`resumeAuthors.isDefined`) skips `Implement` entirely and dispatches
-          //     its own first FIX straight through `Repair` (`shippedWorkflow`'s own `resumeAuthors`
-          //     branch), so the seed is `cfg.repairBudget` with no `Implement`-sized headroom added
-          //     on top.
-          //
-          // Every `Implement`/`Repair` dispatch this tick can make charges this one `Ledger`, through
-          // `Runner.step`'s own decorator, so `remainingDispatches` cannot drift from what
-          // `attemptRepairNext`'s own local reasoning (`shippedWorkflow`) tracks by hand for THOSE
-          // two nodes. `Review` (issue #35) is also a node and also runs through `Runner.step`, but
-          // NOT against this `Ledger` (D1 of issue #37's own design: `shippedWorkflow`'s own doc has
-          // the full reasoning), so a review dispatch still spends nothing against THIS `Ledger`.
-          // That split is what keeps `ledgerSeed` here exactly the FIX/IMPL slice of the tick's real
-          // dispatch count, and what keeps every `self-repair: budget now N` golden line true
-          // regardless of how many review rounds preceded it.
-          //
-          // `math.max(0, cfg.repairBudget)`, not a bare `cfg.repairBudget` (issue #33 review round 2
-          // finding A, still relevant here): `REPAIR_BUDGET` reaches here through a bare
-          // `toIntOption` (`Main.scala`) or a bare `conf.getInt` (`Settings.scala`), neither of which
-          // rejects a negative value, and this codebase already treats negatives as reachable (the
-          // `<= 0`, not `== 0`, guard at `cfg.repairBudget <= 0` in `pickAndSetup`). The `+ 1` on the
-          // ordinary path keeps `Implement` affordable no matter how small `cfg.repairBudget` is
-          // configured, including `REPAIR_BUDGET=0`, which must still dispatch the initial IMPL
-          // rather than park before ever running it (the `ScenarioSpec` case this ledger is required
-          // to keep green); a resumed tick never runs `Implement`, so it needs no matching `+ 1`, and
-          // `pickAndSetup` only ever sets `resumeAuthors` when `cfg.repairBudget > 0` (that guard's
-          // own doc), so this seed is guaranteed positive on that path without a floor of its own.
-          val ledgerSeed =
-            if setup.resumeAuthors.isDefined then math.max(0, cfg.repairBudget)
-            else math.max(0, cfg.repairBudget) + 1
-          val ledger = Runner.Ledger(ledgerSeed)
-
+        case NodeOutcome.Done(started) =>
+          val ledger = Runner.Ledger(started.dispatchBudget)
           Runner.run(
             graph.workflow(cfg, caps, faulting, ledger),
-            ShippedStart(
-              n = n,
-              cur = cur,
-              issue = setup.issue,
-              bodyFile = setup.bodyFile,
-              workerPromptFile = setup.workerPromptFile,
-              isClass1 = setup.isClass1,
-              branch = setup.branch,
-              resumeAuthors = setup.resumeAuthors,
-              carriesParked = setup.carriesParked,
-              resumedFromInProgress = setup.resumedFromInProgress
-            )
+            started.input
           )(using caps, faulting, ledger)
     emit(cur, "DONE", "end", detail = s"rc=${exit.rc}")
     exit
@@ -972,8 +936,16 @@ object Machine:
     * type, `Node[PickInput, PickAndSetup.Ready]`, reads as a graph step with a named input instead
     * of an anonymous tuple a reader has to cross-reference against `pickAndSetup`'s own parameter
     * list to understand.
+    *
+    * `private[litterbox]`, not the plain `private` this carried before issue #43: `LitterBox.shipped`
+    * (`src/LitterBox.scala`) now builds this value itself, inside its own `begin`, the exact call the
+    * old inline `Pick` dispatch in `Machine.runOnce` used to make in this same file. That call moved
+    * to a different top level object in a different file, so the name has to clear the object-private
+    * boundary; `private[litterbox]` is the narrowest modifier that still does, and it grants no
+    * visibility beyond this package, the same ceiling every other `private[litterbox]` name in this
+    * file already sits under.
     */
-  private final case class PickInput(n: Int, cur: Cursor)
+  private[litterbox] final case class PickInput(n: Int, cur: Cursor)
 
   /** Pick, converted to a `Node` (issue #32): the body is `pickAndSetup`, completely untouched,
     * behind a thin adapter that maps its result onto `NodeOutcome`.
@@ -1011,8 +983,12 @@ object Machine:
     * straight into `pickAndSetup`, a method that itself only ever reaches `LoopExit.InfraFault`
     * through `Machine.infraFault`, never through a bare `boundary.break`. A future node written
     * against this kit is not expected to take the same shortcut; `Fault.raise` is its only route.
+    *
+    * `private[litterbox]` (issue #43), for the identical reason `PickInput`'s own doc above states:
+    * `LitterBox.shipped.begin` is the one caller outside this file, and package-private is the
+    * narrowest modifier that reaches it without exposing this node beyond `in.rcard.litterbox`.
     */
-  private val Pick: Node[PickInput, PickAndSetup.Ready] =
+  private[litterbox] val Pick: Node[PickInput, PickAndSetup.Ready] =
     Node(
       name = "Pick",
       cost = Cost.NoDispatch,
@@ -1709,11 +1685,18 @@ object Machine:
     * Issue #43 is what builds that public entry point, later, and every fact this paragraph states
     * is still true after it: `shippedWorkflow` is still `private[litterbox]`, and so are `Faulting`
     * and `Runner.Ledger`'s constructor, unchanged. What #43 adds is `LitterBox.shipped`
-    * (`src/LitterBox.scala`), a `LoopGraph` whose own two members delegate to `shippedWorkflow`/
-    * `shippedShape` and stay `private[litterbox]` themselves, reachable by a consumer only as an
-    * opaque value passed to `LitterBox.run`, never as a way to call either function by name from
-    * outside this package. `LitterBox.scala`'s own doc has the reasoning for why `LoopGraph` is
-    * `sealed` and what that guarantee does and does not buy.
+    * (`src/LitterBox.scala`), a `LoopGraph` inhabitant whose `type Start` member fixes to
+    * `ShippedStart` and whose three term members, `workflow`, `shape` and `begin`, delegate to
+    * `shippedWorkflow`/`shippedShape` (the third, `begin`, is the `Pick` step and the resume-aware
+    * `Ledger` seed, moved here verbatim from this very method, issue #43 review, correcting an
+    * earlier, two-member version of this paragraph that predated `begin` existing at all), all four
+    * staying `private[litterbox]` themselves, reachable by a consumer only as an opaque value passed
+    * to `LitterBox.run`, never as a way to call any of them by name from outside this package. Issue
+    * #43 also adds `LitterBox.graph`, the public smart constructor a consumer builds their OWN,
+    * differently `Start`-typed `LoopGraph` inhabitant through, without ever writing `extends
+    * LoopGraph` themselves (`LitterBox.scala`'s own doc on `LoopGraph` has the full reasoning).
+    * `LitterBox.scala`'s own doc has the reasoning for why `LoopGraph` is `sealed` and what that
+    * guarantee does and does not buy.
     *
     * `shape` (issue #38, RFC #26 decision 16's cheap half) is now `shippedShape(cfg)`, hoisted to its
     * own function (issue #38 review finding 3) so `Machine.runOnce` can validate it before `Pick`
@@ -2244,7 +2227,13 @@ object Machine:
     * review-reachability walk can never fire on THIS graph; what it actually checks here is
     * declaration hygiene alone (an empty `entry`, two nodes disagreeing on a shared name, an orphan
     * node `transitions` names but no `entry` reaches), real, but a strictly narrower guarantee than
-    * "no guarded node is reachable without a review".
+    * "no guarded node is reachable without a review". Rechecked, not merely carried forward, after
+    * issue #43 review round 4's Tier 2 made `Node.apply` derive `Guard.RequiresReview` from a node's
+    * own input type extending `RequiresReviewInput` (`Kit.scala`'s own doc on `GuardOf`): that
+    * derivation cannot silently add a `Guard.RequiresReview` to a node here, because it fires off the
+    * TYPE, and no node's input type in this `Shape` extends the marker (the paragraph below has the
+    * same fact stated for the macro's own read of it), so this claim is still true for the reason it
+    * always was, not by accident.
     *
     * `checkedShape` (issue #39, `Kit.scala`) does NOT wrap this literal (issue #39 review round 3,
     * M3, correcting a version of this file that did and read the wrap as protection). No node
@@ -2742,19 +2731,27 @@ object Machine:
     * marker differently), so the two paths still converge on identical label/tree/status bookkeeping
     * without `AskHuman` itself having to guess which situation it is in.
     *
-    * What a consumer graph can do with this node TODAY stops short of running it outside this library
-    * (issue #44 review, MAJOR, widened by round 3's F5): `AskHuman`, `AskHumanInput` and
-    * `AskHumanReply` are all public and type-check from a foreign package (`ConsumerBoundarySpec`'s
-    * own pin), so a consumer can name this node and wire it into their own `Workflow` right now, but
-    * actually walking that `Workflow` through `Runner.run` needs a `Runner.Ledger` AND a `Caps`, and
-    * NEITHER is buildable outside this package: `Ledger`'s own constructor stays `private[litterbox]`
-    * (RFC #26 decision 9: budget ownership belongs to the runner, not something this ticket reopens),
-    * and `Caps.agents` needs an `AgentDispatch`, itself `sealed` with its only living implementation's
-    * constructor `private[litterbox]` too (`Caps.scala`'s own doc on `LiveAgentDispatch`). This is a
-    * kit-wide, pre-existing gap, not something specific to `AskHuman`: every OTHER node in this file
-    * would hit the identical wall if it were public, `AskHuman` is simply the first one this ticket
-    * makes public enough to notice it. Closing that gap is deliberately left to the publishing
-    * tickets (#41, #43), not this one.
+    * What a consumer graph can do with this node changed with issue #43 (correcting this paragraph,
+    * issue #44 review MAJOR, widened by round 3's F5, was accurate only until then): `AskHuman`,
+    * `AskHumanInput` and `AskHumanReply` were already public and type-checked from a foreign package
+    * (`ConsumerBoundarySpec`'s own pin), so a consumer could name this node and wire it into their own
+    * `Workflow`, but actually walking that `Workflow` needed a `Runner.Ledger` AND a `Caps`, and
+    * neither was buildable outside this package BY HAND: `Ledger`'s own constructor stays
+    * `private[litterbox]` (RFC #26 decision 9: budget ownership belongs to the runner, not something
+    * this ticket reopens), and `Caps.agents` needs an `AgentDispatch`, itself `sealed` with its only
+    * living implementation's constructor `private[litterbox]` too (`Caps.scala`'s own doc on
+    * `LiveAgentDispatch`). That gap is closed now, not by widening either constructor, both stay
+    * exactly as closed to hand construction as this paragraph used to describe, but by
+    * `LitterBox.graph` (`src/LitterBox.scala`, RFC #26 decisions 5 and 8): a consumer wires `AskHuman`
+    * into their own `Workflow`, hands it to `LitterBox.graph` along with a `dispatchBudget: Config =>
+    * Int`, and `LitterBox.run` reuses `Main`'s own Live wiring to supply the `Caps` and
+    * `Machine.runOnce` to build the real `Ledger` from that declared number, the identical path
+    * `LitterBox.shipped` itself runs through. Neither constructor became reachable BY NAME; the
+    * factory is the door, exactly the one `LoopGraph`'s own doc describes for authoring a graph at
+    * all. This was a kit-wide, pre-existing gap, not something specific to `AskHuman`: every OTHER
+    * node in this file would have hit the identical wall if it were public, `AskHuman` was simply the
+    * first one made public enough to notice it, and closing the gap for one node closes it for all of
+    * them, since none of them needed anything AskHuman-specific to reach `LitterBox.graph`.
     *
     * Public, unlike every sibling node in this file (`Gate`, `Repair`, `Review`, ..., all `private`
     * or `private[litterbox]`): issue #44's own acceptance criterion 1 is that `AskHuman` is usable in
@@ -3229,8 +3226,15 @@ object Machine:
     * cases really do have different shapes, and naming both is what lets `runOnce` read as "call the
     * phase, then branch" instead of re-deriving the early-exit condition at the call site (issue #29
     * / RFC #26 decision 12 — extract the phase first, so the later node conversion is a reshape).
+    *
+    * `private[litterbox]`, not the plain `private` this carried before issue #43: `Pick`'s own result
+    * type names this enum's `Ready` case, and `Pick` itself is now `private[litterbox]` so
+    * `LitterBox.shipped.begin` can call it from a different file; a caller that can name `Pick`'s
+    * result type has to be able to name this enum too, or the call would not type-check. Still
+    * entirely closed to anything outside this package: widening object-private to package-private
+    * grants no visibility a foreign consumer can reach.
     */
-  private enum PickAndSetup:
+  private[litterbox] enum PickAndSetup:
     /** The phase stopped on its own before dispatching any work or touching git; `exit` is what
       * `runOnce` must return unchanged (`Runner.step(Pick, ...)`'s own `NodeOutcome.Stopped` arm).
       * `exit` is never `LoopExit.InfraFault`: an infra fault goes
