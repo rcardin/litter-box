@@ -200,7 +200,9 @@ enum DispatchOutcome:
   * `AgentDispatchImpl`, or widen `dispatchReview`'s access), so no foreign package can construct one,
   * so `review` (`final`, the only way to mint a `Judged`) is reachable only through a dispatch this
   * library itself wired. RFC #26 decision 7's trust boundary sits at the capability, not at a shipped
-  * step.
+  * step. Read this together with the fourth part below, never on its own: "a dispatch this library
+  * wired" now includes the scripted one the PUBLISHED TESTKIT wires, which a consumer can hold, and
+  * that is exactly what the fourth part is about.
   *
   * Second, this is a Scala COMPILE TIME guarantee, nothing more. `Judged.mint` is `public` in the
   * compiled bytecode (`private[AgentDispatch]` is a Scala access control construct with no JVM
@@ -213,9 +215,29 @@ enum DispatchOutcome:
   * consumer to deliberately misdeclare their own file's package, a hostile act no accidental
   * agent authored node performs.
   *
-  * Fourth, `TestWorld` (RFC #26 decision 14's published testkit) mints by design: it lives inside this
-  * package on purpose, and putting a testkit on a test classpath is itself the choice to run against a
-  * fake world.
+  * Fourth, `TestWorld` MINTS BY DESIGN, and since issue #42 it does so from a PUBLISHED artifact,
+  * `in.rcard::litter-box-testkit` (`LitterBox.TestkitCoordinate`), so this is now a residual a
+  * consumer can reach rather than one confined to this repo's own suite. `TestWorld.agents` is an
+  * `AgentDispatch` (it satisfies `AgentDispatchImpl` from inside this package, which is the whole
+  * point of decision 14), `review` below is `final` and is the mint site, so anyone holding a
+  * `TestWorld` can call `world.agents.review(...)` and receive a genuine `AgentDispatch.Judged` with
+  * no dispatch behind it. `.map(_ => Verdict.Approve)` on that value then clears
+  * `Guard.RequiresReview` at BOTH gates, the `LitterBox.graph` macro and `Runner.step`'s runtime
+  * class check, because the value really is a `Judged`, not an imitation of one. This was reproduced
+  * end to end in a faithful miniature (sealed capability, `private[pkg]` impl trait, `final` mint
+  * method, `private[Ctor]` constructor) from a foreign package while scoping #42, not merely reasoned
+  * about.
+  *
+  * There is no type level defence available: the mint is inherent to decision 14, since a testkit
+  * that could not produce a `Judged` could not drive a review node at all, which is the one thing a
+  * node author most needs to test. The controls are therefore ARTIFACT SCOPING plus saying this
+  * plainly. The fakes ship as their OWN artifact and are deliberately not in the library jar, so
+  * `//> using test.dep in.rcard::litter-box-testkit:<version>` puts them on the test classpath only,
+  * where running against a fake world is the whole intent; a consumer who writes `dep` instead of
+  * `test.dep` has put the mint on their production compile classpath and hands themselves a forged
+  * review. Nothing in this library can detect that or refuse it. README's Testkit section and
+  * `LitterBox.TestkitCoordinate`'s own scaladoc repeat the `test.dep` rule at the two other points a
+  * reader meets the artifact.
   */
 sealed trait AgentDispatch:
   /** Runs the worker; the contract is "a patch is produced at `patchOut`" (possibly empty). The

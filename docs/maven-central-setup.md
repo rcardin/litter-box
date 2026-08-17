@@ -6,9 +6,52 @@ on every `v*` tag. That coordinate is not decoration: `litter-box init` scaffold
 release whose library never reached Central hands every new consumer a launcher that dies at
 dependency resolution before compiling a line.
 
+Since issue #42 that job pushes a **second artifact** off the same tag, `in.rcard::litter-box-testkit`
+(`LitterBox.TestkitCoordinate`): `test/Recorder.scala`, the scripted in-memory capabilities this
+repository tests itself with, so a consumer authoring their own node can test it the same way. There
+is one manual step behind it, the namespace below, and it is already done: both artifacts sit under
+`in.rcard`, so nothing about Sonatype setup differs for the second one.
+
 The namespace, the account and the four secrets the job authenticates with are manual, one time
 steps a workflow cannot do for itself. They are done for `rcardin/litter-box` itself; this document
 is what you follow to stand the same thing up in a fork.
+
+## The two artifacts
+
+| Artifact | Built from | Consumer declares it as |
+| --- | --- | --- |
+| `in.rcard::litter-box` | the whole project (`.`), with `resources/` | `//> using dep` |
+| `in.rcard::litter-box-testkit` | `test/Recorder.scala`, passed as an explicit file input | `//> using test.dep` |
+
+The testkit is compiled ALONE, not as part of the project build, and that is load bearing in three
+ways. An explicit file input makes that file's own directory the project root, so the root
+`project.scala` is never read: the testkit jar carries none of the library's resources and none of
+its classes, only `TestWorld`, `Script`, `FakeClock`, `buildCaps` and `withFaulting`, 31 files in the
+jar as of this writing. The scala version and JVM
+that `project.scala` would have supplied are read out of it by `sed` in the job and handed over as
+`--scala`/`--jvm`, so the two cannot drift. And the fakes stay OUT of the library jar, which is the
+whole reason for a second artifact rather than a directory in `src/`: `TestWorld` can mint a genuine
+`AgentDispatch.Judged` from a scripted fake, and the only control over that is which classpath it
+lands on. See `src/Caps.scala`'s `AgentDispatch` scaladoc, and README's Testkit section for the
+`test.dep`, never `dep` rule a consumer has to follow.
+
+The testkit depends on the library at exactly the version being released. During the job that
+dependency cannot come from Central, since the version is not there yet, so the `publish` job stages
+the library into `~/.ivy2/local` (which scala-cli resolves by default) and builds the testkit against
+that. Two consequences worth knowing:
+
+- That staging step **publishes the testkit locally too**, with the identical flag set the Central
+  publish uses, deliberately before the Central publish rather than after. Central is immutable, so
+  everything that can fail without the network is moved in front of the irreversible step, and the
+  only thing left after the library upload is the upload itself. It is `publish local` and not
+  `compile` on purpose: `compile` builds no doc jar, no sources jar and no pom, and reads none of the
+  metadata flags, so a scaladoc error or a rejected flag would sail past it and surface for the first
+  time after the library had already spent the version. `.github/workflows/ci.yml`'s `testkit` job
+  runs the same pair on every PR, which is where a scalatest import creeping into
+  `test/Recorder.scala` is supposed to be caught, since it would break nothing else.
+- The release is still **not atomic across the two artifacts**. The library uploads first. A failure
+  between the two leaves a published library and no testkit at that version, and the version cannot
+  be reused. See the failure table below; the recovery is the same one, a new tag.
 
 ## Why `scala-cli publish` and not sbt-ci-release
 
@@ -101,6 +144,13 @@ version is rejected. The failure modes divide cleanly:
   genuine re-run.
 - **Already published.** The version is permanent. Bump `LitterBox.Version`, delete nothing, and cut
   a new tag.
+- **The library published and the testkit did not.** Both artifacts go out of one step, library
+  first, so this is the one partial state the two-artifact release can end in. The library at that
+  version is permanent and correct; the testkit at that version does not exist and cannot be added,
+  since a re-run would be rejected on the library. Bump `LitterBox.Version` and cut a new tag, which
+  republishes both. Do not hand-upload a testkit at the orphaned version: the pairing rule
+  (`LitterBox.TestkitCoordinate`'s scaladoc) is that the two are built together from one tag, and a
+  testkit that reached Central by another route is a testkit nothing checked against its library.
 
 `release` and `formula` both wait on `publish`, so a Central failure stops the GitHub release and
 the Homebrew formula too. That is deliberate, and it is the same rule `image` follows: everything cut

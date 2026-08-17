@@ -425,16 +425,27 @@ final class TestWorld:
 
   // ---- driving the machine ----------------------------------------------------------------
 
-  /** Runs one iteration of the machine against this world's scripted capabilities.
+  /** Runs one iteration of the machine against this world's scripted capabilities, walking whichever
+    * `LoopGraph` the caller names.
     *
     * The `using` clause lives here rather than in each spec so that adding a capability to
     * `Machine` is a one-line edit instead of a lockstep edit across every spec that drives it.
-    * Per-scenario differences stay at the call site: `w.runLoop()` for the defaults,
-    * `w.runLoop(Config(dryRun = true))` to vary config, `w.runLoop(iteration = 2)` to vary the
-    * iteration number the machine reports.
+    * Per-scenario differences stay at the call site: `w.runGraph(g)` for the defaults,
+    * `w.runGraph(g, Config(dryRun = true))` to vary config, `w.runGraph(g, iteration = 2)` to vary
+    * the iteration number the machine reports.
+    *
+    * This is the testkit's entry point for a CONSUMER's own graph (issue #42, RFC #26 decision 14):
+    * a node author builds a `LoopGraph` through `LitterBox.graph` and drives it here, with no
+    * Docker, no network and no credentials, exactly the way this repo drives its own shipped graph
+    * through [[runLoop]] below. It deliberately takes an already-built `LoopGraph` and never
+    * constructs one, and it names no `Runner.Ledger`: `Machine.runOnce` builds the ledger from the
+    * graph's own declared `dispatchBudget`, so the testkit does not become the `Ledger` escape hatch
+    * RFC #26 decision 9 exists to prevent. An earlier draft of this method grew `runNode`/
+    * `runWorkflow` helpers that would have had to build one; issue #43's public `LitterBox.graph`
+    * removed the need for them entirely.
     */
-  def runLoop(cfg: Config = Config(), iteration: Int = 1): LoopExit =
-    Machine.runOnce(iteration)(using
+  def runGraph(graph: LoopGraph, cfg: Config = Config(), iteration: Int = 1): LoopExit =
+    Machine.runOnce(iteration, graph)(using
       cfg,
       github,
       git,
@@ -447,6 +458,17 @@ final class TestWorld:
       clock,
       logger
     )
+
+  /** Runs one iteration of the SHIPPED graph against this world's scripted capabilities: the
+    * `PICK -> IMPLEMENT -> GATE -> REPAIR -> REVIEW -> PR -> CI -> MERGE` pipeline `lb` itself walks.
+    *
+    * Every behavioural spec in this repo drives the machine through here. Kept as its own method,
+    * delegating to [[runGraph]] rather than being replaced by it, because `LitterBox.shipped` is the
+    * one graph the overwhelming majority of call sites want and spelling it out at each of them
+    * would be several hundred lines of noise saying the same thing.
+    */
+  def runLoop(cfg: Config = Config(), iteration: Int = 1): LoopExit =
+    runGraph(LitterBox.shipped, cfg, iteration)
 
 /** A `Clock` a test can script by hand. `nowMillis` answers each element of `answers` in turn, and
   * repeats the last one once exhausted, so a test only has to name as many readings as it cares

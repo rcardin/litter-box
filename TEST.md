@@ -4,6 +4,38 @@
 replace one subprocess, so the loop can be driven end to end without Docker or GitHub. `GATE_CMD`
 overriding `gate.fast` also skips the entire Docker preflight.
 
+## `test/Recorder.scala` is a published artifact: keep it standalone
+
+Since issue #42 that one file is also `in.rcard::litter-box-testkit`, compiled ALONE against the
+published library jar and pushed to Maven Central off every tag. Inside this project it compiles next
+to `src/` and next to scalatest, so nothing about `scala-cli test .` notices an `org.scalatest`
+import, or a reference to a helper some spec defines, creeping into it. Both would break only the
+release publish, on the one path in this pipeline that cannot be retried, since Central is immutable
+at a version.
+
+`.github/workflows/ci.yml`'s `testkit` job runs the release's own compile on every PR to catch that.
+Run it by hand the same way before touching that file:
+
+```bash
+scala_version="$(sed -n 's|^//> using scala \(.*\)$|\1|p' project.scala)"
+jvm_version="$(sed -n 's|^//> using jvm \(.*\)$|\1|p' project.scala)"
+scala-cli --power publish local . --organization in.rcard --name litter-box --project-version 0.0.0-CI
+scala-cli compile test/Recorder.scala --scala "$scala_version" --jvm "$jvm_version" \
+  --dep in.rcard::litter-box:0.0.0-CI
+```
+
+Read out of `project.scala` rather than typed, for the same reason the workflows do it: a `3.8.3`
+written here is a second statement of a fact that file owns, and this copy is the one nothing checks.
+Note the workflows go further and run `publish local` on the testkit rather than `compile`, since only
+that builds the doc jar, the sources jar and the pom; `compile` is enough for the edit-and-check loop
+this command exists for.
+
+Two things follow. Everything in that file, `TestWorld`, `Script`, `FakeClock`, `buildCaps` and
+`withFaulting`, may depend on `src/` and on the Scala library, and on nothing else. And it is all
+consumer-facing surface now, so a rename there is a breaking change for a node author, not a local
+edit. README's Testkit section is where the artifact says which of it is SUPPORTED surface, which is a
+narrower list than what the jar happens to contain.
+
 ## Verifying a macro change: always pass `--server=false`
 
 `src/KitMacro.scala` is compiled and cached by the bloop/BSP daemon `scala-cli` starts by default, and

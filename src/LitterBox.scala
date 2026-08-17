@@ -159,6 +159,34 @@ object LitterBox:
     */
   val Coordinate: String = s"in.rcard::litter-box:$Version"
 
+  /** The Maven coordinate the TESTKIT ships under (issue #42, RFC #26 decision 14): everything in
+    * `test/Recorder.scala`, which is `TestWorld`, `Script`, `FakeClock`, `buildCaps` and
+    * `withFaulting`, published as a second artifact off the same tag so a consumer can test their own
+    * node with no Docker, no network and no credentials. README's Testkit section narrows that list
+    * to the part a consumer may rely on, which is not the same as the part the jar contains.
+    *
+    * THE PAIRING RULE, which is the reason this is a derived string and not a second literal: the
+    * testkit is pinned to the library version it was built against, exactly, and the two are always
+    * released together from one tag. It exposes the capability traits themselves (`AgentDispatch`,
+    * `GitHub`, `Git`, ...), not the far narrower `LitterBox.graph` surface, so a testkit compiled
+    * against one library version has no compatibility story at all against another; under the `0.x`
+    * policy in README's Version policy section, a trait gaining one method is an ordinary release.
+    * Declare both at the same version or neither.
+    *
+    * Nothing renders this into a scaffold the way [[Coordinate]] is rendered into
+    * `.litter-box/loop.scala`, because the scaffold pins the library only: a generated loop compiles
+    * and runs without ever touching a test classpath. Its readers are README's Testkit section, for
+    * the human, and `TestkitPublishSpec`, which asserts `.github/workflows/release.yml` publishes an
+    * artifact under exactly the name spelled here rather than one that drifted from it.
+    *
+    * DECLARE IT AS `test.dep`, NEVER `dep`. A consumer with the testkit on the MAIN compile
+    * classpath can mint an `AgentDispatch.Judged` out of a scripted fake and clear
+    * `Guard.RequiresReview` with it: `src/Caps.scala`'s fourth guarantee paragraph states that
+    * residual in full, and it is the reason the fakes ship as their own artifact rather than inside
+    * the library jar everyone already depends on.
+    */
+  val TestkitCoordinate: String = s"in.rcard::litter-box-testkit:$Version"
+
   /** The tag of the sandbox base image a scaffolded repo pins in `.litter-box/Dockerfile`'s
     * `ARG BASE_IMAGE=` default. Lives beside [[Version]] rather than beside `Init` or the release
     * workflow, because the whole point of building both from one tag (issue #6) is that the image

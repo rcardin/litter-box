@@ -122,7 +122,9 @@ The formula depends on `openjdk@21` and installs a single self-executing jar as 
 [.github/workflows/release.yml](.github/workflows/release.yml) for how a tag turns into a published
 formula, binary, base image and library together.
 
-The same tag also publishes `in.rcard::litter-box` to Maven Central. You do not install that half:
+The same tag also publishes two artifacts to Maven Central, `in.rcard::litter-box` and
+`in.rcard::litter-box-testkit` (see [Testing your own loop](#testing-your-own-loop) for the second
+one). You do not install either half:
 `litter-box init` scaffolds a `.litter-box/loop.scala` that opens with `//> using dep
 in.rcard::litter-box:<version>`, pinned to the exact version of the binary that scaffolded it, and
 `scala-cli` fetches it on the first run. See
@@ -266,6 +268,112 @@ accounting a same-tick capability call would have gone through.
 This whole surface sits under the same `0.x` no-stability-promise policy as everything else in this
 project (see [Version policy](#version-policy) above): pin an exact version if a shape change landing
 under you would be a problem.
+
+### Testing your own loop
+
+The same tag publishes a second artifact, `in.rcard::litter-box-testkit`, which is exactly what this
+repository tests itself with: scripted in-memory handlers for every capability, plus the interaction
+recorder every scenario asserts against. No Docker, no network, no credentials, and no `claude`
+binary; the whole of this project's own suite runs on it, which is why CI needs nothing installed but
+`scala-cli`.
+
+```scala
+//> using test.dep in.rcard::litter-box-testkit:<version>
+```
+
+**`test.dep`, never `dep`.** The testkit's `TestWorld` lives inside the library's own package on
+purpose, so its `agents` really is an `AgentDispatch` and `world.agents.review(...)` really does mint
+an `AgentDispatch.Judged`, out of a scripted fake with no reviewer behind it. That value clears
+`Guard.RequiresReview` at both gates, because it is not an imitation of a trust token, it is one. On a
+test classpath that is the entire point, running against a fake world is what you asked for. On your
+main compile classpath it is a review you forged for yourself, and nothing in this library can detect
+it or refuse it. `src/Caps.scala`'s `AgentDispatch` scaladoc states this residual in full.
+
+**The version pairing.** The testkit and the library are released together from one tag and pin to
+each other exactly. Unlike `LitterBox.graph`, the testkit hands you the capability traits themselves,
+so a testkit compiled against one library version has no compatibility story at all against another,
+and under the `0.x` policy above a trait gaining one method is an ordinary release. Declare both at
+the same version, or neither.
+
+A worked example: your own two-node graph, one scripted dispatch, asserting on the outcome AND on the
+call sequence.
+
+```scala
+//> using dep in.rcard::litter-box:<version>
+//> using test.dep in.rcard::litter-box-testkit:<version>
+import in.rcard.litterbox.*
+import in.rcard.litterbox.Caps.given   // the individual capabilities, derived from the ambient Caps
+
+val First: Node[Unit, Unit] = Node(
+  name = "First", cost = Cost.OneDispatch, timeout = Timeout.Unbounded,
+  probe = _ => None,
+  run = _ =>
+    summon[AgentDispatch].worker(Role.IMPL, "first.md", "first.patch", "first.log", None)
+    NodeOutcome.Done(())
+)
+val Second: Node[Unit, Unit] = Node(
+  name = "Second", cost = Cost.NoDispatch, timeout = Timeout.Unbounded,
+  probe = _ => None,
+  run = _ =>
+    summon[Caps].logger.log("Second ran")
+    NodeOutcome.Done(())
+)
+
+// in your test: a scenario body, whatever framework you use
+def myLoopRunsBothNodes(): Unit =
+  val world = new TestWorld
+  world.implScript = Script.WorkerScript.Produces("1\t0\tsrc/Slice.scala") // numstat DSL
+
+  val exit = world.runGraph(
+    LitterBox.graph(
+      workflow = Workflow[Unit](
+        "my-loop",
+        start = (_: Unit) =>
+          Next.Goto(First, (), _ => Next.Goto(Second, (), _ => Next.Finish(LoopExit.Success)))
+      ),
+      shape = Shape(entry = List(First), transitions = List(Transition(First, Second))),
+      dispatchBudget = _ => 1,
+      startInput = _ => ()
+    )
+  )
+
+  assert(exit == LoopExit.Success)
+  assert(world.callCount("dispatch IMPL") == 1) // the recorded call sequence
+  assert(world.logged("Second ran"))
+```
+
+`First` and `Second` are top level `val`s, not built by a `def` inside the test: `LitterBox.graph`
+reads the SOURCE of the `Shape` literal at its own call site, and a node reached through a `def` is a
+form it refuses outright. [Write your own loop](#write-your-own-loop) above has the full list of what
+that check can and cannot read.
+
+Every capability is a `var` or a scripted list on the `TestWorld`: `implScript`/`fixScripts` for the
+worker, `reviewScripts` for the reviewer, `files` for what a dispatch wrote, plus `cleanTree`,
+`applySucceeds`, `fetchSucceeds` and friends for the git and GitHub answers. Everything it observed
+lands in `calls` (`callCount`), `logLines` (`logged`), `notifications`, `commitMessages`,
+`pushedBranches` and `files`. Patch contents use a tiny numstat DSL, one `added<TAB>deleted<TAB>path`
+line per file, so a scenario can make a patch touch a protected path without producing a real diff.
+
+The supported surface is `TestWorld` (its scripting fields, its recorder buffers, `runGraph` and
+`runLoop`), the `Script` object the scripting fields take their values from (`Script.WorkerScript`,
+`Script.ReviewScript`, `newFilePatch`, `approveReview`), `FakeClock` and `buildCaps`. Everything else
+the artifact happens to expose because it lives in the library's package, `Machine.runOnce` included,
+is internal and moves without notice.
+
+`withFaulting` is in the jar and is listed here only to say what it is not: it takes a
+`Faulting ?=> T`, and `Faulting` is `private[litterbox]`, so a consumer can call `withFaulting { ... }`
+and can never write a body that actually faults, having no way to name the type it would summon. It is
+there for this repository's own specs, which drive `Runner.step` directly. Drive your graph through
+`runGraph` instead, which establishes the same boundary internally.
+
+Two rough edges worth knowing before you copy a default: `Script.newFilePatch` hardcodes
+`src/main/scala/Slice.scala`, and `TestWorld`'s GitHub defaults centre on issue 999. Both are this
+repository's own conventions rather than anything meaningful to yours; script your own values rather
+than asserting against those.
+
+`runGraph` never hands you a `Runner.Ledger`, deliberately. The runner owns the dispatch counter and
+the timeout clock, so a budget of one behaves under test exactly as it does in production, and a
+budget assertion you write means something.
 
 ### Quickstart
 

@@ -144,6 +144,13 @@ jobs:
     # `init` scaffold names a coordinate that exists nowhere, and a consumer's first `scala-cli run`
     # dies at dependency resolution before compiling a line.
     #
+    # TWO artifacts since issue #42, off this one tag and at one version: the library
+    # `in.rcard::litter-box`, and the testkit `in.rcard::litter-box-testkit`
+    # (`LitterBox.TestkitCoordinate`), which is `test/Recorder.scala` compiled ALONE against the
+    # library. The testkit exposes the capability traits themselves, so it pairs with exactly the
+    # library version it was built against and the two must never be released apart. That is why it
+    # is published here, in the same job, rather than by anything with its own trigger.
+    #
     # `scala-cli publish`, not `sbt ci-release` (the sibling `yaes` project's route). project.scala
     # carries the reasoning; the short version is that this repository has no sbt build and must not
     # grow one. The four secrets are the same ones sbt-ci-release wants, under the same names.
@@ -203,7 +210,65 @@ jobs:
             exit 1
           fi
 
-      - name: publish to Maven Central
+      # Everything about the testkit publish that can fail WITHOUT the network, run before the
+      # irreversible step below rather than after it. Central is immutable: a tag that publishes the
+      # library and then dies compiling the testkit cannot be retried at the same version, and the
+      # only recovery is the Portal UI (see the asymmetry note above and docs/maven-central-setup.md).
+      # So the compile happens first, and what is left after the library goes out is an upload.
+      #
+      # The testkit depends on the library, and that dependency cannot come from Central during this
+      # job: the version this tag is publishing is not there yet, and waiting on Central propagation
+      # inside a release job is the kind of timing dependency that fails once a year for reasons
+      # nobody can reproduce afterwards. `publish local` stages the library into `~/.ivy2/local`,
+      # which scala-cli resolves by default, and the testkit compiles against THAT.
+      #
+      # `--scala`/`--jvm` are read out of project.scala rather than written here, because an explicit
+      # FILE input (`test/Recorder.scala`) makes that file's own directory the project root, so the
+      # root project.scala is not read at all. That is the property the testkit publish wants (no
+      # `resourceDir`, so the testkit jar carries none of the library's resources, and no library
+      # sources), and its cost is that the two directives have to be handed over on the command line.
+      # Handed over by `sed`, never retyped: a hardcoded `3.8.3` here is a second statement of a fact
+      # project.scala already owns, and it would go stale silently, the testkit compiling under the
+      # old scala version against a library built with the new one.
+      #
+      # `:?` on both captures, and this is not belt and braces. `set -u` fires on an UNSET variable,
+      # never on a set-but-empty one, so a `project.scala` whose directive line is reformatted or
+      # removed leaves `--scala ""`, which scala-cli ACCEPTS, silently substituting its own default
+      # (reproduced during this issue's review: `--scala ""` published a pom depending on
+      # scala3-library_3 3.8.4 while project.scala pinned 3.8.3, with no warning). The result is a
+      # testkit whose TASTy no consumer on the library's own scala version can read, at a coordinate
+      # nobody can take back.
+      #
+      # The pre-flight is `publish local`, not `compile`. `compile` builds no doc jar, no sources jar
+      # and no pom, and never touches the metadata flags, so a scaladoc error or a rejected flag in
+      # the testkit's own publish would sail past it and surface for the first time at the real
+      # publish, AFTER the library is on Central and the version is spent. Publishing the testkit to
+      # `~/.ivy2/local` with the identical flag set runs every one of those.
+      - name: stage the library locally and dry run the testkit publish against it
+        run: |
+          set -euo pipefail
+          scala_version="$(sed -n 's|^//> using scala \(.*\)$|\1|p' project.scala)"
+          jvm_version="$(sed -n 's|^//> using jvm \(.*\)$|\1|p' project.scala)"
+          : "${scala_version:?no //> using scala directive found in project.scala}"
+          : "${jvm_version:?no //> using jvm directive found in project.scala}"
+          scala-cli --power publish local . \
+            --organization in.rcard \
+            --name litter-box \
+            --compute-version git:tag
+          scala-cli --power publish local test/Recorder.scala \
+            --scala "$scala_version" \
+            --jvm "$jvm_version" \
+            --organization in.rcard \
+            --name litter-box-testkit \
+            --project-version "${GITHUB_REF_NAME#v}" \
+            --dep "in.rcard::litter-box:${GITHUB_REF_NAME#v}" \
+            --license MIT \
+            --url https://github.com/rcardin/litter-box \
+            --vcs github:rcardin/litter-box \
+            --description "Testkit for litter-box: scripted in-memory handlers for every capability, plus the interaction recorder, so a node author tests their own graph with no Docker, no network and no credentials." \
+            --developer "rcardin|Riccardo Cardin|https://github.com/rcardin"
+
+      - name: publish the library and the testkit to Maven Central
         env:
           SONATYPE_USERNAME: ${{ secrets.SONATYPE_USERNAME }}
           SONATYPE_PASSWORD: ${{ secrets.SONATYPE_PASSWORD }}
@@ -211,6 +276,15 @@ jobs:
           PGP_PASSPHRASE: ${{ secrets.PGP_PASSPHRASE }}
         run: |
           set -euo pipefail
+
+          # Re-read rather than inherited from the step above: every `run:` block is its own shell,
+          # so a variable set there is gone here. The `sed` is the single source, and the step above
+          # has the reasoning for why these two facts travel on the command line at all and why an
+          # EMPTY capture has to fail loudly rather than become scala-cli's own silent default.
+          scala_version="$(sed -n 's|^//> using scala \(.*\)$|\1|p' project.scala)"
+          jvm_version="$(sed -n 's|^//> using jvm \(.*\)$|\1|p' project.scala)"
+          : "${scala_version:?no //> using scala directive found in project.scala}"
+          : "${jvm_version:?no //> using jvm directive found in project.scala}"
 
           # sbt-ci-release's own convention is that PGP_SECRET holds the ASCII armored private key
           # base64 encoded a second time, so it survives being pasted into a secrets box as a single
@@ -257,6 +331,37 @@ jobs:
             --url https://github.com/rcardin/litter-box \
             --vcs github:rcardin/litter-box \
             --description "A distrustful autonomous coding loop: one labelled issue at a time, implemented in a sandbox, gated, independently reviewed, and merged only if CI agrees." \
+            --developer "rcardin|Riccardo Cardin|https://github.com/rcardin" \
+            --user env:SONATYPE_USERNAME \
+            --password env:SONATYPE_PASSWORD \
+            --secret-key env:PGP_SECRET_ARMORED \
+            $args
+
+          # The testkit (issue #42), in the SAME step as the library above rather than one of its
+          # own: both publishes need the identical armored key and `$args`, and a second step would
+          # have to repeat all of that shell verbatim, which is the kind of duplicated release-only
+          # code nothing exercises until the day it is wrong.
+          #
+          # `--project-version` here where the library uses `--compute-version git:tag`, and this is
+          # not a third statement of the version: `${GITHUB_REF_NAME#v}` IS the tag `git:tag` would
+          # read, and `build`'s guard above already refused this tag if it disagreed with
+          # `LitterBox.Version`. It is spelled out because an explicit file input moves the project
+          # root to `test/`, and a version computed from git history relative to a root that is not
+          # the repository root is not a thing worth finding out about on an irretrievable path.
+          # The `--dep` line pins the testkit to exactly this version of the library, which is the
+          # pairing rule `LitterBox.TestkitCoordinate`'s scaladoc and README's Testkit section state.
+          scala-cli --power publish test/Recorder.scala \
+            --scala "$scala_version" \
+            --jvm "$jvm_version" \
+            --organization in.rcard \
+            --name litter-box-testkit \
+            --project-version "${GITHUB_REF_NAME#v}" \
+            --dep "in.rcard::litter-box:${GITHUB_REF_NAME#v}" \
+            --publish-repository central \
+            --license MIT \
+            --url https://github.com/rcardin/litter-box \
+            --vcs github:rcardin/litter-box \
+            --description "Testkit for litter-box: scripted in-memory handlers for every capability, plus the interaction recorder, so a node author tests their own graph with no Docker, no network and no credentials." \
             --developer "rcardin|Riccardo Cardin|https://github.com/rcardin" \
             --user env:SONATYPE_USERNAME \
             --password env:SONATYPE_PASSWORD \
