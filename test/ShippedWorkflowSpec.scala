@@ -76,6 +76,83 @@ class ShippedWorkflowSpec extends AnyFlatSpec with Matchers:
         case Left(exit)                => fail(s"expected a Next value, faulted instead with $exit")
     }
 
+  // ---- issue #43: the Pick step and the resume-aware ledger seed moved out of Machine.runOnce, -----
+  // ---- verbatim, into LitterBox.shipped.begin; pinned here at their new home, the same two cases ---
+  // ---- (ordinary vs resumed) `start` above is pinned against, one level earlier in the tick --------
+
+  "LitterBox.shipped.begin" should "declare dispatchBudget == cfg.repairBudget + 1 on an ordinary tick, and cfg.repairBudget on a resume (an accepted human reply on a parked issue)" in {
+    val ordinaryWorld = TestWorld() // default `ready = Some(999)`, nothing in progress or parked
+    val ordinaryCaps  = buildCaps(ordinaryWorld)
+
+    val ordinaryResult = withFaulting:
+      LitterBox.shipped.begin(1, Machine.Cursor(), Config(), ordinaryCaps, summon[Faulting])
+
+    ordinaryResult match
+      case Right(NodeOutcome.Done(started)) =>
+        started.dispatchBudget shouldBe Config().repairBudget + 1
+      case other => fail(s"expected an ordinary-tick NodeOutcome.Done, got $other")
+
+    val resumeWorld = TestWorld()
+    resumeWorld.inProgress = None
+    resumeWorld.ready = None
+    resumeWorld.parked = List(777)
+    resumeWorld.issueCommentBodies = Map(
+      777 -> List(
+        s"@litter-box (OWNER):\n${Machine.ParkMarker}\nparked, awaiting a reply",
+        "@alice (OWNER):\ntry using a HashMap instead"
+      )
+    )
+    val resumeCaps = buildCaps(resumeWorld)
+
+    val resumeResult = withFaulting:
+      LitterBox.shipped.begin(1, Machine.Cursor(), Config(), resumeCaps, summon[Faulting])
+
+    resumeResult match
+      case Right(NodeOutcome.Done(started)) =>
+        started.dispatchBudget shouldBe Config().repairBudget
+      case other => fail(s"expected a resumed-tick NodeOutcome.Done, got $other")
+  }
+
+  // ---- issue #43 review, MINOR 9: the math.max(0, ...) floor `LitterBox.shipped.begin` applies to ---
+  // ---- ledgerSeed had no test at its new home; `src/LitterBox.scala:212-222`'s own comment spends ---
+  // ---- nine lines justifying it against a negative REPAIR_BUDGET, so pin the fact it justifies ------
+
+  it should "floor dispatchBudget at 0 (plus the ordinary tick's +1) rather than go negative when REPAIR_BUDGET itself is configured negative" in {
+    // `REPAIR_BUDGET` reaches `Config.repairBudget` through a bare `toIntOption`/`conf.getInt`
+    // (`LitterBox.shipped.begin`'s own comment has the full citation), neither of which rejects a
+    // negative value, so a negative `repairBudget` here is not a value this test invents, it is a
+    // value production code already has to tolerate.
+    val world = TestWorld() // default `ready = Some(999)`, an ordinary tick
+    val caps  = buildCaps(world)
+    val cfg   = Config(repairBudget = -5)
+
+    val result = withFaulting:
+      LitterBox.shipped.begin(1, Machine.Cursor(), cfg, caps, summon[Faulting])
+
+    result match
+      case Right(NodeOutcome.Done(started)) =>
+        // `math.max(0, -5) + 1 == 1`: the floor keeps Implement affordable even when the configured
+        // budget is nonsensical, never a negative `Runner.Ledger` seed.
+        started.dispatchBudget shouldBe 1
+      case other => fail(s"expected an ordinary-tick NodeOutcome.Done, got $other")
+  }
+
+  // ---- issue #43 review, MINOR 9: begin's own NodeOutcome.Stopped path (the Pick step ending the ---
+  // ---- tick before any walk of workflow) had no test at its new home either -------------------------
+
+  it should "return NodeOutcome.Stopped, not NodeOutcome.Done, when Pick itself stops the tick early (the manual stop-file kill-switch)" in {
+    val world = TestWorld()
+    world.stopFile = true
+    val caps = buildCaps(world)
+
+    val result = withFaulting:
+      LitterBox.shipped.begin(1, Machine.Cursor(), Config(), caps, summon[Faulting])
+
+    result match
+      case Right(NodeOutcome.Stopped(exit)) => exit shouldBe LoopExit.ManualStop
+      case other                            => fail(s"expected NodeOutcome.Stopped(ManualStop), got $other")
+  }
+
   it should "walk end to end through Runner.run and reach LoopExit.Success on the happy path, proving " +
     "the whole graph, not only its first edge, is reachable off the public Workflow value" in {
       val world = TestWorld()

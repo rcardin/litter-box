@@ -130,6 +130,50 @@ class GraphMacroSpec extends AnyFlatSpec with Matchers:
     violations.head should include("Guarded")
   }
 
+  // ---- checkedShape's own PARSING was widened alongside checkedShapeStrict's, and that is a ---------
+  // ---- source-breaking change to checkedShape ITSELF, pinned here rather than left only in prose -----
+  // ---- (issue #43 review round 2, MAJOR M3: three doc paragraphs said checkedShape was "UNCHANGED", -
+  // ---- which was false, since literalListElements/stablePathKey/companionApplyArgs/parseTransition ---
+  // ---- are shared between checkedShape and checkedShapeStrict, never strict-only) --------------------
+
+  it should "refuse to typecheck a literal Shape whose only unreadable piece was a Nil transitions list reaching an unreviewed guarded node, a shape that used to compile clean under checkedShape before this walk learned to read Nil" in {
+    // `entry = List(OpenPr)` alone, `OpenPr` marker-guarded and unreviewed, `transitions = Nil`: the
+    // violation sits entirely in `entry` (a path of length one, `OpenPr` itself, with no reviewed node
+    // anywhere before it), so this shape needs no `transitions` edge to demonstrate it at all, only a
+    // `Nil` the walk has to actually PARSE rather than decline on to ever reach `entry` and find it.
+    // Before issue #43 review's own `Nil` recognition (`KitMacro.literalListElements`), `transitions =
+    // Nil` fell back exactly like a variable or a `:+`/`++` chain would, and `parseShape`'s own fold
+    // declines the WHOLE shape the moment ONE piece is unreadable (`parseShape`'s own doc,
+    // `KitMacro.scala`, has the reasoning), `entry` included even though `entry` itself was perfectly
+    // literal: so this exact snippet compiled clean under `checkedShape` before this fix, confirmed by
+    // running it against the tree immediately before issue #43 review's own `Nil` fix and finding no
+    // error at all. It fails now, under `checkedShape` itself, its strict sibling `checkedShapeStrict`
+    // untouched by this particular test, because `Nil` recognition is not `checkedShapeStrict`-only, the
+    // exact fact three doc paragraphs got wrong (`Kit.scala`'s `checkedShape`/`checkedShapeStrict` doc,
+    // `LitterBox.scala`'s `LitterBox.graph` doc, `KitMacro.literalListElements`'s own doc, all corrected
+    // by this same review round).
+    val errors = scala.compiletime.testing.typeCheckErrors(
+      """
+        |import in.rcard.litterbox._
+        |import in.rcard.litterbox.Caps.given
+        |
+        |case class PrInput() extends RequiresReviewInput
+        |
+        |val OpenPr: Node[PrInput, Unit] = Node(
+        |  name = "OpenPr", cost = Cost.NoDispatch, timeout = Timeout.Unbounded,
+        |  probe = _ => None, run = _ => NodeOutcome.Done(())
+        |)
+        |
+        |val shape = checkedShape(Shape(entry = List(OpenPr), transitions = Nil))
+        |""".stripMargin
+    )
+
+    errors should not be empty
+    val messages = errors.map(_.message).mkString("\n")
+    messages should include("'OpenPr'")
+    messages should include("review")
+  }
+
   // ---- negative: missing reviewer entirely -------------------------------------------------------
 
   it should "refuse to typecheck a literal Shape whose only path into a guarded node has no reviewer anywhere on it" in {
@@ -317,12 +361,20 @@ class GraphMacroSpec extends AnyFlatSpec with Matchers:
   it should "compile a literal Shape whose entry/transitions reference the same instance val member through two distinct receivers, each building a differently named node" in {
     // `Holder`'s own `node` is one member symbol shared by every instance of `Holder`; keying a
     // reference by that member symbol alone, the bug B1 reports, throws the receiver away, so `a.node`
-    // and `b.node` read as the SAME node even though they build two genuinely different `Node` values
-    // here, "Implement" and "CommitAndPush". `Runner.validate` sees the real four node path with a
-    // reviewer in the middle and accepts it; the old macro instead merged `a.node` and `b.node` under
-    // one key, so the edge out of `Review` and the edge into `OpenPr` both attach to that merged key,
-    // producing a path straight from entry into `OpenPr` that skips `Review`, on a graph that never
-    // actually has such an edge.
+    // and `b.node` would read as the SAME node even though they build two genuinely different `Node`
+    // values here, "Implement" and "CommitAndPush", if this walk still tried to key an instance-
+    // qualified receiver at all. It no longer does (issue #43 review round 4, Tier 1, correcting this
+    // comment rather than only the source it describes): between B1's own fix and this one, this walk
+    // DID key `a.node`/`b.node` distinctly, by chaining through the receiver's own symbol, and this
+    // test used to demonstrate a genuine BFS walking four real nodes with a reviewer in the middle and
+    // finding nothing wrong. Round 4 found that receiver-chaining scheme unsound in a different, related
+    // case (`stablePathKey`'s own doc, `KitMacro.scala`, has the three sidesteps) and replaced it with a
+    // blanket decline of every instance-qualified receiver, `a.node`/`b.node` included. So this shape
+    // now DECLINES instead of being walked, and `errors shouldBe empty` below holds for a different
+    // reason than it used to: `checkedShape` is the LENIENT entry point, so a decline falls back
+    // silently rather than aborting, exactly as it does for a shape this walk never recognised at all.
+    // `Runner.validate` is what actually confirms the real four node path is fine, unconditionally,
+    // every tick, never this macro for an instance-qualified reference any more.
     val errors = scala.compiletime.testing.typeCheckErrors(
       """
         |import in.rcard.litterbox._

@@ -40,6 +40,48 @@ the scaffolded files, the base image contract and the log format can all change 
 without a deprecation cycle. Pin an exact version if a change landing under you would be a problem,
 and read a release's notes before bumping past it.
 
+`checkedShape`, the opt-in half of the compile-time review-reachability macro (`in.rcard.litterbox
+.checkedShape`, public since `0.2.0`), is exactly this kind of change as of the release that closes
+issue #43 review round 2: the walk it splices was widened to read `Nil`, `List.empty`, an unqualified
+reference to a `val` member of the enclosing class, out-of-order named arguments, and a local
+`val`-bound `Transition` as literal pieces it can now parse instead of silently falling back on. That
+means a `Shape` whose only previously unreadable piece was one of those now gets fully checked, and can
+newly fail to compile if that check finds a genuine review-reachability violation it could not see
+before. The direction is safe, strictly more checking, never less, but it is still a behaviour change to
+a published `inline def`; pin an exact version if that possibility is a problem for you.
+
+`Node.apply` (`in.rcard.litterbox.Node`, public since `0.1.1`) picks up a second such change as of the
+release that closes issue #43 review round 4: it now derives `Guard.RequiresReview` on the real,
+constructed `Node` whenever the node's own input type extends `RequiresReviewInput`, regardless of what
+`guard` was written as. A node built with `guard` at its default `Guard.Open` and an input type
+extending that marker used to get exactly `Guard.Open`; it now gets `Guard.RequiresReview` instead. The
+direction is again safe for `Runner.validate`, strictly more graphs get correctly flagged, never fewer,
+but any code that read a `Node`'s own `guard` field back out and compared it against `Guard.Open` for a
+marker-carrying node can observe the difference; pin an exact version if that is a concern.
+
+`checkedShape` picks up a third such change as of the release that closes issue #43 review round 5: the
+walk it splices now also reads an explicit `guard = Guard.RequiresReview` argument, named or positional,
+written at an inline `Node(...)` construction inside the `Shape` itself, where before it read only the
+`RequiresReviewInput` marker on a node's own input type. A shape reaching such a node with no reviewer on
+the path used to compile and be rejected by `Runner.validate` at startup; it now fails to compile. The
+direction is again safe, strictly more checking, never less, and the scope is inline constructions only:
+a node built as a `val` elsewhere and merely referenced in the `Shape` carries no argument list the macro
+can read, so an explicit `guard` on one of those is still checked at startup and not while you compile.
+It is still a behaviour change to a published `inline def`; pin an exact version if that possibility is a
+problem for you.
+
+That same derivation is a source-breaking change of its own as of the release that closes issue #26's
+PR review. It used to be read off a `using GuardOf[I]` clause on `Node.apply`, and `GuardOf.open[I]`,
+the given that answers "no marker" for every `I`, was public and nameable, so a call site could pass it
+explicitly and get `Guard.Open` stamped onto a node whose input type extends `RequiresReviewInput`,
+defeating the derivation entirely. `Node.apply` is now an `inline def` that reads the marker off its own
+type argument through a macro, so: `GuardOf` and `LowPriorityGuardOf` are gone from the public API,
+`Node.apply`'s `using` clause takes `TrustOf[O]` alone, and code that passed either given by hand no
+longer compiles. Ordinary call sites, including every form the scaffold and this README show, are
+unaffected. `TrustOf[O]` deliberately stays an ordinary `using` parameter you can answer for yourself;
+that residual, and the runtime check that catches it, are documented on `Trust` and `Runner.step`
+(`Kit.scala`).
+
 ## Install
 
 Every published version is on the [releases page](https://github.com/rcardin/litter-box/releases);
@@ -86,6 +128,144 @@ in.rcard::litter-box:<version>`, pinned to the exact version of the binary that 
 `scala-cli` fetches it on the first run. See
 [docs/maven-central-setup.md](docs/maven-central-setup.md) for how that publishing is set up, which
 again matters if you are forking rather than installing.
+
+### Write your own loop
+
+`.litter-box/loop.scala` names `LitterBox.shipped` by default, the exact `PICK -> IMPLEMENT -> GATE ->
+REPAIR -> REVIEW -> PR -> CI -> MERGE` pipeline described in [The pipeline](#the-pipeline). A repo that
+wants a genuinely different graph, not just different config, builds one through `LitterBox.graph`
+instead and edits that one line:
+
+```scala
+//> using dep in.rcard::litter-box:<version>
+import in.rcard.litterbox.*
+
+@main def loop(args: String*): Unit =
+  LitterBox.run(
+    LitterBox.graph(
+      workflow       = Workflow("my-loop", start = myStart, stages = myStages),
+      shape          = Shape(entry = List(Pick), transitions = List(Transition(Pick, Review))),
+      dispatchBudget = cfg => cfg.repairBudget + 1,
+      startInput     = n => MyStart(n)
+    ),
+    args
+  )
+```
+
+Your own `Node`s, `Workflow` and `Shape` are ordinary values built from the public kit
+(`in.rcard.litterbox.{Node, Workflow, Shape, Transition, Next}`); `dispatchBudget` is always a
+`Config => Int`, never a `Ledger` you build yourself, because the runner, not the graph, owns the
+counter and the timeout clock for every node it walks. That function shape means `dispatchBudget` CAN
+read `.litter-box/config.conf` at runtime, the way the sketch above reads `cfg.repairBudget`; it does
+not mean it must, `dispatchBudget = _ => 42` is just as legal a value. That constant is the one
+accepted, named exception to decision 17's own promise that nothing is expressible in both
+`config.conf` and `loop.scala`: the intended form reads the knob from `config.conf`, and a constant is
+the one way a budget number can still land in `loop.scala` instead, something decision 17 asks a graph
+author not to do rather than something it makes impossible. `LitterBox.graph`'s own scaladoc
+(`src/LitterBox.scala`) states this once; nothing here restates it further.
+
+Precisely what `dispatchBudget` bounds, stated exactly rather than left to sound like a hard spending
+cap: it bounds how many `Cost.OneDispatch` nodes may START. A node that goes on to dispatch MORE than
+once inside its own `run`/`probe` (any node can call `agents.*` more than once; nothing enforces "one
+`Cost.OneDispatch` node, one dispatch") is charged once per real dispatch, not stopped mid-node once the
+budget reaches zero; the runner notices only at the START of the NEXT node, which is refused if nothing
+is left. And a node declaring `Cost.NoDispatch` is never gated by this budget at all, at any point,
+regardless of how many times it actually dispatches: `dispatchBudget = _ => 0` does not stop a
+`Cost.NoDispatch` node from dispatching freely. This is a documented residual, not a bug your graph can
+route around by accident and not one worth chasing on this branch: making the runner's own `charging`
+decorator refuse mid-node once the ledger is exhausted would change the shipped pipeline's own behaviour
+on exactly the budget-exhaustion paths its golden log tests pin (see [ARCHITECTURE.md](ARCHITECTURE.md)
+for the fuller reasoning and why it is left to its own issue). Declare `Cost.OneDispatch` honestly on
+every node that dispatches, and keep dispatch calls to one per node, if you want `dispatchBudget` to be
+the ceiling it looks like.
+
+`shape` above has to be written exactly like that, a literal `Shape(entry = ..., transitions = ...)`
+expression right at this call site, never a `val` you build first and pass by name. `LitterBox.graph`
+compile-time checks that every path into a node whose own input type extends `RequiresReviewInput`
+crosses a reviewer first, the same macro `checkedShape` runs, but unconditionally rather than opt in:
+pass anything other than a literal here and the call refuses to compile at all, naming what it needs
+instead, rather than silently skipping the check the way an opt-in macro would. This reads TWO facts and
+combines them with an OR, the same combination `Node.apply` performs on the real constructed value: the
+INPUT TYPE, whether it extends `RequiresReviewInput`, and the hand-written `guard =
+Guard.RequiresReview` argument you can also pass to `Node`, named or positional, in the one place the
+macro can see one. The two halves do not reach equally far, and the difference is worth knowing before
+you lean on either. The marker half is read off the reference's own static type, so it fires through a
+plain `val` reference exactly as well as through an inline construction. The explicit-argument half is
+read off the SOURCE of a `Node(name = "...", ...)` call written inline in the shape itself, so it fires
+only there: a node you bind to a `val` first and then name in `entry`/`transitions` presents this check
+with the reference alone, never the initializer that built it, so a `guard = Guard.RequiresReview` you
+wrote on that `val` stays invisible at compile time and is caught only by `Runner.validate` at startup,
+which reads the constructed node's real `guard` field rather than the source that produced it
+(`ARCHITECTURE.md` has the fuller reasoning for why the two checks read different facts on purpose).
+The reverse used to be a real gap and no longer is: a node whose input type DOES extend
+`RequiresReviewInput` gets `Guard.RequiresReview` stamped onto its real `guard` field by `Node.apply`
+itself now, regardless of whether you wrote `guard = ...` at all, so both the compile-time macro
+(reading the marker) and `Runner.validate` at startup (reading the now-consistent field) catch a node
+like that; before this, only the compile-time macro could, and only if `shape` was written as a literal
+here. If your shape genuinely cannot be written as a literal (built in a loop, read from
+configuration, ...),
+`LitterBox.graph` is not for you; compose `Runner.run` directly instead, outside the compile-time half
+of this guarantee, though `Runner.validate` still runs against whatever `Shape` you hand `Runner.run`.
+
+Three different compile errors can fire here, worded differently on purpose so none is mistaken for
+another (issue #43 review round 3, BLOCKER 1, adding the third): `shape` was not recognisably a
+`Shape(...)` literal at all (a `val`, a function result, an indirection of any kind); `shape` genuinely
+was a literal written right here but one piece inside it (a node reference, a `Transition`, a list) was
+not written in a form the check can read; or every piece WAS readable but two different references
+canonicalise to the identical node identity while disagreeing on whether that node needs review, most
+often a `class` and its own companion `object` each declaring a member of the same name, or two inline
+`Node(name = "...", ...)` calls sharing one literal name. The forms it can read: a node or `Transition`
+referred to through a stable path (a top-level `val`, an `object` member, or an unqualified `val`
+member of an enclosing `class`, `this.A` written bare as `A`); an inline `Node(name = "...", ...)` call
+carrying a literal name; an inline `Transition(from, to)` call; a `Transition` bound to a `val` local to
+the same block as the `LitterBox.graph` call that uses it; a list written as `List(...)`,
+`List.empty`, `List.empty[...]`, or `Nil`; and `Shape`'s own two named arguments in either order. What
+it cannot read, and never will: a node built by a `def`, because this check reasons about the SOURCE
+written at this call site, never about a value it would have to run code to get. That includes a
+config-parameterised node-building idiom (`def openPr(cfg: Config): Node[...] = ...`, used as
+`Node(openPr(cfg))` in `entry`/`transitions`): `LitterBox.graph` cannot express that shape, on purpose,
+RFC #26 decision 16 records "graphs cannot be assembled dynamically" as a deliberate consequence of
+this whole compile-time route, not an oversight left for a later issue. Read the config value you need
+inside the node's own `probe`/`run` body instead (both already receive an ambient `Config`, derivable
+from the `Caps` every node body is handed), behind one plain, top-level `val` standing for the node,
+rather than a `def` that builds a differently configured `Node` per call. A few more forms read like
+something on the readable list above but are not. An `export`ed member (`export Source.*`) reads like
+an `object` member at the call site but is a compiler-synthesised `def` forwarder, never a `val`, so it
+is unreadable for the identical reason a `def`-built node is; refer to the original `val` on `Source`
+directly instead. And an INSTANCE-QUALIFIED receiver, `holder.node` for an ordinary, non-singleton
+`holder` (a `val holder: SomeClass = ...`, however many stable aliases stand between it and this call),
+is unreadable too, deliberately and unconditionally (issue #43 review round 4): this check can prove
+`holder` is a STABLE value, never rebinding, but has no way to prove whether a SECOND such reference
+elsewhere in the same shape names the same instance or a genuinely different one, and guessing either
+answer risks disagreeing with what the graph actually does at runtime, so it declines every
+instance-qualified receiver rather than guess at some and not others. Two things follow from that:
+first, an idiom like `a.node`/`b.node` on two truly distinct instances is safe to write but is not
+CHECKED by `LitterBox.graph`'s macro at all (it falls straight to the "could not identify" error), so
+lean on `Runner.validate` at startup for a shape built that way, or restructure the reference onto a
+top-level `val`, an `object` member, or an inline `Node(name = "...", ...)` call, every one of which
+this check reads directly; second, one `Node` VALUE bound under two different top-level `val`s (`val
+a = mkNode(); val b = a`) is unreadable for a related but distinct reason, not an instance-qualified
+receiver at all, but two ordinary stable paths that happen to alias the same value: this check keys each
+`val` on its own declaration, so `a` and `b` key differently even though they are the same `Node` at
+runtime, and no widening of this check can close that without evaluating source it is not allowed to
+run. `Runner.validate`, which sees the real, already-resolved `Node` values rather than the source that
+built them, is the backstop for both of these, unconditionally, every tick.
+
+`startInput: Int => Fault ?=> I` gets the tick number and a `Fault`, not a `Caps`: it runs before this
+tick's real dispatch budget exists, so no capability is in scope inside `startInput`, only
+`fault.raise` to abort the tick early. A first step that genuinely needs a capability belongs in a
+node, not in `startInput`. That is a claim about what `startInput` can SUMMON, not about what it can
+ever be handed: a node body from a PREVIOUS tick can stash a `Caps` it summoned honestly (`var stolen:
+Option[Caps] = None` closed over by that node's own `run`) and a later tick's `startInput` can read that
+stashed value back and call a capability through it, a real dispatch, running outside every `Ledger`,
+`Timeout` and shape check that tick's own walk would otherwise apply. This is a documented residual
+(named beside the `inline$graphImpl` one in `LitterBox.graph`'s own scaladoc), not a route to a forged
+result: every `Judged` obtained this way was minted honestly by a real dispatch, only outside the
+accounting a same-tick capability call would have gone through.
+
+This whole surface sits under the same `0.x` no-stability-promise policy as everything else in this
+project (see [Version policy](#version-policy) above): pin an exact version if a shape change landing
+under you would be a problem.
 
 ### Quickstart
 
@@ -136,7 +316,7 @@ then writes seven files under `.litter-box/`:
 | `prompts/conventions.md` | the one file you own — spliced into every prompt as `{{CONVENTIONS}}` |
 | `.env.example` | the credential the sandboxed worker needs, and any other variable from [Running it](#running-it); meant to be copied to `.env`, never committed |
 | `.gitignore` | ignores `logs/` and `.env` inside `.litter-box/` |
-| `loop.scala` | names which pipeline this run walks, through the public `LitterBox`/`LoopGraph` API; editing that pipeline is not yet possible, and running the file is not either, since it names a coordinate this project does not publish until [#41](https://github.com/rcardin/litter-box/issues/41) |
+| `loop.scala` | names which pipeline this run walks, through the public `LitterBox`/`LoopGraph` API; `LitterBox.shipped` by default, or your own graph built with `LitterBox.graph` (see [Write your own loop](#write-your-own-loop)) |
 
 It refuses to overwrite an existing `.litter-box/` unless you pass `--force`, and the check happens
 before the first file is written, so a refused `init` never leaves a half scaffold.

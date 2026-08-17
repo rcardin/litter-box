@@ -6,8 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 litter-box is a distrustful autonomous coding loop. It picks one labelled GitHub issue, dispatches a
 fresh `claude -p` worker inside a network-restricted Docker sandbox, gates the result, has a cold
-independent reviewer judge the diff, opens a PR, and lets CI decide. The pipeline is fixed, not
-pluggable: `PICK → IMPLEMENT → GATE → REPAIR → REVIEW → PR → CI → MERGE`.
+independent reviewer judge the diff, opens a PR, and lets CI decide. The `lb` binary runs the shipped
+pipeline `PICK → IMPLEMENT → GATE → REPAIR → REVIEW → PR → CI → MERGE`, and a consumer can author their
+own graph on the same runner through the public `LitterBox.graph` kit API.
 
 Scala 3.8.3 on temurin 21, built with **scala-cli, not sbt**. Deliberate: the threat model distrusts
 agent-authored build files, so the loop never couples to the build of the project it works on. Do not
