@@ -13,8 +13,9 @@
 //> using resourceDir ./resources
 
 // Publishing to Maven Central (issue #41) is configured ENTIRELY in the `publish` job of
-// `.github/workflows/release.yml`, as command line flags, and deliberately NOT here as the
-// `//> using publish.*` directives that would be the obvious home for it.
+// `.github/workflows/release.yml` and, for the testkit, in the `scripts/publish-testkit.sh` that job
+// calls, as command line flags, and deliberately NOT here as the `//> using publish.*` directives
+// that would be the obvious home for it.
 //
 // Every one of those directives is still marked experimental by scala-cli, and an experimental
 // directive is rejected by any invocation that does not pass `--power`. That is not a publish-time
@@ -25,8 +26,9 @@
 // that happens on tags only is the wrong trade; the flags cost nothing anywhere else.
 //
 // So the metadata (organization, name, license, url, vcs, description, developer), the repository
-// and the version computation all live in that one job. Nothing about them is duplicated here, and
-// nothing here has to be kept in step with them.
+// and the version computation all live in that job, and the testkit's copy of them in the one script
+// its three callers share. Nothing about them is duplicated here, and nothing here has to be kept in
+// step with them.
 //
 // Why `scala-cli publish` at all, rather than sbt-ci-release the way the sibling `yaes` project does
 // it: the same reason stated at the top of this file. This repository has no sbt build and must not

@@ -24,17 +24,29 @@ scala-cli compile test/Recorder.scala --scala "$scala_version" --jvm "$jvm_versi
   --dep in.rcard::litter-box:0.0.0-CI
 ```
 
-Read out of `project.scala` rather than typed, for the same reason the workflows do it: a `3.8.3`
-written here is a second statement of a fact that file owns, and this copy is the one nothing checks.
-Note the workflows go further and run `publish local` on the testkit rather than `compile`, since only
-that builds the doc jar, the sources jar and the pom; `compile` is enough for the edit-and-check loop
-this command exists for.
+Read out of `project.scala` rather than typed, for the same reason `scripts/publish-testkit.sh` does
+it: a `3.8.3` written here is a second statement of a fact that file owns, and this copy is the one
+nothing checks. That script is the single definition of the testkit publish, called by the `testkit`
+job and by both halves of `release.yml`'s publish job, so `scripts/publish-testkit.sh local 0.0.0-CI`
+after the `publish local .` above is literally what CI runs. It goes further than `compile` and runs
+`publish local` on the testkit, since only that builds the doc jar, the sources jar and the pom;
+`compile` is enough for the edit-and-check loop the command above exists for.
 
-Two things follow. Everything in that file, `TestWorld`, `Script`, `FakeClock`, `buildCaps` and
-`withFaulting`, may depend on `src/` and on the Scala library, and on nothing else. And it is all
+Two things follow. Everything in that file, `TestWorld`, `NodeRun`, `Script`, `FakeClock`, `buildCaps`
+and `withFaulting`, may depend on `src/` and on the Scala library, and on nothing else. And it is all
 consumer-facing surface now, so a rename there is a breaking change for a node author, not a local
 edit. README's Testkit section is where the artifact says which of it is SUPPORTED surface, which is a
 narrower list than what the jar happens to contain.
+
+A third thing follows for `TestWorld.runNode`, the one member of that file that exists BECAUSE it
+compiles into `in.rcard.litterbox`. Running a single node means calling `Runner.step`, which takes a
+`using Runner.Ledger` whose constructor is `private[litterbox]` (that class's own doc has why it stays
+that way), so a consumer cannot make that call from their own package at all and no member of `src/`
+was widened to let them. `runNode` makes the call on their behalf from inside the package: it takes a
+`dispatchBudget: Int` and reports what survived as the `Int` in `NodeRun`, so a `Ledger` crosses the
+artifact boundary in neither direction. Keep it that way. `test/TestkitBoundarySpec.scala` runs nodes
+from `package com.example.consumer` and pins `Runner.Ledger(3)` as a compile error from there, so it
+fails the day either half stops being true.
 
 ## Verifying a macro change: always pass `--server=false`
 

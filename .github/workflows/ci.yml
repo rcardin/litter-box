@@ -102,32 +102,18 @@ jobs:
       # states at more length: `compile` builds no doc jar, no sources jar and no pom and reads none
       # of the metadata flags, so it would miss exactly the failures that are unrecoverable on a tag.
       #
-      # `--scala`/`--jvm` come out of project.scala rather than being retyped, since an explicit file
-      # input does not read that file, and `:?` fails the job on an EMPTY capture, which `set -u`
-      # does not catch and scala-cli silently replaces with its own default version.
+      # Literally the same command, not a copy of it: `scripts/publish-testkit.sh` is the single
+      # definition of the testkit's flag set, called from here and from both halves of release.yml's
+      # publish job, so a flag added for the release is a flag this job exercises on every PR. Its
+      # header carries the reasoning, including why `--scala`/`--jvm` are read out of project.scala.
       #
       # `0.0.0-CI` rather than a real version, so nothing here can be mistaken for, or shadow, a
-      # version that was actually released; release.yml uses the tag instead.
+      # version that was actually released; release.yml passes the tag instead.
       - name: the testkit publishes standalone against the library
         run: |
           set -euo pipefail
-          scala_version="$(sed -n 's|^//> using scala \(.*\)$|\1|p' project.scala)"
-          jvm_version="$(sed -n 's|^//> using jvm \(.*\)$|\1|p' project.scala)"
-          : "${scala_version:?no //> using scala directive found in project.scala}"
-          : "${jvm_version:?no //> using jvm directive found in project.scala}"
           scala-cli --power publish local . \
             --organization in.rcard \
             --name litter-box \
             --project-version 0.0.0-CI
-          scala-cli --power publish local test/Recorder.scala \
-            --scala "$scala_version" \
-            --jvm "$jvm_version" \
-            --organization in.rcard \
-            --name litter-box-testkit \
-            --project-version 0.0.0-CI \
-            --dep in.rcard::litter-box:0.0.0-CI \
-            --license MIT \
-            --url https://github.com/rcardin/litter-box \
-            --vcs github:rcardin/litter-box \
-            --description "Testkit for litter-box: scripted in-memory handlers for every capability, plus the interaction recorder, so a node author tests their own graph with no Docker, no network and no credentials." \
-            --developer "rcardin|Riccardo Cardin|https://github.com/rcardin"
+          scripts/publish-testkit.sh local 0.0.0-CI

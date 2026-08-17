@@ -1,10 +1,15 @@
 package com.example.consumer
 
 import in.rcard.litterbox.{Init, LitterBox}
+// Repo-only test plumbing, in a package of its own so that reaching for it here is visibly NOT this
+// file claiming a consumer can see it: nothing under `in.rcard.litterbox.testsupport` ships in either
+// published artifact, and the scaffold body above, the part this file actually proves, imports
+// `in.rcard.litterbox` alone.
+import in.rcard.litterbox.testsupport.RepoTree
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 
-import java.nio.file.{Files, Path, Paths}
+import java.nio.file.{Files, Path}
 
 /** The genuine CONSUMER half of issue #43's "the scaffolded `loop.scala` runs under scala-cli and
   * reproduces the shipped pipeline" acceptance criterion, following the exact reasoning
@@ -85,22 +90,18 @@ val graph: LoopGraph = LitterBox.shipped
 
 class ScaffoldedLoopBoundarySpec extends AnyFlatSpec with Matchers:
 
-  /** This file's own path, found by walking up from the JVM's own cwd, the same approach
-    * `Golden.scala` (`test/Golden.scala`) uses and for the identical reason stated there: this
-    * repo's own sandboxed gate materialises a `git archive` tree with no `.git`, so asking git for
-    * the repo root the way `Main.resolveRepoRoot` does is not an option every runner of this suite
-    * has.
+  /** This file's own path, found by walking up from the JVM's own cwd. `RepoTree`
+    * (`test/RepoTree.scala`) owns that walk and states why it is not `git rev-parse
+    * --show-toplevel`: this repo's own sandboxed gate materialises a `git archive` tree with no
+    * `.git`, so asking git for the repo root the way `Main.resolveRepoRoot` does is not an option
+    * every runner of this suite has.
     */
   private def thisFile(): Path =
-    var d: Path             = Paths.get("").toAbsolutePath.normalize
-    var found: Option[Path] = None
-    while found.isEmpty && d != null do
-      val candidate = d.resolve("test").resolve("ScaffoldedLoopBoundarySpec.scala")
-      if Files.isRegularFile(candidate) then found = Some(candidate)
-      d = d.getParent
-    found.getOrElse(
-      fail("could not locate test/ScaffoldedLoopBoundarySpec.scala by walking up from the JVM cwd")
-    )
+    RepoTree
+      .file("test/ScaffoldedLoopBoundarySpec.scala")
+      .getOrElse(
+        fail("could not locate test/ScaffoldedLoopBoundarySpec.scala by walking up from the JVM cwd")
+      )
 
   /** The exact text between the two `BEGIN`/`END SCAFFOLD BODY` markers above, read back from this
     * file's own source rather than typed out a second time (issue #43 review round two, MAJOR: this

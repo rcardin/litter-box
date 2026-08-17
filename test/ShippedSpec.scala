@@ -1,5 +1,6 @@
 package in.rcard.litterbox
 
+import in.rcard.litterbox.testsupport.RepoTree
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 
@@ -24,16 +25,13 @@ class ShippedSpec extends AnyFlatSpec with Matchers:
   private val Trees: List[Shipped] = List(Sandbox, Observe)
 
   /** The source tree the resources are packaged from. Found by walking up from the JVM cwd so the
-    * test does not care whether the runner starts in the project root or a subdirectory.
+    * test does not care whether the runner starts in the project root or a subdirectory;
+    * `RepoTree` (`test/RepoTree.scala`) owns that walk and the reason it does not ask git instead.
     */
   private def sourceTree(tree: Shipped): Path =
-    var dir: Path = Path.of("").toAbsolutePath.normalize
-    var found     = Option.empty[Path]
-    while found.isEmpty && dir != null do
-      val candidate = dir.resolve("resources").resolve(tree.treeName)
-      if Files.isDirectory(candidate) then found = Some(candidate)
-      dir = dir.getParent
-    found.getOrElse(fail(s"could not locate resources/${tree.treeName} from the JVM cwd"))
+    RepoTree
+      .dir(s"resources/${tree.treeName}")
+      .getOrElse(fail(s"could not locate resources/${tree.treeName} from the JVM cwd"))
 
   Trees.foreach { tree =>
 

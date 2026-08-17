@@ -342,10 +342,39 @@ def myLoopRunsBothNodes(): Unit =
   assert(world.logged("Second ran"))
 ```
 
-`First` and `Second` are top level `val`s, not built by a `def` inside the test: `LitterBox.graph`
-reads the SOURCE of the `Shape` literal at its own call site, and a node reached through a `def` is a
-form it refuses outright. [Write your own loop](#write-your-own-loop) above has the full list of what
-that check can and cannot read.
+`First` and `Second` are named in the `Shape` literal through plain `val` references, and that is the
+actual constraint: `LitterBox.graph` reads the SOURCE of the `Shape` at its own call site, so every
+element written there has to be a stable path (a top level `val`, an `object` member, or an unqualified
+`val` member of the enclosing `class`) or an inline `Node(name = "...", ...)` call carrying a literal
+name. A helper `def` CALL written straight into the `Shape`, `entry = List(myNode("First"))`, is what
+it refuses, because it never runs that call; the same helper is fine when its result is bound to a
+`val` first and the `Shape` names the `val`. [Write your own loop](#write-your-own-loop) above has the
+full list of what that check can and cannot read.
+
+**One node on its own.** `runNode` is the unit-test sibling of `runGraph`: it steps exactly one `Node`,
+with no `Workflow`, no `Shape` and no `LitterBox.graph` call wrapped around it, so the answer you read
+back is about that node and nothing else.
+
+```scala
+def myNodeParksOnAnEmptyBudget(): Unit =
+  val world = new TestWorld
+
+  // Right(NodeRun(outcome, remainingDispatches)); Left(exit) if the node raised a fault
+  val ran = world.runNode(First, (), dispatchBudget = 1)
+
+  assert(ran == Right(NodeRun(NodeOutcome.Done(()), 0))) // dispatched once, budget spent
+  assert(world.callCount("dispatch IMPL") == 1)          // the same recorder buffers as runGraph
+
+  val starved = world.runNode(First, (), dispatchBudget = 0)
+  assert(starved == Right(NodeRun(NodeOutcome.Stopped(LoopExit.Parked), 0)))
+```
+
+`dispatchBudget` is the same number, meaning the same thing, that `LitterBox.graph` takes, and it
+defaults to `1`. The `Either` is what a fault does: a node calling `Fault.raise` abandons the run
+rather than returning, and that lands as `Left(LoopExit.InfraFault)` with the fault line in `logLines`
+and the rc-50 notification in `notifications`. `cfg` is there too, `world.runNode(n, i, cfg = Config(dryRun = true))`,
+for a node that reads `Config` off the ambient `Caps`. There is no `iteration` parameter: an iteration
+number is something a whole tick has, and one node stepped alone is not a tick.
 
 Every capability is a `var` or a scripted list on the `TestWorld`: `implScript`/`fixScripts` for the
 worker, `reviewScripts` for the reviewer, `files` for what a dispatch wrote, plus `cleanTree`,
@@ -354,26 +383,29 @@ lands in `calls` (`callCount`), `logLines` (`logged`), `notifications`, `commitM
 `pushedBranches` and `files`. Patch contents use a tiny numstat DSL, one `added<TAB>deleted<TAB>path`
 line per file, so a scenario can make a patch touch a protected path without producing a real diff.
 
-The supported surface is `TestWorld` (its scripting fields, its recorder buffers, `runGraph` and
-`runLoop`), the `Script` object the scripting fields take their values from (`Script.WorkerScript`,
-`Script.ReviewScript`, `newFilePatch`, `approveReview`), `FakeClock` and `buildCaps`. Everything else
-the artifact happens to expose because it lives in the library's package, `Machine.runOnce` included,
-is internal and moves without notice.
+The supported surface is `TestWorld` (its scripting fields, its recorder buffers, `runGraph`,
+`runLoop` and `runNode`), `NodeRun`, the `Script` object the scripting fields take their values from
+(`Script.WorkerScript`, `Script.ReviewScript`, `newFilePatch`, `approveReview`), `FakeClock` and
+`buildCaps`. Everything else the artifact happens to expose because it lives in the library's package,
+`Machine.runOnce` included, is internal and moves without notice.
 
 `withFaulting` is in the jar and is listed here only to say what it is not: it takes a
 `Faulting ?=> T`, and `Faulting` is `private[litterbox]`, so a consumer can call `withFaulting { ... }`
 and can never write a body that actually faults, having no way to name the type it would summon. It is
-there for this repository's own specs, which drive `Runner.step` directly. Drive your graph through
-`runGraph` instead, which establishes the same boundary internally.
+there for this repository's own specs, which drive `Runner.step` directly. `runNode` is what you want
+instead: it establishes that same boundary internally and reports what crossed it as the `Either` above.
 
 Two rough edges worth knowing before you copy a default: `Script.newFilePatch` hardcodes
 `src/main/scala/Slice.scala`, and `TestWorld`'s GitHub defaults centre on issue 999. Both are this
 repository's own conventions rather than anything meaningful to yours; script your own values rather
 than asserting against those.
 
-`runGraph` never hands you a `Runner.Ledger`, deliberately. The runner owns the dispatch counter and
+Neither `runGraph` nor `runNode` ever hands you a `Runner.Ledger`, deliberately, and you cannot
+construct one either: its constructor is `private[litterbox]`. The runner owns the dispatch counter and
 the timeout clock, so a budget of one behaves under test exactly as it does in production, and a
-budget assertion you write means something.
+budget assertion you write means something. `runNode` mints a ledger for you from the `dispatchBudget`
+you named and reports what survived as the plain `Int` in `NodeRun`, which is all a test needs and
+nothing a node could spend from.
 
 ### Quickstart
 

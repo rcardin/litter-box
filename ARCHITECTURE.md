@@ -214,8 +214,13 @@ configuration**, so they live under `resources/` and travel inside the jar
 A tag publishes **two** Maven artifacts, not one (issue #42, RFC #26 decision 14). The library above,
 and `in.rcard::litter-box-testkit` (`LitterBox.TestkitCoordinate`), which is `test/Recorder.scala`
 compiled alone against the library and nothing else: `TestWorld`, `Script`, `FakeClock`, `buildCaps`,
-`withFaulting` (README's Testkit section narrows that to the part a consumer may rely on). A node author declares it as `test.dep` and drives their own graph through
-`TestWorld.runGraph` with no Docker, no network and no credentials.
+`withFaulting`, `NodeRun` (README's Testkit section narrows that to the part a consumer may rely on). A
+node author declares it as `test.dep` and drives their own graph through `TestWorld.runGraph`, or one
+node of it through `TestWorld.runNode`, with no Docker, no network and no credentials. `runNode` is why
+the artifact has to be compiled into `in.rcard.litterbox` rather than merely depend on it: stepping one
+node means calling `Runner.step`, whose `using Runner.Ledger` no consumer package can satisfy, and
+`runNode` makes that call on their behalf while passing only an `Int` in and an `Int` back out, so
+decision 9's "the runner owns the counter" survives the convenience.
 
 Two artifacts rather than a `testkit` package inside the library jar, and this is a security boundary
 rather than a packaging preference. `TestWorld` satisfies `AgentDispatchImpl` from inside
