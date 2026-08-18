@@ -41,46 +41,48 @@ without a deprecation cycle. Pin an exact version if a change landing under you 
 and read a release's notes before bumping past it.
 
 `checkedShape`, the opt-in half of the compile-time review-reachability macro (`in.rcard.litterbox
-.checkedShape`, public since `0.2.0`), is exactly this kind of change as of the release that closes
-issue #43 review round 2: the walk it splices was widened to read `Nil`, `List.empty`, an unqualified
+.checkedShape`, public since `0.2.0`), is exactly this kind of change as of `0.3.0` (issue #43
+review round 2): the walk it splices was widened to read `Nil`, `List.empty`, an unqualified
 reference to a `val` member of the enclosing class, out-of-order named arguments, and a local
-`val`-bound `Transition` as literal pieces it can now parse instead of silently falling back on. That
-means a `Shape` whose only previously unreadable piece was one of those now gets fully checked, and can
-newly fail to compile if that check finds a genuine review-reachability violation it could not see
-before. The direction is safe, strictly more checking, never less, but it is still a behaviour change to
-a published `inline def`; pin an exact version if that possibility is a problem for you.
+`val`-bound `Transition` as literal pieces it can now parse instead of silently falling back on.
+That means a `Shape` whose only previously unreadable piece was one of those now gets fully checked,
+and can newly fail to compile if that check finds a genuine review-reachability violation it could
+not see before. The direction is safe, strictly more checking, never less, but it is still a
+behaviour change to a published `inline def`; pin an exact version if that possibility is a problem
+for you.
 
-`Node.apply` (`in.rcard.litterbox.Node`, public since `0.1.1`) picks up a second such change as of the
-release that closes issue #43 review round 4: it now derives `Guard.RequiresReview` on the real,
-constructed `Node` whenever the node's own input type extends `RequiresReviewInput`, regardless of what
-`guard` was written as. A node built with `guard` at its default `Guard.Open` and an input type
-extending that marker used to get exactly `Guard.Open`; it now gets `Guard.RequiresReview` instead. The
-direction is again safe for `Runner.validate`, strictly more graphs get correctly flagged, never fewer,
-but any code that read a `Node`'s own `guard` field back out and compared it against `Guard.Open` for a
-marker-carrying node can observe the difference; pin an exact version if that is a concern.
+`Node.apply` (`in.rcard.litterbox.Node`, public since `0.1.1`) picks up a second such change as of
+`0.3.0` (issue #43 review round 4): it now derives `Guard.RequiresReview` on the real, constructed
+`Node` whenever the node's own input type extends `RequiresReviewInput`, regardless of what `guard`
+was written as. A node built with `guard` at its default `Guard.Open` and an input type extending
+that marker used to get exactly `Guard.Open`; it now gets `Guard.RequiresReview` instead. The
+direction is again safe for `Runner.validate`, strictly more graphs get correctly flagged, never
+fewer, but any code that read a `Node`'s own `guard` field back out and compared it against
+`Guard.Open` for a marker-carrying node can observe the difference; pin an exact version if that is
+a concern.
 
-`checkedShape` picks up a third such change as of the release that closes issue #43 review round 5: the
-walk it splices now also reads an explicit `guard = Guard.RequiresReview` argument, named or positional,
-written at an inline `Node(...)` construction inside the `Shape` itself, where before it read only the
-`RequiresReviewInput` marker on a node's own input type. A shape reaching such a node with no reviewer on
-the path used to compile and be rejected by `Runner.validate` at startup; it now fails to compile. The
-direction is again safe, strictly more checking, never less, and the scope is inline constructions only:
-a node built as a `val` elsewhere and merely referenced in the `Shape` carries no argument list the macro
-can read, so an explicit `guard` on one of those is still checked at startup and not while you compile.
-It is still a behaviour change to a published `inline def`; pin an exact version if that possibility is a
-problem for you.
+`checkedShape` picks up a third such change as of `0.3.0` (issue #43 review round 5): the walk it
+splices now also reads an explicit `guard = Guard.RequiresReview` argument, named or positional,
+written at an inline `Node(...)` construction inside the `Shape` itself, where before it read only
+the `RequiresReviewInput` marker on a node's own input type. A shape reaching such a node with no
+reviewer on the path used to compile and be rejected by `Runner.validate` at startup; it now fails
+to compile. The direction is again safe, strictly more checking, never less, and the scope is inline
+constructions only: a node built as a `val` elsewhere and merely referenced in the `Shape` carries
+no argument list the macro can read, so an explicit `guard` on one of those is still checked at
+startup and not while you compile. It is still a behaviour change to a published `inline def`; pin
+an exact version if that possibility is a problem for you.
 
-That same derivation is a source-breaking change of its own as of the release that closes issue #26's
-PR review. It used to be read off a `using GuardOf[I]` clause on `Node.apply`, and `GuardOf.open[I]`,
-the given that answers "no marker" for every `I`, was public and nameable, so a call site could pass it
+That same derivation is a source-breaking change of its own as of `0.3.0` (issue #26's PR review).
+It used to be read off a `using GuardOf[I]` clause on `Node.apply`, and `GuardOf.open[I]`, the given
+that answers "no marker" for every `I`, was public and nameable, so a call site could pass it
 explicitly and get `Guard.Open` stamped onto a node whose input type extends `RequiresReviewInput`,
-defeating the derivation entirely. `Node.apply` is now an `inline def` that reads the marker off its own
-type argument through a macro, so: `GuardOf` and `LowPriorityGuardOf` are gone from the public API,
-`Node.apply`'s `using` clause takes `TrustOf[O]` alone, and code that passed either given by hand no
-longer compiles. Ordinary call sites, including every form the scaffold and this README show, are
-unaffected. `TrustOf[O]` deliberately stays an ordinary `using` parameter you can answer for yourself;
-that residual, and the runtime check that catches it, are documented on `Trust` and `Runner.step`
-(`Kit.scala`).
+defeating the derivation entirely. `Node.apply` is now an `inline def` that reads the marker off its
+own type argument through a macro, so: `GuardOf` and `LowPriorityGuardOf` are gone from the public
+API, `Node.apply`'s `using` clause takes `TrustOf[O]` alone, and code that passed either given by
+hand no longer compiles. Ordinary call sites, including every form the scaffold and this README
+show, are unaffected. `TrustOf[O]` deliberately stays an ordinary `using` parameter you can answer
+for yourself; that residual, and the runtime check that catches it, are documented on `Trust` and
+`Runner.step` (`Kit.scala`).
 
 ## Install
 
