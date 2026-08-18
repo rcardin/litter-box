@@ -747,6 +747,15 @@ exist. See [Getting started](#getting-started) for `init`, `eject`, `--dry-run` 
 | `IMPLEMENT_SLACK` | `300` | Added on top of `ITER_TIMEOUT` for the Implement node's own timeout; raise it on a host with no `timeout`/`gtimeout` binary, where the worker runs unbounded and this is the only backstop left |
 | `CI_WAIT_TIMEOUT` / `CI_APPEAR_TIMEOUT` / `CI_APPEAR_INTERVAL` | `900` / `300` / `10` | CI polling |
 | `NTFY_TOPIC` | — | ntfy.sh topic for notifications |
+| `IMPL_MODEL` | unset | Model for the worker dispatch, for this run only; overrides `agent.model.impl` |
+| `FIX_MODEL` | unset | Model for the fixer dispatch, for this run only; overrides `agent.model.fix` |
+| `REVIEW_MODEL` | unset | Model for the cold reviewer, for this run only; overrides `agent.model.review`. A weak value here silently weakens the adversarial gate, and nothing in the loop can detect, judge or refuse it |
+
+Each of the three must be one of `haiku`, `sonnet`, `opus` or `fable`; any other spelling stops the
+run with exit code 50 before a single issue is read, naming the key and listing the names you may
+write. That check applies whether the value came from `.litter-box/config.conf` or from one of these
+three variables. See [Configuration](#configuration) above for what `agent.model` picks and why a
+default model was deliberately left out.
 
 `IMPL_CMD`, `FIX_CMD`, `REVIEW_CMD`, `NOTIFY_CMD`, `CI_WAIT_CMD`, `CI_APPEAR_CMD` and `MERGE_CMD`
 are test seams: each replaces one subprocess so the loop can be driven without Docker or GitHub.

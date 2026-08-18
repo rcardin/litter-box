@@ -621,6 +621,32 @@ object Main:
 
   @main def litterBoxLoop(args: String*): Unit = dispatch(LitterBox.shipped, args)
 
+  /** The one production line that carries a parsed `agent.model.*` config into the dispatch that
+    * acts on it (issue #73's review thread on this constructor call). Pulled out of `runLoop`'s
+    * `given` block into its own named, testable function because `LiveAgentDispatch.models` carries
+    * a default: every sibling argument here is a compile error to drop, so `models` is the one that
+    * could silently vanish under a rewrite of that block with the suite staying green. A unit test
+    * cannot reach into `runLoop` itself, gated as it is behind PATH probes, the Docker preflight and
+    * `sys.exit`, but it can call this function directly and observe the model actually reaching a
+    * dispatch, which is what keeps this join compiler-adjacent instead of convention-only.
+    */
+  private[litterbox] def liveAgentDispatch(
+      parsed: ParsedEnv,
+      root: Path,
+      sandboxDir: Path,
+      timeoutBin: Option[String]
+  ): LiveAgentDispatch =
+    LiveAgentDispatch(
+      root,
+      sandboxDir,
+      timeoutBin,
+      parsed.cfg.iterTimeout,
+      parsed.implCmd,
+      parsed.fixCmd,
+      parsed.reviewCmd,
+      models = parsed.cfg.models
+    )
+
   /** The loop, which is everything this file did before there were subcommands. `graph` (issue #43)
     * is what `runDriver` hands `Machine.runOnce` every tick; `dispatch` is this function's only
     * caller, always with a graph its caller chose, which today can only be `LitterBox.shipped`,
@@ -758,17 +784,7 @@ object Main:
     given Config        = parsed.cfg
     given GitHub        = LiveGitHub(root, parsed.ciAppearCmd, parsed.mergeCmd)
     given Git           = LiveGit(root)
-    given AgentDispatch =
-      LiveAgentDispatch(
-        root,
-        sandboxDir,
-        timeoutBin,
-        parsed.cfg.iterTimeout,
-        parsed.implCmd,
-        parsed.fixCmd,
-        parsed.reviewCmd,
-        models = parsed.cfg.models
-      )
+    given AgentDispatch = liveAgentDispatch(parsed, root, sandboxDir, timeoutBin)
     val (fastGates, hostGates) =
       gateRunners(root, timeoutBin, sandboxDir, parsed.cfg.gateSandboxed)
     given GateRunner     = fastGates

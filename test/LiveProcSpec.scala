@@ -592,8 +592,9 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
 
   /** A stand in for `run-agent.sh` / `run-reviewer.sh` that reports what the dispatch handed it,
     * so the model half of a REAL (unseamed) dispatch can be asserted with no Docker anywhere near
-    * the test. `${VAR-...}` and not `${VAR:-...}` on purpose: issue #73's rule is that an unset
-    * model carries NO variable, not an empty one, and only the first form can tell those apart.
+    * the test. `${VAR-...}` and not `${VAR:-...}` on purpose: the tests must be able to tell a
+    * variable that is present and empty apart from one that is absent, and only the first form
+    * can make that distinction.
     */
   private val ModelRecorder = """#!/usr/bin/env bash
     |printf 'MODEL=[%s]\n' "${LITTER_BOX_AGENT_MODEL-<absent>}"
@@ -648,9 +649,11 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
   }
 
   /** The failure this pins is the one issue #73 names as a silent behaviour change: a role with no
-    * model must reach the runner with the variable ABSENT, never present and empty, because an
-    * empty value is what would clobber an `ENV ANTHROPIC_MODEL` a consumer's own Dockerfile sets.
-    * The positional argv is asserted for the same reason, one field over: no empty extra word.
+    * model must reach the runner with the variable present and empty, which `sandbox_model_env` in
+    * lib.sh treats as no model at all, so the container never receives an ANTHROPIC_MODEL override
+    * and a consumer's own `ENV ANTHROPIC_MODEL` still stands. The empty value is deliberate: it is
+    * what closes the ambient leak the next test pins. The argv assertion pins that the model never
+    * becomes a positional argument; the trailing empty prior patch field is expected there.
     */
   it should "carry no model at all when the role's model is unset" in {
     val (root, sandboxDir) = modelFixture()

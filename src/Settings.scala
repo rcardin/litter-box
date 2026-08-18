@@ -304,8 +304,10 @@ object Settings:
     * A name of litter-box's own rather than `ANTHROPIC_MODEL` itself, even though that is what the
     * container ends up seeing. The loop's own process may well have `ANTHROPIC_MODEL` exported for
     * the operator's personal `claude`, and reading THAT would silently apply one model to all three
-    * roles, the cold reviewer included, with no config key saying so. A variable only this loop sets
-    * cannot be inherited by accident.
+    * roles, the cold reviewer included, with no config key saying so. Litter box's own name is one
+    * nothing else reads as a model input, so the choice of source stays this loop's; whatever an
+    * operator's shell or a consumer's `.litter-box/.env` may put under that name is overwritten per
+    * dispatch, see `LiveAgentDispatch.modelEnv` below.
     *
     * Per DISPATCH, so deliberately not part of [[childEnv]]: it differs between two children of the
     * same run (a strong implementer, a cheap fixer), which is the whole point of the key, and
