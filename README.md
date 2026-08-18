@@ -392,8 +392,10 @@ for a node that reads `Config` off the ambient `Caps`. There is no `iteration` p
 number is something a whole tick has, and one node stepped alone is not a tick.
 
 A dispatch records the model it asked for as the last field of its call string, `model=` and empty
-when the role has none, so a scenario passing `cfg = Config(models = AgentModels(fix = Some("...")))`
+when the role has none, so a scenario passing `cfg = Config(models = AgentModels(fix = Some(ClaudeModel.Haiku)))`
 can assert that a fixer really asked for the cheap model while the reviewer asked for the strong one.
+The recorded field is the model id the container would have seen, `model=claude-haiku-4-5`, not the
+name the config file spells.
 
 Every capability is a `var` or a scripted list on the `TestWorld`: `implScript`/`fixScripts` for the
 worker, `reviewScripts` for the reviewer, `files` for what a dispatch wrote, plus `cleanTree`,
@@ -566,7 +568,8 @@ gate {
   sandboxed = true                          # false runs it on the host instead, with everything your shell has
   timeout   = 900
 }
-agent.model { impl = null, fix = null, review = null }   # unset = whatever the `claude` CLI defaults to
+agent.model { impl = null, fix = null, review = null }   # haiku | sonnet | opus | fable; unset = whatever
+                                                        # the `claude` CLI itself defaults to
 issues.labels { ready = "ready", active = "in-progress", blocked = "blocked", parked = "parked" }
 issues.park-on-exhaustion = true          # false opens a needs-human PR instead, the earlier contract
 protect  = [".litter-box/**", ".github/**", "CONTEXT.md"]
@@ -588,6 +591,17 @@ same precedence as every other key. UNSET means no model is passed at all: the l
 CLI's own default, is what runs. There is no default model, deliberately, since shipping one would
 move every repo's spend and every repo's answers at once.
 
+The value is one of a closed set of names, `haiku`, `sonnet`, `opus`, `fable`, one per Claude family,
+and anything else STOPS THE RUN with rc 50 before a single issue is read, naming the key and listing
+the names you may write. That is the enum's whole point: an unrecognised model has no safe reading,
+because the only alternative to failing is to dispatch on the CLI's default, and on `review` that is
+a downgrade of the adversarial gate nothing in the loop could ever report. Each name dispatches on a
+pinned full model id (`opus` sends `claude-opus-5`), never a floating family alias, so the same commit
+of your repo asks for the same model next month as it does today; a new family release moves that id
+in a litter-box release, with a release note, rather than under a running repo. Names are bare and
+provider free by design: they stay the spelling you already type, and a second vendor's models would
+join the same flat namespace rather than arrive as `claude:opus`.
+
 The knob is PER ROLE, not per node. A consumer graph can dispatch a fixer from as many nodes as it
 likes, and every one of them asks for `agent.model.fix`; a node cannot name a model of its own. That
 is a decision, not a gap: the model is a property of what a dispatch IS, and `.litter-box/config.conf`
@@ -598,7 +612,8 @@ own next round runs on, which it could if the choice lived in graph code.
 independence is the property the whole loop is built around, and pointing that key at a weak model
 weakens the adversarial gate silently: nothing in the loop can detect it, judge it or refuse it. The
 same goes for writing `REVIEW_MODEL` into `.litter-box/.env`, which is untracked and permanent, so it
-would apply to every future run with nothing in the repository recording that it does.
+would apply to every future run with nothing in the repository recording that it does. The closed set
+of names catches a typo there; it cannot catch a deliberate `haiku`.
 
 `instance-name` earns its place even though litter-box never runs two instances at once:
 `start-proxy.sh` does `docker rm -f "$PROXY_NAME"` at startup, before any issue label is

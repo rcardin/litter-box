@@ -619,14 +619,14 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
       implCmd = None,
       fixCmd = None,
       reviewCmd = None,
-      models = AgentModels(impl = Some("strong-model"), fix = Some("cheap-model"))
+      models = AgentModels(impl = Some(ClaudeModel.Opus), fix = Some(ClaudeModel.Haiku))
     )
 
     dispatch.worker(Role.IMPL, "p.txt", "logs/i.patch", "logs/i.log", None)
     dispatch.worker(Role.FIX, "p.txt", "logs/f.patch", "logs/f.log", None)
 
-    readString(root.resolve("logs/i.log")) should include("MODEL=[strong-model]")
-    readString(root.resolve("logs/f.log")) should include("MODEL=[cheap-model]")
+    readString(root.resolve("logs/i.log")) should include("MODEL=[claude-opus-5]")
+    readString(root.resolve("logs/f.log")) should include("MODEL=[claude-haiku-4-5]")
   }
 
   it should "carry the review model on the reviewer dispatch" in {
@@ -639,12 +639,12 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
       implCmd = None,
       fixCmd = None,
       reviewCmd = None,
-      models = AgentModels(impl = Some("strong-model"), review = Some("cold-model"))
+      models = AgentModels(impl = Some(ClaudeModel.Opus), review = Some(ClaudeModel.Sonnet))
     )
 
     dispatch.review("prompt", "logs/r.md")
 
-    readString(root.resolve("logs/r.md")) should include("MODEL=[cold-model]")
+    readString(root.resolve("logs/r.md")) should include("MODEL=[claude-sonnet-5]")
   }
 
   /** The failure this pins is the one issue #73 names as a silent behaviour change: a role with no
@@ -662,7 +662,7 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
       implCmd = None,
       fixCmd = None,
       reviewCmd = None,
-      models = AgentModels(fix = Some("cheap-model"))
+      models = AgentModels(fix = Some(ClaudeModel.Haiku))
     )
 
     dispatch.worker(Role.IMPL, "p.txt", "logs/i.patch", "logs/i.log", None)
@@ -724,9 +724,9 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
       fixCmd = None,
       reviewCmd = Some("""printf 'MODEL=[%s]\n' "${LITTER_BOX_AGENT_MODEL-<absent>}""""),
       models = AgentModels(
-        impl = Some("strong-model"),
-        fix = Some("cheap-model"),
-        review = Some("cold-model")
+        impl = Some(ClaudeModel.Opus),
+        fix = Some(ClaudeModel.Haiku),
+        review = Some(ClaudeModel.Sonnet)
       )
     )
 

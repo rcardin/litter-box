@@ -627,13 +627,17 @@ final class LiveAgentDispatch private[litterbox] (
     * as no model, so the container still receives no `-e ANTHROPIC_MODEL`, but no ambient value can
     * survive under it.
     *
-    * Not folded into the argv, deliberately. A model identifier comes out of a file the consumer
-    * owns, and every path from that file to `docker run` has to keep it ONE argv element: an env
-    * entry stays one by construction, where a positional argument would sit next to the reviewer's
-    * back compat `$1`-is-the-prompt rule and invite a string built command line.
+    * Not folded into the argv, deliberately. Every path from a chosen model to `docker run` has to
+    * keep it ONE argv element: an env entry stays one by construction, where a positional argument
+    * would sit next to the reviewer's back compat `$1`-is-the-prompt rule and invite a string built
+    * command line. That the value is now an [[AgentModel]] rather than consumer typed text narrows
+    * what can be in it, it does not change where it has to travel.
+    *
+    * `id` is what crosses, never the config spelling: `configName` is how an operator NAMES a model
+    * in `.litter-box/config.conf`, and the CLI inside the container has never heard of it.
     */
-  private def modelEnv(model: Option[String]): Map[String, String] =
-    Map(Settings.AgentModelEnvVar -> model.getOrElse(""))
+  private def modelEnv(model: Option[AgentModel]): Map[String, String] =
+    Map(Settings.AgentModelEnvVar -> model.fold("")(_.id))
 
   def worker(
       role: Role,

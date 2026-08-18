@@ -169,8 +169,10 @@ sandbox_credential_env() {
 # Callers expand it as `${MODEL_ENV[@]+"${MODEL_ENV[@]}"}`, not as `"${MODEL_ENV[@]}"`: under
 # `set -u` bash 3.2 (what macOS ships, and what every runner here executes under) treats the plain
 # expansion of an EMPTY array as an unbound variable and aborts the dispatch. The value stays inside
-# an array either way, which is what keeps a consumer-owned model string one quoted argv element
-# instead of extra words on the command line.
+# an array either way, which is what keeps the model one quoted argv element instead of extra words
+# on the command line. The host resolves a config name (`opus`) to the full model id this variable
+# carries (`claude-opus-5`); nothing here validates it, since a script run by hand has no loop to
+# ask.
 sandbox_model_env() {
   if [[ -n "${LITTER_BOX_AGENT_MODEL:-}" ]]; then
     MODEL_ENV=(-e ANTHROPIC_MODEL="$LITTER_BOX_AGENT_MODEL")

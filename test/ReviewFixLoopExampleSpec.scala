@@ -141,9 +141,9 @@ class ReviewFixLoopExampleSpec extends AnyFlatSpec with Matchers:
       com.example.reviewfix.graph,
       Config(
         models = AgentModels(
-          impl = Some("strong-model"),
-          fix = Some("cheap-model"),
-          review = Some("strong-model")
+          impl = Some(ClaudeModel.Opus),
+          fix = Some(ClaudeModel.Haiku),
+          review = Some(ClaudeModel.Opus)
         )
       )
     )
@@ -151,11 +151,11 @@ class ReviewFixLoopExampleSpec extends AnyFlatSpec with Matchers:
     exit shouldBe LoopExit.Success
     val implDispatches = w.calls.filter(_.startsWith("dispatch IMPL")).toList
     implDispatches should have size 1
-    all(implDispatches) should endWith("model=strong-model")
+    all(implDispatches) should endWith("model=claude-opus-5")
     fixDispatches(w) should have size 1
-    all(fixDispatches(w)) should endWith("model=cheap-model")
+    all(fixDispatches(w)) should endWith("model=claude-haiku-4-5")
     reviewDispatches(w) should have size 2
-    all(reviewDispatches(w)) should endWith("model=strong-model")
+    all(reviewDispatches(w)) should endWith("model=claude-opus-5")
   }
 
   // ---- the round cap: three rounds, then the needs-human PR --------------------------------

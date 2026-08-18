@@ -18,12 +18,30 @@ import java.nio.file.{Files, Path, Paths}
   */
 class MainSpec extends AnyFlatSpec with Matchers:
 
+  /** `Main.parseEnv` is a `Left` on a `*_MODEL` variable naming no model (issue #73). Same unwrap,
+    * same reason, as `parseOk`: these cases are about the layering, not about a rejected name.
+    */
+  private def parseEnvOk(
+      fromFile: com.typesafe.config.Config,
+      env: Map[String, String]
+  ): Main.ParsedEnv =
+    Main.parseEnv(fromFile, env).fold(msg => fail(s"expected a parseable env, got: $msg"), identity)
+
+  private def parseEnvOk(
+      fromFile: com.typesafe.config.Config,
+      env: Map[String, String],
+      ambient: Map[String, String]
+  ): Main.ParsedEnv =
+    Main
+      .parseEnv(fromFile, env, ambient)
+      .fold(msg => fail(s"expected a parseable env, got: $msg"), identity)
+
   // ===============================================================================================
   // Part C: parseEnv
   // ===============================================================================================
 
   "parseEnv" should "produce every bash default (loop.sh:100-139) from an empty env map" in {
-    val parsed = Main.parseEnv(Settings.referenceOnly, Map.empty)
+    val parsed = parseEnvOk(Settings.referenceOnly, Map.empty)
 
     parsed.cfg.dryRun shouldBe false
     parsed.cfg.repairBudget shouldBe 2
@@ -60,7 +78,7 @@ class MainSpec extends AnyFlatSpec with Matchers:
       "NTFY_TOPIC"    -> "some-topic"
     )
 
-    val parsed = Main.parseEnv(Settings.referenceOnly, env)
+    val parsed = parseEnvOk(Settings.referenceOnly, env)
 
     parsed.cfg.gateCmd shouldBe "stub-gate"
     parsed.cfg.ciWaitCmd shouldBe Some("stub-ci-wait")
@@ -75,7 +93,7 @@ class MainSpec extends AnyFlatSpec with Matchers:
   }
 
   it should "treat an empty-string seam as unset (None), matching bash's [[ -n ]] test" in {
-    val parsed = Main.parseEnv(Settings.referenceOnly, Map("IMPL_CMD" -> "", "CI_WAIT_CMD" -> ""))
+    val parsed = parseEnvOk(Settings.referenceOnly, Map("IMPL_CMD" -> "", "CI_WAIT_CMD" -> ""))
 
     parsed.implCmd shouldBe None
     parsed.cfg.ciWaitCmd shouldBe None
@@ -83,7 +101,7 @@ class MainSpec extends AnyFlatSpec with Matchers:
 
   it should "flip gateOverridden even when GATE_CMD is set to its own default value" in {
     val parsed =
-      Main.parseEnv(Settings.referenceOnly, Map("GATE_CMD" -> "sbt -Werror compile test"))
+      parseEnvOk(Settings.referenceOnly, Map("GATE_CMD" -> "sbt -Werror compile test"))
 
     parsed.gateOverridden shouldBe true
     parsed.cfg.gateCmd shouldBe "sbt -Werror compile test"
@@ -99,7 +117,7 @@ class MainSpec extends AnyFlatSpec with Matchers:
     val ambient = Map.empty[String, String]
     val layered = Main.layerDotEnv(dotEnv = Map("GATE_CMD" -> "true"), ambient = ambient)
 
-    val parsed = Main.parseEnv(Settings.referenceOnly, layered.effective, ambient)
+    val parsed = parseEnvOk(Settings.referenceOnly, layered.effective, ambient)
 
     parsed.gateOverridden shouldBe false
     // The value still lands, and still runs sandboxed: a `.env` gate command is a configured gate,
@@ -112,7 +130,7 @@ class MainSpec extends AnyFlatSpec with Matchers:
     val ambient = Map("GATE_CMD" -> "true")
     val layered = Main.layerDotEnv(dotEnv = Map.empty, ambient = ambient)
 
-    val parsed = Main.parseEnv(Settings.referenceOnly, layered.effective, ambient)
+    val parsed = parseEnvOk(Settings.referenceOnly, layered.effective, ambient)
 
     parsed.gateOverridden shouldBe true
     parsed.cfg.gateSandboxed shouldBe false
@@ -122,22 +140,19 @@ class MainSpec extends AnyFlatSpec with Matchers:
     // The override already skips the sandbox preflight (Main step 6b), so the image the command
     // would run in is never built. Honouring `sandboxed = true` here would hand the operator's
     // command to a container that does not exist.
-    Main.parseEnv(Settings.referenceOnly, Map.empty).cfg.gateSandboxed shouldBe true
-    Main
-      .parseEnv(Settings.referenceOnly, Map("GATE_CMD" -> "true"))
-      .cfg
-      .gateSandboxed shouldBe false
+    parseEnvOk(Settings.referenceOnly, Map.empty).cfg.gateSandboxed shouldBe true
+    parseEnvOk(Settings.referenceOnly, Map("GATE_CMD" -> "true")).cfg.gateSandboxed shouldBe false
   }
 
   it should "parse DRY_RUN=1 as true, and treat 0 / absent / any other string as false" in {
-    Main.parseEnv(Settings.referenceOnly, Map("DRY_RUN" -> "1")).cfg.dryRun shouldBe true
-    Main.parseEnv(Settings.referenceOnly, Map("DRY_RUN" -> "0")).cfg.dryRun shouldBe false
-    Main.parseEnv(Settings.referenceOnly, Map.empty).cfg.dryRun shouldBe false
-    Main.parseEnv(Settings.referenceOnly, Map("DRY_RUN" -> "true")).cfg.dryRun shouldBe false
+    parseEnvOk(Settings.referenceOnly, Map("DRY_RUN" -> "1")).cfg.dryRun shouldBe true
+    parseEnvOk(Settings.referenceOnly, Map("DRY_RUN" -> "0")).cfg.dryRun shouldBe false
+    parseEnvOk(Settings.referenceOnly, Map.empty).cfg.dryRun shouldBe false
+    parseEnvOk(Settings.referenceOnly, Map("DRY_RUN" -> "true")).cfg.dryRun shouldBe false
   }
 
   it should "parse numeric overrides" in {
-    val parsed = Main.parseEnv(Settings.referenceOnly, 
+    val parsed = parseEnvOk(Settings.referenceOnly, 
       Map(
         "MAX_ITERS"          -> "5",
         "ITER_TIMEOUT"       -> "60",

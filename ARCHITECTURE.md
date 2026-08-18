@@ -79,7 +79,10 @@ nowhere else; everything here is about the parts, not the order.
 `src/Settings.scala` holds the reference schema as HOCON text, parses `.litter-box/config.conf` onto
 it (`loadFile`) and reads `.litter-box/.env` (`loadDotEnv`); `Main.layerDotEnv` combines that file
 with the process environment and `Main.parseEnv` layers the result over the file's values. A missing
-config file is a `Left`, never silent defaults — the loop exits 50 and names `litter-box init`.
+config file is a `Left`, never silent defaults — the loop exits 50 and names `litter-box init`. So is
+a model name outside the `AgentModel` set, wherever it is written, `agent.model.*` or a `*_MODEL`
+variable: an unrecognised model has no safe reading, since the only alternative to stopping is to
+dispatch on the CLI's default, which on the cold reviewer is a downgrade nothing downstream reports.
 
 `.litter-box/.env` is plain `KEY=value` lines, holds any variable the loop reads rather than a
 credential only, and is OPTIONAL, unlike `config.conf`: exporting the variables is the other equally

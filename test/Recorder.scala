@@ -368,7 +368,7 @@ final class TestWorld:
     ): DispatchOutcome =
       record(
         s"dispatch $role promptFile=$promptFile patchOut=$patchOut logFile=$logFile " +
-          s"currentPatch=${currentPatch.getOrElse("")} model=${models.forRole(role).getOrElse("")}"
+          s"currentPatch=${currentPatch.getOrElse("")} model=${models.forRole(role).fold("")(_.id)}"
       )
       val script = role match
         case Role.IMPL => implScript
@@ -391,7 +391,7 @@ final class TestWorld:
     // moment anyone puts it on a test classpath (RFC #26 decision 14; see `AgentDispatch`'s own doc,
     // `src/Caps.scala`, for the guarantee stated once, in full).
     private[litterbox] def dispatchReview(prompt: String, reviewFile: String): DispatchOutcome =
-      record(s"dispatch REVIEW reviewFile=$reviewFile model=${models.review.getOrElse("")}")
+      record(s"dispatch REVIEW reviewFile=$reviewFile model=${models.review.fold("")(_.id)}")
       reviewScripts match
         case Nil    => DispatchOutcome.Done
         case h :: t =>

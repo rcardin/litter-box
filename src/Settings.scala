@@ -334,8 +334,8 @@ object Settings:
 
   // ---- config -> Config ------------------------------------------------------------------------
 
-  /** One optional file backed key, read the only way an ABSENT value can be told from a set one
-    * after `withFallback` has already merged the consumer's file onto [[Reference]].
+  /** One optional model key, read the only way an ABSENT value can be told from a set one after
+    * `withFallback` has already merged the consumer's file onto [[Reference]].
     *
     * `hasPath` answers false both for a key the consumer's file never mentions and for the explicit
     * `null` [[Reference]] declares, which is exactly the collapse this needs: the reference block
@@ -344,44 +344,66 @@ object Settings:
     * read unconditionally, because every other key has a real default to fall back to.
     *
     * An EMPTY string is absent too, the same rule `Main.parseEnv`'s `str` applies to an exported
-    * variable: a model identifier is either named or it is not, and forwarding `""` into a container
-    * would be the one shape issue #73 rules out, an empty valued variable clobbering a model a
-    * consumer's own Dockerfile already set.
+    * variable: a model is either named or it is not, and forwarding `""` into a container would be
+    * the one shape issue #73 rules out, an empty valued variable clobbering a model a consumer's
+    * own Dockerfile already set.
+    *
+    * A NON EMPTY value that names no model is a `Left`, which the caller turns into the rc 50 a
+    * missing config file gets. Unlike every other key here there is no safe reading of a typo: the
+    * only alternative to failing is to run the dispatch on the CLI's default, and on
+    * `agent.model.review` that is the one downgrade nothing later in the loop can see. The key is
+    * prefixed onto the message because a config file has three of them and the operator has to know
+    * which one to fix.
     */
-  private def optionalString(conf: TsConfig, key: String): Option[String] =
-    if conf.hasPath(key) then Option(conf.getString(key)).filter(_.nonEmpty) else None
+  private def optionalModel(conf: TsConfig, key: String): Either[String, Option[AgentModel]] =
+    if !conf.hasPath(key) then Right(None)
+    else
+      Option(conf.getString(key)).filter(_.nonEmpty) match
+        case None      => Right(None)
+        case Some(raw) => AgentModel.parse(raw).left.map(m => s"$ConfigPath: $key: $m").map(Some(_))
+
+  private def models(conf: TsConfig): Either[String, AgentModels] =
+    for
+      impl   <- optionalModel(conf, "agent.model.impl")
+      fix    <- optionalModel(conf, "agent.model.fix")
+      review <- optionalModel(conf, "agent.model.review")
+    yield AgentModels(impl = impl, fix = fix, review = review)
 
   /** Reads the schema off `conf` (already merged onto [[Reference]] by `loadFile`).
     * Env overlay is `Main.parseEnv`'s job, not this one's: this function is the file half of the
     * layering and stays free of `sys.env`.
+    *
+    * Fallible, where it used to be total, and the `Left` carries the same weight [[loadFile]]'s
+    * does: the caller exits 50 without touching the repo. Every key but the three model ones is
+    * still read unconditionally, because HOCON's own typing already rejects a `budgets.repair =
+    * "two"` before this function sees it, while a model name is a plain string that only
+    * [[AgentModel]] can judge.
     */
-  def parse(conf: TsConfig): Config =
-    Config(
-      instanceName = conf.getString("instance-name"),
-      conventions = conf.getString("conventions"),
-      stopFile = conf.getString("stop-file"),
-      logDir = conf.getString("log-dir"),
-      gateCmd = conf.getString("gate.fast"),
-      gateSandboxed = conf.getBoolean(GateSandboxedKey),
-      gateTimeout = conf.getInt("gate.timeout"),
-      labels = Labels(
-        ready = conf.getString("issues.labels.ready"),
-        active = conf.getString("issues.labels.active"),
-        blocked = conf.getString("issues.labels.blocked"),
-        parked = conf.getString("issues.labels.parked")
-      ),
-      parkOnExhaustion = conf.getBoolean("issues.park-on-exhaustion"),
-      models = AgentModels(
-        impl = optionalString(conf, "agent.model.impl"),
-        fix = optionalString(conf, "agent.model.fix"),
-        review = optionalString(conf, "agent.model.review")
-      ),
-      protect = protectWithFloor(conf),
-      repairBudget = conf.getInt("budgets.repair"),
-      maxPatchBytes = conf.getLong("budgets.max-patch-bytes"),
-      iterTimeout = conf.getInt("timeouts.iter"),
-      ciWaitTimeout = conf.getInt("timeouts.ci-wait"),
-      ciAppearTimeout = conf.getInt("timeouts.ci-appear"),
-      ciAppearInterval = conf.getInt("timeouts.ci-appear-interval"),
-      implementSlack = conf.getInt("timeouts.implement-slack")
-    )
+  def parse(conf: TsConfig): Either[String, Config] =
+    models(conf).map { agentModels =>
+      Config(
+        instanceName = conf.getString("instance-name"),
+        conventions = conf.getString("conventions"),
+        stopFile = conf.getString("stop-file"),
+        logDir = conf.getString("log-dir"),
+        gateCmd = conf.getString("gate.fast"),
+        gateSandboxed = conf.getBoolean(GateSandboxedKey),
+        gateTimeout = conf.getInt("gate.timeout"),
+        labels = Labels(
+          ready = conf.getString("issues.labels.ready"),
+          active = conf.getString("issues.labels.active"),
+          blocked = conf.getString("issues.labels.blocked"),
+          parked = conf.getString("issues.labels.parked")
+        ),
+        parkOnExhaustion = conf.getBoolean("issues.park-on-exhaustion"),
+        models = agentModels,
+        protect = protectWithFloor(conf),
+        repairBudget = conf.getInt("budgets.repair"),
+        maxPatchBytes = conf.getLong("budgets.max-patch-bytes"),
+        iterTimeout = conf.getInt("timeouts.iter"),
+        ciWaitTimeout = conf.getInt("timeouts.ci-wait"),
+        ciAppearTimeout = conf.getInt("timeouts.ci-appear"),
+        ciAppearInterval = conf.getInt("timeouts.ci-appear-interval"),
+        implementSlack = conf.getInt("timeouts.implement-slack")
+      )
+    }

@@ -185,15 +185,94 @@ final case class Labels(
     parked: String = "parked"
 )
 
+/** A model a dispatch may ask for: one member of a closed set, not the free string issue #73 first
+  * shipped.
+  *
+  * A TRAIT over per provider enums rather than one enum, because the model is the first place a
+  * second agent vendor would show up: a `CodexModel` enum joins this hierarchy beside
+  * [[ClaudeModel]] and every seam between here and the dispatch keeps its type, since Scala 3
+  * cannot have one enum extend another. Nothing else in the loop is provider aware yet, and this
+  * trait deliberately does not pretend otherwise: `resources/sandbox/run-agent.sh` execs `claude`
+  * and `lib.sh` writes `-e ANTHROPIC_MODEL`, so a second provider is a second runner and a second
+  * variable, and the members below stay the two facts that are true of every model rather than a
+  * `provider` or `envVar` the loop could not honour today.
+  *
+  * Closed rather than open for the reason the free string turned out to be wrong: a model name is
+  * one typo away from a dispatch that silently runs the CLI's default, and the one place that
+  * matters most, `agent.model.review`, is exactly where the loop can never notice (see
+  * [[AgentModels]]). A typo is now a parse failure at startup instead, and every call site in
+  * `src/`, in the testkit and in a consumer's own graph code can only name a model that exists.
+  */
+sealed trait AgentModel:
+  /** What the provider's own CLI is told, and the value that reaches the container as
+    * `ANTHROPIC_MODEL`.
+    *
+    * A FULL model id, never a family alias like `opus`: an alias floats to whatever that family's
+    * latest release is, so the same commit of the same repo would dispatch to a different model
+    * from one week to the next with nothing in the config file, the logs or the PR recording that
+    * it moved. A run's model is part of what produced its diff, so it is pinned. The cost is that a
+    * new family release is an edit here, which is a release note rather than a silent change.
+    */
+  def id: String
+
+  /** How `.litter-box/config.conf` and the `*_MODEL` env vars spell this model, which is the case
+    * name lowercased (`opus`, `haiku`).
+    *
+    * BARE, with no provider prefix, so the spelling stays the one an operator already types at a
+    * CLI. That makes the names one flat namespace across every provider: when a `CodexModel`
+    * arrives, its case names have to stay distinct from these, and a collision is a rename, not a
+    * qualified name. [[AgentModel.parse]] is where that flatness is enforced.
+    */
+  def configName: String = toString.toLowerCase
+
+object AgentModel:
+
+  /** Every model any provider offers, and the ONE list both the parse and its error message read,
+    * so a case that is addable is by construction also namable and reportable.
+    */
+  val values: Seq[AgentModel] = ClaudeModel.values.toIndexedSeq
+
+  /** A config or env spelling, resolved to the model it names.
+    *
+    * The `Left` is what an operator sees, so it names every valid spelling: this is the one moment
+    * the loop can catch `agent.model.review = "opuss"`, and a message that only said "unknown"
+    * would leave them guessing at the very key whose mistake nothing downstream can detect.
+    *
+    * Case insensitive and trimmed, because the input is hand typed into a HOCON file or an
+    * `export`, and `Opus` cannot mean anything other than `opus` in a namespace this small. That is
+    * leniency about TYPOGRAPHY only: a name no case carries is still a failed run.
+    */
+  def parse(name: String): Either[String, AgentModel] =
+    val wanted = name.strip
+    values
+      .find(_.configName.equalsIgnoreCase(wanted))
+      .toRight(
+        s"unknown model \"$wanted\" — valid models are ${values.map(_.configName).mkString(", ")}"
+      )
+
+/** The Claude models a dispatch can ask for, one per family.
+  *
+  * One case per FAMILY rather than per released snapshot: a consumer picking a model is choosing
+  * how strong and how expensive a dispatch is, which is what a family name says and what a dated
+  * snapshot buries. The `id` each case carries is still a full pinned id, so the choice is a fact
+  * about the run rather than a moving target (see [[AgentModel.id]]).
+  */
+enum ClaudeModel(val id: String) extends AgentModel:
+  case Haiku  extends ClaudeModel("claude-haiku-4-5")
+  case Sonnet extends ClaudeModel("claude-sonnet-5")
+  case Opus   extends ClaudeModel("claude-opus-5")
+  case Fable  extends ClaudeModel("claude-fable-5")
+
 /** Which model each of the three model touched dispatches asks for (`agent.model`), resolved on the
   * HOST and carried into the container, so the choice is stated once in `.litter-box/config.conf`
   * and no node body has to know a container exists.
   *
-  * A named record rather than three loose `Option[String]` fields on `Config` for the reason issue
-  * #73's own risk list gives: `LiveAgentDispatch` already takes three `Option[String]` seam
-  * overrides (`IMPL_CMD`/`FIX_CMD`/`REVIEW_CMD`) sitting immediately next to these, so three more
-  * parameters of that identical type would let a positional slip compile and silently wire a seam
-  * as a model. One distinct type cannot be confused with any of them.
+  * A named record rather than three loose fields on `Config` for the reason issue #73's own risk
+  * list gives: `LiveAgentDispatch` already takes three `Option[String]` seam overrides
+  * (`IMPL_CMD`/`FIX_CMD`/`REVIEW_CMD`) sitting immediately next to these, so three more parameters
+  * would let a positional slip compile and silently wire a seam as a model. One distinct type
+  * cannot be confused with any of them, and [[AgentModel]] being a type of its own rather than a
+  * `String` now makes that slip a compile error rather than a convention.
   *
   * Every role is INDEPENDENTLY optional and there is no default model anywhere: `None` means the
   * dispatch carries no model at all, so the container keeps whatever `.litter-box/Dockerfile` or the
@@ -213,14 +292,14 @@ final case class Labels(
   * control is saying so here and in the README.
   */
 final case class AgentModels(
-    impl: Option[String] = None,
-    fix: Option[String] = None,
-    review: Option[String] = None
+    impl: Option[AgentModel] = None,
+    fix: Option[AgentModel] = None,
+    review: Option[AgentModel] = None
 ):
   /** The model a worker dispatch of `role` asks for. Here rather than at the two call sites so
     * "which key does a FIX read" has one answer instead of a match repeated per handler.
     */
-  def forRole(role: Role): Option[String] = role match
+  def forRole(role: Role): Option[AgentModel] = role match
     case Role.IMPL => impl
     case Role.FIX  => fix
 
