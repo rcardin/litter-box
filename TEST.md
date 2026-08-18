@@ -71,3 +71,29 @@ anything else a macro reads**, and prefer real, separately compiled top-level co
 a fix closes a hole: round 3 and round 4 of that review sequence each found BLOCKERs that a snippet-only
 verification pass had missed, because a snippet resolves imports and package paths differently from a
 real, separately compiled file.
+## The worked consumer example
+
+`test/ReviewFixLoopExample.scala` is the `loop.scala` a consumer repository writes for itself, and
+`test/ReviewFixLoopExampleSpec.scala` walks it through a `TestWorld`. It sits under `test/` for the
+reason every example should: one nobody compiles rots silently against the API it claims to
+demonstrate, and this one is a build failure the day a kit signature moves.
+
+`docs/` was the obvious home and does not work: scala-cli reads every `.scala` file under this
+project as a MAIN source, so an example there would be compiled into the published library jar and
+into the `lb` assembly, and its `@main def loop` would sit next to the CLI's own entry point. The
+`.test.scala` suffix moves a file to the test scope but renames its synthetic package object after
+the file, dots and all, which every top level definition in it then warns about, and CONVENTIONS.md
+forbids carrying a warning.
+
+Two things separate that file from the copy a consumer writes.
+
+It carries a `package com.example.reviewfix` clause where a consumer's `loop.scala` is a package-less
+top level script. The spec that drives it has to import it, and a package this library does not own
+is the honest place for it, the same convention `test/ConsumerGraphIdioms.scala` and
+`test/ScaffoldedLoopBoundarySpec.scala` already follow.
+
+It carries no dependency directive where a consumer's copy opens with `using dep` naming
+`in.rcard::litter-box` at the version they are on. Written here it would be read on every scala-cli
+invocation in this repository and make the project depend on a published copy of itself, so the
+example compiles against the sources next door instead. That is strictly the stronger check: it is
+pinned to the API as it is now, not to the API as it was at the last release.

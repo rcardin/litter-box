@@ -271,6 +271,19 @@ This whole surface sits under the same `0.x` no-stability-promise policy as ever
 project (see [Version policy](#version-policy) above): pin an exact version if a shape change landing
 under you would be a problem.
 
+**A full worked graph, compiled and walked by this repo's own suite.**
+[`test/ReviewFixLoopExample.scala`](test/ReviewFixLoopExample.scala) is a complete consumer
+`loop.scala`: its own edge types, a patch seam that inspects before it applies, and a bounded
+`REVIEW -> FIX` cycle that fans out one fixer dispatch per reviewer finding and stops after three
+rounds on a needs-human PR. Its `Fix` node takes an input extending `RequiresReviewInput`, so the
+macro above proves at compile time that no path reaches the fixer without a cold review first, which
+is why a red gate there travels into the review prompt rather than straight into the fixer. It lives
+under `test/` rather than under `docs/` on purpose: it is compiled by `scala-cli test .` and driven
+end to end by [`test/ReviewFixLoopExampleSpec.scala`](test/ReviewFixLoopExampleSpec.scala) against a
+`TestWorld`, so it is a build failure the day it stops matching the API, instead of an example that
+quietly rots. Its own header comment lists the three things it carries for this repository that your
+copy does not.
+
 ### Testing your own loop
 
 The same tag publishes a second artifact, `in.rcard::litter-box-testkit`, which is exactly what this
