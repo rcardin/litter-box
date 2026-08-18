@@ -85,7 +85,24 @@ object Main:
       ciWaitTimeout = int("CI_WAIT_TIMEOUT", base.ciWaitTimeout),
       ciAppearTimeout = int("CI_APPEAR_TIMEOUT", base.ciAppearTimeout),
       ciAppearInterval = int("CI_APPEAR_INTERVAL", base.ciAppearInterval),
-      implementSlack = int("IMPLEMENT_SLACK", base.implementSlack)
+      implementSlack = int("IMPLEMENT_SLACK", base.implementSlack),
+      // Issue #73. Per KEY, never per block: an operator raising the fixer for one run must not
+      // unset the implementer and the reviewer their `agent.model` block already names. `str`
+      // carries the project's empty-means-absent rule, so an exported `FIX_MODEL=` shadows nothing
+      // and the file's answer stands.
+      //
+      // A `.litter-box/.env` entry wins here the same way it wins for `gateCmd`, and the asymmetry
+      // that file gets for `GATE_CMD` (the `ambient` read above) is deliberately NOT reproduced:
+      // that read exists because an export additionally means "skip the sandbox preflight", a claim
+      // no permanent untracked file should be able to make. A model is only ever a model, so there
+      // is no second meaning for an export to carry and nothing for a file entry to claim falsely.
+      // What a `.env` model CAN do is quietly point `agent.model.review` at a weak reviewer for
+      // every future run; nothing in the loop can detect that, which is why the README says so.
+      models = AgentModels(
+        impl = str("IMPL_MODEL").orElse(base.models.impl),
+        fix = str("FIX_MODEL").orElse(base.models.fix),
+        review = str("REVIEW_MODEL").orElse(base.models.review)
+      )
     )
 
     ParsedEnv(
@@ -724,7 +741,8 @@ object Main:
         parsed.cfg.iterTimeout,
         parsed.implCmd,
         parsed.fixCmd,
-        parsed.reviewCmd
+        parsed.reviewCmd,
+        models = parsed.cfg.models
       )
     val (fastGates, hostGates) =
       gateRunners(root, timeoutBin, sandboxDir, parsed.cfg.gateSandboxed)

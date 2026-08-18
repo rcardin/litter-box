@@ -185,6 +185,45 @@ final case class Labels(
     parked: String = "parked"
 )
 
+/** Which model each of the three model touched dispatches asks for (`agent.model`), resolved on the
+  * HOST and carried into the container, so the choice is stated once in `.litter-box/config.conf`
+  * and no node body has to know a container exists.
+  *
+  * A named record rather than three loose `Option[String]` fields on `Config` for the reason issue
+  * #73's own risk list gives: `LiveAgentDispatch` already takes three `Option[String]` seam
+  * overrides (`IMPL_CMD`/`FIX_CMD`/`REVIEW_CMD`) sitting immediately next to these, so three more
+  * parameters of that identical type would let a positional slip compile and silently wire a seam
+  * as a model. One distinct type cannot be confused with any of them.
+  *
+  * Every role is INDEPENDENTLY optional and there is no default model anywhere: `None` means the
+  * dispatch carries no model at all, so the container keeps whatever `.litter-box/Dockerfile` or the
+  * CLI itself already provides. Shipping a default here would silently move every consumer's spend
+  * and every consumer's answers at once.
+  *
+  * PER ROLE, NOT PER NODE, deliberately (issue #73's one open design question, decided here): the
+  * model is a property of what a dispatch IS, an implementer, a fixer, a cold reviewer, not of which
+  * node in which graph happens to make it, so it is resolved from `Config` at the dispatch handler
+  * and `AgentDispatch`'s own signature does not move. A node that wanted a model of its own would
+  * put the choice in graph code, which is agent authored in this loop's own threat model, and out of
+  * reach of the patch guard that protects the `.litter-box` directory.
+  *
+  * `review` is the dangerous one. The cold reviewer's independence is this project's central safety
+  * property, and pointing this key at a weak model weakens the adversarial gate with nothing in the
+  * loop able to detect it or refuse it, the same shape `gate.sandboxed` takes: the only available
+  * control is saying so here and in the README.
+  */
+final case class AgentModels(
+    impl: Option[String] = None,
+    fix: Option[String] = None,
+    review: Option[String] = None
+):
+  /** The model a worker dispatch of `role` asks for. Here rather than at the two call sites so
+    * "which key does a FIX read" has one answer instead of a match repeated per handler.
+    */
+  def forRole(role: Role): Option[String] = role match
+    case Role.IMPL => impl
+    case Role.FIX  => fix
+
 /** The per-iteration knobs, read from `.litter-box/config.conf` and overlaid with the loop.sh env
   * vars (see `Settings` for the layering and `Settings.Reference` for the schema).
   *
@@ -288,5 +327,10 @@ final case class Config(
       * `iterTimeout + implementSlack` is provably unreachable and this is the pure backstop it
       * otherwise claims to be — the tunability matters for the unbounded-child host class only.
       */
-    implementSlack: Int = 300
+    implementSlack: Int = 300,
+    /** `agent.model`: which model each of the three model touched dispatches asks for. See
+      * [[AgentModels]] for why it is one record, why every role is independently optional and why
+      * pointing `review` at a weak model is the dangerous edit.
+      */
+    models: AgentModels = AgentModels()
 )

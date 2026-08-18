@@ -151,6 +151,34 @@ sandbox_credential_env() {
   fi
 }
 
+# The model ONE dispatch asks for (issue #73), as the `docker run` arguments that carry it into the
+# container. The loop resolves which model a role gets on the HOST, from `.litter-box/config.conf`
+# (agent.model.impl / .fix / .review), and exports the answer as LITTER_BOX_AGENT_MODEL onto the
+# runner it is about to fork; a script run by hand simply has no such variable.
+#
+# Derived HERE, once, for the two model-touched runners for the same reason `effective_allowlist`
+# is: the two must never disagree about what "no model" means, and that is precisely the case with
+# no observable symptom until a bill or a weak review shows up.
+#
+# UNSET AND EMPTY BOTH MEAN NO MODEL AT ALL, and MODEL_ENV is then genuinely empty rather than
+# holding `-e ANTHROPIC_MODEL=`: an empty value inside the container would OVERRIDE an
+# `ENV ANTHROPIC_MODEL` a consumer baked into their own .litter-box/Dockerfile, turning "the loop
+# has no opinion" into a silent behaviour change for exactly the repos that had already solved this
+# the other way.
+#
+# Callers expand it as `${MODEL_ENV[@]+"${MODEL_ENV[@]}"}`, not as `"${MODEL_ENV[@]}"`: under
+# `set -u` bash 3.2 (what macOS ships, and what every runner here executes under) treats the plain
+# expansion of an EMPTY array as an unbound variable and aborts the dispatch. The value stays inside
+# an array either way, which is what keeps a consumer-owned model string one quoted argv element
+# instead of extra words on the command line.
+sandbox_model_env() {
+  if [[ -n "${LITTER_BOX_AGENT_MODEL:-}" ]]; then
+    MODEL_ENV=(-e ANTHROPIC_MODEL="$LITTER_BOX_AGENT_MODEL")
+  else
+    MODEL_ENV=()
+  fi
+}
+
 # The proxy-stack preflight, identical in all three runners: Docker reachable, sandbox image
 # present, proxy sidecar running. On any failure the caller's infra_fault emits its tagged message
 # and exits 124. (The per-runner credential check is intentionally NOT here — it is absent in

@@ -12,6 +12,11 @@
 # PATCH_OUT    where the cumulative-vs-origin/main patch is written on the host
 # PRIOR_PATCH  the prior cumulative patch to seed the tree with (empty on the initial IMPL)
 #
+# LITTER_BOX_AGENT_MODEL  (env, optional) the model THIS dispatch asks for, resolved on the host
+#                         from `agent.model.impl` / `agent.model.fix`. Forwarded into the container
+#                         as ANTHROPIC_MODEL; absent or empty passes nothing at all, so the image's
+#                         own ENV or the CLI default stands (see sandbox_model_env in lib.sh).
+#
 # Exit codes mirror run-fast-gate.sh so dispatch_worker needs no new dispatch logic:
 #   0    the container ran; PATCH_OUT holds the agent's patch (possibly empty = no diff)
 #   124  timeout (container killed) or any infra fault (missing image, dead proxy, unreachable
@@ -31,6 +36,7 @@ infra_fault() { echo "[run-agent] INFRA FAULT: $*" >&2; exit 124; }
 
 sandbox_credential_env || infra_fault "neither CLAUDE_CODE_OAUTH_TOKEN nor ANTHROPIC_API_KEY set (the sandboxed agent has no other way to authenticate)"
 sandbox_preflight   # docker reachable + image present + proxy running (shared, see lib.sh)
+sandbox_model_env   # -e ANTHROPIC_MODEL=... when the loop named one, nothing when it did not
 
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || infra_fault "not inside a git working tree"
 
@@ -88,6 +94,7 @@ docker run -d --name "$cname" \
   --security-opt=no-new-privileges \
   -e HOME=/home/gate \
   "${CREDENTIAL_ENV[@]}" \
+  ${MODEL_ENV[@]+"${MODEL_ENV[@]}"} \
   -e HTTP_PROXY="$proxy_url" -e HTTPS_PROXY="$proxy_url" \
   -e http_proxy="$proxy_url" -e https_proxy="$proxy_url" \
   -e NO_PROXY="" -e no_proxy="" \

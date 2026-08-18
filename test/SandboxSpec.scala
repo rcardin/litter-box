@@ -207,3 +207,191 @@ class SandboxSpec extends AnyFlatSpec with Matchers:
     }
   }
 
+
+  // ===============================================================================================
+  // ANTHROPIC_MODEL forwarding (issue #73)
+  // ===============================================================================================
+
+  /** A second stand in for the docker CLI, answering the questions the two model touched runners
+    * ask (`info`, `image inspect`, `inspect -f`, `run`, `logs`, `wait`, `rm`) and recording the
+    * `run` invocation ONE ARGUMENT PER LINE.
+    *
+    * Per line and not `"$*"` like the proxy fixture above, because the claim under test is about
+    * argv ELEMENTS: a model identifier comes out of a file the consumer owns, and it is safe only
+    * while it stays one separate, quoted element inside the runner's bash array. A recording that
+    * flattened the argv back into a string could not tell that apart from a command line built by
+    * concatenation, which is the failure mode.
+    */
+  private val ArgvDocker = """#!/usr/bin/env bash
+    |state="$FAKE_DOCKER_STATE"
+    |case "$1" in
+    |  run)    printf '%s\n' "$@" >"$state/run-argv" ;;
+    |  wait)   printf '0\n' ;;
+    |  inspect) printf 'true\n' ;;
+    |esac
+    |exit 0
+    |""".stripMargin
+
+  /** An extracted sandbox tree, the fake docker's state and the bin directory holding it. */
+  private case class RunnerFixture(sandbox: Path, state: Path, bin: Path)
+
+  private def runnerFixture(): RunnerFixture =
+    val sandbox = Files.createTempDirectory("sandbox-spec")
+    Sandbox.extract(sandbox)
+    val state  = Files.createTempDirectory("sandbox-spec-docker")
+    val bin    = Files.createTempDirectory("sandbox-spec-bin")
+    val docker = bin.resolve("docker")
+    Files.writeString(docker, ArgvDocker)
+    docker.toFile.setExecutable(true) shouldBe true
+    RunnerFixture(sandbox, state, bin)
+
+  /** The `docker run` argv the fixture recorded, one element per entry, in order. */
+  private def runArgv(f: RunnerFixture): List[String] =
+    val recorded = f.state.resolve("run-argv")
+    if Files.isRegularFile(recorded) then Files.readAllLines(recorded).asScala.toList else Nil
+
+  /** A repository the way `run-agent.sh` needs to find one: a work tree with a commit and an
+    * `origin/main` ref for its `git archive` to read. The remote is faked with a local ref rather
+    * than a real one, since nothing here is allowed to reach the network.
+    */
+  private def repoWithOriginMain(): Path =
+    val repo = Files.createTempDirectory("sandbox-spec-repo")
+    Files.writeString(repo.resolve("README.md"), "hello\n")
+    LiveProc.run(repo, Seq("git", "init", "--quiet"))
+    LiveProc.run(repo, Seq("git", "config", "user.email", "t@t"))
+    LiveProc.run(repo, Seq("git", "config", "user.name", "t"))
+    LiveProc.run(repo, Seq("git", "config", "commit.gpgsign", "false"))
+    LiveProc.run(repo, Seq("git", "add", "-A"))
+    LiveProc.run(repo, Seq("git", "commit", "--quiet", "-m", "init"))
+    LiveProc.run(repo, Seq("git", "update-ref", "refs/remotes/origin/main", "HEAD"))
+    repo
+
+  /** Runs one of the two runners against the fake docker, with a dummy credential and a tmp root of
+    * its own so nothing lands in the operator's `$HOME`.
+    */
+  private def runRunner(
+      f: RunnerFixture,
+      script: String,
+      cwd: Path,
+      args: Seq[String],
+      extraEnv: Map[String, String]
+  ): (Int, String) =
+    val pb = new ProcessBuilder((f.sandbox.resolve(script).toString +: args).asJava)
+    pb.directory(cwd.toFile)
+    pb.redirectErrorStream(true)
+    val env = pb.environment()
+    env.put("PATH", s"${f.bin}${java.io.File.pathSeparator}${env.get("PATH")}")
+    env.put("FAKE_DOCKER_STATE", f.state.toString)
+    env.put("CLAUDE_CODE_OAUTH_TOKEN", "dummy-token")
+    env.remove("ANTHROPIC_API_KEY")
+    env.put("LITTER_BOX_SANDBOX_TMP_ROOT", Files.createTempDirectory("sandbox-spec-tmp").toString)
+    env.remove(Settings.AgentModelEnvVar)
+    extraEnv.foreach((k, v) => env.put(k, v))
+    val proc = pb.start()
+    val out  = new String(proc.getInputStream.readAllBytes(), StandardCharsets.UTF_8)
+    (proc.waitFor(), out)
+
+  private def runAgent(f: RunnerFixture, extraEnv: Map[String, String]): (Int, String) =
+    val repo   = repoWithOriginMain()
+    val prompt = repo.resolve("prompt.txt")
+    Files.writeString(prompt, "do the thing\n")
+    runRunner(
+      f,
+      "run-agent.sh",
+      repo,
+      Seq(prompt.toString, repo.resolve("out.patch").toString),
+      extraEnv
+    )
+
+  private def runReviewer(f: RunnerFixture, extraEnv: Map[String, String]): (Int, String) =
+    runRunner(
+      f,
+      "run-reviewer.sh",
+      f.sandbox,
+      Seq.empty,
+      extraEnv + ("REVIEW_PROMPT" -> "judge this")
+    )
+
+  "run-agent.sh" should "pass the model the loop asked for as one -e ANTHROPIC_MODEL argument" in {
+    val f          = runnerFixture()
+    val (rc, logs) = runAgent(f, Map(Settings.AgentModelEnvVar -> "strong-model"))
+
+    withClue(logs) {
+      rc shouldBe 0
+      // `contain inOrder` only checks relative order, not adjacency, so it cannot tell an
+      // `-e ANTHROPIC_MODEL=strong-model` pair from the flag landing elsewhere in the argv with
+      // the model turning into a stray positional argument. `sliding(2)` proves adjacency.
+      runArgv(f).sliding(2).toList should contain(List("-e", "ANTHROPIC_MODEL=strong-model"))
+    }
+  }
+
+  it should "keep a model holding a space as ONE argv element" in {
+    // The injection the risk list names: a model identifier comes out of `.litter-box/config.conf`,
+    // a file the consumer owns, and the only thing that keeps it from becoming extra words on a
+    // `docker run` is that it never leaves the bash array it is quoted inside.
+    val f          = runnerFixture()
+    val (rc, logs) = runAgent(f, Map(Settings.AgentModelEnvVar -> "strong model"))
+
+    withClue(logs) {
+      rc shouldBe 0
+      runArgv(f) should contain("ANTHROPIC_MODEL=strong model")
+    }
+  }
+
+  it should "pass NO model argument at all when the loop supplied none" in {
+    // Absent, never present-and-empty: an empty `-e ANTHROPIC_MODEL=` would clobber an
+    // `ENV ANTHROPIC_MODEL` a consumer set in their own `.litter-box/Dockerfile`, which is the
+    // route issue #73 replaces.
+    val f          = runnerFixture()
+    val (rc, logs) = runAgent(f, Map.empty)
+
+    withClue(logs) {
+      rc shouldBe 0
+      runArgv(f).filter(_.startsWith("ANTHROPIC_MODEL")) shouldBe empty
+    }
+  }
+
+  it should "treat an empty model variable as no model at all" in {
+    val f          = runnerFixture()
+    val (rc, logs) = runAgent(f, Map(Settings.AgentModelEnvVar -> ""))
+
+    withClue(logs) {
+      rc shouldBe 0
+      runArgv(f).filter(_.startsWith("ANTHROPIC_MODEL")) shouldBe empty
+    }
+  }
+
+  "run-reviewer.sh" should "pass the model the loop asked for as one -e ANTHROPIC_MODEL argument" in {
+    val f          = runnerFixture()
+    val (rc, logs) = runReviewer(f, Map(Settings.AgentModelEnvVar -> "cold-model"))
+
+    withClue(logs) {
+      rc shouldBe 0
+      // Adjacency, not just relative order: see the matching comment on run-agent.sh's test above.
+      runArgv(f).sliding(2).toList should contain(List("-e", "ANTHROPIC_MODEL=cold-model"))
+    }
+  }
+
+  it should "pass NO model argument at all when the loop supplied none, and keep the deny flags positional" in {
+    // The second half is the back compat contract the model must not disturb: the reviewer's deny
+    // flags travel as POSITIONAL arguments after the `_` placeholder, because the prompt itself
+    // rides in an env var and must never enter argv.
+    val f          = runnerFixture()
+    val (rc, logs) = runReviewer(f, Map.empty)
+
+    withClue(logs) {
+      rc shouldBe 0
+      runArgv(f).filter(_.startsWith("ANTHROPIC_MODEL")) shouldBe empty
+      runArgv(f) should contain inOrder ("_", "--disallowed-tools")
+    }
+  }
+
+  it should "still honour the prompt as $1 with no model supplied" in {
+    val f          = runnerFixture()
+    val (rc, logs) = runRunner(f, "run-reviewer.sh", f.sandbox, Seq("judge this"), Map.empty)
+
+    withClue(logs) {
+      rc shouldBe 0
+      runArgv(f) should contain("REVIEW_PROMPT=judge this")
+    }
+  }

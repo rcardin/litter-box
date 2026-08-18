@@ -590,6 +590,154 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
     dispatch.review("prompt", "logs/r.md").value shouldBe DispatchOutcome.Done
   }
 
+  /** A stand in for `run-agent.sh` / `run-reviewer.sh` that reports what the dispatch handed it,
+    * so the model half of a REAL (unseamed) dispatch can be asserted with no Docker anywhere near
+    * the test. `${VAR-...}` and not `${VAR:-...}` on purpose: issue #73's rule is that an unset
+    * model carries NO variable, not an empty one, and only the first form can tell those apart.
+    */
+  private val ModelRecorder = """#!/usr/bin/env bash
+    |printf 'MODEL=[%s]\n' "${LITTER_BOX_AGENT_MODEL-<absent>}"
+    |printf 'ARGV=[%s]\n' "$*"
+    |""".stripMargin
+
+  /** A repo root with a sandbox tree next to it holding both recording runners. */
+  private def modelFixture(): (Path, Path) =
+    val root       = tempRoot()
+    val sandboxDir = root.resolve("sandbox")
+    Files.createDirectories(sandboxDir)
+    writeExecutable(sandboxDir, "run-agent.sh", ModelRecorder)
+    writeExecutable(sandboxDir, "run-reviewer.sh", ModelRecorder)
+    (root, sandboxDir)
+
+  "LiveAgentDispatch's real dispatch" should "carry the impl model on IMPL and the fix model on FIX" in {
+    val (root, sandboxDir) = modelFixture()
+    val dispatch           = LiveAgentDispatch(
+      root,
+      sandboxDir = sandboxDir,
+      timeoutBin = None,
+      iterTimeout = 5,
+      implCmd = None,
+      fixCmd = None,
+      reviewCmd = None,
+      models = AgentModels(impl = Some("strong-model"), fix = Some("cheap-model"))
+    )
+
+    dispatch.worker(Role.IMPL, "p.txt", "logs/i.patch", "logs/i.log", None)
+    dispatch.worker(Role.FIX, "p.txt", "logs/f.patch", "logs/f.log", None)
+
+    readString(root.resolve("logs/i.log")) should include("MODEL=[strong-model]")
+    readString(root.resolve("logs/f.log")) should include("MODEL=[cheap-model]")
+  }
+
+  it should "carry the review model on the reviewer dispatch" in {
+    val (root, sandboxDir) = modelFixture()
+    val dispatch           = LiveAgentDispatch(
+      root,
+      sandboxDir = sandboxDir,
+      timeoutBin = None,
+      iterTimeout = 5,
+      implCmd = None,
+      fixCmd = None,
+      reviewCmd = None,
+      models = AgentModels(impl = Some("strong-model"), review = Some("cold-model"))
+    )
+
+    dispatch.review("prompt", "logs/r.md")
+
+    readString(root.resolve("logs/r.md")) should include("MODEL=[cold-model]")
+  }
+
+  /** The failure this pins is the one issue #73 names as a silent behaviour change: a role with no
+    * model must reach the runner with the variable ABSENT, never present and empty, because an
+    * empty value is what would clobber an `ENV ANTHROPIC_MODEL` a consumer's own Dockerfile sets.
+    * The positional argv is asserted for the same reason, one field over: no empty extra word.
+    */
+  it should "carry no model at all when the role's model is unset" in {
+    val (root, sandboxDir) = modelFixture()
+    val dispatch           = LiveAgentDispatch(
+      root,
+      sandboxDir = sandboxDir,
+      timeoutBin = None,
+      iterTimeout = 5,
+      implCmd = None,
+      fixCmd = None,
+      reviewCmd = None,
+      models = AgentModels(fix = Some("cheap-model"))
+    )
+
+    dispatch.worker(Role.IMPL, "p.txt", "logs/i.patch", "logs/i.log", None)
+    dispatch.review("prompt", "logs/r.md")
+
+    readString(root.resolve("logs/i.log")) should include("MODEL=[]")
+    readString(root.resolve("logs/i.log")) should include(
+      s"ARGV=[${root.resolve("p.txt")} ${root.resolve("logs/i.patch")} ]"
+    )
+    readString(root.resolve("logs/r.md")) should include("MODEL=[]")
+    readString(root.resolve("logs/r.md")) should include("ARGV=[]")
+  }
+
+  /** Pins the regression named in the issue #73 review: `LiveProc.builder` never clears the child's
+    * environment, so an ambient `LITTER_BOX_AGENT_MODEL` (inherited from the operator's own shell, or
+    * stamped onto every child by `LiveProc.exportEnv` from `.litter-box/.env`, exactly as
+    * `withExportedEnv` below simulates) must not survive into a dispatch whose role has no model
+    * configured. `modelEnv` returning an EMPTY map for an unset role is not enough to guarantee that:
+    * `LiveProc.prepare` only ADDS entries on top of the inherited environment, it never subtracts, so
+    * an ambient value would ride along untouched unless the unset case is stamped shut with an
+    * explicit empty value.
+    */
+  it should "not let an ambient LITTER_BOX_AGENT_MODEL leak into a dispatch whose role has no model" in {
+    val (root, sandboxDir) = modelFixture()
+    val dispatch           = LiveAgentDispatch(
+      root,
+      sandboxDir = sandboxDir,
+      timeoutBin = None,
+      iterTimeout = 5,
+      implCmd = None,
+      fixCmd = None,
+      reviewCmd = None,
+      models = AgentModels() // every role unset
+    )
+
+    withExportedEnv(Map(Settings.AgentModelEnvVar -> "leaked-model")) {
+      dispatch.worker(Role.IMPL, "p.txt", "logs/i.patch", "logs/i.log", None)
+      dispatch.review("prompt", "logs/r.md")
+    }
+
+    readString(root.resolve("logs/i.log")) should include("MODEL=[]")
+    readString(root.resolve("logs/r.md")) should include("MODEL=[]")
+  }
+
+  /** The seams are a TEST affordance, never a supported way to pick a model (issue #73's own out of
+    * scope list), so a configured model must change nothing about them: the stub is still a plain
+    * host `bash -c` with `PATCH_OUT` and no model anywhere near it. Pinned rather than assumed,
+    * because the seam branch and the sandbox branch sit in the same `match` and a model threaded
+    * through the wrong one would put a consumer owned string into a host shell command.
+    */
+  it should "leave the IMPL_CMD and REVIEW_CMD seams untouched whatever the models resolve to" in {
+    val (root, sandboxDir) = modelFixture()
+    val dispatch           = LiveAgentDispatch(
+      root,
+      sandboxDir = sandboxDir,
+      timeoutBin = None,
+      iterTimeout = 5,
+      implCmd = Some("""printf 'MODEL=[%s]\n' "${LITTER_BOX_AGENT_MODEL-<absent>}" > "$PATCH_OUT""""),
+      fixCmd = None,
+      reviewCmd = Some("""printf 'MODEL=[%s]\n' "${LITTER_BOX_AGENT_MODEL-<absent>}""""),
+      models = AgentModels(
+        impl = Some("strong-model"),
+        fix = Some("cheap-model"),
+        review = Some("cold-model")
+      )
+    )
+
+    dispatch.worker(Role.IMPL, "p.txt", "logs/i.patch", "logs/i.log", None) shouldBe
+      DispatchOutcome.Done
+    dispatch.review("prompt", "logs/r.md").value shouldBe DispatchOutcome.Done
+
+    readString(root.resolve("logs/i.patch")).strip shouldBe "MODEL=[<absent>]"
+    readString(root.resolve("logs/r.md")).strip shouldBe "MODEL=[<absent>]"
+  }
+
   // =============================================================================================
   // LiveGit
   // =============================================================================================

@@ -127,6 +127,46 @@ class SettingsSpec extends AnyFlatSpec with Matchers:
   }
 
   // ===============================================================================================
+  // 2b. agent.model: three independently optional keys
+  // ===============================================================================================
+
+  /** Why the three model keys are asserted one at a time rather than as a block: a consumer picking
+    * a cheap fixer while leaving the implementer and the reviewer on whatever the CLI defaults to is
+    * the shape issue #73 exists for, and an all-or-nothing block would silently unset the other two
+    * the moment the file mentions the block at all. That is the same trap `protect` documents, one
+    * level down.
+    */
+  "a config file naming one agent model" should "leave the other two roles unset" in {
+    val partial = ConfigFactory.parseString(
+      """agent.model.fix = "cheap-model"
+        |""".stripMargin
+    )
+
+    val cfg = Settings.parse(partial.withFallback(Settings.referenceOnly))
+
+    cfg.models shouldBe AgentModels(fix = Some("cheap-model"))
+  }
+
+  it should "read all three when the file names all three" in {
+    val partial = ConfigFactory.parseString(
+      """agent.model { impl = "strong-model", fix = "cheap-model", review = "cold-model" }
+        |""".stripMargin
+    )
+
+    val cfg = Settings.parse(partial.withFallback(Settings.referenceOnly))
+
+    cfg.models shouldBe AgentModels(
+      impl = Some("strong-model"),
+      fix = Some("cheap-model"),
+      review = Some("cold-model")
+    )
+  }
+
+  it should "leave every role unset when the file mentions no agent.model key at all" in {
+    Settings.parse(Settings.referenceOnly).models shouldBe AgentModels()
+  }
+
+  // ===============================================================================================
   // 3. Missing config file
   // ===============================================================================================
 
@@ -219,6 +259,35 @@ class SettingsSpec extends AnyFlatSpec with Matchers:
     parsed.gateOverridden shouldBe false
     parsed.cfg.dryRun shouldBe false
     parsed.cfg.ciWaitCmd shouldBe None
+  }
+
+  /** The three model keys are layered one at a time for the same reason the file half is read one at
+    * a time: an operator raising the fixer to a stronger model for one run must not silently unset
+    * the implementer and the reviewer their config already names. The empty `REVIEW_MODEL` here is
+    * the project's existing rule about an exported empty value, not a fourth case: it shadows
+    * nothing, exactly as an unset variable does.
+    */
+  it should "layer an env override over each agent model independently" in {
+    val fromFile = ConfigFactory
+      .parseString(
+        """agent.model { impl = "file-impl", fix = "file-fix", review = "file-review" }
+          |""".stripMargin
+      )
+      .withFallback(Settings.referenceOnly)
+
+    val parsed = Main.parseEnv(fromFile, Map("FIX_MODEL" -> "env-fix", "REVIEW_MODEL" -> ""))
+
+    parsed.cfg.models shouldBe AgentModels(
+      impl = Some("file-impl"),
+      fix = Some("env-fix"),
+      review = Some("file-review")
+    )
+  }
+
+  it should "leave a role unset when neither the file nor the environment names a model" in {
+    val parsed = Main.parseEnv(Settings.referenceOnly, Map("IMPL_MODEL" -> "env-impl"))
+
+    parsed.cfg.models shouldBe AgentModels(impl = Some("env-impl"))
   }
 
   // ===============================================================================================

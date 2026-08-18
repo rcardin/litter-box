@@ -608,13 +608,32 @@ final class LiveAgentDispatch private[litterbox] (
     iterTimeout: Int,
     implCmd: Option[String],
     fixCmd: Option[String],
-    reviewCmd: Option[String]
+    reviewCmd: Option[String],
+    models: AgentModels = AgentModels()
 ) extends AgentDispatchImpl:
 
   // "" means unset, folded once on the way in (LiveProc.seam).
   private val implSeam   = LiveProc.seam(implCmd)
   private val fixSeam    = LiveProc.seam(fixCmd)
   private val reviewSeam = LiveProc.seam(reviewCmd)
+
+  /** The `-e ANTHROPIC_MODEL` half of a dispatch, as the environment the runner script reads it off
+    * (`Settings.AgentModelEnvVar`). ALWAYS sets the key, empty string for an unset role, never an
+    * absent entry: `LiveProc.prepare` only ADDS keys on top of whatever the child inherits, it never
+    * clears the environment first, so an absent entry here would let an ambient
+    * `LITTER_BOX_AGENT_MODEL` (the operator's own shell, or a value `.litter-box/.env` stamped onto
+    * every child through `LiveProc.exportEnv`) ride along untouched into a dispatch that asked for no
+    * model at all. Stamping it shut with `""` is what `sandbox_model_env` (`lib.sh`) already treats
+    * as no model, so the container still receives no `-e ANTHROPIC_MODEL`, but no ambient value can
+    * survive under it.
+    *
+    * Not folded into the argv, deliberately. A model identifier comes out of a file the consumer
+    * owns, and every path from that file to `docker run` has to keep it ONE argv element: an env
+    * entry stays one by construction, where a positional argument would sit next to the reviewer's
+    * back compat `$1`-is-the-prompt rule and invite a string built command line.
+    */
+  private def modelEnv(model: Option[String]): Map[String, String] =
+    Map(Settings.AgentModelEnvVar -> model.getOrElse(""))
 
   def worker(
       role: Role,
@@ -650,7 +669,7 @@ final class LiveAgentDispatch private[litterbox] (
           case Some(tb) => Seq(tb, iterTimeout.toString)
           case None     => Seq.empty
         ) ++ Seq(runner, promptAbs, patchOutAbs.toString, currentPatchArg)
-        val rc = LiveProc.runToFile(root, args, logPath)
+        val rc = LiveProc.runToFile(root, args, logPath, env = modelEnv(models.forRole(role)))
         if rc == 124 then
           LiveLog.log(
             s"WARNING: $role sandbox dispatch failed rc=124 (${iterTimeout}s timeout or infra fault: missing image/proxy/Docker/API key/prior-patch)"
@@ -691,7 +710,7 @@ final class LiveAgentDispatch private[litterbox] (
           args,
           reviewPath,
           stderrPath,
-          env = Map("REVIEW_PROMPT" -> prompt)
+          env = Map("REVIEW_PROMPT" -> prompt) ++ modelEnv(models.review)
         )
         if rc == 124 then
           LiveLog.log(

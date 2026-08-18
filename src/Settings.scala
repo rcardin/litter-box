@@ -63,6 +63,7 @@ object Settings:
       |  sandboxed = true
       |  timeout   = 900
       |}
+      |agent.model { impl = null, fix = null, review = null }
       |issues.labels { ready = "ready", active = "in-progress", blocked = "blocked", parked = "parked" }
       |issues.park-on-exhaustion = true
       |protect  = [".litter-box/**", ".github/**", "CONTEXT.md"]
@@ -297,6 +298,34 @@ object Settings:
     */
   val LogDirEnvVar = "LITTER_BOX_LOG_DIR"
 
+  /** Env var carrying the model ONE dispatch asks for into `run-agent.sh` / `run-reviewer.sh`,
+    * which turn it into a `-e ANTHROPIC_MODEL=<model>` argument on their `docker run` (issue #73).
+    *
+    * A name of litter-box's own rather than `ANTHROPIC_MODEL` itself, even though that is what the
+    * container ends up seeing. The loop's own process may well have `ANTHROPIC_MODEL` exported for
+    * the operator's personal `claude`, and reading THAT would silently apply one model to all three
+    * roles, the cold reviewer included, with no config key saying so. A variable only this loop sets
+    * cannot be inherited by accident.
+    *
+    * Per DISPATCH, so deliberately not part of [[childEnv]]: it differs between two children of the
+    * same run (a strong implementer, a cheap fixer), which is the whole point of the key, and
+    * `childEnv` is the set of variables every child shares.
+    *
+    * `LiveAgentDispatch.modelEnv` exports this variable for every real dispatch, unset role included:
+    * an EMPTY value is how "no model" is spelled on this seam, stamped shut rather than omitted, so
+    * an ambient `LITTER_BOX_AGENT_MODEL` a consumer's own `.litter-box/.env` happens to export can
+    * never leak into a dispatch whose role names no model.
+    *
+    * The empty value is not what reaches `docker run`, though. `sandbox_model_env` in
+    * `resources/sandbox/lib.sh` is the one place that turns an empty value into no
+    * `-e ANTHROPIC_MODEL` argument at all, because that argument, if passed empty, would clobber
+    * whatever a consumer's own `.litter-box/Dockerfile` set with its own `ENV ANTHROPIC_MODEL`,
+    * turning "no opinion" into a silent behaviour change for exactly the repos that had solved this
+    * the other way. The absence has to happen there, on the actual `docker run` argv, not on this
+    * variable.
+    */
+  val AgentModelEnvVar = "LITTER_BOX_AGENT_MODEL"
+
   /** The environment every child of the loop inherits. A function rather than a constant so the
     * call sites in `Main` stay honest about the entries being derived, not fixed.
     */
@@ -304,6 +333,23 @@ object Settings:
     Map(InstanceEnvVar -> cfg.instanceName, RepoRootEnvVar -> root.toString)
 
   // ---- config -> Config ------------------------------------------------------------------------
+
+  /** One optional file backed key, read the only way an ABSENT value can be told from a set one
+    * after `withFallback` has already merged the consumer's file onto [[Reference]].
+    *
+    * `hasPath` answers false both for a key the consumer's file never mentions and for the explicit
+    * `null` [[Reference]] declares, which is exactly the collapse this needs: the reference block
+    * exists to DOCUMENT the three model keys, not to give any of them a value, and issue #73's rule
+    * is that unset keeps meaning "whatever the CLI defaults to". Every other key in the schema is
+    * read unconditionally, because every other key has a real default to fall back to.
+    *
+    * An EMPTY string is absent too, the same rule `Main.parseEnv`'s `str` applies to an exported
+    * variable: a model identifier is either named or it is not, and forwarding `""` into a container
+    * would be the one shape issue #73 rules out, an empty valued variable clobbering a model a
+    * consumer's own Dockerfile already set.
+    */
+  private def optionalString(conf: TsConfig, key: String): Option[String] =
+    if conf.hasPath(key) then Option(conf.getString(key)).filter(_.nonEmpty) else None
 
   /** Reads the schema off `conf` (already merged onto [[Reference]] by `loadFile`).
     * Env overlay is `Main.parseEnv`'s job, not this one's: this function is the file half of the
@@ -325,6 +371,11 @@ object Settings:
         parked = conf.getString("issues.labels.parked")
       ),
       parkOnExhaustion = conf.getBoolean("issues.park-on-exhaustion"),
+      models = AgentModels(
+        impl = optionalString(conf, "agent.model.impl"),
+        fix = optionalString(conf, "agent.model.fix"),
+        review = optionalString(conf, "agent.model.review")
+      ),
       protect = protectWithFloor(conf),
       repairBudget = conf.getInt("budgets.repair"),
       maxPatchBytes = conf.getLong("budgets.max-patch-bytes"),
