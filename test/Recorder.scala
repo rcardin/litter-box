@@ -37,6 +37,24 @@ object Script:
   val newFilePatch: String  = "1\t0\tsrc/main/scala/Slice.scala"
   val approveReview: String = "checked AC1/AC2, tests present.\nVERDICT: APPROVE"
 
+/** What [[TestWorld.runNode]] observed about ONE node's execution, everything that call can report
+  * without handing a `Runner.Ledger` over.
+  *
+  * Two fields rather than a bare `NodeOutcome[O]`, because the budget is half of what a node author
+  * actually needs to assert on and the outcome alone cannot answer it: a node declaring
+  * `Cost.OneDispatch` that never dispatches, and one that dispatches three times, both return the
+  * same `Done`, and only the counter tells them apart (`Runner.Ledger`'s own doc: the declared `Cost`
+  * is a ceiling on STARTING, the real charge happens per real dispatch).
+  *
+  * `remainingDispatches` is a plain `Int`, named exactly after `Runner.Ledger.remainingDispatches`
+  * and read off the very ledger the run used, never the ledger itself. That is the whole reason this
+  * type exists instead of `runNode` returning the ledger: reading how much budget survived is public
+  * on `Ledger` already, while HOLDING one is what RFC #26 decision 9 rules out, since a consumer with
+  * a `Ledger` in hand could re-enter `Runner.step` with a budget of their own invention and every
+  * budget assertion in their suite would stop meaning anything (issue #32 review finding 2c).
+  */
+final case class NodeRun[O](outcome: NodeOutcome[O], remainingDispatches: Int)
+
 final class TestWorld:
   import Script.*
 
@@ -425,16 +443,27 @@ final class TestWorld:
 
   // ---- driving the machine ----------------------------------------------------------------
 
-  /** Runs one iteration of the machine against this world's scripted capabilities.
+  /** Runs one iteration of the machine against this world's scripted capabilities, walking whichever
+    * `LoopGraph` the caller names.
     *
     * The `using` clause lives here rather than in each spec so that adding a capability to
     * `Machine` is a one-line edit instead of a lockstep edit across every spec that drives it.
-    * Per-scenario differences stay at the call site: `w.runLoop()` for the defaults,
-    * `w.runLoop(Config(dryRun = true))` to vary config, `w.runLoop(iteration = 2)` to vary the
-    * iteration number the machine reports.
+    * Per-scenario differences stay at the call site: `w.runGraph(g)` for the defaults,
+    * `w.runGraph(g, Config(dryRun = true))` to vary config, `w.runGraph(g, iteration = 2)` to vary
+    * the iteration number the machine reports.
+    *
+    * This is the testkit's entry point for a CONSUMER's own graph (issue #42, RFC #26 decision 14):
+    * a node author builds a `LoopGraph` through `LitterBox.graph` and drives it here, with no
+    * Docker, no network and no credentials, exactly the way this repo drives its own shipped graph
+    * through [[runLoop]] below. It deliberately takes an already-built `LoopGraph` and never
+    * constructs one, and it names no `Runner.Ledger`: `Machine.runOnce` builds the ledger from the
+    * graph's own declared `dispatchBudget`, so the testkit does not become the `Ledger` escape hatch
+    * RFC #26 decision 9 exists to prevent. [[runNode]] below is the one entry point that does build a
+    * ledger, and it holds that same line a different way: it takes a plain `Int` and returns a plain
+    * `Int`, so a consumer still has no way to name the type.
     */
-  def runLoop(cfg: Config = Config(), iteration: Int = 1): LoopExit =
-    Machine.runOnce(iteration)(using
+  def runGraph(graph: LoopGraph, cfg: Config = Config(), iteration: Int = 1): LoopExit =
+    Machine.runOnce(iteration, graph)(using
       cfg,
       github,
       git,
@@ -447,6 +476,61 @@ final class TestWorld:
       clock,
       logger
     )
+
+  /** Runs one iteration of the SHIPPED graph against this world's scripted capabilities: the
+    * `PICK -> IMPLEMENT -> GATE -> REPAIR -> REVIEW -> PR -> CI -> MERGE` pipeline `lb` itself walks.
+    *
+    * Every behavioural spec in this repo drives the machine through here. Kept as its own method,
+    * delegating to [[runGraph]] rather than being replaced by it, because `LitterBox.shipped` is the
+    * one graph the overwhelming majority of call sites want and spelling it out at each of them
+    * would be several hundred lines of noise saying the same thing.
+    */
+  def runLoop(cfg: Config = Config(), iteration: Int = 1): LoopExit =
+    runGraph(LitterBox.shipped, cfg, iteration)
+
+  /** Runs exactly ONE `Node` against this world's scripted capabilities, the unit-test sibling of
+    * [[runGraph]]'s whole-graph run.
+    *
+    * Why it exists at all, given [[runGraph]] already runs a consumer's graph: a node author's first
+    * question about a node they just wrote is what THAT node does, and answering it through a graph
+    * means writing a `Workflow`, a literal `Shape` and a `LitterBox.graph` call around a single node,
+    * then reading its behaviour back out of an exit code that every other node on the walk also
+    * contributed to. Before this method the only way to step one node was `Runner.step` itself, which
+    * a consumer cannot call: it takes a `using Runner.Ledger` whose constructor is `private[litterbox]`
+    * (that type's own doc has why), so the call does not compile outside this package no matter what
+    * else the testkit exposes. This method lives inside `in.rcard.litterbox`, mints the ledger here,
+    * and hands back only numbers, so the blocker is removed without the boundary moving: nothing in
+    * the signature or the result names `Runner.Ledger`, and a consumer still cannot construct, receive
+    * or re-use one (`test/TestkitBoundarySpec.scala` pins that as a compile-time refusal).
+    *
+    * `Either[LoopExit, NodeRun[O]]`, the exact shape [[withFaulting]] already reports, rather than a
+    * bare `NodeRun[O]`: a node is free to `Fault.raise`, and a fault is not a value the node returns,
+    * it abandons the iteration at the boundary. `Left(exit)` is that abandonment, `Right` is a node
+    * that ran to a `NodeOutcome` of its own. Reusing the established shape rather than inventing a
+    * third one means a consumer who has seen this repo's own specs reads it without a second story,
+    * and `Runner.step`'s own routing (a node returning `Stopped(LoopExit.InfraFault)` directly is
+    * re-raised as a real fault) lands on the same side here as it does in a full run.
+    *
+    * `dispatchBudget` is a plain `Int`, the same name and the same meaning `LitterBox.graph`'s own
+    * parameter carries, so the number a consumer writes in their graph is the number they write here.
+    * It defaults to `1`, enough for one `Cost.OneDispatch` node to start and dispatch once, the
+    * commonest single-node case; `0` is what a test proving the budget-exhaustion park writes.
+    *
+    * There is no `iteration` parameter, unlike [[runGraph]]: the iteration number is something
+    * `Machine.runOnce` reports about a whole tick (the status stream, the branch name), and one node
+    * stepped on its own is not a tick.
+    */
+  def runNode[I, O](
+      node: Node[I, O],
+      input: I,
+      cfg: Config = Config(),
+      dispatchBudget: Int = 1
+  ): Either[LoopExit, NodeRun[O]] =
+    val ledger = Runner.Ledger(dispatchBudget)
+    val caps   = buildCaps(this).copy(cfg = cfg)
+    withFaulting:
+      val outcome = Runner.step(node, input)(using caps, summon[Faulting], ledger)
+      NodeRun(outcome, ledger.remainingDispatches)
 
 /** A `Clock` a test can script by hand. `nowMillis` answers each element of `answers` in turn, and
   * repeats the last one once exhausted, so a test only has to name as many readings as it cares

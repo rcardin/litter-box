@@ -5,7 +5,8 @@ on:
     branches: [main]
   pull_request:
 
-# Neither job below writes anything back (no push, no release, no registry, no PR comment), so both
+# No job below writes anything back (no push, no release, no registry, no PR comment; the `testkit`
+# job's `publish local` writes to the runner's own `~/.ivy2/local` and nowhere else), so all three
 # read contents only from the top rather than inheriting the repository default, which is commonly
 # read and write on contents and would hand that scope to the assembly smoke job's freshly built
 # binary for no reason it needs.
@@ -74,3 +75,45 @@ jobs:
           # real credential before Main.scala's preflight lets it reach its own dry-run stop
           # point, and faking either would not prove anything the in-memory test suite has not
           # already asserted.
+
+  testkit:
+    # The testkit artifact (issue #42) is `test/Recorder.scala` compiled ALONE against the published
+    # library, and `scala-cli test .` in the `test` job above cannot fail the way that compile can:
+    # inside the suite that file sits next to `src/` and next to scalatest, so an `org.scalatest`
+    # import, or a reference to a helper defined in some spec, would compile perfectly here and break
+    # only `release.yml`'s testkit publish. That is the one path in this whole pipeline with no retry,
+    # since Maven Central is immutable at a version. This job runs the release's own compile on every
+    # PR, where the fix is free.
+    #
+    # Its own job rather than a step bolted onto `test` or `assembly-smoke`: it needs neither's output
+    # and runs in parallel with both, so it costs wall clock nothing.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: coursier/setup-action@039f736548afa5411c1382f40a5bd9c2d30e0383 # v1.3.9
+        with:
+          jvm: temurin:21
+          apps: scala-cli
+
+      # The same commands `release.yml`'s publish job runs, minus the upload: stage the library into
+      # `~/.ivy2/local` (which scala-cli resolves by default), then publish the testkit there too,
+      # against it. `publish local` rather than `compile` for the testkit, for the reason that job
+      # states at more length: `compile` builds no doc jar, no sources jar and no pom and reads none
+      # of the metadata flags, so it would miss exactly the failures that are unrecoverable on a tag.
+      #
+      # Literally the same command, not a copy of it: `scripts/publish-testkit.sh` is the single
+      # definition of the testkit's flag set, called from here and from both halves of release.yml's
+      # publish job, so a flag added for the release is a flag this job exercises on every PR. Its
+      # header carries the reasoning, including why `--scala`/`--jvm` are read out of project.scala.
+      #
+      # `0.0.0-CI` rather than a real version, so nothing here can be mistaken for, or shadow, a
+      # version that was actually released; release.yml passes the tag instead.
+      - name: the testkit publishes standalone against the library
+        run: |
+          set -euo pipefail
+          scala-cli --power publish local . \
+            --organization in.rcard \
+            --name litter-box \
+            --project-version 0.0.0-CI
+          scripts/publish-testkit.sh local 0.0.0-CI

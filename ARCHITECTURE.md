@@ -25,7 +25,10 @@ The central split, and the reason the whole suite runs in memory:
 - `src/Live.scala` — every real side effect (`LiveGit`, `LiveGitHub`, `LiveGateRunner`,
   `LiveAgentDispatch`, `LiveProc`, ...). Handlers take dependencies as constructor params.
 - `test/Recorder.scala` — `TestWorld`, scripted in-memory handlers for every capability plus an
-  interaction recorder. Scenarios assert on both the outcome and the call sequence.
+  interaction recorder. Scenarios assert on both the outcome and the call sequence. Also the
+  published testkit artifact `in.rcard::litter-box-testkit` (issue #42), compiled standalone against
+  the library jar off the same tag, so a consumer tests their own graph the way this repo tests its
+  own; `TEST.md` has the constraint that follows from that.
 
 Adding behaviour that needs the outside world means adding a capability method in `Caps.scala`, a
 decision in `Machine.scala`, an implementation in `Live.scala`, and a script in `Recorder.scala`.
@@ -207,6 +210,28 @@ configuration**, so they live under `resources/` and travel inside the jar
   `given (using c: Caps): Config = c.cfg`), behind one plain top-level `val` standing for the node,
   never a `def` building a fresh `Node` per call. `src/LitterBox.scala`'s own doc on `LoopGraph` and
   `KitMacro.checkShapeImpl`'s own doc have the fuller reasoning.
+
+A tag publishes **two** Maven artifacts, not one (issue #42, RFC #26 decision 14). The library above,
+and `in.rcard::litter-box-testkit` (`LitterBox.TestkitCoordinate`), which is `test/Recorder.scala`
+compiled alone against the library and nothing else: `TestWorld`, `Script`, `FakeClock`, `buildCaps`,
+`withFaulting`, `NodeRun` (README's Testkit section narrows that to the part a consumer may rely on). A
+node author declares it as `test.dep` and drives their own graph through `TestWorld.runGraph`, or one
+node of it through `TestWorld.runNode`, with no Docker, no network and no credentials. `runNode` is why
+the artifact has to be compiled into `in.rcard.litterbox` rather than merely depend on it: stepping one
+node means calling `Runner.step`, whose `using Runner.Ledger` no consumer package can satisfy, and
+`runNode` makes that call on their behalf while passing only an `Int` in and an `Int` back out, so
+decision 9's "the runner owns the counter" survives the convenience.
+
+Two artifacts rather than a `testkit` package inside the library jar, and this is a security boundary
+rather than a packaging preference. `TestWorld` satisfies `AgentDispatchImpl` from inside
+`in.rcard.litterbox`, so `world.agents.review(...)` mints a genuine `AgentDispatch.Judged` out of a
+scripted fake, which then clears `Guard.RequiresReview` at both the `LitterBox.graph` macro and
+`Runner.step`'s runtime class check, because the token is real. There is no type level defence: a
+testkit that could not mint could not drive a review node, which is the thing a node author most needs
+to test. Artifact scoping is the whole control. `src/Caps.scala`'s `AgentDispatch` doc states the
+residual in full and `test/TestkitBoundarySpec.scala` reproduces it from a foreign package, so it
+fails the day the claim stops being true. `docs/maven-central-setup.md` covers the release mechanics,
+including why the testkit compiles against a locally staged library before anything reaches Central.
 
 ### The log contract
 

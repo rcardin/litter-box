@@ -144,6 +144,13 @@ jobs:
     # `init` scaffold names a coordinate that exists nowhere, and a consumer's first `scala-cli run`
     # dies at dependency resolution before compiling a line.
     #
+    # TWO artifacts since issue #42, off this one tag and at one version: the library
+    # `in.rcard::litter-box`, and the testkit `in.rcard::litter-box-testkit`
+    # (`LitterBox.TestkitCoordinate`), which is `test/Recorder.scala` compiled ALONE against the
+    # library. The testkit exposes the capability traits themselves, so it pairs with exactly the
+    # library version it was built against and the two must never be released apart. That is why it
+    # is published here, in the same job, rather than by anything with its own trigger.
+    #
     # `scala-cli publish`, not `sbt ci-release` (the sibling `yaes` project's route). project.scala
     # carries the reasoning; the short version is that this repository has no sbt build and must not
     # grow one. The four secrets are the same ones sbt-ci-release wants, under the same names.
@@ -166,14 +173,26 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    env:
+      # THE version this job publishes both artifacts at, read once, from the job that already
+      # refused a tag whose name disagreed with `LitterBox.Version`. Every command below spends
+      # `$VERSION`; none of them works out a version of its own.
+      #
+      # It was two derivations until issue #42's review: the library went out under scala-cli's
+      # `--compute-version git:tag`, the testkit under `${GITHUB_REF_NAME#v}`. Those two are not the
+      # same function of the repository state, and where they part company the testkit ships a
+      # `--dep` on a library version that was never published, at a coordinate Central is immutable
+      # at. Measured, not assumed: with `v0.2.0` and `v0.10.0` both on one commit, scala-cli 1.16.0's
+      # `git:tag` computes `0.2.0` whichever of the two was pushed, while `${GITHUB_REF_NAME#v}` is
+      # whichever one actually triggered the run, and `git describe --tags` at that same commit says
+      # `v0.10.0`, so all three disagree. On the ordinary one tag per commit release they agree, which
+      # is precisely why nothing would have caught this before a tag that did not.
+      VERSION: ${{ needs.build.outputs.version }}
     steps:
-      # `fetch-depth: 0` unlike every other checkout in this file: `//> using publish.computeVersion
-      # git:tag` reads the version out of the git history itself, and the default shallow, tagless
-      # checkout leaves it nothing to read, so the artifact would go out under a computed SNAPSHOT
-      # version instead of the tag's.
+      # A shallow checkout, like every other one in this file, now that no command in this job reads
+      # a version out of the git history. It was `fetch-depth: 0` for `--compute-version git:tag`
+      # alone, which needed the tags a shallow clone omits.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          fetch-depth: 0
 
       - uses: coursier/setup-action@039f736548afa5411c1382f40a5bd9c2d30e0383 # v1.3.9
         with:
@@ -203,7 +222,46 @@ jobs:
             exit 1
           fi
 
-      - name: publish to Maven Central
+      # Everything about the testkit publish that can fail WITHOUT the network, run before the
+      # irreversible step below rather than after it. Central is immutable: a tag that publishes the
+      # library and then dies compiling the testkit cannot be retried at the same version, and the
+      # only recovery is the Portal UI (see the asymmetry note above and docs/maven-central-setup.md).
+      # So the compile happens first, and what is left after the library goes out is an upload.
+      #
+      # The testkit depends on the library, and that dependency cannot come from Central during this
+      # job: the version this tag is publishing is not there yet, and waiting on Central propagation
+      # inside a release job is the kind of timing dependency that fails once a year for reasons
+      # nobody can reproduce afterwards. `publish local` stages the library into `~/.ivy2/local`,
+      # which scala-cli resolves by default, and the testkit compiles against THAT.
+      #
+      # "with the identical flag set" is literal: `scripts/publish-testkit.sh` is the one definition
+      # of the testkit publish, and all this call and the Central one below disagree about is `local`
+      # versus `central` and the credentials only an upload needs. The two used to be near identical
+      # fifteen flag blocks separated by fifty lines of comment, differing in a handful of tokens, so
+      # a dry run could pass while the upload it stood in for carried a different flag set entirely.
+      # The script's header also carries why `--scala`/`--jvm` are read out of project.scala by `sed`
+      # and why an EMPTY capture has to fail loudly rather than become scala-cli's own silent default.
+      #
+      # The pre-flight is `publish local`, not `compile`. `compile` builds no doc jar, no sources jar
+      # and no pom, and never touches the metadata flags, so a scaladoc error or a rejected flag in
+      # the testkit's own publish would sail past it and surface for the first time at the real
+      # publish, AFTER the library is on Central and the version is spent. Publishing the testkit to
+      # `~/.ivy2/local` with the identical flag set runs every one of those.
+      - name: stage the library locally and dry run the testkit publish against it
+        run: |
+          set -euo pipefail
+          # `set -u` fires on an UNSET variable, never on a set but empty one, and an empty
+          # `--project-version` is not rejected by scala-cli, it is replaced by a version of its own
+          # choosing. So the one value this whole job spends is checked here, in the step before the
+          # irreversible one, rather than discovered from the version a Central upload went out under.
+          : "${VERSION:?empty release version; needs.build.outputs.version produced nothing}"
+          scala-cli --power publish local . \
+            --organization in.rcard \
+            --name litter-box \
+            --project-version "$VERSION"
+          scripts/publish-testkit.sh local "$VERSION"
+
+      - name: publish the library and the testkit to Maven Central
         env:
           SONATYPE_USERNAME: ${{ secrets.SONATYPE_USERNAME }}
           SONATYPE_PASSWORD: ${{ secrets.SONATYPE_PASSWORD }}
@@ -243,15 +301,16 @@ jobs:
           # reached end of life on 30 June 2025. The aliases `central-legacy` and `central-s01` still
           # name those dead hosts; neither is what this project wants.
           #
-          # `--compute-version git:tag` reads the version out of the git history rather than taking
-          # it from a flag: the `build` job above already fails a tag whose name disagrees with
-          # `LitterBox.Version`, so the tag and that constant cannot describe different versions of
-          # one release, and passing an explicit `--version` here would be a third statement of the
-          # one fact, the first of the three to go stale.
+          # `--project-version "$VERSION"`, and the same `$VERSION` the step above staged and dry ran
+          # the testkit against: see this job's `env:` for why the library asking git for a version of
+          # its own was the one place the two artifacts of this release could disagree about what
+          # release they are. The `build` job is where the tag is checked against `LitterBox.Version`,
+          # so the value arriving here has already been made to agree with the binary's own copy of
+          # the fact.
           scala-cli --power publish . \
             --organization in.rcard \
             --name litter-box \
-            --compute-version git:tag \
+            --project-version "$VERSION" \
             --publish-repository central \
             --license MIT \
             --url https://github.com/rcardin/litter-box \
@@ -262,6 +321,25 @@ jobs:
             --password env:SONATYPE_PASSWORD \
             --secret-key env:PGP_SECRET_ARMORED \
             $args
+
+          # The testkit (issue #42), in the SAME step as the library above rather than one of its
+          # own: both publishes need the identical armored key and `$args`, and a second step would
+          # have to repeat all of that shell verbatim, which is the kind of duplicated release-only
+          # code nothing exercises until the day it is wrong. `$args` is passed through to the script
+          # for that same reason: whether a key with no passphrase gets `--secret-key-password` is
+          # one decision, taken once above, not one taken here and again inside the script.
+          #
+          # `$VERSION` again, the same value the library four lines up went out under and the same one
+          # the dry run in the step above rehearsed with, which is what makes that dry run a rehearsal
+          # of THIS call. The script pins both `--project-version` and the `--dep` on the library to
+          # it, so the testkit cannot name a library version this tag did not just publish: the
+          # pairing rule `LitterBox.TestkitCoordinate`'s scaladoc and README's Testkit section state.
+          #
+          # A version handed over as an argument rather than computed here also because an explicit
+          # file input moves scala-cli's project root to `test/`, and a version computed from git
+          # history relative to a root that is not the repository root is not a thing worth finding
+          # out about on an irretrievable path.
+          scripts/publish-testkit.sh central "$VERSION" $args
 
   image:
     # Gated on `build` and `smoke` rather than merely triggered alongside them: before this

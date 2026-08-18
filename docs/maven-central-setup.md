@@ -6,9 +6,56 @@ on every `v*` tag. That coordinate is not decoration: `litter-box init` scaffold
 release whose library never reached Central hands every new consumer a launcher that dies at
 dependency resolution before compiling a line.
 
+Since issue #42 that job pushes a **second artifact** off the same tag, `in.rcard::litter-box-testkit`
+(`LitterBox.TestkitCoordinate`): `test/Recorder.scala`, the scripted in-memory capabilities this
+repository tests itself with, so a consumer authoring their own node can test it the same way. There
+is one manual step behind it, the namespace below, and it is already done: both artifacts sit under
+`in.rcard`, so nothing about Sonatype setup differs for the second one.
+
 The namespace, the account and the four secrets the job authenticates with are manual, one time
 steps a workflow cannot do for itself. They are done for `rcardin/litter-box` itself; this document
 is what you follow to stand the same thing up in a fork.
+
+## The two artifacts
+
+| Artifact | Built from | Consumer declares it as |
+| --- | --- | --- |
+| `in.rcard::litter-box` | the whole project (`.`), with `resources/` | `//> using dep` |
+| `in.rcard::litter-box-testkit` | `test/Recorder.scala`, passed as an explicit file input | `//> using test.dep` |
+
+The testkit is compiled ALONE, not as part of the project build, and that is load bearing in three
+ways. An explicit file input makes that file's own directory the project root, so the root
+`project.scala` is never read: the testkit jar carries none of the library's resources and none of
+the library's own classes. What it does carry is what `test/Recorder.scala` declares: `TestWorld`,
+`Script`, `FakeClock`, `buildCaps` and `withFaulting`. The scala version and JVM that
+`project.scala` would have supplied are read out of it by `sed` in `scripts/publish-testkit.sh` and
+handed over as `--scala`/`--jvm`, so the two cannot drift. And the fakes stay OUT of the library
+jar, which is the whole reason for a second artifact rather than a directory in `src/`: `TestWorld`
+can mint a genuine `AgentDispatch.Judged` from a scripted fake, and the only control over that is
+which classpath it lands on. See `src/Caps.scala`'s `AgentDispatch` scaladoc, and README's Testkit
+section for the `test.dep`, never `dep` rule a consumer has to follow.
+
+The testkit depends on the library at exactly the version being released. During the job that
+dependency cannot come from Central, since the version is not there yet, so the `publish` job stages
+the library into `~/.ivy2/local` (which scala-cli resolves by default) and builds the testkit against
+that. Two consequences worth knowing:
+
+- That staging step **publishes the testkit locally too**, with the identical flag set the Central
+  publish uses, deliberately before the Central publish rather than after. Identical is literal:
+  every testkit publish in this repository, this one, the Central one below and `ci.yml`'s, is a
+  call to `scripts/publish-testkit.sh <local|central> <version>`, which states that flag set once
+  and takes as arguments only what genuinely differs, where the artifact lands and at which version.
+  Central is immutable, so everything that can fail without the network is moved in front of the
+  irreversible step, and the only thing left after the library upload is the upload itself. It is
+  `publish local` and not `compile` on purpose: `compile` builds no doc jar, no sources jar and no
+  pom, and reads none of the metadata flags, so a scaladoc error or a rejected flag would sail past
+  it and surface for the first time after the library had already spent the version.
+  `.github/workflows/ci.yml`'s `testkit` job runs the same pair on every PR, which is where a
+  scalatest import creeping into `test/Recorder.scala` is supposed to be caught, since it would
+  break nothing else.
+- The release is still **not atomic across the two artifacts**. The library uploads first. A failure
+  between the two leaves a published library and no testkit at that version, and the version cannot
+  be reused. See the failure table below; the recovery is the same one, a new tag.
 
 ## Why `scala-cli publish` and not sbt-ci-release
 
@@ -23,8 +70,9 @@ divergence would ship rather than fail.
 
 Everything sbt-ci-release contributes is a flag here instead. The publishing metadata Central
 requires (organization, name, license, url, vcs, description, developer), the target repository, the
-version computation, the credentials and the signing key are all arguments to the single
-`scala-cli publish` invocation in that job.
+version computation, the credentials and the signing key are all arguments to a `scala-cli publish`
+invocation: the library's, written out in that job, and the testkit's, written out once in
+`scripts/publish-testkit.sh` and called from it.
 
 That is worth one note, because `project.scala` is where a reader would expect to find at least the
 metadata, as `//> using publish.*` directives. Those directives are still marked experimental by
@@ -32,7 +80,7 @@ scala-cli, and an experimental directive fails any invocation that does not pass
 Directives are read on every command, not only on `publish`, so a single `//> using publish.name` in
 `project.scala` makes plain `scala-cli test .` fail with `directive is experimental`, taking the
 `build` job, `ci.yml` and the command CLAUDE.md documents down with it. The flags cost nothing
-anywhere else, so the configuration lives entirely in the job that uses it.
+anywhere else, so the configuration lives entirely in the job and the script that run the publish.
 
 ## 1. Claim the `in.rcard` namespace
 
@@ -40,10 +88,10 @@ Sign in at <https://central.sonatype.com> and verify the `in.rcard` namespace. V
 domain-shaped namespace is a DNS TXT record on `rcard.in`; Sonatype's UI tells you the exact token
 to publish. A namespace stays verified once done, so this is genuinely a one time step.
 
-If you are working in a fork under a namespace you do not own, the `--organization` flag in the
-`publish` job and `LitterBox.Coordinate` in `src/LitterBox.scala` both have to change, and
-`InitSpec` asserts the scaffold against the constant rather than a literal, so the scaffold follows
-automatically.
+If you are working in a fork under a namespace you do not own, every `--organization` flag (the
+`publish` job's, `ci.yml`'s `testkit` job's, and `scripts/publish-testkit.sh`'s) and
+`LitterBox.Coordinate` in `src/LitterBox.scala` have to change, and `InitSpec` asserts the scaffold
+against the constant rather than a literal, so the scaffold follows automatically.
 
 ## 2. Generate a Central Portal user token
 
@@ -52,8 +100,9 @@ credentials. Store them as the repository secrets `SONATYPE_USERNAME` and `SONAT
 
 These are Central Portal tokens, not the old OSSRH ones. OSSRH reached end of life on 30 June 2025
 and `oss.sonatype.org` no longer accepts deployments; a token minted before the migration will fail
-authentication. The job passes `--publish-repository central`, which since scala-cli
-1.8.4 resolves to the Portal's OSSRH Staging API at `https://ossrh-staging-api.central.sonatype.com`.
+authentication. Both publishes pass `--publish-repository central`, the library's in the job and the
+testkit's from `scripts/publish-testkit.sh`'s `central` mode, and since scala-cli 1.8.4 that alias
+resolves to the Portal's OSSRH Staging API at `https://ossrh-staging-api.central.sonatype.com`.
 The aliases `central-legacy` and `central-s01` still name the dead hosts, so neither is what this
 project wants.
 
@@ -101,6 +150,13 @@ version is rejected. The failure modes divide cleanly:
   genuine re-run.
 - **Already published.** The version is permanent. Bump `LitterBox.Version`, delete nothing, and cut
   a new tag.
+- **The library published and the testkit did not.** Both artifacts go out of one step, library
+  first, so this is the one partial state the two-artifact release can end in. The library at that
+  version is permanent and correct; the testkit at that version does not exist and cannot be added,
+  since a re-run would be rejected on the library. Bump `LitterBox.Version` and cut a new tag, which
+  republishes both. Do not hand-upload a testkit at the orphaned version: the pairing rule
+  (`LitterBox.TestkitCoordinate`'s scaladoc) is that the two are built together from one tag, and a
+  testkit that reached Central by another route is a testkit nothing checked against its library.
 
 `release` and `formula` both wait on `publish`, so a Central failure stops the GitHub release and
 the Homebrew formula too. That is deliberate, and it is the same rule `image` follows: everything cut
