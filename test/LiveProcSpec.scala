@@ -389,7 +389,8 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
       iterTimeout = 5,
       implCmd = Some("echo hello patch > \"$PATCH_OUT\""),
       fixCmd = None,
-      reviewCmd = None
+      reviewCmd = None,
+      models = AgentModels() // no role configured: this case drives a stub seam
     )
 
     val outcome = dispatch.worker(
@@ -415,7 +416,8 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
         iterTimeout = 5,
         implCmd = Some("exit 124"),
         fixCmd = None,
-        reviewCmd = None
+        reviewCmd = None,
+        models = AgentModels() // no role configured: this case drives a stub seam
       )
 
     dispatch.worker(
@@ -438,7 +440,8 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
         iterTimeout = 5,
         implCmd = Some("exit 7"),
         fixCmd = None,
-        reviewCmd = None
+        reviewCmd = None,
+        models = AgentModels() // no role configured: this case drives a stub seam
       )
 
     dispatch.worker(
@@ -460,7 +463,8 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
       iterTimeout = 5,
       implCmd = Some("exit 1"), // would fold to Done too, but must not be the one that runs
       fixCmd = Some("echo fix patch > \"$PATCH_OUT\""),
-      reviewCmd = None
+      reviewCmd = None,
+      models = AgentModels() // no role configured: this case drives a stub seam
     )
 
     dispatch.worker(
@@ -483,7 +487,8 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
       iterTimeout = 5,
       implCmd = Some("echo worker-stdout; echo worker-stderr 1>&2"),
       fixCmd = None,
-      reviewCmd = None
+      reviewCmd = None,
+      models = AgentModels() // no role configured: this case drives a stub seam
     )
 
     dispatch.worker(
@@ -512,7 +517,8 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
         iterTimeout = 5,
         implCmd = Some("true"),
         fixCmd = None,
-        reviewCmd = None
+        reviewCmd = None,
+        models = AgentModels() // no role configured: this case drives a stub seam
       )
 
     val lines = captureLogLines {
@@ -540,7 +546,8 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
       iterTimeout = 5,
       implCmd = None,
       fixCmd = None,
-      reviewCmd = Some("echo VERDICT: APPROVE; echo diagnostic 1>&2")
+      reviewCmd = Some("echo VERDICT: APPROVE; echo diagnostic 1>&2"),
+      models = AgentModels() // no role configured: this case drives a stub seam
     )
 
     val outcome = dispatch.review("the prompt (unused by the stub)", "logs/r.md")
@@ -563,7 +570,8 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
         iterTimeout = 5,
         implCmd = None,
         fixCmd = None,
-        reviewCmd = Some("true")
+        reviewCmd = Some("true"),
+        models = AgentModels() // no role configured: this case drives a stub seam
       )
 
     val lines = captureLogLines { dispatch.review("prompt", "logs/issue-999-review.md") }
@@ -584,7 +592,8 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
         iterTimeout = 5,
         implCmd = None,
         fixCmd = None,
-        reviewCmd = Some("exit 124")
+        reviewCmd = Some("exit 124"),
+        models = AgentModels() // no role configured: this case drives a stub seam
       )
 
     dispatch.review("prompt", "logs/r.md").value shouldBe DispatchOutcome.Done
@@ -739,6 +748,36 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
 
     readString(root.resolve("logs/i.patch")).strip shouldBe "MODEL=[<absent>]"
     readString(root.resolve("logs/r.md")).strip shouldBe "MODEL=[<absent>]"
+  }
+
+  /** The compile time half of the issue #73 review thread on `Main.liveAgentDispatch`. A test that
+    * calls `Main.liveAgentDispatch` proves that ONE function threads `parsed.cfg.models` through; it
+    * cannot prove that production still goes through that function, so a rewrite inlining the
+    * constructor back into `runLoop`'s `given` block would drop the model and leave the suite green.
+    * `models` therefore has no default: every construction site has to name it, and the only way to
+    * lose the model in production is now to write `AgentModels()` at the call site on purpose.
+    * This pins that, because a default is one keystroke to reintroduce and nothing else would notice.
+    */
+  "LiveAgentDispatch's models parameter" should "have no default, so no call site can omit it" in {
+    val errors = scala.compiletime.testing.typeCheckErrors(
+      """
+        |import in.rcard.litterbox.*
+        |import java.nio.file.Paths
+        |
+        |LiveAgentDispatch(
+        |  Paths.get("."),
+        |  sandboxDir = Paths.get("."),
+        |  timeoutBin = None,
+        |  iterTimeout = 5,
+        |  implCmd = None,
+        |  fixCmd = None,
+        |  reviewCmd = None
+        |)
+        |""".stripMargin
+    )
+
+    errors should not be empty
+    errors.map(_.message).mkString("\n") should include("models")
   }
 
   // =============================================================================================

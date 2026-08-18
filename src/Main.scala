@@ -623,12 +623,14 @@ object Main:
 
   /** The one production line that carries a parsed `agent.model.*` config into the dispatch that
     * acts on it (issue #73's review thread on this constructor call). Pulled out of `runLoop`'s
-    * `given` block into its own named, testable function because `LiveAgentDispatch.models` carries
-    * a default: every sibling argument here is a compile error to drop, so `models` is the one that
-    * could silently vanish under a rewrite of that block with the suite staying green. A unit test
-    * cannot reach into `runLoop` itself, gated as it is behind PATH probes, the Docker preflight and
-    * `sys.exit`, but it can call this function directly and observe the model actually reaching a
-    * dispatch, which is what keeps this join compiler-adjacent instead of convention-only.
+    * `given` block into its own named function because `runLoop` cannot be reached from a unit test,
+    * gated as it is behind PATH probes, the Docker preflight and `sys.exit`, while this function can
+    * be called directly and the model observed actually reaching a dispatch.
+    *
+    * What the test here CANNOT prove is that production still comes through this function, so the
+    * other half of the guarantee lives in `LiveAgentDispatch` itself: `models` has no default, which
+    * makes an inlined rewrite of the `given` block that forgets the config a compile error rather
+    * than a silently model-less loop.
     */
   private[litterbox] def liveAgentDispatch(
       parsed: ParsedEnv,

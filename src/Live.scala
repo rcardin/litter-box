@@ -600,6 +600,13 @@ object LiveGateRunner:
   * own exit code. This is bash's OWN asymmetry with the worker stub path (loop.sh: 314-317: a
   * review stub cannot simulate a reviewer timeout at all in the current suite), not something this
   * port introduced. Preserved verbatim, not "fixed" into worker-like rc-124 propagation.
+  *
+  * `models` carries no default on purpose (issue #73's review thread on the `Main` call site).
+  * Every other constructor argument is a compile error to drop, so a defaulted `models` would have
+  * been the one join a rewrite could silently lose: production would fall back to "no model for any
+  * role", the loop would keep dispatching, and no test that constructs this class itself would
+  * notice. Requiring it means the only way to dispatch with no model is to write `AgentModels()` at
+  * the call site, which is a decision a reader can see.
   */
 final class LiveAgentDispatch private[litterbox] (
     root: Path,
@@ -609,7 +616,7 @@ final class LiveAgentDispatch private[litterbox] (
     implCmd: Option[String],
     fixCmd: Option[String],
     reviewCmd: Option[String],
-    models: AgentModels = AgentModels()
+    models: AgentModels
 ) extends AgentDispatchImpl:
 
   // "" means unset, folded once on the way in (LiveProc.seam).
