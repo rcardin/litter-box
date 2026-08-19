@@ -22,6 +22,31 @@ import java.nio.file.{Files, Path}
   */
 class SettingsSpec extends AnyFlatSpec with Matchers:
 
+  /** `Settings.parse` is a `Left` on a model name no `AgentModel` case carries (issue #73), so every
+    * case below that is about a config which PARSES unwraps here rather than at each call site. A
+    * config that does not parse is a test failure with the message an operator would have seen.
+    */
+  private def parseOk(conf: com.typesafe.config.Config): Config =
+    Settings.parse(conf).fold(msg => fail(s"expected a parseable config, got: $msg"), identity)
+
+  /** `Main.parseEnv` is a `Left` on a `*_MODEL` variable naming no model (issue #73). Same unwrap,
+    * same reason, as `parseOk`: these cases are about the layering, not about a rejected name.
+    */
+  private def parseEnvOk(
+      fromFile: com.typesafe.config.Config,
+      env: Map[String, String]
+  ): Main.ParsedEnv =
+    Main.parseEnv(fromFile, env).fold(msg => fail(s"expected a parseable env, got: $msg"), identity)
+
+  private def parseEnvOk(
+      fromFile: com.typesafe.config.Config,
+      env: Map[String, String],
+      ambient: Map[String, String]
+  ): Main.ParsedEnv =
+    Main
+      .parseEnv(fromFile, env, ambient)
+      .fold(msg => fail(s"expected a parseable env, got: $msg"), identity)
+
   private def tempRoot(): Path = Files.createTempDirectory("settings-spec")
 
   private def readString(p: Path): String =
@@ -55,7 +80,7 @@ class SettingsSpec extends AnyFlatSpec with Matchers:
       |""".stripMargin
 
   private def nonDefaultConfig: Config =
-    Settings.parse(ConfigFactory.parseString(nonDefaultHocon).withFallback(Settings.referenceOnly))
+    parseOk(ConfigFactory.parseString(nonDefaultHocon).withFallback(Settings.referenceOnly))
 
   // ===============================================================================================
   // 1. Reference text vs case-class defaults
@@ -69,8 +94,8 @@ class SettingsSpec extends AnyFlatSpec with Matchers:
     * through the file) and every hand-built test fixture would disagree about the same knob. This
     * assertion is the only thing that notices.
     */
-  "Settings.parse(referenceOnly)" should "equal Config()'s own case-class defaults, key for key" in {
-    Settings.parse(Settings.referenceOnly) shouldBe Config()
+  "parseOk(referenceOnly)" should "equal Config()'s own case-class defaults, key for key" in {
+    parseOk(Settings.referenceOnly) shouldBe Config()
   }
 
   // ===============================================================================================
@@ -89,7 +114,7 @@ class SettingsSpec extends AnyFlatSpec with Matchers:
         |""".stripMargin
     )
 
-    val cfg = Settings.parse(partial.withFallback(Settings.referenceOnly))
+    val cfg = parseOk(partial.withFallback(Settings.referenceOnly))
 
     cfg.logDir shouldBe "build/loop-logs"
     cfg.repairBudget shouldBe 5
@@ -127,6 +152,133 @@ class SettingsSpec extends AnyFlatSpec with Matchers:
   }
 
   // ===============================================================================================
+  // 2b. agent.model: three independently optional keys
+  // ===============================================================================================
+
+  /** Why the three model keys are asserted one at a time rather than as a block: a consumer picking
+    * a cheap fixer while leaving the implementer and the reviewer on whatever the CLI defaults to is
+    * the shape issue #73 exists for, and an all-or-nothing block would silently unset the other two
+    * the moment the file mentions the block at all. That is the same trap `protect` documents, one
+    * level down.
+    */
+  "a config file naming one agent model" should "leave the other two roles unset" in {
+    val partial = ConfigFactory.parseString(
+      """agent.model.fix = "haiku"
+        |""".stripMargin
+    )
+
+    val cfg = parseOk(partial.withFallback(Settings.referenceOnly))
+
+    cfg.models shouldBe AgentModels(fix = Some(ClaudeModel.Haiku))
+  }
+
+  it should "read all three when the file names all three" in {
+    val partial = ConfigFactory.parseString(
+      """agent.model { impl = "opus", fix = "haiku", review = "sonnet" }
+        |""".stripMargin
+    )
+
+    val cfg = parseOk(partial.withFallback(Settings.referenceOnly))
+
+    cfg.models shouldBe AgentModels(
+      impl = Some(ClaudeModel.Opus),
+      fix = Some(ClaudeModel.Haiku),
+      review = Some(ClaudeModel.Sonnet)
+    )
+  }
+
+  it should "leave every role unset when the file mentions no agent.model key at all" in {
+    parseOk(Settings.referenceOnly).models shouldBe AgentModels()
+  }
+
+  /** The four names an operator may write, and the ids those names dispatch on. Pinned as a pair
+    * because the two answer different questions and both are load bearing: `configName` is the
+    * spelling `.litter-box/config.conf` and the README promise, so changing one silently breaks
+    * every consumer config that used it, while `id` is what reaches the CLI inside the container,
+    * so changing one silently moves what a run costs and what it produces.
+    *
+    * Every id is a FULL model id rather than a family alias like `opus`, which is the property this
+    * asserts and the reason a case exists per family at all: an alias would float to whatever that
+    * family's latest release is, so the same commit would dispatch differently from one week to the
+    * next with nothing recording the move.
+    */
+  "ClaudeModel" should "name each family once and dispatch it on a pinned full model id" in {
+    ClaudeModel.values.map(m => m.configName -> m.id).toList shouldBe List(
+      "haiku"  -> "claude-haiku-4-5",
+      "sonnet" -> "claude-sonnet-5",
+      "opus"   -> "claude-opus-5",
+      "fable"  -> "claude-fable-5"
+    )
+  }
+
+  /** The spellings have to stay unique across every provider, not just within one enum, because
+    * `.litter-box/config.conf` names a model BARE (`fix = "haiku"`) with no provider prefix. The day
+    * a second provider's enum joins `AgentModel.values` a collision would make one of the two
+    * unreachable through the config file, silently, and this is what says so first.
+    */
+  it should "spell every model distinctly across every provider in AgentModel.values" in {
+    val names = AgentModel.values.map(_.configName)
+    names.distinct should have size names.size
+  }
+
+  "AgentModel.parse" should "accept every model's own config spelling, whatever its case" in {
+    AgentModel.values.foreach { m =>
+      AgentModel.parse(m.configName) shouldBe Right(m)
+      AgentModel.parse(m.configName.toUpperCase) shouldBe Right(m)
+      AgentModel.parse(s"  ${m.configName}  ") shouldBe Right(m)
+    }
+  }
+
+  /** The message is the whole point of failing rather than defaulting: the operator is told what
+    * they may write instead. A bare "unknown model" would leave them guessing at exactly the key,
+    * `agent.model.review`, whose mistake nothing downstream can report.
+    */
+  it should "be a Left naming every valid spelling when the name is not one of them" in {
+    val result = AgentModel.parse("opuss")
+
+    result.isLeft shouldBe true
+    val msg = result.swap.getOrElse("")
+    msg should include("opuss")
+    AgentModel.values.foreach(m => msg should include(m.configName))
+  }
+
+  /** A typo in the config file stops the run, and the message names WHICH of the three keys carries
+    * it: a file may set all three, and "unknown model" alone would send the operator looking at all
+    * of them. The alternative to failing is a dispatch on the CLI's default, which on `review` is
+    * the one downgrade the loop can never notice (see `AgentModels`).
+    */
+  "a config file naming a model no case carries" should "be a Left naming the key and the run's options" in {
+    val partial = ConfigFactory.parseString("""agent.model.review = "gpt-4"""")
+
+    val result = Settings.parse(partial.withFallback(Settings.referenceOnly))
+
+    result.isLeft shouldBe true
+    val msg = result.swap.getOrElse("")
+    msg should include("agent.model.review")
+    msg should include("gpt-4")
+    msg should include("opus")
+  }
+
+  /** An override that named nothing must fail rather than fall through to the file's answer. Silently
+    * losing looks, from the operator's side, exactly like never being read: they would watch a run
+    * they believe is on the model they exported, and the recorded evidence would agree with the file
+    * instead. Asserted with the file naming a VALID model for the same role, since that is the case
+    * a fall-through would hide.
+    */
+  "an env var naming a model no case carries" should "be a Left even when the file names a valid one" in {
+    val fromFile = ConfigFactory
+      .parseString("""agent.model.impl = "opus"""")
+      .withFallback(Settings.referenceOnly)
+
+    val result = Main.parseEnv(fromFile, Map("IMPL_MODEL" -> "opuss"))
+
+    result.isLeft shouldBe true
+    val msg = result.swap.getOrElse("")
+    msg should include("IMPL_MODEL")
+    msg should include("opuss")
+  }
+
+  // ===============================================================================================
   // 3. Missing config file
   // ===============================================================================================
 
@@ -158,7 +310,7 @@ class SettingsSpec extends AnyFlatSpec with Matchers:
     Files.createDirectories(file.getParent)
     Files.write(file, """instance-name = "other"""".getBytes(StandardCharsets.UTF_8))
 
-    val cfg = Settings.parse(Settings.loadFile(root).getOrElse(fail("expected a Right")))
+    val cfg = parseOk(Settings.loadFile(root).getOrElse(fail("expected a Right")))
 
     cfg.instanceName shouldBe "other"
     cfg.stopFile shouldBe "STOP.md" // came off the reference, so the merge really happened
@@ -176,7 +328,7 @@ class SettingsSpec extends AnyFlatSpec with Matchers:
   "Main.parseEnv" should "let an env var win over the config file, key by key" in {
     val fromFile = ConfigFactory.parseString(nonDefaultHocon).withFallback(Settings.referenceOnly)
 
-    val parsed = Main.parseEnv(
+    val parsed = parseEnvOk(
       fromFile,
       Map(
         "GATE_CMD"      -> "sbt scalafmtCheckAll",
@@ -213,12 +365,41 @@ class SettingsSpec extends AnyFlatSpec with Matchers:
   it should "leave every file value untouched when the env map is empty" in {
     val fromFile = ConfigFactory.parseString(nonDefaultHocon).withFallback(Settings.referenceOnly)
 
-    val parsed = Main.parseEnv(fromFile, Map.empty)
+    val parsed = parseEnvOk(fromFile, Map.empty)
 
     parsed.cfg shouldBe nonDefaultConfig
     parsed.gateOverridden shouldBe false
     parsed.cfg.dryRun shouldBe false
     parsed.cfg.ciWaitCmd shouldBe None
+  }
+
+  /** The three model keys are layered one at a time for the same reason the file half is read one at
+    * a time: an operator raising the fixer to a stronger model for one run must not silently unset
+    * the implementer and the reviewer their config already names. The empty `REVIEW_MODEL` here is
+    * the project's existing rule about an exported empty value, not a fourth case: it shadows
+    * nothing, exactly as an unset variable does.
+    */
+  it should "layer an env override over each agent model independently" in {
+    val fromFile = ConfigFactory
+      .parseString(
+        """agent.model { impl = "opus", fix = "sonnet", review = "opus" }
+          |""".stripMargin
+      )
+      .withFallback(Settings.referenceOnly)
+
+    val parsed = parseEnvOk(fromFile, Map("FIX_MODEL" -> "haiku", "REVIEW_MODEL" -> ""))
+
+    parsed.cfg.models shouldBe AgentModels(
+      impl = Some(ClaudeModel.Opus),
+      fix = Some(ClaudeModel.Haiku),
+      review = Some(ClaudeModel.Opus)
+    )
+  }
+
+  it should "leave a role unset when neither the file nor the environment names a model" in {
+    val parsed = parseEnvOk(Settings.referenceOnly, Map("IMPL_MODEL" -> "opus"))
+
+    parsed.cfg.models shouldBe AgentModels(impl = Some(ClaudeModel.Opus))
   }
 
   // ===============================================================================================
@@ -285,7 +466,7 @@ class SettingsSpec extends AnyFlatSpec with Matchers:
     * own secrets and nothing of the loop's — and the assertion is that it cannot open that door.
     */
   it should "protect .litter-box even when the consumer list omits it entirely" in {
-    val cfg = Settings.parse(
+    val cfg = parseOk(
       ConfigFactory
         .parseString("""protect = ["secrets/**"]""")
         .withFallback(Settings.referenceOnly)
@@ -304,7 +485,7 @@ class SettingsSpec extends AnyFlatSpec with Matchers:
     * `.github` entry twice invites someone to "fix" it by dropping the floor.
     */
   it should "not duplicate an entry the consumer already names" in {
-    val cfg = Settings.parse(
+    val cfg = parseOk(
       ConfigFactory
         .parseString("""protect = [".github/**", "secrets/**"]""")
         .withFallback(Settings.referenceOnly)
@@ -717,7 +898,7 @@ class SettingsSpec extends AnyFlatSpec with Matchers:
     Settings.omitsGateSandboxed(root) shouldBe true
     // And the value it inherits really is the container, so the warning is about a flip that
     // happens rather than about one that might.
-    val merged = Settings.parse(Settings.loadFile(root).getOrElse(fail("expected a Right")))
+    val merged = parseOk(Settings.loadFile(root).getOrElse(fail("expected a Right")))
     merged.gateSandboxed shouldBe true
   }
 

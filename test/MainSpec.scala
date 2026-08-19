@@ -3,6 +3,8 @@ package in.rcard.litterbox
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 
+import java.nio.charset.StandardCharsets
+import java.nio.file.attribute.PosixFilePermissions
 import java.nio.file.{Files, Path, Paths}
 
 /** Unit tests for the pure parts of `Main`: env parsing (Part C) and the driver's rc ->
@@ -18,12 +20,30 @@ import java.nio.file.{Files, Path, Paths}
   */
 class MainSpec extends AnyFlatSpec with Matchers:
 
+  /** `Main.parseEnv` is a `Left` on a `*_MODEL` variable naming no model (issue #73). Same unwrap,
+    * same reason, as `parseOk`: these cases are about the layering, not about a rejected name.
+    */
+  private def parseEnvOk(
+      fromFile: com.typesafe.config.Config,
+      env: Map[String, String]
+  ): Main.ParsedEnv =
+    Main.parseEnv(fromFile, env).fold(msg => fail(s"expected a parseable env, got: $msg"), identity)
+
+  private def parseEnvOk(
+      fromFile: com.typesafe.config.Config,
+      env: Map[String, String],
+      ambient: Map[String, String]
+  ): Main.ParsedEnv =
+    Main
+      .parseEnv(fromFile, env, ambient)
+      .fold(msg => fail(s"expected a parseable env, got: $msg"), identity)
+
   // ===============================================================================================
   // Part C: parseEnv
   // ===============================================================================================
 
   "parseEnv" should "produce every bash default (loop.sh:100-139) from an empty env map" in {
-    val parsed = Main.parseEnv(Settings.referenceOnly, Map.empty)
+    val parsed = parseEnvOk(Settings.referenceOnly, Map.empty)
 
     parsed.cfg.dryRun shouldBe false
     parsed.cfg.repairBudget shouldBe 2
@@ -60,7 +80,7 @@ class MainSpec extends AnyFlatSpec with Matchers:
       "NTFY_TOPIC"    -> "some-topic"
     )
 
-    val parsed = Main.parseEnv(Settings.referenceOnly, env)
+    val parsed = parseEnvOk(Settings.referenceOnly, env)
 
     parsed.cfg.gateCmd shouldBe "stub-gate"
     parsed.cfg.ciWaitCmd shouldBe Some("stub-ci-wait")
@@ -75,7 +95,7 @@ class MainSpec extends AnyFlatSpec with Matchers:
   }
 
   it should "treat an empty-string seam as unset (None), matching bash's [[ -n ]] test" in {
-    val parsed = Main.parseEnv(Settings.referenceOnly, Map("IMPL_CMD" -> "", "CI_WAIT_CMD" -> ""))
+    val parsed = parseEnvOk(Settings.referenceOnly, Map("IMPL_CMD" -> "", "CI_WAIT_CMD" -> ""))
 
     parsed.implCmd shouldBe None
     parsed.cfg.ciWaitCmd shouldBe None
@@ -83,7 +103,7 @@ class MainSpec extends AnyFlatSpec with Matchers:
 
   it should "flip gateOverridden even when GATE_CMD is set to its own default value" in {
     val parsed =
-      Main.parseEnv(Settings.referenceOnly, Map("GATE_CMD" -> "sbt -Werror compile test"))
+      parseEnvOk(Settings.referenceOnly, Map("GATE_CMD" -> "sbt -Werror compile test"))
 
     parsed.gateOverridden shouldBe true
     parsed.cfg.gateCmd shouldBe "sbt -Werror compile test"
@@ -99,7 +119,7 @@ class MainSpec extends AnyFlatSpec with Matchers:
     val ambient = Map.empty[String, String]
     val layered = Main.layerDotEnv(dotEnv = Map("GATE_CMD" -> "true"), ambient = ambient)
 
-    val parsed = Main.parseEnv(Settings.referenceOnly, layered.effective, ambient)
+    val parsed = parseEnvOk(Settings.referenceOnly, layered.effective, ambient)
 
     parsed.gateOverridden shouldBe false
     // The value still lands, and still runs sandboxed: a `.env` gate command is a configured gate,
@@ -112,7 +132,7 @@ class MainSpec extends AnyFlatSpec with Matchers:
     val ambient = Map("GATE_CMD" -> "true")
     val layered = Main.layerDotEnv(dotEnv = Map.empty, ambient = ambient)
 
-    val parsed = Main.parseEnv(Settings.referenceOnly, layered.effective, ambient)
+    val parsed = parseEnvOk(Settings.referenceOnly, layered.effective, ambient)
 
     parsed.gateOverridden shouldBe true
     parsed.cfg.gateSandboxed shouldBe false
@@ -122,22 +142,19 @@ class MainSpec extends AnyFlatSpec with Matchers:
     // The override already skips the sandbox preflight (Main step 6b), so the image the command
     // would run in is never built. Honouring `sandboxed = true` here would hand the operator's
     // command to a container that does not exist.
-    Main.parseEnv(Settings.referenceOnly, Map.empty).cfg.gateSandboxed shouldBe true
-    Main
-      .parseEnv(Settings.referenceOnly, Map("GATE_CMD" -> "true"))
-      .cfg
-      .gateSandboxed shouldBe false
+    parseEnvOk(Settings.referenceOnly, Map.empty).cfg.gateSandboxed shouldBe true
+    parseEnvOk(Settings.referenceOnly, Map("GATE_CMD" -> "true")).cfg.gateSandboxed shouldBe false
   }
 
   it should "parse DRY_RUN=1 as true, and treat 0 / absent / any other string as false" in {
-    Main.parseEnv(Settings.referenceOnly, Map("DRY_RUN" -> "1")).cfg.dryRun shouldBe true
-    Main.parseEnv(Settings.referenceOnly, Map("DRY_RUN" -> "0")).cfg.dryRun shouldBe false
-    Main.parseEnv(Settings.referenceOnly, Map.empty).cfg.dryRun shouldBe false
-    Main.parseEnv(Settings.referenceOnly, Map("DRY_RUN" -> "true")).cfg.dryRun shouldBe false
+    parseEnvOk(Settings.referenceOnly, Map("DRY_RUN" -> "1")).cfg.dryRun shouldBe true
+    parseEnvOk(Settings.referenceOnly, Map("DRY_RUN" -> "0")).cfg.dryRun shouldBe false
+    parseEnvOk(Settings.referenceOnly, Map.empty).cfg.dryRun shouldBe false
+    parseEnvOk(Settings.referenceOnly, Map("DRY_RUN" -> "true")).cfg.dryRun shouldBe false
   }
 
   it should "parse numeric overrides" in {
-    val parsed = Main.parseEnv(Settings.referenceOnly, 
+    val parsed = parseEnvOk(Settings.referenceOnly, 
       Map(
         "MAX_ITERS"          -> "5",
         "ITER_TIMEOUT"       -> "60",
@@ -628,4 +645,52 @@ class MainSpec extends AnyFlatSpec with Matchers:
     // An empty string argument is not the same thing as no argument: the scripts default the path
     // themselves, and only an absent one lets them.
     child.command shouldBe List(scripts.resolve("watch.sh").toString)
+  }
+
+  // ===============================================================================================
+  // liveAgentDispatch: the parsed `agent.model.*` config -> the constructed dispatch (issue #73's
+  // review thread on this join). `runLoop` itself cannot be reached from a unit test (PATH probes,
+  // the Docker preflight, `sys.exit`), so this exercises the one function `runLoop` calls to build
+  // the dispatch, with a real (unseamed) `LiveAgentDispatch` and a fake sandbox script standing in
+  // for `run-agent.sh`, exactly the way `LiveProcSpec` pins the model half of that constructor.
+  // ===============================================================================================
+
+  private def tempRoot(): Path = Files.createTempDirectory("main-spec-dispatch")
+
+  private def readString(p: Path): String =
+    new String(Files.readAllBytes(p), StandardCharsets.UTF_8)
+
+  /** Writes an executable script and returns its path. */
+  private def writeExecutable(dir: Path, name: String, content: String): Path =
+    val p = dir.resolve(name)
+    Files.write(p, content.getBytes(StandardCharsets.UTF_8))
+    Files.setPosixFilePermissions(p, PosixFilePermissions.fromString("rwxr-xr-x"))
+    p
+
+  /** A stand in for `run-agent.sh`, reporting the model it was handed, so the model that
+    * `liveAgentDispatch` wired in can be observed with no Docker anywhere near the test.
+    */
+  private val ModelRecorder = """#!/usr/bin/env bash
+    |printf 'MODEL=[%s]\n' "${LITTER_BOX_AGENT_MODEL-<absent>}"
+    |""".stripMargin
+
+  "liveAgentDispatch" should "carry parsed.cfg.models into the dispatch it constructs" in {
+    val root       = tempRoot()
+    val sandboxDir = root.resolve("sandbox")
+    Files.createDirectories(sandboxDir)
+    writeExecutable(sandboxDir, "run-agent.sh", ModelRecorder)
+
+    val parsed = parseEnvOk(
+      Settings.referenceOnly,
+      Map("IMPL_MODEL" -> "opus", "FIX_MODEL" -> "haiku")
+    )
+    parsed.cfg.models shouldBe AgentModels(impl = Some(ClaudeModel.Opus), fix = Some(ClaudeModel.Haiku))
+
+    val dispatch = Main.liveAgentDispatch(parsed, root, sandboxDir, timeoutBin = None)
+    dispatch.worker(Role.IMPL, "p.txt", "logs/i.patch", "logs/i.log", None)
+
+    // This is the assertion that a dropped `models = parsed.cfg.models` argument would fail: with
+    // the constructor default (`AgentModels()`) standing in, the recorder would see `<absent>`
+    // rather than the model IMPL_MODEL=opus named above.
+    readString(root.resolve("logs/i.log")) should include("MODEL=[claude-opus-5]")
   }

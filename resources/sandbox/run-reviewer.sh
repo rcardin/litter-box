@@ -16,6 +16,12 @@
 #                delivered via ENV so the large multi-line diff never rides in argv (ARG_MAX /
 #                process-listing leak). $1 is still honoured as a back-compat fallback.
 #
+# LITTER_BOX_AGENT_MODEL  (env, optional) the model THIS dispatch asks for, resolved on the host
+#                         from `agent.model.review`. Forwarded into the container as
+#                         ANTHROPIC_MODEL; absent or empty passes nothing at all, so the image's own
+#                         ENV or the CLI default stands (see sandbox_model_env in lib.sh). Pointing
+#                         it at a weak model weakens the adversarial gate and nothing here can tell.
+#
 # stdout   the reviewer's text output — the VERDICT: sentinel on its last line — the product
 # stderr   this script's diagnostics + the container's stderr (never the verdict)
 #
@@ -47,6 +53,7 @@ PROMPT="${REVIEW_PROMPT:-${1:-}}"
 
 sandbox_credential_env || infra_fault "neither CLAUDE_CODE_OAUTH_TOKEN nor ANTHROPIC_API_KEY set (the sandboxed reviewer has no other way to authenticate)"
 sandbox_preflight   # docker reachable + image present + proxy running (shared, see lib.sh)
+sandbox_model_env   # -e ANTHROPIC_MODEL=... when the loop named one, nothing when it did not
 
 # Only a waitfile is needed on the host — the reviewer container mounts nothing, so there is no
 # workdir/input/output tmpdir to stage. Rooted under $HOME for the same colima reason the other
@@ -89,6 +96,7 @@ docker run -d --name "$cname" \
   --security-opt=no-new-privileges \
   -e HOME=/home/gate \
   "${CREDENTIAL_ENV[@]}" \
+  ${MODEL_ENV[@]+"${MODEL_ENV[@]}"} \
   -e HTTP_PROXY="$proxy_url" -e HTTPS_PROXY="$proxy_url" \
   -e http_proxy="$proxy_url" -e https_proxy="$proxy_url" \
   -e NO_PROXY="" -e no_proxy="" \

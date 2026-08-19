@@ -389,7 +389,8 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
       iterTimeout = 5,
       implCmd = Some("echo hello patch > \"$PATCH_OUT\""),
       fixCmd = None,
-      reviewCmd = None
+      reviewCmd = None,
+      models = AgentModels() // no role configured: this case drives a stub seam
     )
 
     val outcome = dispatch.worker(
@@ -415,7 +416,8 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
         iterTimeout = 5,
         implCmd = Some("exit 124"),
         fixCmd = None,
-        reviewCmd = None
+        reviewCmd = None,
+        models = AgentModels() // no role configured: this case drives a stub seam
       )
 
     dispatch.worker(
@@ -438,7 +440,8 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
         iterTimeout = 5,
         implCmd = Some("exit 7"),
         fixCmd = None,
-        reviewCmd = None
+        reviewCmd = None,
+        models = AgentModels() // no role configured: this case drives a stub seam
       )
 
     dispatch.worker(
@@ -460,7 +463,8 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
       iterTimeout = 5,
       implCmd = Some("exit 1"), // would fold to Done too, but must not be the one that runs
       fixCmd = Some("echo fix patch > \"$PATCH_OUT\""),
-      reviewCmd = None
+      reviewCmd = None,
+      models = AgentModels() // no role configured: this case drives a stub seam
     )
 
     dispatch.worker(
@@ -483,7 +487,8 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
       iterTimeout = 5,
       implCmd = Some("echo worker-stdout; echo worker-stderr 1>&2"),
       fixCmd = None,
-      reviewCmd = None
+      reviewCmd = None,
+      models = AgentModels() // no role configured: this case drives a stub seam
     )
 
     dispatch.worker(
@@ -512,7 +517,8 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
         iterTimeout = 5,
         implCmd = Some("true"),
         fixCmd = None,
-        reviewCmd = None
+        reviewCmd = None,
+        models = AgentModels() // no role configured: this case drives a stub seam
       )
 
     val lines = captureLogLines {
@@ -540,7 +546,8 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
       iterTimeout = 5,
       implCmd = None,
       fixCmd = None,
-      reviewCmd = Some("echo VERDICT: APPROVE; echo diagnostic 1>&2")
+      reviewCmd = Some("echo VERDICT: APPROVE; echo diagnostic 1>&2"),
+      models = AgentModels() // no role configured: this case drives a stub seam
     )
 
     val outcome = dispatch.review("the prompt (unused by the stub)", "logs/r.md")
@@ -563,7 +570,8 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
         iterTimeout = 5,
         implCmd = None,
         fixCmd = None,
-        reviewCmd = Some("true")
+        reviewCmd = Some("true"),
+        models = AgentModels() // no role configured: this case drives a stub seam
       )
 
     val lines = captureLogLines { dispatch.review("prompt", "logs/issue-999-review.md") }
@@ -584,10 +592,192 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
         iterTimeout = 5,
         implCmd = None,
         fixCmd = None,
-        reviewCmd = Some("exit 124")
+        reviewCmd = Some("exit 124"),
+        models = AgentModels() // no role configured: this case drives a stub seam
       )
 
     dispatch.review("prompt", "logs/r.md").value shouldBe DispatchOutcome.Done
+  }
+
+  /** A stand in for `run-agent.sh` / `run-reviewer.sh` that reports what the dispatch handed it,
+    * so the model half of a REAL (unseamed) dispatch can be asserted with no Docker anywhere near
+    * the test. `${VAR-...}` and not `${VAR:-...}` on purpose: the tests must be able to tell a
+    * variable that is present and empty apart from one that is absent, and only the first form
+    * can make that distinction.
+    */
+  private val ModelRecorder = """#!/usr/bin/env bash
+    |printf 'MODEL=[%s]\n' "${LITTER_BOX_AGENT_MODEL-<absent>}"
+    |printf 'ARGV=[%s]\n' "$*"
+    |""".stripMargin
+
+  /** A repo root with a sandbox tree next to it holding both recording runners. */
+  private def modelFixture(): (Path, Path) =
+    val root       = tempRoot()
+    val sandboxDir = root.resolve("sandbox")
+    Files.createDirectories(sandboxDir)
+    writeExecutable(sandboxDir, "run-agent.sh", ModelRecorder)
+    writeExecutable(sandboxDir, "run-reviewer.sh", ModelRecorder)
+    (root, sandboxDir)
+
+  "LiveAgentDispatch's real dispatch" should "carry the impl model on IMPL and the fix model on FIX" in {
+    val (root, sandboxDir) = modelFixture()
+    val dispatch           = LiveAgentDispatch(
+      root,
+      sandboxDir = sandboxDir,
+      timeoutBin = None,
+      iterTimeout = 5,
+      implCmd = None,
+      fixCmd = None,
+      reviewCmd = None,
+      models = AgentModels(impl = Some(ClaudeModel.Opus), fix = Some(ClaudeModel.Haiku))
+    )
+
+    dispatch.worker(Role.IMPL, "p.txt", "logs/i.patch", "logs/i.log", None)
+    dispatch.worker(Role.FIX, "p.txt", "logs/f.patch", "logs/f.log", None)
+
+    readString(root.resolve("logs/i.log")) should include("MODEL=[claude-opus-5]")
+    readString(root.resolve("logs/f.log")) should include("MODEL=[claude-haiku-4-5]")
+  }
+
+  it should "carry the review model on the reviewer dispatch" in {
+    val (root, sandboxDir) = modelFixture()
+    val dispatch           = LiveAgentDispatch(
+      root,
+      sandboxDir = sandboxDir,
+      timeoutBin = None,
+      iterTimeout = 5,
+      implCmd = None,
+      fixCmd = None,
+      reviewCmd = None,
+      models = AgentModels(impl = Some(ClaudeModel.Opus), review = Some(ClaudeModel.Sonnet))
+    )
+
+    dispatch.review("prompt", "logs/r.md")
+
+    readString(root.resolve("logs/r.md")) should include("MODEL=[claude-sonnet-5]")
+  }
+
+  /** The failure this pins is the one issue #73 names as a silent behaviour change: a role with no
+    * model must reach the runner with the variable present and empty, which `sandbox_model_env` in
+    * lib.sh treats as no model at all, so the container never receives an ANTHROPIC_MODEL override
+    * and a consumer's own `ENV ANTHROPIC_MODEL` still stands. The empty value is deliberate: it is
+    * what closes the ambient leak the next test pins. The argv assertion pins that the model never
+    * becomes a positional argument; the trailing empty prior patch field is expected there.
+    */
+  it should "carry no model at all when the role's model is unset" in {
+    val (root, sandboxDir) = modelFixture()
+    val dispatch           = LiveAgentDispatch(
+      root,
+      sandboxDir = sandboxDir,
+      timeoutBin = None,
+      iterTimeout = 5,
+      implCmd = None,
+      fixCmd = None,
+      reviewCmd = None,
+      models = AgentModels(fix = Some(ClaudeModel.Haiku))
+    )
+
+    dispatch.worker(Role.IMPL, "p.txt", "logs/i.patch", "logs/i.log", None)
+    dispatch.review("prompt", "logs/r.md")
+
+    readString(root.resolve("logs/i.log")) should include("MODEL=[]")
+    readString(root.resolve("logs/i.log")) should include(
+      s"ARGV=[${root.resolve("p.txt")} ${root.resolve("logs/i.patch")} ]"
+    )
+    readString(root.resolve("logs/r.md")) should include("MODEL=[]")
+    readString(root.resolve("logs/r.md")) should include("ARGV=[]")
+  }
+
+  /** Pins the regression named in the issue #73 review: `LiveProc.builder` never clears the child's
+    * environment, so an ambient `LITTER_BOX_AGENT_MODEL` (inherited from the operator's own shell, or
+    * stamped onto every child by `LiveProc.exportEnv` from `.litter-box/.env`, exactly as
+    * `withExportedEnv` below simulates) must not survive into a dispatch whose role has no model
+    * configured. `modelEnv` returning an EMPTY map for an unset role is not enough to guarantee that:
+    * `LiveProc.prepare` only ADDS entries on top of the inherited environment, it never subtracts, so
+    * an ambient value would ride along untouched unless the unset case is stamped shut with an
+    * explicit empty value.
+    */
+  it should "not let an ambient LITTER_BOX_AGENT_MODEL leak into a dispatch whose role has no model" in {
+    val (root, sandboxDir) = modelFixture()
+    val dispatch           = LiveAgentDispatch(
+      root,
+      sandboxDir = sandboxDir,
+      timeoutBin = None,
+      iterTimeout = 5,
+      implCmd = None,
+      fixCmd = None,
+      reviewCmd = None,
+      models = AgentModels() // every role unset
+    )
+
+    withExportedEnv(Map(Settings.AgentModelEnvVar -> "leaked-model")) {
+      dispatch.worker(Role.IMPL, "p.txt", "logs/i.patch", "logs/i.log", None)
+      dispatch.review("prompt", "logs/r.md")
+    }
+
+    readString(root.resolve("logs/i.log")) should include("MODEL=[]")
+    readString(root.resolve("logs/r.md")) should include("MODEL=[]")
+  }
+
+  /** The seams are a TEST affordance, never a supported way to pick a model (issue #73's own out of
+    * scope list), so a configured model must change nothing about them: the stub is still a plain
+    * host `bash -c` with `PATCH_OUT` and no model anywhere near it. Pinned rather than assumed,
+    * because the seam branch and the sandbox branch sit in the same `match` and a model threaded
+    * through the wrong one would put a consumer owned string into a host shell command.
+    */
+  it should "leave the IMPL_CMD and REVIEW_CMD seams untouched whatever the models resolve to" in {
+    val (root, sandboxDir) = modelFixture()
+    val dispatch           = LiveAgentDispatch(
+      root,
+      sandboxDir = sandboxDir,
+      timeoutBin = None,
+      iterTimeout = 5,
+      implCmd = Some("""printf 'MODEL=[%s]\n' "${LITTER_BOX_AGENT_MODEL-<absent>}" > "$PATCH_OUT""""),
+      fixCmd = None,
+      reviewCmd = Some("""printf 'MODEL=[%s]\n' "${LITTER_BOX_AGENT_MODEL-<absent>}""""),
+      models = AgentModels(
+        impl = Some(ClaudeModel.Opus),
+        fix = Some(ClaudeModel.Haiku),
+        review = Some(ClaudeModel.Sonnet)
+      )
+    )
+
+    dispatch.worker(Role.IMPL, "p.txt", "logs/i.patch", "logs/i.log", None) shouldBe
+      DispatchOutcome.Done
+    dispatch.review("prompt", "logs/r.md").value shouldBe DispatchOutcome.Done
+
+    readString(root.resolve("logs/i.patch")).strip shouldBe "MODEL=[<absent>]"
+    readString(root.resolve("logs/r.md")).strip shouldBe "MODEL=[<absent>]"
+  }
+
+  /** The compile time half of the issue #73 review thread on `Main.liveAgentDispatch`. A test that
+    * calls `Main.liveAgentDispatch` proves that ONE function threads `parsed.cfg.models` through; it
+    * cannot prove that production still goes through that function, so a rewrite inlining the
+    * constructor back into `runLoop`'s `given` block would drop the model and leave the suite green.
+    * `models` therefore has no default: every construction site has to name it, and the only way to
+    * lose the model in production is now to write `AgentModels()` at the call site on purpose.
+    * This pins that, because a default is one keystroke to reintroduce and nothing else would notice.
+    */
+  "LiveAgentDispatch's models parameter" should "have no default, so no call site can omit it" in {
+    val errors = scala.compiletime.testing.typeCheckErrors(
+      """
+        |import in.rcard.litterbox.*
+        |import java.nio.file.Paths
+        |
+        |LiveAgentDispatch(
+        |  Paths.get("."),
+        |  sandboxDir = Paths.get("."),
+        |  timeoutBin = None,
+        |  iterTimeout = 5,
+        |  implCmd = None,
+        |  fixCmd = None,
+        |  reviewCmd = None
+        |)
+        |""".stripMargin
+    )
+
+    errors should not be empty
+    errors.map(_.message).mkString("\n") should include("models")
   }
 
   // =============================================================================================

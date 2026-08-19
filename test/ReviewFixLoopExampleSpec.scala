@@ -49,7 +49,7 @@ class ReviewFixLoopExampleSpec extends AnyFlatSpec with Matchers:
 
     exit shouldBe LoopExit.Success
     w.callCount("dispatch IMPL") shouldBe 1
-    reviewDispatches(w) shouldBe List(s"dispatch REVIEW reviewFile=$logDir/issue-999-r1.review.md")
+    reviewDispatches(w) shouldBe List(s"dispatch REVIEW reviewFile=$logDir/issue-999-r1.review.md model=")
     // The cycle never entered its fixing half: an approval on round 1 is the one path through this
     // graph on which the fixer is never dispatched at all.
     fixDispatches(w) shouldBe Nil
@@ -88,17 +88,17 @@ class ReviewFixLoopExampleSpec extends AnyFlatSpec with Matchers:
     fixDispatches(w) shouldBe List(
       s"dispatch FIX promptFile=$logDir/issue-999-r1-f0.fix.prompt.txt " +
         s"patchOut=$logDir/issue-999-r1-f0.patch logFile=$logDir/issue-999-r1-f0.fix.log " +
-        s"currentPatch=$logDir/issue-999.patch",
+        s"currentPatch=$logDir/issue-999.patch model=",
       s"dispatch FIX promptFile=$logDir/issue-999-r1-f1.fix.prompt.txt " +
         s"patchOut=$logDir/issue-999-r1-f1.patch logFile=$logDir/issue-999-r1-f1.fix.log " +
-        s"currentPatch=$logDir/issue-999-r1-f0.patch"
+        s"currentPatch=$logDir/issue-999-r1-f0.patch model="
     )
 
     // The cycle, observed rather than assumed: a SECOND review dispatch, against the round 2 review
     // file, which only a `reviewCycle(gated, round + 1)` edge taken after the fixer can produce.
     reviewDispatches(w) shouldBe List(
-      s"dispatch REVIEW reviewFile=$logDir/issue-999-r1.review.md",
-      s"dispatch REVIEW reviewFile=$logDir/issue-999-r2.review.md"
+      s"dispatch REVIEW reviewFile=$logDir/issue-999-r1.review.md model=",
+      s"dispatch REVIEW reviewFile=$logDir/issue-999-r2.review.md model="
     )
     w.logged("review round 1: 2 finding(s)") shouldBe true
     w.logged("review round 2: 0 finding(s)") shouldBe true
@@ -117,6 +117,47 @@ class ReviewFixLoopExampleSpec extends AnyFlatSpec with Matchers:
     w.prBodies.head should include("A cold reviewer found nothing left to fix.")
   }
 
+  // ---- per role models (issue #73) ---------------------------------------------------------
+
+  /** The scenario issue #73 exists to make expressible: "implement strong, review strong, fix
+    * cheap", stated once in `.litter-box/config.conf` and true of the dispatches a CONSUMER's own
+    * graph makes, with no seam override and nothing executing on the host.
+    *
+    * Asserted on the recorded dispatches rather than on a log line, and through a graph this
+    * library does not own, because the claim is about what each dispatch ASKED FOR: a resolution
+    * that read the same key for all three roles, or read the role off the node rather than off the
+    * dispatch, would still log identically.
+    */
+  it should "ask for the model its own role's config key names, per dispatch" in {
+    val w = TestWorld()
+    w.implScript = patchTouching("src/Slice.scala")
+    w.reviewScripts = List(
+      ReviewScript.Says("FINDING: SliceSpec asserts the happy path only"),
+      ReviewScript.Says(approveReview)
+    )
+    w.fixScripts = List(patchTouching("test/SliceSpec.scala"))
+
+    val exit = w.runGraph(
+      com.example.reviewfix.graph,
+      Config(
+        models = AgentModels(
+          impl = Some(ClaudeModel.Opus),
+          fix = Some(ClaudeModel.Haiku),
+          review = Some(ClaudeModel.Opus)
+        )
+      )
+    )
+
+    exit shouldBe LoopExit.Success
+    val implDispatches = w.calls.filter(_.startsWith("dispatch IMPL")).toList
+    implDispatches should have size 1
+    all(implDispatches) should endWith("model=claude-opus-5")
+    fixDispatches(w) should have size 1
+    all(fixDispatches(w)) should endWith("model=claude-haiku-4-5")
+    reviewDispatches(w) should have size 2
+    all(reviewDispatches(w)) should endWith("model=claude-opus-5")
+  }
+
   // ---- the round cap: three rounds, then the needs-human PR --------------------------------
 
   it should "stop after exactly MaxRounds review rounds and open the needs-human PR" in {
@@ -133,9 +174,9 @@ class ReviewFixLoopExampleSpec extends AnyFlatSpec with Matchers:
 
     exit shouldBe LoopExit.NeedsHuman
     reviewDispatches(w) shouldBe List(
-      s"dispatch REVIEW reviewFile=$logDir/issue-999-r1.review.md",
-      s"dispatch REVIEW reviewFile=$logDir/issue-999-r2.review.md",
-      s"dispatch REVIEW reviewFile=$logDir/issue-999-r3.review.md"
+      s"dispatch REVIEW reviewFile=$logDir/issue-999-r1.review.md model=",
+      s"dispatch REVIEW reviewFile=$logDir/issue-999-r2.review.md model=",
+      s"dispatch REVIEW reviewFile=$logDir/issue-999-r3.review.md model="
     )
     // Two fixing rounds, not three: round 3's findings are what END the cycle, so the fixer is never
     // dispatched a third time and the round 3 findings travel to a human instead.

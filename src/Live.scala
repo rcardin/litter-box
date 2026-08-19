@@ -600,6 +600,13 @@ object LiveGateRunner:
   * own exit code. This is bash's OWN asymmetry with the worker stub path (loop.sh: 314-317: a
   * review stub cannot simulate a reviewer timeout at all in the current suite), not something this
   * port introduced. Preserved verbatim, not "fixed" into worker-like rc-124 propagation.
+  *
+  * `models` carries no default on purpose (issue #73's review thread on the `Main` call site).
+  * Every other constructor argument is a compile error to drop, so a defaulted `models` would have
+  * been the one join a rewrite could silently lose: production would fall back to "no model for any
+  * role", the loop would keep dispatching, and no test that constructs this class itself would
+  * notice. Requiring it means the only way to dispatch with no model is to write `AgentModels()` at
+  * the call site, which is a decision a reader can see.
   */
 final class LiveAgentDispatch private[litterbox] (
     root: Path,
@@ -608,13 +615,36 @@ final class LiveAgentDispatch private[litterbox] (
     iterTimeout: Int,
     implCmd: Option[String],
     fixCmd: Option[String],
-    reviewCmd: Option[String]
+    reviewCmd: Option[String],
+    models: AgentModels
 ) extends AgentDispatchImpl:
 
   // "" means unset, folded once on the way in (LiveProc.seam).
   private val implSeam   = LiveProc.seam(implCmd)
   private val fixSeam    = LiveProc.seam(fixCmd)
   private val reviewSeam = LiveProc.seam(reviewCmd)
+
+  /** The `-e ANTHROPIC_MODEL` half of a dispatch, as the environment the runner script reads it off
+    * (`Settings.AgentModelEnvVar`). ALWAYS sets the key, empty string for an unset role, never an
+    * absent entry: `LiveProc.prepare` only ADDS keys on top of whatever the child inherits, it never
+    * clears the environment first, so an absent entry here would let an ambient
+    * `LITTER_BOX_AGENT_MODEL` (the operator's own shell, or a value `.litter-box/.env` stamped onto
+    * every child through `LiveProc.exportEnv`) ride along untouched into a dispatch that asked for no
+    * model at all. Stamping it shut with `""` is what `sandbox_model_env` (`lib.sh`) already treats
+    * as no model, so the container still receives no `-e ANTHROPIC_MODEL`, but no ambient value can
+    * survive under it.
+    *
+    * Not folded into the argv, deliberately. Every path from a chosen model to `docker run` has to
+    * keep it ONE argv element: an env entry stays one by construction, where a positional argument
+    * would sit next to the reviewer's back compat `$1`-is-the-prompt rule and invite a string built
+    * command line. That the value is now an [[AgentModel]] rather than consumer typed text narrows
+    * what can be in it, it does not change where it has to travel.
+    *
+    * `id` is what crosses, never the config spelling: `configName` is how an operator NAMES a model
+    * in `.litter-box/config.conf`, and the CLI inside the container has never heard of it.
+    */
+  private def modelEnv(model: Option[AgentModel]): Map[String, String] =
+    Map(Settings.AgentModelEnvVar -> model.fold("")(_.id))
 
   def worker(
       role: Role,
@@ -650,7 +680,7 @@ final class LiveAgentDispatch private[litterbox] (
           case Some(tb) => Seq(tb, iterTimeout.toString)
           case None     => Seq.empty
         ) ++ Seq(runner, promptAbs, patchOutAbs.toString, currentPatchArg)
-        val rc = LiveProc.runToFile(root, args, logPath)
+        val rc = LiveProc.runToFile(root, args, logPath, env = modelEnv(models.forRole(role)))
         if rc == 124 then
           LiveLog.log(
             s"WARNING: $role sandbox dispatch failed rc=124 (${iterTimeout}s timeout or infra fault: missing image/proxy/Docker/API key/prior-patch)"
@@ -691,7 +721,7 @@ final class LiveAgentDispatch private[litterbox] (
           args,
           reviewPath,
           stderrPath,
-          env = Map("REVIEW_PROMPT" -> prompt)
+          env = Map("REVIEW_PROMPT" -> prompt) ++ modelEnv(models.review)
         )
         if rc == 124 then
           LiveLog.log(

@@ -23,6 +23,13 @@ import scala.jdk.CollectionConverters.*
   */
 class InitSpec extends AnyFlatSpec with Matchers:
 
+  /** `Settings.parse` is a `Left` on a model name no `AgentModel` case carries (issue #73), so every
+    * case below that is about a config which PARSES unwraps here rather than at each call site. A
+    * config that does not parse is a test failure with the message an operator would have seen.
+    */
+  private def parseOk(conf: com.typesafe.config.Config): Config =
+    Settings.parse(conf).fold(msg => fail(s"expected a parseable config, got: $msg"), identity)
+
   private def tempRoot(): Path = Files.createTempDirectory("init-spec")
 
   private def readString(p: Path): String =
@@ -109,7 +116,7 @@ class InitSpec extends AnyFlatSpec with Matchers:
     Init.run(root, sbtRepo, force = false).isRight shouldBe true
     val loaded = Settings.loadFile(root)
     loaded.isRight shouldBe true
-    val cfg = Settings.parse(loaded.toOption.get)
+    val cfg = parseOk(loaded.toOption.get)
     cfg.conventions shouldBe ".litter-box/prompts/conventions.md"
     cfg.gateCmd shouldBe "false"
 
@@ -126,13 +133,13 @@ class InitSpec extends AnyFlatSpec with Matchers:
   it should "point conventions at a file it actually wrote" in:
     val root = tempRoot()
     Init.run(root, sbtRepo, force = false)
-    val cfg = Settings.parse(Settings.loadFile(root).toOption.get)
+    val cfg = parseOk(Settings.loadFile(root).toOption.get)
     Files.isRegularFile(root.resolve(cfg.conventions)) shouldBe true
 
   it should "keep .litter-box protected in the scaffolded config" in:
     val root = tempRoot()
     Init.run(root, sbtRepo, force = false)
-    val cfg = Settings.parse(Settings.loadFile(root).toOption.get)
+    val cfg = parseOk(Settings.loadFile(root).toOption.get)
     cfg.protect should contain(".litter-box/**")
 
   it should "gitignore the logs and the env file" in:
@@ -157,7 +164,7 @@ class InitSpec extends AnyFlatSpec with Matchers:
     // litter-box for did not cover the gate.
     val root = tempRoot()
     Init.run(root, sbtRepo, force = false)
-    val cfg = Settings.parse(Settings.loadFile(root).toOption.get)
+    val cfg = parseOk(Settings.loadFile(root).toOption.get)
     cfg.gateSandboxed shouldBe true
 
   it should "write a Dockerfile the sandbox actually builds from" in:
@@ -279,7 +286,7 @@ class InitSpec extends AnyFlatSpec with Matchers:
     everyRepo.foreach { d =>
       val root = tempRoot()
       Init.run(root, d, force = false).isRight shouldBe true
-      val cfg = Settings.parse(Settings.loadFile(root).toOption.get)
+      val cfg = parseOk(Settings.loadFile(root).toOption.get)
       withClue(s"gate.fast scaffolded for $d: ") { cfg.gateCmd shouldBe "false" }
     }
 
@@ -334,7 +341,7 @@ class InitSpec extends AnyFlatSpec with Matchers:
     // silent sbt preset the issue forbids.
     val root = tempRoot()
     Init.run(root, plainRepo, force = false)
-    val cfg = Settings.parse(Settings.loadFile(root).toOption.get)
+    val cfg = parseOk(Settings.loadFile(root).toOption.get)
     cfg.gateCmd should not include "sbt"
 
   it should "warn out loud" in:

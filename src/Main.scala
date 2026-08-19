@@ -45,13 +45,17 @@ object Main:
     * (`.litter-box/.env` under the ambient one, see `layerDotEnv`) and answers every VALUE lookup,
     * while `ambient` is the exported environment alone and answers the single question that is about
     * the operator rather than about a value — `gateOverridden`.
+    *
+    * Fallible for the one reason `Settings.parse` is: a `*_MODEL` variable naming no model has no
+    * safe reading, so it is the caller's rc 50 rather than a dispatch quietly running the CLI's
+    * default. Both halves of the layering fail the same way, since an operator mistypes an export
+    * exactly as easily as a config key.
     */
   def parseEnv(
       fromFile: TsConfig,
       env: Map[String, String],
       ambient: Map[String, String]
-  ): ParsedEnv =
-    val base = Settings.parse(fromFile)
+  ): Either[String, ParsedEnv] =
 
     def str(key: String): Option[String]    = env.get(key).filter(_.nonEmpty)
     def int(key: String, default: Int): Int = env.get(key).flatMap(_.toIntOption).getOrElse(default)
@@ -69,37 +73,66 @@ object Main:
     // to claim it is an operator bypassing the sandbox for one run.
     val gateOverridden = ambient.get("GATE_CMD").exists(_.nonEmpty)
 
-    val cfg = base.copy(
-      dryRun = env.getOrElse("DRY_RUN", "0") == "1", // loop.sh:654: `[[ "$DRY_RUN" == "1" ]]`
-      repairBudget = int("REPAIR_BUDGET", base.repairBudget),
-      maxPatchBytes = long("MAX_PATCH_BYTES", base.maxPatchBytes),
-      gateCmd = str("GATE_CMD").getOrElse(base.gateCmd),
-      // A `GATE_CMD` override is by definition a host command: it is what an operator exports to
-      // run the loop with no sandbox at all, and it already skips the preflight that would build
-      // the image (step 6b below). Leaving `gate.sandboxed` true there would hand the override to
-      // a container that was never built.
-      gateSandboxed = base.gateSandboxed && !gateOverridden,
-      ciWaitCmd = str("CI_WAIT_CMD"),
-      gateTimeout = int("GATE_TIMEOUT", base.gateTimeout),
-      iterTimeout = int("ITER_TIMEOUT", base.iterTimeout),
-      ciWaitTimeout = int("CI_WAIT_TIMEOUT", base.ciWaitTimeout),
-      ciAppearTimeout = int("CI_APPEAR_TIMEOUT", base.ciAppearTimeout),
-      ciAppearInterval = int("CI_APPEAR_INTERVAL", base.ciAppearInterval),
-      implementSlack = int("IMPLEMENT_SLACK", base.implementSlack)
-    )
+    /** One `*_MODEL` variable, resolved against the file's answer for the same role. The variable is
+      * read for its NAME, so an `IMPL_MODEL=opuss` fails the run rather than falling through to the
+      * config file: an override that silently lost is indistinguishable, from the operator's side,
+      * from one that was never read.
+      */
+    def envModel(key: String, fromConfig: Option[AgentModel]): Either[String, Option[AgentModel]] =
+      str(key) match
+        case None      => Right(fromConfig)
+        case Some(raw) => AgentModel.parse(raw).left.map(m => s"$key: $m").map(Some(_))
 
-    ParsedEnv(
-      cfg = cfg,
-      maxIters = int("MAX_ITERS", 1),
-      implCmd = str("IMPL_CMD"),
-      fixCmd = str("FIX_CMD"),
-      reviewCmd = str("REVIEW_CMD"),
-      notifyCmd = str("NOTIFY_CMD"),
-      ciAppearCmd = str("CI_APPEAR_CMD"),
-      mergeCmd = str("MERGE_CMD"),
-      ntfyTopic = str("NTFY_TOPIC"),
-      gateOverridden = gateOverridden
-    )
+    for
+      base <- Settings.parse(fromFile)
+      // Issue #73. Per KEY, never per block: an operator raising the fixer for one run must not
+      // unset the implementer and the reviewer their `agent.model` block already names. `str`
+      // carries the project's empty-means-absent rule, so an exported `FIX_MODEL=` shadows nothing
+      // and the file's answer stands.
+      //
+      // A `.litter-box/.env` entry wins here the same way it wins for `gateCmd`, and the asymmetry
+      // that file gets for `GATE_CMD` (the `ambient` read above) is deliberately NOT reproduced:
+      // that read exists because an export additionally means "skip the sandbox preflight", a claim
+      // no permanent untracked file should be able to make. A model is only ever a model, so there
+      // is no second meaning for an export to carry and nothing for a file entry to claim falsely.
+      // What a `.env` model CAN do is quietly point `agent.model.review` at a weak reviewer for
+      // every future run; nothing in the loop can detect that, which is why the README says so.
+      implModel   <- envModel("IMPL_MODEL", base.models.impl)
+      fixModel    <- envModel("FIX_MODEL", base.models.fix)
+      reviewModel <- envModel("REVIEW_MODEL", base.models.review)
+    yield
+      val cfg = base.copy(
+        dryRun = env.getOrElse("DRY_RUN", "0") == "1", // loop.sh:654: `[[ "$DRY_RUN" == "1" ]]`
+        repairBudget = int("REPAIR_BUDGET", base.repairBudget),
+        maxPatchBytes = long("MAX_PATCH_BYTES", base.maxPatchBytes),
+        gateCmd = str("GATE_CMD").getOrElse(base.gateCmd),
+        // A `GATE_CMD` override is by definition a host command: it is what an operator exports to
+        // run the loop with no sandbox at all, and it already skips the preflight that would build
+        // the image (step 6b below). Leaving `gate.sandboxed` true there would hand the override to
+        // a container that was never built.
+        gateSandboxed = base.gateSandboxed && !gateOverridden,
+        ciWaitCmd = str("CI_WAIT_CMD"),
+        gateTimeout = int("GATE_TIMEOUT", base.gateTimeout),
+        iterTimeout = int("ITER_TIMEOUT", base.iterTimeout),
+        ciWaitTimeout = int("CI_WAIT_TIMEOUT", base.ciWaitTimeout),
+        ciAppearTimeout = int("CI_APPEAR_TIMEOUT", base.ciAppearTimeout),
+        ciAppearInterval = int("CI_APPEAR_INTERVAL", base.ciAppearInterval),
+        implementSlack = int("IMPLEMENT_SLACK", base.implementSlack),
+        models = AgentModels(impl = implModel, fix = fixModel, review = reviewModel)
+      )
+
+      ParsedEnv(
+        cfg = cfg,
+        maxIters = int("MAX_ITERS", 1),
+        implCmd = str("IMPL_CMD"),
+        fixCmd = str("FIX_CMD"),
+        reviewCmd = str("REVIEW_CMD"),
+        notifyCmd = str("NOTIFY_CMD"),
+        ciAppearCmd = str("CI_APPEAR_CMD"),
+        mergeCmd = str("MERGE_CMD"),
+        ntfyTopic = str("NTFY_TOPIC"),
+        gateOverridden = gateOverridden
+      )
 
   /** The same parse for a run with NO `.litter-box/.env`, where the layered environment and the
     * exported one are the same map.
@@ -109,7 +142,7 @@ object Main:
     * distinction by omission. A default argument would not do — Scala lets a default refer only to an
     * earlier parameter LIST, and splitting the parameters would make the ordinary call read as two.
     */
-  def parseEnv(fromFile: TsConfig, env: Map[String, String]): ParsedEnv =
+  def parseEnv(fromFile: TsConfig, env: Map[String, String]): Either[String, ParsedEnv] =
     parseEnv(fromFile, env, env)
 
   // ---- `.litter-box/.env` layered under the ambient environment (issue #12) -------------------
@@ -497,7 +530,11 @@ object Main:
   ): ObserveChild =
     val logDir =
       if inherited.get(Settings.LogDirEnvVar).exists(_.nonEmpty) then None
-      else Settings.loadFile(root).toOption.map(conf => Settings.parse(conf).logDir)
+      // Both `Left`s collapse to `None` here, the unparseable config and the unnamable model alike:
+      // the caller is `watch`/`tail` deciding whether to stamp a log directory onto a script that
+      // has its own fallback, and a subcommand that only reads logs must not refuse to run over a
+      // key it never uses. The loop itself still exits 50 on either (`runLoop` step 2).
+      else Settings.loadFile(root).toOption.flatMap(Settings.parse(_).toOption).map(_.logDir)
     ObserveChild(
       command = scriptDir.resolve(tool.script).toString :: target
         .map(t => callerCwd.resolve(t).toString)
@@ -584,6 +621,34 @@ object Main:
 
   @main def litterBoxLoop(args: String*): Unit = dispatch(LitterBox.shipped, args)
 
+  /** The one production line that carries a parsed `agent.model.*` config into the dispatch that
+    * acts on it (issue #73's review thread on this constructor call). Pulled out of `runLoop`'s
+    * `given` block into its own named function because `runLoop` cannot be reached from a unit test,
+    * gated as it is behind PATH probes, the Docker preflight and `sys.exit`, while this function can
+    * be called directly and the model observed actually reaching a dispatch.
+    *
+    * What the test here CANNOT prove is that production still comes through this function, so the
+    * other half of the guarantee lives in `LiveAgentDispatch` itself: `models` has no default, which
+    * makes an inlined rewrite of the `given` block that forgets the config a compile error rather
+    * than a silently model-less loop.
+    */
+  private[litterbox] def liveAgentDispatch(
+      parsed: ParsedEnv,
+      root: Path,
+      sandboxDir: Path,
+      timeoutBin: Option[String]
+  ): LiveAgentDispatch =
+    LiveAgentDispatch(
+      root,
+      sandboxDir,
+      timeoutBin,
+      parsed.cfg.iterTimeout,
+      parsed.implCmd,
+      parsed.fixCmd,
+      parsed.reviewCmd,
+      models = parsed.cfg.models
+    )
+
   /** The loop, which is everything this file did before there were subcommands. `graph` (issue #43)
     * is what `runDriver` hands `Machine.runOnce` every tick; `dispatch` is this function's only
     * caller, always with a graph its caller chose, which today can only be `LitterBox.shipped`,
@@ -620,7 +685,12 @@ object Main:
     // `ambient` is passed alongside the layered `env` on purpose: every value comes from the layered
     // one, but "the operator is bypassing the sandbox preflight for this run" can only be said by an
     // exported variable — see `parseEnv`.
-    val parsed0 = parseEnv(fromFile, env, ambient)
+    // A model no case names is rc 50 like the missing file above, and for the same reason: nothing
+    // has been touched, and running the dispatch on the CLI's default instead would be a downgrade
+    // of the cold reviewer that no later step could report.
+    val parsed0 = parseEnv(fromFile, env, ambient) match
+      case Right(p)  => p
+      case Left(msg) => die50(msg)
     val parsed  = parsed0.copy(cfg =
       parsed0.cfg.copy(dryRun = applyDryRunFlag(dryRunFlag, env))
     )
@@ -716,16 +786,7 @@ object Main:
     given Config        = parsed.cfg
     given GitHub        = LiveGitHub(root, parsed.ciAppearCmd, parsed.mergeCmd)
     given Git           = LiveGit(root)
-    given AgentDispatch =
-      LiveAgentDispatch(
-        root,
-        sandboxDir,
-        timeoutBin,
-        parsed.cfg.iterTimeout,
-        parsed.implCmd,
-        parsed.fixCmd,
-        parsed.reviewCmd
-      )
+    given AgentDispatch = liveAgentDispatch(parsed, root, sandboxDir, timeoutBin)
     val (fastGates, hostGates) =
       gateRunners(root, timeoutBin, sandboxDir, parsed.cfg.gateSandboxed)
     given GateRunner     = fastGates

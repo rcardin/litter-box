@@ -391,6 +391,12 @@ and the rc-50 notification in `notifications`. `cfg` is there too, `world.runNod
 for a node that reads `Config` off the ambient `Caps`. There is no `iteration` parameter: an iteration
 number is something a whole tick has, and one node stepped alone is not a tick.
 
+A dispatch records the model it asked for as the last field of its call string, `model=` and empty
+when the role has none, so a scenario passing `cfg = Config(models = AgentModels(fix = Some(ClaudeModel.Haiku)))`
+can assert that a fixer really asked for the cheap model while the reviewer asked for the strong one.
+The recorded field is the model id the container would have seen, `model=claude-haiku-4-5`, not the
+name the config file spells.
+
 Every capability is a `var` or a scripted list on the `TestWorld`: `implScript`/`fixScripts` for the
 worker, `reviewScripts` for the reviewer, `files` for what a dispatch wrote, plus `cleanTree`,
 `applySucceeds`, `fetchSucceeds` and friends for the git and GitHub answers. Everything it observed
@@ -562,6 +568,8 @@ gate {
   sandboxed = true                          # false runs it on the host instead, with everything your shell has
   timeout   = 900
 }
+agent.model { impl = null, fix = null, review = null }   # haiku | sonnet | opus | fable; unset = whatever
+                                                        # the `claude` CLI itself defaults to
 issues.labels { ready = "ready", active = "in-progress", blocked = "blocked", parked = "parked" }
 issues.park-on-exhaustion = true          # false opens a needs-human PR instead, the earlier contract
 protect  = [".litter-box/**", ".github/**", "CONTEXT.md"]
@@ -574,6 +582,38 @@ container without ever asking for it, and a `gate.fast` written for the host sto
 host the moment the binary is upgraded. A config that leaves the key unsaid therefore gets a
 `WARNING` at startup naming both ways to answer it; writing `sandboxed = true` is as good an answer
 as `sandboxed = false` and silences it just the same.
+
+`agent.model` picks the model each of the three model touched dispatches asks for: `impl` for the
+worker, `fix` for the fixer, `review` for the cold reviewer. Each is independently optional, and each
+takes an environment override for a single run, `IMPL_MODEL`, `FIX_MODEL` and `REVIEW_MODEL`, on the
+same precedence as every other key. UNSET means no model is passed at all: the loop adds no
+`ANTHROPIC_MODEL` to the container, so whatever your `.litter-box/Dockerfile` sets, or the `claude`
+CLI's own default, is what runs. There is no default model, deliberately, since shipping one would
+move every repo's spend and every repo's answers at once.
+
+The value is one of a closed set of names, `haiku`, `sonnet`, `opus`, `fable`, one per Claude family,
+and anything else STOPS THE RUN with rc 50 before a single issue is read, naming the key and listing
+the names you may write. That is the enum's whole point: an unrecognised model has no safe reading,
+because the only alternative to failing is to dispatch on the CLI's default, and on `review` that is
+a downgrade of the adversarial gate nothing in the loop could ever report. Each name dispatches on a
+pinned full model id (`opus` sends `claude-opus-5`), never a floating family alias, so the same commit
+of your repo asks for the same model next month as it does today; a new family release moves that id
+in a litter-box release, with a release note, rather than under a running repo. Names are bare and
+provider free by design: they stay the spelling you already type, and a second vendor's models would
+join the same flat namespace rather than arrive as `claude:opus`.
+
+The knob is PER ROLE, not per node. A consumer graph can dispatch a fixer from as many nodes as it
+likes, and every one of them asks for `agent.model.fix`; a node cannot name a model of its own. That
+is a decision, not a gap: the model is a property of what a dispatch IS, and `.litter-box/config.conf`
+sits inside the `protect` floor, so an agent working under the harness cannot rewrite the models its
+own next round runs on, which it could if the choice lived in graph code.
+
+`agent.model.review` is the dangerous one, in the same way `gate.sandboxed` is. The cold reviewer's
+independence is the property the whole loop is built around, and pointing that key at a weak model
+weakens the adversarial gate silently: nothing in the loop can detect it, judge it or refuse it. The
+same goes for writing `REVIEW_MODEL` into `.litter-box/.env`, which is untracked and permanent, so it
+would apply to every future run with nothing in the repository recording that it does. The closed set
+of names catches a typo there; it cannot catch a deliberate `haiku`.
 
 `instance-name` earns its place even though litter-box never runs two instances at once:
 `start-proxy.sh` does `docker rm -f "$PROXY_NAME"` at startup, before any issue label is
@@ -707,6 +747,15 @@ exist. See [Getting started](#getting-started) for `init`, `eject`, `--dry-run` 
 | `IMPLEMENT_SLACK` | `300` | Added on top of `ITER_TIMEOUT` for the Implement node's own timeout; raise it on a host with no `timeout`/`gtimeout` binary, where the worker runs unbounded and this is the only backstop left |
 | `CI_WAIT_TIMEOUT` / `CI_APPEAR_TIMEOUT` / `CI_APPEAR_INTERVAL` | `900` / `300` / `10` | CI polling |
 | `NTFY_TOPIC` | — | ntfy.sh topic for notifications |
+| `IMPL_MODEL` | unset | Model for the worker dispatch, for this run only; overrides `agent.model.impl` |
+| `FIX_MODEL` | unset | Model for the fixer dispatch, for this run only; overrides `agent.model.fix` |
+| `REVIEW_MODEL` | unset | Model for the cold reviewer, for this run only; overrides `agent.model.review`. A weak value here silently weakens the adversarial gate, and nothing in the loop can detect, judge or refuse it |
+
+Each of the three must be one of `haiku`, `sonnet`, `opus` or `fable`; any other spelling stops the
+run with exit code 50 before a single issue is read, naming the key and listing the names you may
+write. That check applies whether the value came from `.litter-box/config.conf` or from one of these
+three variables. See [Configuration](#configuration) above for what `agent.model` picks and why a
+default model was deliberately left out.
 
 `IMPL_CMD`, `FIX_CMD`, `REVIEW_CMD`, `NOTIFY_CMD`, `CI_WAIT_CMD`, `CI_APPEAR_CMD` and `MERGE_CMD`
 are test seams: each replaces one subprocess so the loop can be driven without Docker or GitHub.

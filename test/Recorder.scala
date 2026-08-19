@@ -219,6 +219,20 @@ final class TestWorld:
   )
   var conventionsText: String = "# CONTEXT\nConventions: onion layout, use-case error enum."
 
+  /** The per role models the run's `Config` asks for (`agent.model`, issue #73), as the fake
+    * dispatch resolves them.
+    *
+    * A field of the world, stamped by [[runGraph]] / [[runNode]] out of the `Config` they are
+    * handed, because that is the shape the REAL wiring has: `Main` reads the three keys off the
+    * parsed config and builds `LiveAgentDispatch` with them once, so the handler already knows the
+    * answer by the time any node dispatches. `TestWorld.agents` is likewise built once, before any
+    * `Config` exists at a call site, and `AgentDispatch.worker`/`dispatchReview` take no model
+    * argument to carry one in with, by the same decision that keeps the model per ROLE and not per
+    * node (see `AgentModels`). Settable directly too, for a test that steps a fake dispatch without
+    * a graph around it.
+    */
+  var models: AgentModels = AgentModels()
+
   // ---- derived state the fakes maintain ---------------------------------------------------
   var appliedPatches: List[String] = Nil
   var staged: Boolean              = false
@@ -353,7 +367,8 @@ final class TestWorld:
         currentPatch: Option[String]
     ): DispatchOutcome =
       record(
-        s"dispatch $role promptFile=$promptFile patchOut=$patchOut logFile=$logFile currentPatch=${currentPatch.getOrElse("")}"
+        s"dispatch $role promptFile=$promptFile patchOut=$patchOut logFile=$logFile " +
+          s"currentPatch=${currentPatch.getOrElse("")} model=${models.forRole(role).fold("")(_.id)}"
       )
       val script = role match
         case Role.IMPL => implScript
@@ -376,7 +391,7 @@ final class TestWorld:
     // moment anyone puts it on a test classpath (RFC #26 decision 14; see `AgentDispatch`'s own doc,
     // `src/Caps.scala`, for the guarantee stated once, in full).
     private[litterbox] def dispatchReview(prompt: String, reviewFile: String): DispatchOutcome =
-      record(s"dispatch REVIEW reviewFile=$reviewFile")
+      record(s"dispatch REVIEW reviewFile=$reviewFile model=${models.review.fold("")(_.id)}")
       reviewScripts match
         case Nil    => DispatchOutcome.Done
         case h :: t =>
@@ -463,6 +478,7 @@ final class TestWorld:
     * `Int`, so a consumer still has no way to name the type.
     */
   def runGraph(graph: LoopGraph, cfg: Config = Config(), iteration: Int = 1): LoopExit =
+    models = cfg.models
     Machine.runOnce(iteration, graph)(using
       cfg,
       github,
@@ -527,6 +543,7 @@ final class TestWorld:
       dispatchBudget: Int = 1
   ): Either[LoopExit, NodeRun[O]] =
     val ledger = Runner.Ledger(dispatchBudget)
+    models = cfg.models
     val caps   = buildCaps(this).copy(cfg = cfg)
     withFaulting:
       val outcome = Runner.step(node, input)(using caps, summon[Faulting], ledger)

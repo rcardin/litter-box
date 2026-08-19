@@ -63,6 +63,7 @@ object Settings:
       |  sandboxed = true
       |  timeout   = 900
       |}
+      |agent.model { impl = null, fix = null, review = null }
       |issues.labels { ready = "ready", active = "in-progress", blocked = "blocked", parked = "parked" }
       |issues.park-on-exhaustion = true
       |protect  = [".litter-box/**", ".github/**", "CONTEXT.md"]
@@ -297,6 +298,36 @@ object Settings:
     */
   val LogDirEnvVar = "LITTER_BOX_LOG_DIR"
 
+  /** Env var carrying the model ONE dispatch asks for into `run-agent.sh` / `run-reviewer.sh`,
+    * which turn it into a `-e ANTHROPIC_MODEL=<model>` argument on their `docker run` (issue #73).
+    *
+    * A name of litter-box's own rather than `ANTHROPIC_MODEL` itself, even though that is what the
+    * container ends up seeing. The loop's own process may well have `ANTHROPIC_MODEL` exported for
+    * the operator's personal `claude`, and reading THAT would silently apply one model to all three
+    * roles, the cold reviewer included, with no config key saying so. Litter box's own name is one
+    * nothing else reads as a model input, so the choice of source stays this loop's; whatever an
+    * operator's shell or a consumer's `.litter-box/.env` may put under that name is overwritten per
+    * dispatch, see `LiveAgentDispatch.modelEnv` below.
+    *
+    * Per DISPATCH, so deliberately not part of [[childEnv]]: it differs between two children of the
+    * same run (a strong implementer, a cheap fixer), which is the whole point of the key, and
+    * `childEnv` is the set of variables every child shares.
+    *
+    * `LiveAgentDispatch.modelEnv` exports this variable for every real dispatch, unset role included:
+    * an EMPTY value is how "no model" is spelled on this seam, stamped shut rather than omitted, so
+    * an ambient `LITTER_BOX_AGENT_MODEL` a consumer's own `.litter-box/.env` happens to export can
+    * never leak into a dispatch whose role names no model.
+    *
+    * The empty value is not what reaches `docker run`, though. `sandbox_model_env` in
+    * `resources/sandbox/lib.sh` is the one place that turns an empty value into no
+    * `-e ANTHROPIC_MODEL` argument at all, because that argument, if passed empty, would clobber
+    * whatever a consumer's own `.litter-box/Dockerfile` set with its own `ENV ANTHROPIC_MODEL`,
+    * turning "no opinion" into a silent behaviour change for exactly the repos that had solved this
+    * the other way. The absence has to happen there, on the actual `docker run` argv, not on this
+    * variable.
+    */
+  val AgentModelEnvVar = "LITTER_BOX_AGENT_MODEL"
+
   /** The environment every child of the loop inherits. A function rather than a constant so the
     * call sites in `Main` stay honest about the entries being derived, not fixed.
     */
@@ -305,32 +336,78 @@ object Settings:
 
   // ---- config -> Config ------------------------------------------------------------------------
 
+  /** One optional model key, read the only way an ABSENT value can be told from a set one after
+    * `withFallback` has already merged the consumer's file onto [[Reference]].
+    *
+    * `hasPath` answers false both for a key the consumer's file never mentions and for the explicit
+    * `null` [[Reference]] declares, which is exactly the collapse this needs: the reference block
+    * exists to DOCUMENT the three model keys, not to give any of them a value, and issue #73's rule
+    * is that unset keeps meaning "whatever the CLI defaults to". Every other key in the schema is
+    * read unconditionally, because every other key has a real default to fall back to.
+    *
+    * An EMPTY string is absent too, the same rule `Main.parseEnv`'s `str` applies to an exported
+    * variable: a model is either named or it is not, and forwarding `""` into a container would be
+    * the one shape issue #73 rules out, an empty valued variable clobbering a model a consumer's
+    * own Dockerfile already set.
+    *
+    * A NON EMPTY value that names no model is a `Left`, which the caller turns into the rc 50 a
+    * missing config file gets. Unlike every other key here there is no safe reading of a typo: the
+    * only alternative to failing is to run the dispatch on the CLI's default, and on
+    * `agent.model.review` that is the one downgrade nothing later in the loop can see. The key is
+    * prefixed onto the message because a config file has three of them and the operator has to know
+    * which one to fix.
+    */
+  private def optionalModel(conf: TsConfig, key: String): Either[String, Option[AgentModel]] =
+    if !conf.hasPath(key) then Right(None)
+    else
+      try
+        Option(conf.getString(key)).filter(_.nonEmpty) match
+          case None      => Right(None)
+          case Some(raw) => AgentModel.parse(raw).left.map(m => s"$ConfigPath: $key: $m").map(Some(_))
+      catch case e: ConfigException => Left(s"$ConfigPath: $key: ${e.getMessage}")
+
+  private def models(conf: TsConfig): Either[String, AgentModels] =
+    for
+      impl   <- optionalModel(conf, "agent.model.impl")
+      fix    <- optionalModel(conf, "agent.model.fix")
+      review <- optionalModel(conf, "agent.model.review")
+    yield AgentModels(impl = impl, fix = fix, review = review)
+
   /** Reads the schema off `conf` (already merged onto [[Reference]] by `loadFile`).
     * Env overlay is `Main.parseEnv`'s job, not this one's: this function is the file half of the
     * layering and stays free of `sys.env`.
+    *
+    * Fallible, where it used to be total, and the `Left` carries the same weight [[loadFile]]'s
+    * does: the caller exits 50 without touching the repo. Every key but the three model ones is
+    * still read unconditionally, because HOCON's own typing already rejects a `budgets.repair =
+    * "two"` before this function sees it, while a model name is a plain string that only
+    * [[AgentModel]] can judge.
     */
-  def parse(conf: TsConfig): Config =
-    Config(
-      instanceName = conf.getString("instance-name"),
-      conventions = conf.getString("conventions"),
-      stopFile = conf.getString("stop-file"),
-      logDir = conf.getString("log-dir"),
-      gateCmd = conf.getString("gate.fast"),
-      gateSandboxed = conf.getBoolean(GateSandboxedKey),
-      gateTimeout = conf.getInt("gate.timeout"),
-      labels = Labels(
-        ready = conf.getString("issues.labels.ready"),
-        active = conf.getString("issues.labels.active"),
-        blocked = conf.getString("issues.labels.blocked"),
-        parked = conf.getString("issues.labels.parked")
-      ),
-      parkOnExhaustion = conf.getBoolean("issues.park-on-exhaustion"),
-      protect = protectWithFloor(conf),
-      repairBudget = conf.getInt("budgets.repair"),
-      maxPatchBytes = conf.getLong("budgets.max-patch-bytes"),
-      iterTimeout = conf.getInt("timeouts.iter"),
-      ciWaitTimeout = conf.getInt("timeouts.ci-wait"),
-      ciAppearTimeout = conf.getInt("timeouts.ci-appear"),
-      ciAppearInterval = conf.getInt("timeouts.ci-appear-interval"),
-      implementSlack = conf.getInt("timeouts.implement-slack")
-    )
+  def parse(conf: TsConfig): Either[String, Config] =
+    models(conf).map { agentModels =>
+      Config(
+        instanceName = conf.getString("instance-name"),
+        conventions = conf.getString("conventions"),
+        stopFile = conf.getString("stop-file"),
+        logDir = conf.getString("log-dir"),
+        gateCmd = conf.getString("gate.fast"),
+        gateSandboxed = conf.getBoolean(GateSandboxedKey),
+        gateTimeout = conf.getInt("gate.timeout"),
+        labels = Labels(
+          ready = conf.getString("issues.labels.ready"),
+          active = conf.getString("issues.labels.active"),
+          blocked = conf.getString("issues.labels.blocked"),
+          parked = conf.getString("issues.labels.parked")
+        ),
+        parkOnExhaustion = conf.getBoolean("issues.park-on-exhaustion"),
+        models = agentModels,
+        protect = protectWithFloor(conf),
+        repairBudget = conf.getInt("budgets.repair"),
+        maxPatchBytes = conf.getLong("budgets.max-patch-bytes"),
+        iterTimeout = conf.getInt("timeouts.iter"),
+        ciWaitTimeout = conf.getInt("timeouts.ci-wait"),
+        ciAppearTimeout = conf.getInt("timeouts.ci-appear"),
+        ciAppearInterval = conf.getInt("timeouts.ci-appear-interval"),
+        implementSlack = conf.getInt("timeouts.implement-slack")
+      )
+    }
