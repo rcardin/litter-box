@@ -363,20 +363,26 @@ class ConsumerGraphRunSpec extends AnyFlatSpec with Matchers:
     world.logged("backstop entry ran") shouldBe false
   }
 
-  // ---- 19: issue #67 review, the derived walk keys an edge's source on the NODE it leaves, ----------
-  // ---- never on that node's name, so two distinct nodes sharing one name are never merged -----------
+  // ---- 19: issue #67 review, a Plan declaring two distinct nodes that share one name is refused by ----
+  // ---- Plan.declarationViolations outright, before Plan.workflowOf's own identity-based walk is ------
+  // ---- even built --------------------------------------------------------------------------------------
 
-  it should "walk the edges leaving each of two distinct nodes that happen to share one name separately, never treating the second as an alias of the first" in {
+  it should "reject a Plan through Plan.workflowOf when two distinct nodes share one name, rather than silently merging or cycling them" in {
     // `dupA` and `dupB` are two DIFFERENT `Node` values, deliberately given the same `name`, "Dup",
     // and identical `cost`/`timeout`/`trust`/`guard` so `Runner.validate`'s own duplicate-name check
-    // (`identityOf`, `Kit.scala`) has nothing to disagree on: this test is entirely about the WALK,
-    // never about a violation `validate` was already going to catch. A walk keyed on `name` alone
-    // cannot tell `dupA`'s own outgoing edge from `dupB`'s, so once `dupB` runs it wrongly takes
-    // `dupA`'s edge back into `dupMid`, and the walk cycles Mid/Dup forever, never reaching `dupEnd`.
-    // Stepping by hand, a bounded number of hops, rather than running the graph through
-    // `Machine.runOnce`/`TestWorld.runGraph`, is deliberate: that cycle is a genuine infinite loop on
-    // the unfixed code (confirmed by hand: tens of millions of lines in under two minutes before being
-    // killed), so a test that let it run to completion could hang the suite instead of failing it.
+    // (`identityOf`, `Kit.scala`) has nothing to disagree on: this test is entirely about the
+    // declaration check `Plan.declarationViolations` performs, never about a violation `validate` was
+    // already going to catch on its own. Before that check existed, a walk keyed on `name` alone could
+    // not tell `dupA`'s own outgoing edge from `dupB`'s, so once `dupB` ran it wrongly took `dupA`'s
+    // edge back into `dupMid`, and the walk cycled Mid/Dup forever, never reaching `dupEnd` (confirmed
+    // by hand against that earlier code: tens of millions of lines in under two minutes before being
+    // killed). `Plan.workflowOf` was fixed, in an earlier round, to walk by reference identity instead
+    // (that method's own doc), which stopped the silent cycle, but left the ambiguous DECLARATION
+    // itself uncaught: `Runner.validate`, reading the same plan through `Plan.shapeOf` downstream,
+    // still could not tell the two nodes apart by name, and could invent or hide an edge neither one
+    // declared (issue #67 review, pinned end to end by n21 below). `Plan.declarationViolations` closes
+    // that at the root, refusing the declaration itself rather than merely walking around it, so this
+    // Plan never reaches either the walk or the validator.
     val dupA = Node[Unit, Unit](
       name = "Dup",
       cost = Cost.NoDispatch,
@@ -408,30 +414,126 @@ class ConsumerGraphRunSpec extends AnyFlatSpec with Matchers:
     val caps  = buildCaps(world)
 
     val stepped = withFaulting:
-      val fault    = Fault(summon[Faulting], caps.logger, caps.notifier)
-      val workflow = Plan.workflowOf("dup-walk", plan, StageSet(Nil, None, None))(using caps, summon[Faulting])
+      Plan.workflowOf("dup-walk", plan, StageSet(Nil, None, None))(using caps, summon[Faulting])
 
-      @scala.annotation.tailrec
-      def hop(next: Next, remaining: Int): Next =
-        next match
-          case f: Next.Finish => f
-          case _ if remaining == 0 => next
-          case Next.Goto(node, input, andThen) =>
-            val out = node.run(input)(using caps, fault) match
-              case NodeOutcome.Done(value)   => value
-              case NodeOutcome.Stopped(exit) => fail(s"node '${node.name}' stopped early with $exit")
-            hop(andThen(out), remaining - 1)
-
-      // A straight walk of this plan is four hops: dupA (entry), dupMid, dupB, dupEnd, then Finish.
-      // Ten is generous headroom without being unbounded: on the unfixed code the walk is cycling
-      // Mid/Dup well before hop 10 and never reaches Finish at all.
-      hop(workflow.start(()), 10)
-
-    stepped shouldBe Right(Next.Finish(LoopExit.Success))
-    world.logged("dup end ran") shouldBe true
+    stepped shouldBe Left(LoopExit.InfraFault)
+    world.logLines.exists(l =>
+      l.contains("dup-walk") && l.contains("'Dup'") && l.contains("2 distinct nodes")
+    ) shouldBe true
+    world.logged("dup end ran") shouldBe false
   }
 
-  // ---- 20: Edge's own declaration order precedence rule, pinned by a plan where two edges leaving ----
+  // ---- 20: issue #67 review, the identity/name gap n19 pins reproduced through a genuine review -----
+  // ---- boundary (the adjudicated failure scenario): a VALID, reviewed plan must never be rejected ----
+  // ---- because Runner.validate merges two distinct same-named nodes into one --------------------------
+
+  it should "reject rc 50 through Plan.declarationViolations, naming the name collision, rather than through Runner.validate's own invented Dup -> Guarded path, for a plan whose two distinct Dup nodes are separated by a genuine Review" in {
+    // `dupA -> Review(Trust.Reviewed) -> dupB -> Guarded(Guard.RequiresReview)` is a VALID graph: every
+    // path into `Guarded` genuinely crosses `Review` first. `dupA` and `dupB` are, once again, two
+    // DIFFERENT `Node` values sharing the name "Dup" with identical cost/timeout/trust/guard, so
+    // `Runner.validate`'s own duplicate-name check has nothing to disagree on. Before
+    // `Plan.declarationViolations` existed, `Plan.shapeOf` merged the two `Dup` nodes' own transitions
+    // under one name, `Runner.validate`'s own `byFrom` map then read BOTH `Review` and `Guarded` as
+    // children of that single "Dup" state, so it walked straight from entry to `Guarded` without ever
+    // crossing `Review`, and rejected a plan the real walk runs cleanly, naming a `Dup -> Guarded` edge
+    // that does not exist anywhere in this plan (adjudicator repro, issue #67 review). This test pins
+    // that this Plan is now refused before either the walk or the validator ever runs, with a message
+    // about the name collision, never with that invented path, and that the review dispatch itself
+    // never fires: a bad declaration is a fact true before any node's own side effects could occur.
+    val dupA = Node[Unit, Unit](
+      name = "Dup",
+      cost = Cost.NoDispatch,
+      timeout = Timeout.Unbounded,
+      probe = _ => None,
+      run = _ => NodeOutcome.Done(())
+    )
+    val review = Node[Unit, AgentDispatch.Judged[Unit]](
+      name = "Review",
+      cost = Cost.NoDispatch,
+      timeout = Timeout.Unbounded,
+      probe = _ => None,
+      run = _ => NodeOutcome.Done(summon[AgentDispatch].review("prompt", "review.log").map(_ => ()))
+    )
+    val dupB = Node[Unit, Unit](
+      name = "Dup",
+      cost = Cost.NoDispatch,
+      timeout = Timeout.Unbounded,
+      probe = _ => None,
+      run = _ => NodeOutcome.Done(())
+    )
+    val guarded = Node[GuardedInput, Unit](
+      name = "Guarded",
+      cost = Cost.NoDispatch,
+      timeout = Timeout.Unbounded,
+      probe = _ => None,
+      run = _ => NodeOutcome.Done(())
+    )
+    val myGraph = LitterBox.graph(
+      name = "consumer-dup-review",
+      plan = Plan(
+        entry = dupA,
+        edges = List(
+          Edge.To(dupA, review, _ => Some(())),
+          Edge.To(review, dupB, (_: AgentDispatch.Judged[Unit]) => Some(())),
+          Edge.To(dupB, guarded, _ => Some(GuardedInput())),
+          Edge.Exit(guarded, _ => Some(LoopExit.Success))
+        )
+      ),
+      dispatchBudget = _ => 0,
+      startInput = _ => ()
+    )
+
+    val world = new TestWorld
+    val exit  = runOnce(world, myGraph)
+
+    exit shouldBe LoopExit.InfraFault
+    world.logLines.exists(l =>
+      l.contains("consumer-dup-review") && l.contains("'Dup'") && l.contains("2 distinct nodes")
+    ) shouldBe true
+    world.logLines.exists(l => l.contains("Dup -> Guarded")) shouldBe false
+    world.callCount("dispatch REVIEW") shouldBe 0
+  }
+
+  // ---- 21: issue #67 review, an Edge.Exit whose source is unreachable is rejected up front, rather ---
+  // ---- than silently compiling and validating clean before dying mid-tick at the real terminal node ---
+
+  it should "reject rc 50 through Plan.declarationViolations, naming the orphan Edge.Exit source, before any node runs, rather than dead-ending mid-tick at the node the consumer actually meant" in {
+    // `start -> finish` is the only real edge; `Edge.Exit(stale, ...)` names a THIRD node the plan
+    // never reaches, the shape of mistake a consumer makes typing the wrong val as an exit's own
+    // source. `Plan.shapeOf` keeps only `Edge.To` in the `Shape` it derives (that method's own doc has
+    // the reason), so `stale` never reaches `Runner.validate`'s own declared-node set at all: before
+    // `Plan.declarationViolations` existed, this plan compiled clean, validated clean, and only failed
+    // mid-tick once `finish` ran and no edge left it, after `start`'s own real side effects had already
+    // fired. This test pins that the mistake is caught before `start` ever runs, naming `stale`
+    // directly rather than the node the walk would otherwise dead-end at.
+    val start  = loggingNode("Start", "orphan-exit start ran")
+    val finish = loggingNode("Finish", "orphan-exit finish ran")
+    val stale  = loggingNode("Stale", "orphan-exit stale ran")
+    val myGraph = LitterBox.graph(
+      name = "consumer-orphan-exit",
+      plan = Plan(
+        entry = start,
+        edges = List(
+          Edge.To(start, finish, _ => Some(())),
+          Edge.Exit(stale, _ => Some(LoopExit.Success))
+        )
+      ),
+      dispatchBudget = _ => 0,
+      startInput = _ => ()
+    )
+
+    val world = new TestWorld
+    val exit  = runOnce(world, myGraph)
+
+    exit shouldBe LoopExit.InfraFault
+    world.logLines.exists(l =>
+      l.contains("consumer-orphan-exit") && l.contains("'Stale'") && l.contains("unreachable")
+    ) shouldBe true
+    world.logged("orphan-exit start ran") shouldBe false
+    world.logged("orphan-exit finish ran") shouldBe false
+  }
+
+  // ---- 22: Edge's own declaration order precedence rule, pinned by a plan where two edges leaving ----
   // ---- the same node both answer Some for the identical produced value ------------------------------
 
   it should "take the first-declared edge out of a node when a second, later edge out of that same node also answers Some for the produced value" in {

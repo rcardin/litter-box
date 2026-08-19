@@ -241,18 +241,26 @@ configuration, ...),
 `LitterBox.graph` is not for you; compose `Runner.run` directly instead, outside the compile-time half
 of this guarantee, though `Runner.validate` still runs against whatever `Shape` you hand `Runner.run`.
 
-Four different compile errors can fire here, worded differently on purpose so none is mistaken for
-another (issue #43 review round 3, BLOCKER 1, adding the third; issue #67 review, adding the fourth):
-`plan` was not recognisably a `Plan(...)` literal at all (a `val`, a function result, an indirection of
-any kind); `plan` genuinely was a literal written right here but one piece inside it (a node reference,
-an `Edge`, a list) was not written in a form the check can read; every piece WAS readable but two
-different references canonicalise to the identical node identity while disagreeing on whether that node
-needs review, most often a `class` and its own companion `object` each declaring a member of the same
-name; or one readable reference named a node built by an inline `Node(name = "...", ...)` call, refused
-outright rather than accepted, because `Runner`'s own walk of a `Plan` links one edge to the next by
-which runtime OBJECT a node is, never by this check's own canonical name, and an inline call allocates a
-fresh object at every place it is written, so the identical `Node(name = "X", ...)` written twice, or
-even once with nothing else naming that same object, is never the value a real run needs. The forms it
+Five different compile errors can fire here, worded differently on purpose so none is mistaken for
+another (issue #43 review round 3, BLOCKER 1, adding the third; issue #67 review, adding the fourth and
+the fifth): `plan` was not recognisably a `Plan(...)` literal at all (a `val`, a function result, an
+indirection of any kind); `plan` genuinely was a literal written right here but one piece inside it (a
+node reference, an `Edge`, a list) was not written in a form the check can read; every piece WAS
+readable but two different references canonicalise to the identical node identity while disagreeing on
+whether that node needs review, most often a `class` and its own companion `object` each declaring a
+member of the same name; one readable reference named a node built by an inline `Node(name = "...",
+...)` call, refused outright rather than accepted, because `Runner`'s own walk of a `Plan` links one
+edge to the next by which runtime OBJECT a node is, never by this check's own canonical name, and an
+inline call allocates a fresh object at every place it is written, so the identical `Node(name = "X",
+...)` written twice, or even once with nothing else naming that same object, is never the value a real
+run needs; or two different references canonicalise to the identical node identity while AGREEING on
+both `trust` and `guard`, still most often a `class` and its own companion `object` declaring a member
+of the same name, this time with both sides' input types agreeing on review, refused just as hard as the
+disagreeing case above because `Plan.workflowOf` still links one edge to the next by which runtime
+OBJECT a node is, never by this check's own canonical name, so two agreeing declarations are still two
+different objects, and a real run dead ends the moment it reaches one without an edge naming that exact
+object as its own source, after both objects already produced whatever side effects they carry. The
+forms it
 can read: a node or `Edge` referred to through a stable path (a top-level `val`, an `object` member, or
 an unqualified `val` member of an enclosing `class`, `this.A` written bare as `A`); an inline
 `Edge.To(from, to, input)` or `Edge.Exit(from, exit)` call; an `Edge` bound to a `val` local to the same

@@ -173,8 +173,8 @@ class ConsumerGraphSpec extends AnyFlatSpec with Matchers:
   it should "refuse to typecheck LitterBox.graph(...) whose literal Plan reaches a RequiresReviewInput node with no reviewer on the path" in {
     // `ConsumerBoundarySpec`'s own equivalent negative (`:247-285`) only fires when the consumer
     // remembers to splice `checkedShape` themselves around their own local `shape` value; here the
-    // exact same violation reaches the macro because `LitterBox.graph`'s own `inline shape` parameter
-    // splices it automatically, with no `checkedShape` call anywhere in this snippet at all.
+    // exact same violation reaches the macro because `LitterBox.graph`'s own `inline plan` parameter
+    // splices it automatically, with no `checkedPlan` call anywhere in this snippet at all.
     val errors = scala.compiletime.testing.typeCheckErrors(
       """
         |import in.rcard.litterbox._
@@ -597,7 +597,7 @@ class ConsumerGraphSpec extends AnyFlatSpec with Matchers:
     messages should include("'OpenPr15'")
   }
 
-  it should "typecheck a val-bound Edge, declared local to the same block as the LitterBox.graph call that uses it, referenced as a list element (issue #43 review round 2, BLOCKER B1 part 2: parseTransition now reads through a LOCAL val binding to its own Transition(...) initialiser)" in {
+  it should "typecheck a val-bound Edge, declared local to the same block as the LitterBox.graph call that uses it, referenced as a list element (issue #43 review round 2, BLOCKER B1 part 2: parseEdge now reads through a LOCAL val binding to its own Edge.To(...) initialiser)" in {
     // `parseTransition`'s own doc (`KitMacro.scala`) has the reason this resolves for a LOCAL val
     // (its initialiser is still part of the tree macro expansion is currently typing) but declines for
     // a class-or-object-MEMBER val (its initialiser is compiled away into that type's own constructor,
@@ -629,7 +629,7 @@ class ConsumerGraphSpec extends AnyFlatSpec with Matchers:
     errors shouldBe empty
   }
 
-  it should "refuse to typecheck a val-bound Edge, local to the same block as the LitterBox.graph call, when the marker-guarded node has no reviewer on the path (issue #43 review round 3, MAJOR 1: the negative twin of the local-val-bound-Transition positive above)" in {
+  it should "refuse to typecheck a val-bound Edge, local to the same block as the LitterBox.graph call, when the marker-guarded node has no reviewer on the path (issue #43 review round 3, MAJOR 1: the negative twin of the local-val-bound-Edge positive above)" in {
     val errors = scala.compiletime.testing.typeCheckErrors(
       """
         |import in.rcard.litterbox._

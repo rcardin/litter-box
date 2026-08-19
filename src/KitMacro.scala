@@ -814,8 +814,9 @@ private[litterbox] object KitMacro:
         case _ => None
 
     /** The three ways `parseShape` below can fail to read a full literal graph, kept as DISTINCT cases
-      * rather than a single `None` (issue #43 review), and a fourth that only `parsePlan` below can
-      * ever raise (`InlineNodeInPlan`'s own doc has that one in full). The strict caller (`checkGraph`'s
+      * rather than a single `None` (issue #43 review), and two more that only `parsePlan` below can
+      * ever raise, `InlineNodeInPlan` and `IdentityConflict` (each one's own doc below has it in
+      * full). The strict caller (`checkGraph`'s
       * own tail match) needs to tell them apart to raise differently worded errors: `NotALiteral` is
       * `root` itself not recognisably the expected call at all (a `val`, a function result,
       * `Machine.shippedShape`, ...); `UnreadablePiece` is a narrower failure, `root` genuinely IS a
@@ -1349,12 +1350,13 @@ private[litterbox] object KitMacro:
           )
         else ()
       case Left(ParseFailure.IdentityConflict(key, first, second)) =>
-        // The FOURTH strict failure, `KeyConflict`'s own sibling rather than a widening of it
-        // (`IdentityConflict`'s own doc above has the reasoning): `KeyConflict` fires only when the two
-        // colliding references disagree on `(trust, guard)`; this fires whenever they come from two
-        // different defining symbols at all, agreeing or not, because `Plan.workflowOf` walks by
-        // reference identity, never by this walk's own canonicalised key, so an agreeing companion pair
-        // is exactly as broken at runtime as a disagreeing one. Anchored at `second`'s own position,
+        // The second failure only `parsePlan` can raise, `KeyConflict`'s own sibling rather than a
+        // widening of it (`IdentityConflict`'s own doc above has the reasoning): `KeyConflict` fires
+        // only when the two colliding references disagree on `(trust, guard)`; this fires whenever
+        // they come from two different defining symbols at all, agreeing or not, because
+        // `Plan.workflowOf` walks by reference identity, never by this walk's own canonicalised key,
+        // so an agreeing companion pair is exactly as broken at runtime as a disagreeing one.
+        // Anchored at `second`'s own position,
         // with `first`'s own line named in the message text, for the identical reason `KeyConflict`'s
         // own case does.
         if strict then

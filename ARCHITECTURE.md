@@ -192,23 +192,33 @@ configuration**, so they live under `resources/` and travel inside the jar
   this walk cannot detect as incomplete at all), for which `Runner.validate` is not a backstop for a
   fact read differently, it is the only check that ever runs against the graph's real, already-resolved
   `Node` values (`KitMacro.checkReconciled`'s own doc, `KitMacro.scala`, has the mechanism for both).
-  That hard error is FOUR differently worded errors, not one (issue #43 review round 2, BLOCKER B1,
+  That hard error is FIVE differently worded errors, not one (issue #43 review round 2, BLOCKER B1,
   part 1; issue #43 review round 3, BLOCKER 1, part 2, adding the third; issue #67 review, adding the
-  fourth): `plan` not being recognisable as a `Plan(...)` literal at all gets one message; `plan` being
-  a genuine literal whose walk still could not read one piece inside it gets another, naming that exact
-  piece, so a consumer who already wrote a literal is never told to do what they already did; every
-  piece being readable but two different references canonicalising to the identical node identity while
-  disagreeing on whether that node needs review gets a third, naming both references, so a
-  `class`/`object` companion pair are never silently merged into one node by whichever the reachability
-  walk's own visited set happens to keep; and one readable reference naming an inline `Node.apply`
-  construction gets a fourth, refused outright rather than only on a collision, because `Kit.scala`'s
-  own `Plan.workflowOf` links one edge to the next by which runtime OBJECT a node is, `Edge.source(e) eq
-  from`, never by this walk's own canonical name, and an inline call allocates a fresh object at every
-  place it is written, so the identical construction written twice is never one runtime value, and
-  written once is a node no edge can ever leave (`KitMacro.ParseFailure.InlineNodeInPlan`'s own doc,
-  `KitMacro.scala`, has the full reasoning, including why `checkedShape`'s own opt in walk, which never
-  links a `Shape` to a real run the way `Plan.workflowOf` does, keeps reading an inline construction
-  unchanged). That second walk was also
+  fourth and the fifth): `plan` not being recognisable as a `Plan(...)` literal at all gets one message;
+  `plan` being a genuine literal whose walk still could not read one piece inside it gets another,
+  naming that exact piece, so a consumer who already wrote a literal is never told to do what they
+  already did; every piece being readable but two different references canonicalising to the identical
+  node identity while disagreeing on whether that node needs review gets a third, naming both
+  references, so a `class`/`object` companion pair whose two sides DISAGREE on whether the node needs
+  review are never silently merged into one node by whichever the reachability walk's own visited set
+  happens to keep; one readable reference naming an inline `Node.apply` construction gets a fourth,
+  refused outright rather than only on a collision, because `Kit.scala`'s own `Plan.workflowOf` links
+  one edge to the next by which runtime OBJECT a node is, `Edge.source(e) eq from`, never by this walk's
+  own canonical name, and an inline call allocates a fresh object at every place it is written, so the
+  identical construction written twice is never one runtime value, and written once is a node no edge
+  can ever leave (`KitMacro.ParseFailure.InlineNodeInPlan`'s own doc, `KitMacro.scala`, has the full
+  reasoning, including why `checkedShape`'s own opt in walk, which never links a `Shape` to a real run
+  the way `Plan.workflowOf` does, keeps reading an inline construction unchanged); and two readable
+  references canonicalising to the identical node identity while coming from two different DEFINING
+  SYMBOLS gets a fifth, naming both references, refused on symbol identity alone before agreement or
+  disagreement is ever asked about, because `Plan.workflowOf` links an edge to the node it leaves by
+  reference identity and never by this walk's own canonical key, so a `class`/`object` companion pair
+  whose two sides AGREE on `(trust, guard)` is exactly as broken at runtime as a disagreeing one
+  (`KitMacro.ParseFailure.IdentityConflict`'s own doc, `KitMacro.scala`, has the full reasoning, and
+  `KitMacro.checkIdentity` is the pass that raises it, restricted to `parsePlan` and never run from
+  `parseShape`, since a `Shape` only feeds `Runner.validate`'s reachability check, which keys by name
+  the way an agreeing companion pair spells identically on purpose, never `Plan.workflowOf`'s own
+  reference identity walk). That second walk was also
   widened in round 2 to read a `val` member of a class referenced unqualified (`this.A` written bare),
   `List.empty`/`List.empty[...]` alongside `List(...)`/`Nil`, the literal's own two named arguments in
   either order, and an edge bound to a `val` local to the same block as the `LitterBox.graph`

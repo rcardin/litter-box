@@ -743,12 +743,104 @@ object Plan:
     * rather than off a second one a consumer wrote beside it. Never empty: the entry node is always
     * declared, so a derived `Shape` can never come back as the `Shape(Nil, Nil)` `validate` reads as
     * trivially valid, the failure mode that would silently turn a rejection into a pass.
+    *
+    * `edges.collect { case Edge.To(...) => ... }` on purpose drops an `Edge.Exit`'s own `from`
+    * entirely: a `Transition` states which node can follow which, and an exit is the one edge that has
+    * no follower, so the equivalent statement for it would be a `Transition` to nowhere, a shape
+    * `Transition` cannot express (issue #67 review). That is not the same claim as "an exit source
+    * needs no check at all": [[declarationViolations]] below is where that check now lives, reading
+    * `plan.edges` directly rather than the `Shape` this method derives, precisely because this method's
+    * own output has nowhere to carry it.
     */
   private[litterbox] def shapeOf(plan: Plan[?]): Shape =
     Shape(
       entry = List(plan.entry),
       transitions = plan.edges.collect { case Edge.To(from, to, _) => Transition(from, to) }
     )
+
+  /** Declaration hygiene violations a `Plan` can carry that no other check catches, both because
+    * `Runner.validate` and the compile time macro (`KitMacro.checkGraph`) read a `Plan` through two
+    * DIFFERENT lenses, neither of which is the one [[workflowOf]] actually walks by (issue #67 review,
+    * two rounds naming two failure modes of the same root cause):
+    *
+    *   - Two references inside `plan` sharing one `name` while being genuinely distinct `Node` values
+    *     (never `eq`). `workflowOf` walks each one's own outgoing edges separately, since it can never
+    *     confuse two different objects for one; `shapeOf` above cannot keep that distinction, a
+    *     `Transition` holds a bare `Node[?, ?]`, and `Runner.validate` groups the `Shape` it derives by
+    *     `name` alone (`Runner.validate`'s own `byFrom`), so two same-named nodes collapse into one
+    *     validator-side identity. A node reached by EITHER one is then read as having crossed every
+    *     edge either one declared, which can invent an edge neither node actually has (a direct path
+    *     into a guarded node that skips the reviewer one of the two genuinely sits behind), or, just as
+    *     dangerous the other way, invent a review neither node earned. Either is a false verdict about a
+    *     graph the real walk runs correctly.
+    *   - A node named only as the `from` of an `Edge.Exit`, unreachable from `plan.entry` over the
+    *     plan's own `Edge.To` edges. `shapeOf`'s own doc above has the reason such a node contributes no
+    *     `Transition`: it is invisible to `Runner.validate` entirely, where the identical typo written
+    *     as an `Edge.To`'s destination instead IS caught, by that same validator's own unreachable-node
+    *     check. An `Edge.Exit` should not be a quieter way to make the identical mistake.
+    *
+    * Read by [[workflowOf]] itself, before it derives a single closure: a `Plan` carrying either shape
+    * of violation faults through the same `Machine.infraFault` channel every other declaration problem
+    * in this file already uses, and it does so strictly before `Runner.validate` ever sees the `Shape`
+    * this same `Plan` derives, on every path that reaches one (`Machine.runOnce` builds a `Workflow`
+    * off `graph.workflow(...)` before it reads `graph.shape(cfg)`, and `Runner.run` receives an
+    * already-built `Workflow` as its own argument, evaluated before its body ever calls
+    * `validate(wf.shape)`), so the false-verdict failure mode named above can never actually surface as
+    * a `Runner.validate` rejection or a `Runner.validate` false pass: this check runs first and names
+    * the real problem instead.
+    *
+    * Deliberately narrower than "every fact `Runner.validate` reads": nothing here re-checks
+    * `cost`/`timeout`/`trust`/`guard` agreement (`Runner.validate`'s own duplicate name check already
+    * owns that fact, unconditionally, on every `Shape` including this one's own derived `shapeOf(plan)`),
+    * and nothing here re-checks whether an `Edge.To` destination is reachable (the identical case
+    * `Runner.validate`'s own unreachable-node check already owns, since `shapeOf` keeps every `Edge.To`
+    * in the `Shape` it derives). Both of those stay exactly where they already were; this method exists
+    * only for the two facts a derived `Shape` cannot state at all.
+    */
+  private[litterbox] def declarationViolations(plan: Plan[?]): List[String] =
+    val declaredRefs: List[Node[?, ?]] =
+      plan.entry :: plan.edges.flatMap { e =>
+        Edge.source(e) :: (e match
+          case t: Edge.To[?, ?] => List(t.to)
+          case _: Edge.Exit[?]  => Nil
+        )
+      }
+
+    val duplicateNameViolations = declaredRefs.map(_.name).distinct.flatMap { nodeName =>
+      val distinctByIdentity =
+        declaredRefs.filter(_.name == nodeName).foldLeft(List.empty[Node[?, ?]]) { (acc, n) =>
+          if acc.exists(_ eq n) then acc else n :: acc
+        }
+      if distinctByIdentity.size > 1 then
+        List(
+          s"name '$nodeName' is declared by ${distinctByIdentity.size} distinct nodes that are not " +
+            "the same object: this Plan's own derived walk links edges by node identity while " +
+            "Runner.validate reads declared names, so every distinct node in a Plan needs its own name"
+        )
+      else Nil
+    }
+
+    def outgoingTo(from: Node[?, ?]): List[Node[?, ?]] =
+      plan.edges.collect { case t: Edge.To[?, ?] if t.from eq from => t.to }
+
+    @scala.annotation.tailrec
+    def reachableFrom(frontier: List[Node[?, ?]], visited: List[Node[?, ?]]): List[Node[?, ?]] =
+      frontier match
+        case Nil => visited
+        case n :: rest =>
+          if visited.exists(_ eq n) then reachableFrom(rest, visited)
+          else reachableFrom(outgoingTo(n) ::: rest, n :: visited)
+
+    val reachable = reachableFrom(List(plan.entry), Nil)
+
+    val unreachableExitViolations = plan.edges.collect {
+      case x: Edge.Exit[?] if !reachable.exists(_ eq x.from) =>
+        s"node '${x.from.name}' is the source of an Edge.Exit but is unreachable from this Plan's " +
+          "own entry over its own Edge.To edges, so it can never run: check for a typo naming the " +
+          "wrong node"
+    }.distinct
+
+    duplicateNameViolations ++ unreachableExitViolations
 
   /** The walk, derived from the same edges [[shapeOf]] declares.
     *
@@ -763,18 +855,26 @@ object Plan:
     * while doing genuinely different work pass validation cleanly and yet, under a name keyed walk,
     * every edge either one declared filtered in for BOTH, so the second node's own edges were never
     * reached at all and the walk silently followed the first node's edges back onto itself, a real
-    * graph cycling forever with no consumer ever declaring one (pinned by
-    * `test/ConsumerGraphRunSpec.scala`'s own "two distinct nodes... share one name" test). Identity
-    * carries no such gap: two distinct `Node` values are never `eq`, however many facts they happen
-    * to agree on, and one `Node` value read back through a second `val` (the alias residual
-    * `checkReconciled`'s own doc, `KitMacro.scala`, names for the compile time walk) stays `eq` to
-    * itself, so nothing this walk needs from the alias case is lost by the change.
+    * graph cycling forever with no consumer ever declaring one. Identity carries no such gap: two
+    * distinct `Node` values are never `eq`, however many facts they happen to agree on, and one `Node`
+    * value read back through a second `val` (the alias residual `checkReconciled`'s own doc,
+    * `KitMacro.scala`, names for the compile time walk) stays `eq` to itself, so nothing this walk
+    * needs from the alias case is lost by the change. This method no longer merely tolerates that
+    * name/identity gap by walking around it, though (issue #67 review, second round): a `Plan` that
+    * carries it at all is refused outright, below, before this walk is ever built, so `Runner.validate`
+    * downstream is never handed a `Shape` that gap could make it misread either way (pinned by
+    * `test/ConsumerGraphRunSpec.scala`'s own dup-name rejection test).
     *
     * A node the walk reaches whose every outgoing edge declines the value it produced is a fault, not
     * a quiet success: the alternative is inventing a `LoopExit` the consumer never declared. It goes
     * through `Machine.infraFault`, the one fault channel every other failure in this loop already
     * uses, which is why this derivation needs `caps` and `faulting` and therefore happens inside
     * `LoopGraph.workflow`, the one place a tick's own capabilities exist.
+    *
+    * [[declarationViolations]] runs first, for the identical reason: a bad declaration is a fact about
+    * `plan` itself, true before a single edge of this walk is ever taken, so checking it after the walk
+    * had already started would be too late to mean "rejected before executing any node" (the same
+    * ordering argument `Runner.run`'s own doc makes for `validate(wf.shape)` against `wf.start`).
     *
     * Reference identity is a promise this walk can keep only about a runtime VALUE, never about the
     * SOURCE a consumer wrote (issue #67 review, walk identity splits node macro merges): an inline
@@ -795,6 +895,11 @@ object Plan:
       plan: Plan[I],
       stages: StageSet
   )(using caps: Caps, faulting: Faulting): Workflow[I] =
+    val declViolations = declarationViolations(plan)
+    if declViolations.nonEmpty then
+      Machine.infraFault(
+        s"graph '$name' plan is not well declared: ${declViolations.mkString("; ")}"
+      )(using caps.logger, caps.notifier)(using faulting)
     def andThen(from: Node[?, ?]): Any => Next =
       out =>
         plan.edges.iterator
