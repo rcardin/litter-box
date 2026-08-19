@@ -17,57 +17,6 @@ import scala.quoted.*
   */
 private[litterbox] object KitMacro:
 
-  /** Walks `shapeExpr`'s own AST, looking for the literal shape `Shape(entry = List(...), transitions
-    * = List(Transition(...), ...))` written directly at the call site. Two independent things can
-    * make this fail to recognise the literal: the expression is not that literal shape at all (a
-    * variable, a function call, `Machine.shippedShape`, anything indirect), or it is that shape but
-    * this walk cannot fully make sense of one of its pieces (an entry or transition list built some
-    * way other than a plain `List(...)` literal, say). What happens next on either one is controlled
-    * by `strict` (issue #43 review, added alongside `checkedShapeStrict`, `Kit.scala`): called
-    * leniently, from `checkedShape`, this falls back to returning `shapeExpr` completely unchanged,
-    * neither case an error, `checkedShape`'s own doc states why silently degrading, rather than
-    * aborting, is the only choice that keeps THAT function safe to sprinkle onto a `Shape` a future
-    * author is not yet ready to write as a full literal, `Runner.validate` remains the backstop for
-    * exactly that graph. Called strictly, from `checkedShapeStrict`, `LitterBox.graph`'s own only
-    * caller, the identical situation instead aborts compilation: `checkedShapeStrict`'s own doc has the
-    * reason a silent fallback is not safe for that one entry point specifically. The two "independent
-    * things" named above are NOT collapsed into one strict error: they are distinguished by
-    * `ParseFailure` (below `parseShape`'s own definition), whose own doc has the reasoning for raising
-    * two differently worded messages instead of one. The reachable table of what this walk can and
-    * cannot read is spelled out at `stablePathKey`, `literalListElements` and `companionApplyArgs`
-    * below, each at the point that recognises the relevant form.
-    *
-    * When the literal IS fully readable, this runs the SAME BFS `Runner.validate` runs (from `entry`,
-    * over `transitions`, a state keyed on `(node, reviewed so far)` so no diamond or cycle is ever
-    * expanded twice, `Runner.validate`'s own doc, `Kit.scala`, has the shared reasoning for why BFS
-    * and why that particular key). Identity is NOT read off the `Node.name` string the way
-    * `Runner.validate` reads it: it is read off a STABLE PATH, a package, a module, or an immutable
-    * `val`, chained through every prefix, or off a literal `name` argument written directly at an
-    * inline `Node.apply` call (`identifyRef`'s own doc below has the full reasoning), through ONE
-    * canonical function, `stablePathKey`'s own `canonical` (that function's own doc has the mechanism
-    * and the reason a single scheme replaced three incompatible ones this walk used to compute by
-    * hand). `trust`, unlike identity, is read the same way `Node.apply` itself derives it, by summoning
-    * `TrustOf[O]` and reading which given answered (`nodeFacts`'s own doc below has the mechanism),
-    * declining the whole shape rather than guessing whenever neither `TrustOf.judged` nor
-    * `LowPriorityTrustOf.plain` answers. `guard` is read the same OR `Node.apply` itself computes, off
-    * the reference's own input type extending `RequiresReviewInput` and off an explicit
-    * `guard = Guard.RequiresReview` argument (`nodeFacts`'s and `explicitRequiresReviewGuard`'s own
-    * docs below have the mechanism and the reason both halves are needed), with one asymmetry worth
-    * knowing before trusting what this walk reports: the marker half reads a STATIC TYPE, so it fires
-    * for every reference form this walk can key at all, while the argument half reads SOURCE TEXT that
-    * only an inline `Node.apply` written at the shape's own call site still carries, so an explicit
-    * `guard` on a node built elsewhere and referenced by a stable path is invisible here and left to
-    * `Runner.validate` alone (`explicitRequiresReviewGuard`'s own doc below has that scope in full).
-    *
-    * One respect this walk is NOT `Runner.validate`'s, by design rather than by oversight: three
-    * DECLARATION level checks `Runner.validate` also runs have no AST level analogue here at all
-    * (`violations`'s own doc, below, names each one and why). What keeps a key COLLISION honest, as
-    * opposed to an alias this walk cannot even see, is `checkReconciled` (below `parseShape`'s own
-    * definition), not `Runner.validate`: two `NodeRef`s sharing one canonical key while disagreeing on
-    * `(trust, guard)` is a hard compile error naming both, raised BEFORE the BFS below ever runs
-    * (`checkReconciled`'s own doc has the full reasoning, including the residual alias this check
-    * cannot catch).
-    */
   /** The implementation behind `markerRequiresReview` (`Kit.scala`), which `Node.apply`'s own `inline`
     * body reads to decide the marker half of a node's `guard`. One line, and every line of that
     * function's own doc is about why it has to be this line and not a given: `TypeRepr.of[I] <:<
@@ -85,8 +34,86 @@ private[litterbox] object KitMacro:
     import quotes.reflect.*
     Expr(TypeRepr.of[I] <:< TypeRepr.of[RequiresReviewInput])
 
-  def checkShapeImpl(shapeExpr: Expr[Shape], strict: Boolean)(using Quotes): Expr[Shape] =
+  /** Which of the two literals below [[checkGraph]] was asked to read, and, since the two answers
+    * differ on exactly this, whether an unreadable literal is a hard error or a silent fallback.
+    * `Plan` is the mandatory check `LitterBox.graph` splices; `Shape` is the opt in `checkedShape`
+    * a caller composing `Runner.run` by hand may reach for, which has always degraded silently
+    * rather than reject a graph its author is not yet ready to write as one literal.
+    */
+  private enum GraphKind:
+    case Shape, Plan
+
+  def checkShapeImpl(shapeExpr: Expr[Shape])(using Quotes): Expr[Shape] =
+    checkGraph(shapeExpr, GraphKind.Shape)
+    shapeExpr
+
+  def checkPlanImpl[I: Type](planExpr: Expr[Plan[I]])(using Quotes): Expr[Plan[I]] =
+    checkGraph(planExpr, GraphKind.Plan)
+    planExpr
+
+  /** Walks `root`'s own AST, looking for the one literal `kind` says to expect, a `Plan(entry = ...,
+    * edges = List(...))` for [[checkPlanImpl]] or a `Shape(entry = List(...), transitions =
+    * List(...))` for [[checkShapeImpl]], written directly at the call site. Two independent things can
+    * make this fail to recognise the literal: the expression is not that literal shape at all (a
+    * variable, a function call, `Machine.shippedShape`, anything indirect), or it is that shape but
+    * this walk cannot fully make sense of one of its pieces (a list built some way other than a plain
+    * `List(...)` literal, say). What happens next on either one is controlled by `kind`: for a
+    * `Shape`, read leniently from the opt in `checkedShape`, this falls back completely, neither case
+    * an error, `checkedShape`'s own doc states why silently degrading rather than aborting is the only
+    * choice that keeps THAT function safe to sprinkle onto a `Shape` a future author is not yet ready
+    * to write as a full literal, `Runner.validate` remains the backstop for exactly that graph. For a
+    * `Plan`, read from `checkedPlan`, `LitterBox.graph`'s own only caller, the identical situation
+    * instead aborts compilation: `checkedPlan`'s own doc has the reason a silent fallback is not safe
+    * for that one entry point specifically. The two "independent things" named above are NOT collapsed
+    * into one strict error: they are distinguished by `ParseFailure` (below `parseShape`'s own
+    * definition), whose own doc has the reasoning for raising two differently worded messages instead
+    * of one. The reachable table of what this walk can and cannot read is spelled out at
+    * `stablePathKey`, `literalListElements` and `companionApplyArgs` below, each at the point that
+    * recognises the relevant form.
+    *
+    * Both literals meet at the same `(entry, transitions)` pair (`parseShape` and `parsePlan` below),
+    * on purpose: everything past the parse, reconciliation, the BFS and every message either kind can
+    * raise, is then one implementation, so the mandatory check and the opt in one cannot come to read
+    * node identity, trust or review need by two subtly different rules.
+    *
+    * When the literal IS fully readable, this runs the SAME BFS `Runner.validate` runs (from `entry`,
+    * over `transitions`, a state keyed on `(node, reviewed so far)` so no diamond or cycle is ever
+    * expanded twice, `Runner.validate`'s own doc, `Kit.scala`, has the shared reasoning for why BFS
+    * and why that particular key). Identity is NOT read off the `Node.name` string the way
+    * `Runner.validate` reads it: it is read off a STABLE PATH, a package, a module, or an immutable
+    * `val`, chained through every prefix, or off a literal `name` argument written directly at an
+    * inline `Node.apply` call (`identifyRef`'s own doc below has the full reasoning), through ONE
+    * canonical function, `stablePathKey`'s own `canonical` (that function's own doc has the mechanism
+    * and the reason a single scheme replaced three incompatible ones this walk used to compute by
+    * hand). `trust`, unlike identity, is read the same way `Node.apply` itself derives it, by summoning
+    * `TrustOf[O]` and reading which given answered (`nodeFacts`'s own doc below has the mechanism),
+    * declining the whole literal rather than guessing whenever neither `TrustOf.judged` nor
+    * `LowPriorityTrustOf.plain` answers. `guard` is read the same OR `Node.apply` itself computes, off
+    * the reference's own input type extending `RequiresReviewInput` and off an explicit
+    * `guard = Guard.RequiresReview` argument (`nodeFacts`'s and `explicitRequiresReviewGuard`'s own
+    * docs below have the mechanism and the reason both halves are needed), with one asymmetry worth
+    * knowing before trusting what this walk reports: the marker half reads a STATIC TYPE, so it fires
+    * for every reference form this walk can key at all, while the argument half reads SOURCE TEXT that
+    * only an inline `Node.apply` written at the literal's own call site still carries, so an explicit
+    * `guard` on a node built elsewhere and referenced by a stable path is invisible here and left to
+    * `Runner.validate` alone (`explicitRequiresReviewGuard`'s own doc below has that scope in full).
+    *
+    * One respect this walk is NOT `Runner.validate`'s, by design rather than by oversight: three
+    * DECLARATION level checks `Runner.validate` also runs have no AST level analogue here at all
+    * (`violations`'s own doc, below, names each one and why). What keeps a key COLLISION honest, as
+    * opposed to an alias this walk cannot even see, is `checkReconciled` (below `parseShape`'s own
+    * definition), not `Runner.validate`: two `NodeRef`s sharing one canonical key while disagreeing on
+    * `(trust, guard)` is a hard compile error naming both, raised BEFORE the BFS below ever runs
+    * (`checkReconciled`'s own doc has the full reasoning, including the residual alias this check
+    * cannot catch).
+    *
+    * Returns nothing: both callers hand their own expression straight back unchanged, since the only
+    * effect this walk ever has is aborting compilation.
+    */
+  private def checkGraph(root: Expr[Any], kind: GraphKind)(using Quotes): Unit =
     import quotes.reflect.*
+
+    val strict = kind == GraphKind.Plan
 
     /** Peels the wrapper layers a literal expression accumulates on its way through the typer
       * (`Inlined` around an inlined call, `Typed` around an argument adapted to an expected type,
@@ -110,14 +137,13 @@ private[litterbox] object KitMacro:
       case other             => other
 
     /** The element terms of a literal `List(a, b, c)` call, or of the literal singleton `Nil` (read as
-      * a zero element list): `LitterBox.graph(..., shape = Shape(entry = List(only), transitions =
-      * Nil), ...)`, a fully literal declaration of a single node graph with no transitions, an entirely
-      * ordinary shape for a consumer to write, would otherwise be refused purely because `Nil` was not
-      * recognised. `Nil` is exactly as literal as `List()`, always the same value, so recognising it
-      * costs none of the caution the rest of this function reserves for varargs calls that only LOOK
-      * like `List(...)`.
+      * a zero element list): `checkedShape(Shape(entry = List(only), transitions = Nil))`, a fully
+      * literal declaration of a single node graph with no transitions, an entirely ordinary shape for a
+      * consumer to write, would otherwise be refused purely because `Nil` was not recognised. `Nil` is
+      * exactly as literal as `List()`, always the same value, so recognising it costs none of the
+      * caution the rest of this function reserves for varargs calls that only LOOK like `List(...)`.
       *
-      * This function is shared by BOTH `checkedShape` and `checkedShapeStrict` (`strict`'s own only two
+      * This function is shared by BOTH `checkedShape` and `checkedPlan` (`GraphKind`'s own only two
       * values thread through to the same `literalListElements`, `Kit.scala` has both entries), so
       * recognising `Nil` (and, below, `List.empty`) is NOT a strict-only change: a `Shape` whose only
       * unreadable piece is one of those now gets FULLY PARSED under lenient `checkedShape` too, not only
@@ -126,9 +152,9 @@ private[litterbox] object KitMacro:
       * checking, never less, but "safe direction" and "unchanged" are different claims, and
       * `checkedShape` is a published, public `inline def` (shipped in `0.2.0`) with no stability promise
       * attached to it beyond the blanket `0.x` one `README.md`'s version policy section already states,
-      * so a caller of `checkedShape` itself, not only of `checkedShapeStrict`, can have working code
+      * so a caller of `checkedShape` itself, not only of `checkedPlan`, can have working code
       * newly fail to compile after upgrading past this fix. `Kit.scala`'s own doc on `checkedShape` and
-      * `checkedShapeStrict`, and `LitterBox.scala`'s own doc on `LitterBox.graph`, all state this
+      * `checkedPlan`, and `LitterBox.scala`'s own doc on `LitterBox.graph`, all state this
       * plainly; `test/GraphMacroSpec.scala` pins the new behaviour so it reads as a decision made with
       * eyes open, not an accident later discovered. The same applies, for the identical reason (a shared
       * function, so no widening here is strict-only), to every other form this file widened alongside
@@ -237,6 +263,9 @@ private[litterbox] object KitMacro:
     val shapeModuleClass      = Symbol.requiredModule("in.rcard.litterbox.Shape").moduleClass
     val transitionModuleClass = Symbol.requiredModule("in.rcard.litterbox.Transition").moduleClass
     val nodeModuleClass       = Symbol.requiredModule("in.rcard.litterbox.Node").moduleClass
+    val planModuleClass       = Symbol.requiredModule("in.rcard.litterbox.Plan").moduleClass
+    val edgeToModuleClass     = Symbol.requiredModule("in.rcard.litterbox.Edge.To").moduleClass
+    val edgeExitModuleClass   = Symbol.requiredModule("in.rcard.litterbox.Edge.Exit").moduleClass
 
     /** The exact given `Node.apply`'s own `using t: TrustOf[O]` resolves to for a genuinely
       * `AgentDispatch.Judged`-shaped `O` (`nodeFacts` below reads `trust` by summoning `TrustOf[o]`
@@ -251,7 +280,7 @@ private[litterbox] object KitMacro:
       * TRAP for a future editor: looked up through `TrustOf`'s own path, `in.rcard.litterbox.
       * TrustOf.plain`, not through `LowPriorityTrustOf` directly, even though `plain` is declared on
       * that parent trait: `Symbol.requiredMethod` against the trait's OWN path is unreliable this
-      * early in scala-cli's suspend and resume compilation (`checkShapeImpl`'s own doc has the reason
+      * early in scala-cli's suspend and resume compilation (`checkGraph`'s own doc has the reason
       * that compilation shape exists at all), landing on an unrelated symbol on the very first macro
       * expansion of a run and only the real one from then on, while the identical lookup through
       * `TrustOf`, the object every OTHER symbol in this file is already anchored to, is stable from the
@@ -264,8 +293,15 @@ private[litterbox] object KitMacro:
       * reference's own static type (`nodeFacts` below), never off a value, and `pos` is the reference's
       * own source position, carried purely so `checkReconciled` below can point a human at BOTH sides
       * of a key collision it finds, not only the one `parseShape`'s own fold happened to visit last.
+      *
+      * `sym` is the reference's own DEFINING symbol, `Symbol.noSymbol` for an inline `Node.apply`
+      * call, which has none (`identifyRef` below has the reasoning for the sentinel). `canonical`
+      * strips a module class's own trailing `$` on purpose, so a `class` and its own companion
+      * `object` declaring a member of the identical simple name canonicalise to one `key` while
+      * remaining two different symbols underneath; `checkIdentity` below reads this field precisely
+      * because that is a fact `key` alone can no longer tell apart once canonicalised.
       */
-    final case class NodeRef(key: String, display: String, trust: Trust, guard: Guard, pos: Position)
+    final case class NodeRef(key: String, display: String, trust: Trust, guard: Guard, pos: Position, sym: Symbol)
 
     /** Peels a curried call (`mk("x")("y")`; `Node.apply`'s own call shape too, `(mainArgs)(using
       * t: TrustOf[O])` is one more curried layer past the explicit arguments) down to the innermost
@@ -375,7 +411,7 @@ private[litterbox] object KitMacro:
       *     an `a.node` reference where `a` could, for all this macro can prove, be one of several
       *     distinct `SomeClass` values at once). This branch DECLINES ENTIRELY, `None`, never a key:
       *     every instance-qualified receiver, regardless of what it widens to, is `UnreadablePiece`, a
-      *     hard error under `checkedShapeStrict` naming the unreadable term, a silent lenient fallback
+      *     hard error under `checkedPlan` naming the unreadable term, a silent lenient fallback
       *     under `checkedShape`.
       *
       *     TRAP for a future editor: this looks over-cautious, and two narrower rules were tried and
@@ -398,19 +434,20 @@ private[litterbox] object KitMacro:
       *     happens to equal some class" was always a proxy for "this receiver might alias `this`", and no
       *     FURTHER proxy is going to fare any better, since the actual fact needed, whether two distinct
       *     instance qualifiers name the same runtime value or two genuinely different ones, is exactly
-      *     the fact a tree-only macro cannot observe (`checkShapeImpl`'s own doc above has the general
+      *     the fact a tree-only macro cannot observe (`checkGraph`'s own doc above has the general
       *     limit). So this branch stops trying to distinguish provably-same from provably-different
       *     instance qualifiers and declines ALL of them, uniformly: the macro cannot tell `a.node`/
       *     `b.node` on two genuinely different instances (the idiom `GraphMacroSpec` pins, still
       *     compiling under `checkedShape`'s own lenient fallback, `Runner.validate` the backstop for it
       *     now) apart from `n2a.Start`/`n2b.Start` on one instance aliased twice, so keying an instance
-      *     path AT ALL is guessing, and this file's own stated philosophy, restated at `checkShapeImpl`'s
+      *     path AT ALL is guessing, and this file's own stated philosophy, restated at `checkGraph`'s
       *     own doc above, is "canonicalise, or decline loudly rather than guess": there is no honest
       *     THIRD option between those two for a fact this macro cannot observe. A consumer whose shape
       *     genuinely needs an instance-qualified node reference has `checkedShape`'s own lenient fallback
-      *     with `Runner.validate` as a backstop, or restructures the reference onto a top-level `val`, an
-      *     `object` member, or an inline `Node(name = ..., ...)` call, every one of which this walk reads
-      *     directly.
+      *     with `Runner.validate` as a backstop, or restructures the reference onto a top-level `val` or
+      *     an `object` member, either of which this walk reads directly; a `Plan`, unlike a `Shape`, has
+      *     no third option even in principle, an inline `Node(name = ..., ...)` call included
+      *     (`ParseFailure.InlineNodeInPlan`'s own doc above has the reason `Plan` never reads one).
       */
     def stablePathKey(t: Term): Option[String] =
       t match
@@ -425,12 +462,23 @@ private[litterbox] object KitMacro:
             case q => None
         case _ => None
 
+    /** The namespace prefix an inline `Node.apply` call's own key carries (`identifyRef`'s own doc
+      * below has the reasoning for why the prefix exists at all), pulled out as one named constant
+      * rather than the literal string `"inline:"` repeated wherever a caller needs to tell an inline
+      * construction's key apart from a stable path's: `parsePlan` below needs that same test, to refuse
+      * an inline construction outright rather than only on a collision (`ParseFailure.InlineNodeInPlan`'s
+      * own doc has the reasoning), and a second, independently typed literal is one more place the two
+      * tests could silently drift apart.
+      */
+    val inlineKeyNamespace = "inline:"
+
     /** Identifies one node REFERENCE: `key` is what `violations` below deduplicates and links edges
-      * on, `display` is what an error message shows a human, and `None` is what makes `nodeFacts`
-      * decline, which `parseShape`'s own fold turns into a fallback for the WHOLE shape. A reference is
-      * trusted only when it is a STABLE PATH (`stablePathKey` above, a package, a module, or an
-      * immutable `val`, chained through every prefix) or an inline `Node.apply` call carrying a literal
-      * `name`; every other shape, including every method call that is not `Node.apply` itself,
+      * on, `display` is what an error message shows a human, `sym` is what `checkIdentity` below tells
+      * two agreeing but genuinely different references apart with, and `None` is what makes
+      * `nodeFacts` decline, which `parseShape`'s own fold turns into a fallback for the WHOLE shape. A
+      * reference is trusted only when it is a STABLE PATH (`stablePathKey` above, a package, a module,
+      * or an immutable `val`, chained through every prefix) or an inline `Node.apply` call carrying a
+      * literal `name`; every other shape, including every method call that is not `Node.apply` itself,
       * regardless of how many arguments it carries, falls back rather than guesses.
       *
       * TRAP for a future editor: trusting a call with NO arguments in any curried layer, on the theory
@@ -451,7 +499,11 @@ private[litterbox] object KitMacro:
       * (`stablePathKey`'s own doc has the reasoning for declining every instance-qualified receiver
       * rather than keying it): `stablePathKey(t)` returns `None` for it, so this function's own
       * `Ident(_) | Select(_, _)` case below declines it too, rather than reaching this "keyed on the
-      * whole chain" case at all.
+      * whole chain" case at all. `sym` for this case is `t.symbol` itself, the exact member `key` was
+      * canonicalised FROM, carried alongside the canonicalised string precisely because canonicalising
+      * a `class`/`object` companion pair's own trailing `$` away is what makes two genuinely different
+      * symbols share one `key` in the first place (`canonical`'s own doc above has the mechanism);
+      * `checkIdentity` reads `sym`, never `key`, to tell that pair apart.
       *
       * A call whose own callee, after peeling every curried layer (`uncurry` above), resolves into
       * `Node`'s own companion IS `Node.apply` itself, written inline; here the `name` string really is
@@ -464,7 +516,10 @@ private[litterbox] object KitMacro:
       * naming the same node twice actually has, and the walk missed every violation past `entry`. When
       * `name` was written some other way, this returns `None` rather than inventing a key: guessing
       * which two inline constructions "probably" share a name is exactly the confident-but-wrong
-      * reading this whole function exists to avoid.
+      * reading this whole function exists to avoid. `sym` for this case is `Symbol.noSymbol`: an inline
+      * construction has no defining member to point at, only a call, and `parsePlan` refuses every
+      * inline construction outright before `checkIdentity` ever runs, so no caller reads this sentinel
+      * expecting it to distinguish anything.
       *
       * The key returned for an inline construction is `s"inline:$n"`, never the bare literal `n`:
       * `stablePathKey`'s own namespace above (a plain dotted path, built from a SYMBOL,
@@ -476,14 +531,14 @@ private[litterbox] object KitMacro:
       * inline `Node("Pick", ...)` calls still key identically to each other (`inline:Pick` both times),
       * only now provably unable to collide with a stable path spelled `Pick` too.
       */
-    def identifyRef(t: Term): Option[(String, String)] =
+    def identifyRef(t: Term): Option[(String, String, Symbol)] =
       t match
         case Ident(_) | Select(_, _) =>
-          stablePathKey(t).map(key => (key, t.symbol.name))
+          stablePathKey(t).map(key => (key, t.symbol.name, t.symbol))
         case Apply(_, _) =>
           val (fn, argss) = uncurry(t)
           if fn.symbol.exists && fn.symbol.owner == nodeModuleClass then
-            literalNameArg(argss.headOption.getOrElse(Nil)).map(n => (s"inline:$n", n))
+            literalNameArg(argss.headOption.getOrElse(Nil)).map(n => (s"$inlineKeyNamespace$n", n, Symbol.noSymbol))
           else None
         case _ => None
 
@@ -608,7 +663,7 @@ private[litterbox] object KitMacro:
       case _                                                        => t
 
     /** Reads `trust`/`guard` off a node reference's own static type `Node[I, O]`, and, for `guard`
-      * alone, off the reference's own SOURCE TEXT too, never off a value (`checkShapeImpl`'s own doc
+      * alone, off the reference's own SOURCE TEXT too, never off a value (`checkGraph`'s own doc
       * has the reason no value exists yet to read). `I` extending `RequiresReviewInput` is one half of
       * `guard` (`RequiresReviewInput`'s own doc, `Kit.scala`, has the reason a node author's own hand
       * written argument cannot be the only half read, and `markerRequiresReview`'s own doc has the
@@ -708,8 +763,8 @@ private[litterbox] object KitMacro:
               else Guard.Open
             for
               trust        <- trustOpt
-              (key, display) <- identifyRef(real)
-            yield NodeRef(key, display, trust, guard, real.pos)
+              (key, display, sym) <- identifyRef(real)
+            yield NodeRef(key, display, trust, guard, real.pos, sym)
         case _ => None
 
     /** Parses one `Transition(from, to)` element into its two node references, or `None` if either
@@ -759,18 +814,20 @@ private[litterbox] object KitMacro:
         case _ => None
 
     /** The three ways `parseShape` below can fail to read a full literal graph, kept as DISTINCT cases
-      * rather than a single `None` (issue #43 review). The strict caller (`checkShapeImpl`'s own tail
-      * match) needs to tell them apart to raise three DIFFERENTLY worded errors: `NotALiteral` is
-      * `shapeExpr` itself not recognisably a `Shape(...)` call at all (a `val`, a function result,
-      * `Machine.shippedShape`, ...); `UnreadablePiece` is a narrower failure, `shapeExpr` genuinely IS a
-      * `Shape(...)` literal, written directly at the call site, but one TERM somewhere inside it (a node
-      * reference, a `Transition`, a list) is not one of the forms this walk can read; `KeyConflict` is
-      * narrower still, every piece of `shapeExpr` WAS readable, but two of the `NodeRef`s this walk
+      * rather than a single `None` (issue #43 review), and two more that only `parsePlan` below can
+      * ever raise, `InlineNodeInPlan` and `IdentityConflict` (each one's own doc below has it in
+      * full). The strict caller (`checkGraph`'s
+      * own tail match) needs to tell them apart to raise differently worded errors: `NotALiteral` is
+      * `root` itself not recognisably the expected call at all (a `val`, a function result,
+      * `Machine.shippedShape`, ...); `UnreadablePiece` is a narrower failure, `root` genuinely IS a
+      * literal, written directly at the call site, but one TERM somewhere inside it (a node
+      * reference, an edge, a list) is not one of the forms this walk can read; `KeyConflict` is
+      * narrower still, every piece of `root` WAS readable, but two of the `NodeRef`s this walk
       * built from it canonicalise to the identical `key` (`stablePathKey`'s own doc above has the two
       * ways that can happen, a `class`/`object` companion pair or two inline constructions sharing one
       * literal `name`) while disagreeing on `(trust, guard)`, so there is no honest way to decide which
       * of the two facts `violations` below should trust (`checkReconciled`'s own doc has the full
-      * reasoning). Conflating the first two under `checkedShapeStrict` was found unsound: a consumer who
+      * reasoning). Conflating the first two under the mandatory check was found unsound: a consumer who
       * wrote a fully literal `Shape` reaching only ordinary idioms this walk simply had not been taught
       * yet (a class member `val` referenced bare, `List.empty`, out-of-order named arguments) received
       * the SAME "write a literal here" message a consumer who wrote no literal at all would get, advice
@@ -778,7 +835,7 @@ private[litterbox] object KitMacro:
       * of a BFS silently pick a winner between two conflicting `NodeRef`s sharing one key is the
       * identical class of mistake one level down, so `KeyConflict` gets its own wording for the same
       * reason. The lenient caller (`checkedShape`) does not need any of these three distinguished, and
-      * does not get them: every case falls back to `shapeExpr` unchanged there, exactly as a single
+      * does not get them: every case falls back to `root` unchanged there, exactly as a single
       * `None` always did, since `checkedShape`'s own doc (`Kit.scala`) already commits to silently
       * degrading on ANY unreadable shape for its own callers, regardless of why, key conflicts included.
       */
@@ -786,6 +843,43 @@ private[litterbox] object KitMacro:
       case NotALiteral
       case UnreadablePiece(term: Term)
       case KeyConflict(key: String, first: NodeRef, second: NodeRef)
+
+      /** `parsePlan`'s own extra failure (issue #67 review, walk identity splits node macro merges):
+        * `ref` names a node built by an inline `Node.apply` call written directly inside the `Plan`
+        * literal, at `entry`, at an edge's `from`, or at an edge's `to`. `parsePlan` refuses this
+        * unconditionally, never only when it collides with another reference (`checkReconciled` above
+        * is what catches a collision), because `Plan.workflowOf` (`Kit.scala`) links one edge to the
+        * next by reference identity, `Edge.source(e) eq from`, and an inline construction allocates a
+        * fresh object at every call site it appears in source: two writings of the identical
+        * `Node(name = "X", ...)` call are never the same runtime value, however much this walk's own
+        * canonical key treats them as one. A node named this way is therefore always broken at
+        * runtime, whether it is written once, a dead end no edge can ever leave because nothing else
+        * can spell the same object to stand as its `from`, or written twice, a split where the object
+        * the walk starts a tick at and the object an edge declares as its `from` are two values that
+        * never compare `eq`. A stable path never has either problem, since reading the same `val` or
+        * `object` member twice always answers with the identical object. `checkedShape`'s own literal
+        * `Shape` keeps accepting an inline construction, unaffected: nothing built from a `Shape`
+        * alone is ever walked this way, since a `Shape` only feeds `Runner.validate`'s reachability
+        * check, never a runner's own edge to edge walk.
+        */
+      case InlineNodeInPlan(ref: NodeRef)
+
+      /** `parsePlan`'s own second extra failure, beside `InlineNodeInPlan` above (issue #67 review,
+        * companion key merge splits derived walk): `first` and `second` canonicalise to the identical
+        * `key` while coming from two DIFFERENT defining symbols, `first.sym != second.sym`, regardless
+        * of whether the two also happen to agree on `(trust, guard)`. `checkReconciled` above only
+        * fires on disagreement, so a `class` and its own companion `object` declaring a member of the
+        * same simple name, agreeing on every fact that check reads, used to merge into one `NodeRef`
+        * and pass both the BFS and `Runner.validate` clean. `Plan.workflowOf` (`Kit.scala`) still links
+        * an edge to the node it leaves by REFERENCE IDENTITY, never by this walk's own canonicalised
+        * key, so an agreeing pair is exactly as broken at runtime as a disagreeing one: whichever of
+        * the two objects a real tick produces is never `eq` to the other one an edge names as its own
+        * source, and the walk dead ends into `Machine.infraFault` after both objects' own side effects
+        * already ran. Refusing on symbol identity alone, before agreement or disagreement is ever
+        * asked about, is what closes that gap without waiting to find out whether the two sides happen
+        * to differ on a fact this walk reads.
+        */
+      case IdentityConflict(key: String, first: NodeRef, second: NodeRef)
 
     /** Checks every `NodeRef` `parseShape` below has collected so far, `entry` and both sides of every
       * `Transition`, for two references sharing one `key` (`stablePathKey`/`identifyRef` above) while
@@ -839,7 +933,7 @@ private[litterbox] object KitMacro:
       * shape, a scope well past what this macro's per-call-site tree walk is built to do, and would
       * still fail the moment the alias crossed a FILE boundary this same compilation unit does not see,
       * `n19Same` defined in a different module than `n19Start`. So this is left standing, uniformly,
-      * alongside the def-built-node residue `checkShapeImpl`'s own doc above already names: this macro
+      * alongside the def-built-node residue `checkGraph`'s own doc above already names: this macro
       * cannot tell one `Node` bound under two stable paths apart from two genuinely different `Node`s
       * that happen to canonicalise differently, which is exactly what it is, two different symbols, so
       * there is nothing dishonest about the silence, only a real limit of a walk that reasons over
@@ -865,7 +959,29 @@ private[litterbox] object KitMacro:
         }
         .toLeft(())
 
-    /** The full parse: `shapeExpr` has to be a literal `Shape(entry = List(...), transitions =
+    /** `parsePlan`'s own extra pass, run alongside `checkReconciled` above rather than folded into it,
+      * because the two read a different fact and answer a different question: `checkReconciled` asks
+      * whether two references sharing a `key` DISAGREE on `(trust, guard)`; this asks whether they come
+      * from the SAME defining symbol at all, which `IdentityConflict`'s own doc above explains stays
+      * broken at runtime whether or not the two happen to agree. Restricted to `parsePlan`, never called
+      * from `parseShape`: a `Shape` only feeds `Runner.validate`'s reachability walk, which keys by
+      * `name` the way a class/object companion pair spells identically on purpose, so an agreeing
+      * companion pair costs a `Shape` only caller nothing this check would need to close, unlike
+      * `Plan.workflowOf`'s own reference identity walk.
+      */
+    def checkIdentity(refs: List[NodeRef]): Either[ParseFailure, Unit] =
+      refs
+        .groupBy(_.key)
+        .values
+        .collectFirst {
+          case group if group.map(_.sym).distinct.sizeIs > 1 =>
+            val first  = group.head
+            val second = group.find(_.sym != first.sym).get
+            ParseFailure.IdentityConflict(first.key, first, second)
+        }
+        .toLeft(())
+
+    /** The full parse: `root` has to be a literal `Shape(entry = List(...), transitions =
       * List(...))` call, every entry element a recognisable node reference, and every transitions
       * element a recognisable `Transition(...)` of two recognisable node references, for this to
       * return anything at all. One unrecognised piece anywhere is enough to fall back for the WHOLE
@@ -873,7 +989,7 @@ private[litterbox] object KitMacro:
       * where the real violation lives, which would be worse than not checking at all.
       *
       * Returns `Either[ParseFailure, ...]`, not `Option`, precisely so the FIRST unreadable term, or
-      * the fact that `shapeExpr` was never a `Shape(...)` literal in the first place, survives past this
+      * the fact that `root` was never a `Shape(...)` literal in the first place, survives past this
       * function (issue #43 review): a single walk here, rather than a
       * successful `Option`-returning walk re-run a second time purely to find out where it would have
       * failed, is what keeps the strict caller's diagnostic from ever being able to disagree with what
@@ -881,7 +997,7 @@ private[litterbox] object KitMacro:
       */
     def parseShape: Either[ParseFailure, (List[NodeRef], List[(NodeRef, NodeRef)])] =
       for
-        args                          <- companionApplyArgs(shapeExpr.asTerm, shapeModuleClass)
+        args                          <- companionApplyArgs(root.asTerm, shapeModuleClass)
                                             .toRight(ParseFailure.NotALiteral)
         // `companionApplyArgs` matches ANY call whose callee is owned by `Shape`'s own module class,
         // not specifically `Shape.apply`: Scala synthesises `Shape.unapply` on that exact same module
@@ -890,12 +1006,12 @@ private[litterbox] object KitMacro:
         // review). Matching `args` here as a generator, not a plain `val` pattern, is what
         // turns that arity mismatch into a graceful failure, the same fallback every other unreadable
         // piece in this function already gets, rather than a `MatchError` thrown straight out of the
-        // macro and into the compiler's own error stream. Blamed on `shapeExpr` itself, not a narrower
+        // macro and into the compiler's own error stream. Blamed on `root` itself, not a narrower
         // term, since there is no `entry`/`transitions` term to point at yet at this point in the walk.
         (entryTerm, transitionsTerm) <- (args match
                                            case List(e, t) => Some((e, t))
                                            case _          => None
-                                         ).toRight(ParseFailure.UnreadablePiece(shapeExpr.asTerm))
+                                         ).toRight(ParseFailure.UnreadablePiece(root.asTerm))
         entryElems        <- literalListElements(entryTerm)
                                .toRight(ParseFailure.UnreadablePiece(entryTerm))
         entryNodes        <- entryElems.foldRight(
@@ -924,6 +1040,99 @@ private[litterbox] object KitMacro:
         // conflict apart from a key that simply has not been seen a second time yet.
         _                 <- checkReconciled(entryNodes ++ transitions.flatMap((from, to) => List(from, to)))
       yield (entryNodes, transitions)
+
+    /** One element of a `Plan`'s own `edges` list, read the same way `parseTransition` above reads a
+      * `Transition`, including through a LOCAL `val` bound to its own `Edge.To(...)`/`Edge.Exit(...)`
+      * initialiser, and declining a class-or-object-MEMBER-bound one for the identical reason that
+      * function's own doc gives (a member's initialiser lives in its owner's constructor, not on the
+      * member's own `ValDef`, so there is nothing to read there).
+      *
+      * The answer is `(from, Some(to))` for an edge joining two nodes and `(from, None)` for one that
+      * ends the run: an `Edge.Exit` names a node this walk must still reconcile and must still be able
+      * to blame in a message, but it adds no transition for the reachability walk to follow, exactly
+      * as the `Shape` derived from the same plan adds none.
+      *
+      * Every argument past `from`/`to` is deliberately unread. `input`/`exit` are functions of a value
+      * that does not exist until the graph runs, so nothing about which edge a run actually takes is
+      * knowable here; this walk reads reachability, which is a fact about the table alone.
+      */
+    def parseEdge(t: Term): Option[(NodeRef, Option[NodeRef])] =
+      def viaCompanion(term: Term): Option[(List[Term], Boolean)] =
+        companionApplyArgs(term, edgeToModuleClass)
+          .map(args => (args, true))
+          .orElse(companionApplyArgs(term, edgeExitModuleClass).map(args => (args, false)))
+      val resolvedArgs: Option[(List[Term], Boolean)] =
+        viaCompanion(t).orElse {
+          val u = unwrap(t)
+          if stablePathKey(u).isDefined then
+            scala.util.Try(u.symbol.tree).toOption
+              .collect { case vd: ValDef => vd.rhs }
+              .flatten
+              .flatMap(viaCompanion)
+          else None
+        }
+      resolvedArgs match
+        case Some((List(fromTerm, toTerm, _), true)) =>
+          for
+            from <- nodeFacts(fromTerm)
+            to   <- nodeFacts(toTerm)
+          yield (from, Some(to))
+        case Some((List(fromTerm, _), false)) =>
+          nodeFacts(fromTerm).map(from => (from, None))
+        case _ => None
+
+    /** The `Plan` half of the full parse (issue #67), the mandatory one `LitterBox.graph` splices.
+      * Structurally the twin of `parseShape` above, and deliberately so: the two produce the identical
+      * `(entry, transitions)` pair, so everything past this point, reconciliation, the BFS, and every
+      * message either can raise, is one implementation reading one kind of fact, never two that could
+      * come to disagree about what an edge is.
+      *
+      * `entry` is one node here rather than a list, matching `Plan` itself: a walk begins at exactly
+      * one node, and `Plan`'s own doc has the reasoning for why a second entry would be a claim no
+      * run could ever honour.
+      *
+      * Two checks below have no twin in `parseShape` at all. Every reference this parse collects, from
+      * `entry` and from both ends of every edge, is refused outright the moment one of them is an
+      * inline `Node.apply` construction (`ParseFailure.InlineNodeInPlan`'s own doc has the full
+      * reasoning). Run before `checkReconciled`, over the same reference list that function reads,
+      * rather than folded into it: an inline construction is wrong on its own, whether or not it
+      * happens to collide with anything else, so this does not wait to find out whether a second
+      * reference shares its key. `checkIdentity`, run after `checkReconciled`, is the other: two
+      * references sharing a key but coming from different defining symbols are refused even when they
+      * AGREE on every fact `checkReconciled` reads (`ParseFailure.IdentityConflict`'s own doc has the
+      * full reasoning), a distinction only `Plan.workflowOf`'s own reference identity walk needs,
+      * never `Runner.validate`'s own name keyed one that `parseShape` restates at compile time.
+      */
+    def parsePlan: Either[ParseFailure, (List[NodeRef], List[(NodeRef, NodeRef)])] =
+      for
+        args                  <- companionApplyArgs(root.asTerm, planModuleClass)
+                                   .toRight(ParseFailure.NotALiteral)
+        (entryTerm, edgesTerm) <- (args match
+                                    case List(e, t) => Some((e, t))
+                                    case _          => None
+                                  ).toRight(ParseFailure.UnreadablePiece(root.asTerm))
+        entryNode             <- nodeFacts(entryTerm).toRight(ParseFailure.UnreadablePiece(entryTerm))
+        edgeElems             <- literalListElements(edgesTerm)
+                                   .toRight(ParseFailure.UnreadablePiece(edgesTerm))
+        edges                 <- edgeElems.foldRight(
+                                   Right(List.empty[(NodeRef, Option[NodeRef])]): Either[
+                                     ParseFailure,
+                                     List[(NodeRef, Option[NodeRef])]
+                                   ]
+                                 ) { (e, acc) =>
+                                   for
+                                     tail <- acc
+                                     edge <- parseEdge(e).toRight(ParseFailure.UnreadablePiece(e))
+                                   yield edge :: tail
+                                 }
+        allRefs                = entryNode :: edges.flatMap((from, to) => from :: to.toList)
+        _                     <- allRefs
+                                   .find(_.key.startsWith(inlineKeyNamespace))
+                                   .toLeft(())
+                                   .left.map(ParseFailure.InlineNodeInPlan(_))
+        _                     <- checkReconciled(allRefs)
+        _                     <- checkIdentity(allRefs)
+      yield (List(entryNode), edges.collect { case (from, Some(to)) => (from, to) })
 
     /** The reachability walk itself, identical in shape to the BFS half of `Runner.validate`
       * (`Kit.scala`'s own doc on that method has the full reasoning for BFS, for the `(name, reviewed)`
@@ -979,54 +1188,58 @@ private[litterbox] object KitMacro:
 
       found.toList
 
-    parseShape match
+    val parsed = kind match
+      case GraphKind.Shape => parseShape
+      case GraphKind.Plan  => parsePlan
+
+    parsed match
       case Left(ParseFailure.NotALiteral) =>
-        // The lenient path (`strict = false`, `checkedShape`'s own caller): a `shapeExpr` this walk
+        // The lenient path (`GraphKind.Shape`, `checkedShape`'s own caller): a `root` this walk
         // cannot read as a literal is not this function's business to reject, `Runner.validate`
         // remains the backstop (`checkedShape`'s own doc, `Kit.scala`, has the reasoning). The strict
-        // path (`strict = true`, `checkedShapeStrict`'s own only caller, `LitterBox.graph`): the
+        // path (`GraphKind.Plan`, `checkedPlan`'s own only caller, `LitterBox.graph`): the
         // identical situation is a hard error instead (issue #43 review). `Node.apply` (`Kit.scala`,
         // `markerRequiresReview`'s own doc) derives `Guard.RequiresReview` on the real `Node` whenever a node's own
         // input type extends `RequiresReviewInput`, even if its `guard` argument was left at the
         // default `Guard.Open`, so `Runner.validate` catches that case too; erroring here remains
-        // correct regardless (`checkedShapeStrict`'s own doc, `Kit.scala`, has the two reasons that
+        // correct regardless (`checkedPlan`'s own doc, `Kit.scala`, has the two reasons that
         // survive: compile time beats startup on timing alone, and two alias residuals exist, named in
         // `stablePathKey`'s and `checkReconciled`'s own docs above, that no widening of THIS walk
         // closes, for which `Runner.validate` remains the only check that ever runs at all). Naming
         // what to do instead, rather than merely refusing, is what `report.errorAndAbort` buys over a
         // bare fallback here. This is `ParseFailure.NotALiteral` specifically, never `UnreadablePiece`:
-        // `shapeExpr` itself was not recognisable as a `Shape(...)` call at all, so "write the Shape
-        // literal inline" is advice this consumer genuinely has not yet followed, unlike the
+        // `root` itself was not recognisable as the expected call at all, so "write the literal
+        // inline" is advice this consumer genuinely has not yet followed, unlike the
         // `UnreadablePiece` case below.
         if strict then
           report.errorAndAbort(
-            "litter-box: LitterBox.graph requires a literal Shape(entry = List(...), transitions = " +
-              "List(...)) expression written directly at this call site (issue #43 review, BLOCKER " +
-              "1), never a val, a function result, or any other indirection: catching a review-" +
+            "litter-box: LitterBox.graph requires a literal Plan(entry = ..., edges = List(...)) " +
+              "expression written directly at this call site (issue #43 review, BLOCKER 1; issue " +
+              "#67), never a val, a function result, or any other indirection: catching a review-" +
               "reachability violation at compile time is strictly earlier than catching the same one " +
               "at Runner.validate's own startup check, on every graph this macro can read, and two " +
               "alias residuals exist that no widening of this check closes (an instance-qualified " +
               "receiver, and one Node value bound under two stable paths), for which Runner.validate " +
               "is the only check that ever runs against your graph's real values at all, so silently " +
               "skipping this check here would silently drop the earliest, and for those two residuals " +
-              "the only, chance to catch a mistake in this graph. Write the Shape literal inline in " +
+              "the only, chance to catch a mistake in this graph. Write the Plan literal inline in " +
               "this LitterBox.graph call. If a literal genuinely cannot be written here, compose " +
               "Runner.run directly instead of LitterBox.graph, and call Runner.validate on your own " +
               "Shape at startup yourself."
           )
-        else shapeExpr
+        else ()
       case Left(ParseFailure.UnreadablePiece(bad)) =>
         // The SECOND, narrower strict failure, deliberately given DIFFERENT wording from `NotALiteral`
         // above so the two can never be confused for one another by a reader or by a test asserting on
-        // the message: `shapeExpr` WAS recognised as a literal `Shape(...)` call written directly at
+        // the message: `root` WAS recognised as the literal it had to be, written directly at
         // this call site, but this one TERM inside it, `bad`, is not a form this walk can read (an
-        // entry/transitions list built some way other than `List(...)`/`List.empty`/`Nil`, a node or
-        // `Transition` reference that is neither a stable path nor an inline literal construction, ...).
+        // entry or edge list built some way other than `List(...)`/`List.empty`/`Nil`, a node or
+        // edge reference that is neither a stable path nor an inline literal construction, ...).
         // Falling back leniently here, the way the lenient `checkedShape` path still does, is explicitly
         // ruled out (issue #43 review): that would reopen for every marker-only-guarded node this walk
         // happens not to recognise the exact hole `NotALiteral` above closes, so this raises just as
         // loud, only with different words and anchored at `bad`'s own source position
-        // (`report.errorAndAbort`'s two-argument overload), rather than at the whole `shapeExpr`
+        // (`report.errorAndAbort`'s two-argument overload), rather than at the whole `root`
         // `NotALiteral` points at, so the compiler underlines the exact unread term rather than the
         // whole call. The forms actually named below are precisely the ones `stablePathKey`,
         // `literalListElements` and `identifyRef` accept, kept in sync with them by hand since a macro
@@ -1036,7 +1249,7 @@ private[litterbox] object KitMacro:
         // `Machine.shippedShape`'s own config-parameterised `A(cfg)` idiom (`LitterBox.graph`'s own
         // scaladoc has the fuller reasoning for why that idiom is not, and cannot be made, expressible
         // through this factory), is the one residue this fix leaves on purpose: this macro reasons about
-        // TREES, never about a running value (`checkShapeImpl`'s own doc above), so a node a `def` call
+        // TREES, never about a running value (`checkGraph`'s own doc above), so a node a `def` call
         // would build is not a fact this walk could ever read no matter how far
         // `stablePathKey`/`literalListElements` are widened. `export`ed member forwarders are named
         // explicitly, separately from the def-built-node residue above, rather than left for a consumer
@@ -1053,16 +1266,16 @@ private[litterbox] object KitMacro:
         // keying either answer risks disagreeing with the runtime.
         if strict then
           report.errorAndAbort(
-            "litter-box: LitterBox.graph could read this Shape(...) literal at the call site, but " +
+            "litter-box: LitterBox.graph could read this Plan(...) literal at the call site, but " +
               s"could not identify or fully parse one piece of it, `${bad.show}`, here (issue #43 " +
               "review round 2, BLOCKER B1). Falling back silently for this piece alone, the way the " +
               "opt-in checkedShape still does for its own callers, would reopen round 1's own BLOCKER " +
               "1 for every node this walk happens not to recognise, so this aborts too, with different " +
-              "wording from the \"not a Shape literal at all\" error so the two can never be mistaken " +
-              "for each other. Forms this macro CAN read: a node or Transition referred to through a " +
+              "wording from the \"not a Plan literal at all\" error so the two can never be mistaken " +
+              "for each other. Forms this macro CAN read: a node or Edge referred to through a " +
               "stable path (a top level val, an object member, or an unqualified val member of the " +
-              "enclosing class); an inline Node(name = \"...\", ...) call carrying a literal name; an " +
-              "inline Transition(from, to) call; and a list written as List(...), List.empty, " +
+              "enclosing class); an inline Edge.To(from, to, input) or Edge.Exit(from, exit) call; " +
+              "and a list written as List(...), List.empty, " +
               "List.empty[...], or Nil. A node produced by a def, including a config-parameterised " +
               "idiom such as A(cfg), cannot be identified this way, because this macro never evaluates " +
               "it: give that node's config to its own run/probe body instead, behind a plain top level " +
@@ -1073,23 +1286,54 @@ private[litterbox] object KitMacro:
               "non-singleton `holder`, however many stable aliases stand between it and this call) is " +
               "never readable this way either, deliberately, because this macro cannot tell two distinct " +
               "instances of the same class apart from one instance aliased twice: write the node as a " +
-              "top level val, an object member, or an inline Node(name = \"...\", ...) call instead.",
+              "top level val or an object member instead.",
             bad.pos
           )
-        else shapeExpr
+        else ()
+      case Left(ParseFailure.InlineNodeInPlan(ref)) =>
+        // A failure `parseShape` can never raise (`ParseFailure.InlineNodeInPlan`'s own doc has the
+        // full reasoning), given its own wording for the same reason every case here already has one:
+        // `ref` was fully readable, an inline Node.apply call this walk can identify and key, so
+        // `UnreadablePiece`'s wording, built for a TERM this walk could not make sense of at all,
+        // would tell a consumer to fix something that was never broken in that sense. What is wrong
+        // is that `Plan.workflowOf` (`Kit.scala`) walks a Plan by matching runtime objects, never by
+        // the canonical key this macro reads, and an inline construction can never be the same
+        // runtime object twice.
+        if strict then
+          report.errorAndAbort(
+            "litter-box: LitterBox.graph found an inline Node(name = \"...\", ...) construction " +
+              s"written directly inside this Plan, naming '${ref.display}' (issue #67 review). A " +
+              "Plan is walked at runtime by matching the exact object Runner.step just produced " +
+              "against each edge's own declared source, so one node has to be the same runtime " +
+              "object everywhere this Plan names it. An inline Node.apply call allocates a fresh " +
+              "object at every call site it appears in source, so naming a node this way, once or " +
+              "several times, never gives two edges the identical object a real run would need: " +
+              "written once it is a dead end no edge can ever leave, and written twice it is a split " +
+              "where the object this walk starts a tick at and the object an edge declares as its " +
+              "own source are two different values that never compare equal. Bind it to a top level " +
+              "val or an object member instead, and refer to that one val everywhere this Plan names " +
+              "the node.",
+            ref.pos
+          )
+        else ()
       case Left(ParseFailure.KeyConflict(key, first, second)) =>
         // The THIRD strict failure, given its own wording for the identical reason `NotALiteral` and
         // `UnreadablePiece` above already have separate ones:
-        // every piece of `shapeExpr` WAS readable, `bad`-style advice about an unreadable term names
+        // every piece of `root` WAS readable, `bad`-style advice about an unreadable term names
         // nothing this consumer could act on, since nothing here was unreadable. What went wrong is
         // narrower and stranger: two DIFFERENT source references canonicalise to the SAME `key`
-        // (`stablePathKey`'s own doc above has the two ways that happens, a `class`/`object` companion
-        // pair or two inline constructions sharing one literal `name`) while disagreeing on whether the
-        // node they name requires review or carries genuine review trust. `checkReconciled`'s own doc
-        // has the reasoning for why this is caught here, hard, rather than left to `violations`' own BFS
-        // to silently pick a winner between the two. Anchored at `second`'s own position, with `first`'s
-        // own line named in the message text, so a human reading the compiler's underline still learns
-        // where BOTH disagreeing references sit, not only the one this walk happened to visit last.
+        // while disagreeing on whether the node they name requires review or carries genuine review
+        // trust. `InlineNodeInPlan` above already refuses every inline construction on its own, so the
+        // ONLY way this walk still reaches `strict` here, from `parsePlan`, is a `class`/`object`
+        // companion pair sharing one simple name (`stablePathKey`'s own doc above has the mechanism);
+        // `checkedShape`'s own opt in callers can still reach this case through two agreeing named
+        // inline constructions too, though never as a hard abort, since `checkedShape` never aborts on
+        // this family of failure at all (`checkGraph`'s own doc above has the reasoning).
+        // `checkReconciled`'s own doc has the fuller reasoning for why this is caught here, hard,
+        // rather than left to `violations`' own BFS to silently pick a winner between the two.
+        // Anchored at `second`'s own position, with `first`'s own line named in the message text, so a
+        // human reading the compiler's underline still learns where BOTH disagreeing references sit,
+        // not only the one this walk happened to visit last.
         if strict then
           report.errorAndAbort(
             "litter-box: LitterBox.graph found two references that canonicalise to the same node " +
@@ -1097,17 +1341,43 @@ private[litterbox] object KitMacro:
               s"review trust: '${first.display}' at line ${first.pos.startLine + 1} and " +
               s"'${second.display}' here (issue #43 review round 3, BLOCKER 1 part 2). This is most " +
               "often a class and its own companion object each declaring a member of the identical " +
-              "name, or two inline Node(name = \"...\", ...) calls sharing one literal name, where one " +
-              "side's input type extends RequiresReviewInput and the other's does not: picking a winner " +
-              "silently here could either miss a real review-reachability violation or invent one that " +
-              "does not exist, so this refuses instead. Give the two references distinct names, or " +
-              "confirm they really are the same node and make their input types agree.",
+              "name, where one side's input type extends RequiresReviewInput and the other's does " +
+              "not: picking a winner silently here could either miss a real review-reachability " +
+              "violation or invent one that does not exist, so this refuses instead. Give the two " +
+              "references distinct names, or confirm they really are the same node and make their " +
+              "input types agree.",
             second.pos
           )
-        else shapeExpr
+        else ()
+      case Left(ParseFailure.IdentityConflict(key, first, second)) =>
+        // The second failure only `parsePlan` can raise, `KeyConflict`'s own sibling rather than a
+        // widening of it (`IdentityConflict`'s own doc above has the reasoning): `KeyConflict` fires
+        // only when the two colliding references disagree on `(trust, guard)`; this fires whenever
+        // they come from two different defining symbols at all, agreeing or not, because
+        // `Plan.workflowOf` walks by reference identity, never by this walk's own canonicalised key,
+        // so an agreeing companion pair is exactly as broken at runtime as a disagreeing one.
+        // Anchored at `second`'s own position,
+        // with `first`'s own line named in the message text, for the identical reason `KeyConflict`'s
+        // own case does.
+        if strict then
+          report.errorAndAbort(
+            "litter-box: LitterBox.graph found two references that canonicalise to the same node " +
+              s"identity (\"$key\") but come from two different definitions: '${first.display}' at " +
+              s"line ${first.pos.startLine + 1} and '${second.display}' here (issue #67 review, " +
+              "companion key merge splits derived walk). This is most often a class and its own " +
+              "companion object each declaring a member of the identical name: even when the two " +
+              "sides agree on every fact this walk reads, Plan.workflowOf links an edge to the node " +
+              "it leaves by reference identity, never by name, so the two are still two different " +
+              "runtime objects and a real run dead ends the moment it reaches one without an edge " +
+              "naming that exact object as its own source, after both objects already produced " +
+              "whatever side effects they carry. Give the two references distinct names, or confirm " +
+              "they really are meant to be the same node and remove one of the two declarations.",
+            second.pos
+          )
+        else ()
       case Right((entry, transitions)) =>
         val vs = violations(entry, transitions)
-        if vs.isEmpty then shapeExpr
+        if vs.isEmpty then ()
         else
           report.errorAndAbort(
             "litter-box: this Workflow graph is rejected at compile time (issue #39, RFC #26 " +

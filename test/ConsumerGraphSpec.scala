@@ -25,7 +25,7 @@ class ConsumerGraphSpec extends AnyFlatSpec with Matchers:
 
   // ---- positive 1: the RFC sketch itself, verbatim -----------------------------------------------
 
-  it should "typecheck a consumer's own Nodes, Workflow and Shape passed to LitterBox.graph, whose result is passed to LitterBox.run" in {
+  it should "typecheck a consumer's own Nodes and Plan passed to LitterBox.graph, whose result is passed to LitterBox.run" in {
     val errors = scala.compiletime.testing.typeCheckErrors(
       """
         |import in.rcard.litterbox._
@@ -46,15 +46,17 @@ class ConsumerGraphSpec extends AnyFlatSpec with Matchers:
         |def loop(args: Seq[String]): Unit =
         |  LitterBox.run(
         |    LitterBox.graph(
-        |      workflow = Workflow[MyStart](
-        |        "my-loop",
-        |        start = (s: MyStart) =>
-        |          Next.Goto(Pick, s, _ => Next.Goto(Review, (), _ => Next.Finish(LoopExit.Success))),
-        |        stages = myStages
+        |      name = "my-loop",
+        |      plan = Plan(
+        |        entry = Pick,
+        |        edges = List(
+        |          Edge.To(Pick, Review, _ => Some(())),
+        |          Edge.Exit(Review, _ => Some(LoopExit.Success))
+        |        )
         |      ),
-        |      shape = Shape(entry = List(Pick), transitions = List(Transition(Pick, Review))),
         |      dispatchBudget = cfg => cfg.repairBudget + 1,
-        |      startInput = n => MyStart(n)
+        |      startInput = n => MyStart(n),
+        |      stages = myStages
         |    ),
         |    args
         |  )
@@ -77,8 +79,8 @@ class ConsumerGraphSpec extends AnyFlatSpec with Matchers:
         |)
         |
         |val myGraph = LitterBox.graph(
-        |  workflow = Workflow[Unit]("budget-graph", start = (_: Unit) => Next.Goto(Only, (), _ => Next.Finish(LoopExit.Success))),
-        |  shape = Shape(entry = List(Only), transitions = Nil),
+        |  name = "budget-graph",
+        |  plan = Plan(entry = Only, edges = List(Edge.Exit(Only, _ => Some(LoopExit.Success)))),
         |  dispatchBudget = (cfg: Config) => cfg.repairBudget,
         |  startInput = (_: Int) => ()
         |)
@@ -107,8 +109,8 @@ class ConsumerGraphSpec extends AnyFlatSpec with Matchers:
         |)
         |
         |val myGraph = LitterBox.graph(
-        |  workflow = Workflow[Unit]("fault-graph", start = (_: Unit) => Next.Goto(Only, (), _ => Next.Finish(LoopExit.Success))),
-        |  shape = Shape(entry = List(Only), transitions = Nil),
+        |  name = "fault-graph",
+        |  plan = Plan(entry = Only, edges = List(Edge.Exit(Only, _ => Some(LoopExit.Success)))),
         |  dispatchBudget = (cfg: Config) => cfg.repairBudget,
         |  startInput = (n: Int) =>
         |    if n < 0 then summon[Fault].raise("negative tick number") else ()
@@ -147,18 +149,14 @@ class ConsumerGraphSpec extends AnyFlatSpec with Matchers:
         |)
         |
         |val myGraph = LitterBox.graph(
-        |  workflow = Workflow[Unit](
-        |    "reviewed-graph",
-        |    start = (_: Unit) =>
-        |      Next.Goto(
-        |        Pick,
-        |        (),
-        |        _ => Next.Goto(Review, (), _ => Next.Goto(OpenPr, PrInput(), _ => Next.Finish(LoopExit.Success)))
-        |      )
-        |  ),
-        |  shape = Shape(
-        |    entry = List(Pick),
-        |    transitions = List(Transition(Pick, Review), Transition(Review, OpenPr))
+        |  name = "reviewed-graph",
+        |  plan = Plan(
+        |    entry = Pick,
+        |    edges = List(
+        |      Edge.To(Pick, Review, _ => Some(())),
+        |      Edge.To(Review, OpenPr, _ => Some(PrInput())),
+        |      Edge.Exit(OpenPr, _ => Some(LoopExit.Success))
+        |    )
         |  ),
         |  dispatchBudget = (cfg: Config) => cfg.repairBudget,
         |  startInput = (_: Int) => ()
@@ -172,11 +170,11 @@ class ConsumerGraphSpec extends AnyFlatSpec with Matchers:
   // ---- negative 5: an unreviewed path into a guarded node, through LitterBox.graph, must fail at ---
   // ---- compile time: this is the new MANDATORY macro guarantee, not the opt-in one -----------------
 
-  it should "refuse to typecheck LitterBox.graph(...) whose literal Shape reaches a RequiresReviewInput node with no reviewer on the path" in {
+  it should "refuse to typecheck LitterBox.graph(...) whose literal Plan reaches a RequiresReviewInput node with no reviewer on the path" in {
     // `ConsumerBoundarySpec`'s own equivalent negative (`:247-285`) only fires when the consumer
     // remembers to splice `checkedShape` themselves around their own local `shape` value; here the
-    // exact same violation reaches the macro because `LitterBox.graph`'s own `inline shape` parameter
-    // splices it automatically, with no `checkedShape` call anywhere in this snippet at all.
+    // exact same violation reaches the macro because `LitterBox.graph`'s own `inline plan` parameter
+    // splices it automatically, with no `checkedPlan` call anywhere in this snippet at all.
     val errors = scala.compiletime.testing.typeCheckErrors(
       """
         |import in.rcard.litterbox._
@@ -197,18 +195,14 @@ class ConsumerGraphSpec extends AnyFlatSpec with Matchers:
         |)
         |
         |val myGraph = LitterBox.graph(
-        |  workflow = Workflow[Unit](
-        |    "unreviewed-graph",
-        |    start = (_: Unit) =>
-        |      Next.Goto(
-        |        Pick,
-        |        (),
-        |        _ => Next.Goto(Implement, (), _ => Next.Goto(OpenPr, PrInput(), _ => Next.Finish(LoopExit.Success)))
-        |      )
-        |  ),
-        |  shape = Shape(
-        |    entry = List(Pick),
-        |    transitions = List(Transition(Pick, Implement), Transition(Implement, OpenPr))
+        |  name = "unreviewed-graph",
+        |  plan = Plan(
+        |    entry = Pick,
+        |    edges = List(
+        |      Edge.To(Pick, Implement, _ => Some(())),
+        |      Edge.To(Implement, OpenPr, _ => Some(PrInput())),
+        |      Edge.Exit(OpenPr, _ => Some(LoopExit.Success))
+        |    )
         |  ),
         |  dispatchBudget = (cfg: Config) => cfg.repairBudget,
         |  startInput = (_: Int) => ()
@@ -367,8 +361,8 @@ class ConsumerGraphSpec extends AnyFlatSpec with Matchers:
         |)
         |
         |val myGraph = LitterBox.graph(
-        |  workflow = Workflow[Unit]("caps-graph", start = (_: Unit) => Next.Goto(Only, (), _ => Next.Finish(LoopExit.Success))),
-        |  shape = Shape(entry = List(Only), transitions = Nil),
+        |  name = "caps-graph",
+        |  plan = Plan(entry = Only, edges = List(Edge.Exit(Only, _ => Some(LoopExit.Success)))),
         |  dispatchBudget = (cfg: Config) => cfg.repairBudget,
         |  startInput = (n: Int) =>
         |    summon[Caps].logger.log(s"starting tick $n")
@@ -385,13 +379,14 @@ class ConsumerGraphSpec extends AnyFlatSpec with Matchers:
   // ---- silently degrade to checkedShape's own lenient, opt-in fallback the moment shape is passed ---
   // ---- by identifier instead of being written as a literal at this call site ------------------------
 
-  it should "refuse to typecheck LitterBox.graph(shape = someVal, ...) since shape must be written as a literal Shape(...) expression at the call site" in {
+  it should "refuse to typecheck LitterBox.graph(plan = someVal, ...) since plan must be written as a literal Plan(...) expression at the call site" in {
     // Reproduced against this working tree before this fix (issue #43 review, BLOCKER 1): a graph
     // reaching a `Guard.RequiresReview` node whose input type extends `RequiresReviewInput`, with no
-    // reviewer anywhere on the path, compiled clean and `Runner.validate` on the same shape returned
-    // `List()` too, purely because `shape` was written as a `val` and passed by identifier here. This
-    // snippet does not even need a guarded node to demonstrate the fix: `checkedShapeStrict` rejects a
-    // non-literal `shape` unconditionally, before it would ever get as far as walking for a violation.
+    // reviewer anywhere on the path, compiled clean and `Runner.validate` on the same graph returned
+    // `List()` too, purely because the declaration was written as a `val` and passed by identifier
+    // here. This snippet does not even need a guarded node to demonstrate the fix: `checkedPlan`
+    // rejects a non-literal `plan` unconditionally, before it would ever get as far as walking for a
+    // violation.
     val errors = scala.compiletime.testing.typeCheckErrors(
       """
         |import in.rcard.litterbox._
@@ -400,11 +395,11 @@ class ConsumerGraphSpec extends AnyFlatSpec with Matchers:
         |  name = "Only", cost = Cost.NoDispatch, timeout = Timeout.Unbounded,
         |  probe = _ => None, run = _ => NodeOutcome.Done(())
         |)
-        |val myShape = Shape(entry = List(Only), transitions = Nil)
+        |val myPlan = Plan(entry = Only, edges = Nil)
         |
         |val myGraph = LitterBox.graph(
-        |  workflow = Workflow[Unit]("val-shape-graph", start = (_: Unit) => Next.Goto(Only, (), _ => Next.Finish(LoopExit.Success))),
-        |  shape = myShape,
+        |  name = "val-shape-graph",
+        |  plan = myPlan,
         |  dispatchBudget = (cfg: Config) => cfg.repairBudget,
         |  startInput = (_: Int) => ()
         |)
@@ -413,11 +408,11 @@ class ConsumerGraphSpec extends AnyFlatSpec with Matchers:
 
     errors should not be empty
     val messages = errors.map(_.message).mkString("\n")
-    messages should include("requires a literal Shape")
+    messages should include("requires a literal Plan")
   }
 
   // ---- 13 through 19: the idiom-by-idiom table from issue #43 review round 2, BLOCKER B1 -----------
-  // ---- part 2, widening what checkedShapeStrict can read, and part 1, the two DIFFERENTLY worded ----
+  // ---- part 2, widening what the mandatory check can read, and part 1, the two DIFFERENTLY worded ---
   // ---- strict errors that replace the single "write a literal here" message every one of these -----
   // ---- idioms used to get regardless of why this walk actually declined -----------------------------
 
@@ -443,8 +438,8 @@ class ConsumerGraphSpec extends AnyFlatSpec with Matchers:
         |    probe = _ => None, run = _ => NodeOutcome.Done(())
         |  )
         |  val g: LoopGraph = LitterBox.graph(
-        |    workflow = Workflow[Unit]("c13", start = (_: Unit) => Next.Finish(LoopExit.Success)),
-        |    shape = Shape(entry = List(A), transitions = List(Transition(A, B))),
+        |    name = "c13",
+        |    plan = Plan(entry = A, edges = List(Edge.To(A, B, _ => Some(())))),
         |    dispatchBudget = (_: Config) => 0,
         |    startInput = (_: Int) => ()
         |  )
@@ -471,8 +466,8 @@ class ConsumerGraphSpec extends AnyFlatSpec with Matchers:
         |    probe = _ => None, run = _ => NodeOutcome.Done(())
         |  )
         |  val g: LoopGraph = LitterBox.graph(
-        |    workflow = Workflow[Unit]("c13neg", start = (_: Unit) => Next.Finish(LoopExit.Success)),
-        |    shape = Shape(entry = List(A), transitions = List(Transition(A, OpenPr))),
+        |    name = "c13neg",
+        |    plan = Plan(entry = A, edges = List(Edge.To(A, OpenPr, _ => Some(PrInput13())))),
         |    dispatchBudget = (_: Config) => 0,
         |    startInput = (_: Int) => ()
         |  )
@@ -485,7 +480,7 @@ class ConsumerGraphSpec extends AnyFlatSpec with Matchers:
     messages should include("'OpenPr'")
   }
 
-  it should "typecheck transitions = List.empty and transitions = List.empty[Transition] (issue #43 review round 2, BLOCKER B1 part 2: literalListElements now accepts List.empty)" in {
+  it should "typecheck edges = List.empty and edges = List.empty[Edge] (issue #43 review round 2, BLOCKER B1 part 2: literalListElements now accepts List.empty)" in {
     val bareEmpty = scala.compiletime.testing.typeCheckErrors(
       """
         |import in.rcard.litterbox._
@@ -495,8 +490,8 @@ class ConsumerGraphSpec extends AnyFlatSpec with Matchers:
         |  probe = _ => None, run = _ => NodeOutcome.Done(())
         |)
         |val myGraph = LitterBox.graph(
-        |  workflow = Workflow[Unit]("c14a", start = (_: Unit) => Next.Finish(LoopExit.Success)),
-        |  shape = Shape(entry = List(Only), transitions = List.empty),
+        |  name = "c14a",
+        |  plan = Plan(entry = Only, edges = List.empty),
         |  dispatchBudget = (_: Config) => 0,
         |  startInput = (_: Int) => ()
         |)
@@ -513,8 +508,8 @@ class ConsumerGraphSpec extends AnyFlatSpec with Matchers:
         |  probe = _ => None, run = _ => NodeOutcome.Done(())
         |)
         |val myGraph = LitterBox.graph(
-        |  workflow = Workflow[Unit]("c14b", start = (_: Unit) => Next.Finish(LoopExit.Success)),
-        |  shape = Shape(entry = List(Only), transitions = List.empty[Transition]),
+        |  name = "c14b",
+        |  plan = Plan(entry = Only, edges = List.empty[Edge]),
         |  dispatchBudget = (_: Config) => 0,
         |  startInput = (_: Int) => ()
         |)
@@ -523,7 +518,7 @@ class ConsumerGraphSpec extends AnyFlatSpec with Matchers:
     typedEmpty shouldBe empty
   }
 
-  it should "refuse to typecheck transitions = List.empty when the entry itself is the marker-guarded node with no reviewer (issue #43 review round 3, MAJOR 1: the negative twin of List.empty above, pinning that a fully-parsed empty list still lets the BFS run rather than silently falling back)" in {
+  it should "refuse to typecheck edges = List.empty when the entry itself is the marker-guarded node with no reviewer (issue #43 review round 3, MAJOR 1: the negative twin of List.empty above, pinning that a fully-parsed empty list still lets the BFS run rather than silently falling back)" in {
     val errors = scala.compiletime.testing.typeCheckErrors(
       """
         |import in.rcard.litterbox._
@@ -534,10 +529,10 @@ class ConsumerGraphSpec extends AnyFlatSpec with Matchers:
         |  probe = _ => None, run = _ => NodeOutcome.Done(())
         |)
         |val myGraph = LitterBox.graph(
-        |  workflow = Workflow[Unit]("c14neg", start = (_: Unit) => Next.Finish(LoopExit.Success)),
-        |  shape = Shape(entry = List(OpenPr14), transitions = List.empty),
+        |  name = "c14neg",
+        |  plan = Plan(entry = OpenPr14, edges = List.empty),
         |  dispatchBudget = (_: Config) => 0,
-        |  startInput = (_: Int) => ()
+        |  startInput = (_: Int) => PrInput14()
         |)
         |""".stripMargin
     )
@@ -548,7 +543,7 @@ class ConsumerGraphSpec extends AnyFlatSpec with Matchers:
     messages should include("'OpenPr14'")
   }
 
-  it should "typecheck Shape(transitions = ..., entry = ...) with named arguments out of Shape's own declaration order (issue #43 review round 2, BLOCKER B1 part 2: companionApplyArgs now reads through the compiler's own out-of-order-named-argument temp-val block)" in {
+  it should "typecheck Plan(edges = ..., entry = ...) with named arguments out of Plan's own declaration order (issue #43 review round 2, BLOCKER B1 part 2: companionApplyArgs now reads through the compiler's own out-of-order-named-argument temp-val block)" in {
     val errors = scala.compiletime.testing.typeCheckErrors(
       """
         |import in.rcard.litterbox._
@@ -562,8 +557,8 @@ class ConsumerGraphSpec extends AnyFlatSpec with Matchers:
         |  probe = _ => None, run = _ => NodeOutcome.Done(())
         |)
         |val myGraph = LitterBox.graph(
-        |  workflow = Workflow[Unit]("c15", start = (_: Unit) => Next.Finish(LoopExit.Success)),
-        |  shape = Shape(transitions = List(Transition(A, B)), entry = List(A)),
+        |  name = "c15",
+        |  plan = Plan(edges = List(Edge.To(A, B, _ => Some(()))), entry = A),
         |  dispatchBudget = (_: Config) => 0,
         |  startInput = (_: Int) => ()
         |)
@@ -573,7 +568,7 @@ class ConsumerGraphSpec extends AnyFlatSpec with Matchers:
     errors shouldBe empty
   }
 
-  it should "refuse to typecheck Shape(transitions = ..., entry = ...) out of declaration order when the marker-guarded node has no reviewer on the path (issue #43 review round 3, MAJOR 1: the negative twin of the out-of-order-named-arguments positive above)" in {
+  it should "refuse to typecheck Plan(edges = ..., entry = ...) out of declaration order when the marker-guarded node has no reviewer on the path (issue #43 review round 3, MAJOR 1: the negative twin of the out-of-order-named-arguments positive above)" in {
     val errors = scala.compiletime.testing.typeCheckErrors(
       """
         |import in.rcard.litterbox._
@@ -588,8 +583,8 @@ class ConsumerGraphSpec extends AnyFlatSpec with Matchers:
         |  probe = _ => None, run = _ => NodeOutcome.Done(())
         |)
         |val myGraph = LitterBox.graph(
-        |  workflow = Workflow[Unit]("c15neg", start = (_: Unit) => Next.Finish(LoopExit.Success)),
-        |  shape = Shape(transitions = List(Transition(A, OpenPr15)), entry = List(A)),
+        |  name = "c15neg",
+        |  plan = Plan(edges = List(Edge.To(A, OpenPr15, _ => Some(PrInput15()))), entry = A),
         |  dispatchBudget = (_: Config) => 0,
         |  startInput = (_: Int) => ()
         |)
@@ -602,7 +597,7 @@ class ConsumerGraphSpec extends AnyFlatSpec with Matchers:
     messages should include("'OpenPr15'")
   }
 
-  it should "typecheck a val-bound Transition, declared local to the same block as the LitterBox.graph call that uses it, referenced as a list element (issue #43 review round 2, BLOCKER B1 part 2: parseTransition now reads through a LOCAL val binding to its own Transition(...) initialiser)" in {
+  it should "typecheck a val-bound Edge, declared local to the same block as the LitterBox.graph call that uses it, referenced as a list element (issue #43 review round 2, BLOCKER B1 part 2: parseEdge now reads through a LOCAL val binding to its own Edge.To(...) initialiser)" in {
     // `parseTransition`'s own doc (`KitMacro.scala`) has the reason this resolves for a LOCAL val
     // (its initialiser is still part of the tree macro expansion is currently typing) but declines for
     // a class-or-object-MEMBER val (its initialiser is compiled away into that type's own constructor,
@@ -621,10 +616,10 @@ class ConsumerGraphSpec extends AnyFlatSpec with Matchers:
         |  probe = _ => None, run = _ => NodeOutcome.Done(())
         |)
         |def buildGraph(): LoopGraph =
-        |  val t1 = Transition(A, B)
+        |  val t1 = Edge.To(A, B, (_: Unit) => Some(()))
         |  LitterBox.graph(
-        |    workflow = Workflow[Unit]("c16", start = (_: Unit) => Next.Finish(LoopExit.Success)),
-        |    shape = Shape(entry = List(A), transitions = List(t1)),
+        |    name = "c16",
+        |    plan = Plan(entry = A, edges = List(t1)),
         |    dispatchBudget = (_: Config) => 0,
         |    startInput = (_: Int) => ()
         |  )
@@ -634,7 +629,7 @@ class ConsumerGraphSpec extends AnyFlatSpec with Matchers:
     errors shouldBe empty
   }
 
-  it should "refuse to typecheck a val-bound Transition, local to the same block as the LitterBox.graph call, when the marker-guarded node has no reviewer on the path (issue #43 review round 3, MAJOR 1: the negative twin of the local-val-bound-Transition positive above)" in {
+  it should "refuse to typecheck a val-bound Edge, local to the same block as the LitterBox.graph call, when the marker-guarded node has no reviewer on the path (issue #43 review round 3, MAJOR 1: the negative twin of the local-val-bound-Edge positive above)" in {
     val errors = scala.compiletime.testing.typeCheckErrors(
       """
         |import in.rcard.litterbox._
@@ -649,10 +644,10 @@ class ConsumerGraphSpec extends AnyFlatSpec with Matchers:
         |  probe = _ => None, run = _ => NodeOutcome.Done(())
         |)
         |def buildGraph(): LoopGraph =
-        |  val t1 = Transition(A, OpenPr16)
+        |  val t1 = Edge.To(A, OpenPr16, (_: Unit) => Some(PrInput16()))
         |  LitterBox.graph(
-        |    workflow = Workflow[Unit]("c16neg", start = (_: Unit) => Next.Finish(LoopExit.Success)),
-        |    shape = Shape(entry = List(A), transitions = List(t1)),
+        |    name = "c16neg",
+        |    plan = Plan(entry = A, edges = List(t1)),
         |    dispatchBudget = (_: Config) => 0,
         |    startInput = (_: Int) => ()
         |  )
@@ -682,8 +677,8 @@ class ConsumerGraphSpec extends AnyFlatSpec with Matchers:
         |  probe = _ => None, run = _ => NodeOutcome.Done(())
         |)
         |val myGraph = LitterBox.graph(
-        |  workflow = Workflow[Unit]("c17", start = (_: Unit) => Next.Finish(LoopExit.Success)),
-        |  shape = Shape(entry = List(A), transitions = Nil),
+        |  name = "c17",
+        |  plan = Plan(entry = A, edges = Nil),
         |  dispatchBudget = (_: Config) => 0,
         |  startInput = (_: Int) => ()
         |)
@@ -693,7 +688,7 @@ class ConsumerGraphSpec extends AnyFlatSpec with Matchers:
     errors should not be empty
     val messages = errors.map(_.message).mkString("\n")
     messages should include("could not identify or fully parse")
-    messages should not include "requires a literal Shape(entry = List"
+    messages should not include "requires a literal Plan(entry ="
   }
 
   it should "refuse to typecheck an exported member, with wording that names it as a def forwarder rather than telling the consumer to do the object-member form they just used (issue #43 review round 3, MINOR 3)" in {
@@ -719,8 +714,8 @@ class ConsumerGraphSpec extends AnyFlatSpec with Matchers:
         |object ZZExp:
         |  export ZZSrc._
         |val myGraph = LitterBox.graph(
-        |  workflow = Workflow[Unit]("export-fwd", start = (_: Unit) => Next.Finish(LoopExit.Success)),
-        |  shape = Shape(entry = List(ZZExp.Start), transitions = List(Transition(ZZExp.Start, ZZExp.OpenPr))),
+        |  name = "export-fwd",
+        |  plan = Plan(entry = ZZExp.Start, edges = List(Edge.To(ZZExp.Start, ZZExp.OpenPr, _ => Some(())))),
         |  dispatchBudget = (_: Config) => 0,
         |  startInput = (_: Int) => ()
         |)
@@ -755,8 +750,8 @@ class ConsumerGraphSpec extends AnyFlatSpec with Matchers:
         |)
         |val myCfg = MyCfg(1)
         |val myGraph = LitterBox.graph(
-        |  workflow = Workflow[Unit]("c18", start = (_: Unit) => Next.Finish(LoopExit.Success)),
-        |  shape = Shape(entry = List(A(myCfg)), transitions = List(Transition(A(myCfg), B(myCfg)))),
+        |  name = "c18",
+        |  plan = Plan(entry = A(myCfg), edges = List(Edge.To(A(myCfg), B(myCfg), _ => Some(())))),
         |  dispatchBudget = (_: Config) => 0,
         |  startInput = (_: Int) => ()
         |)
@@ -804,8 +799,8 @@ class ConsumerGraphSpec extends AnyFlatSpec with Matchers:
         |  probe = _ => None, run = _ => NodeOutcome.Done(())
         |)
         |val myGraph = LitterBox.graph(
-        |  workflow = Workflow[Unit]("c20", start = (_: Unit) => Next.Finish(LoopExit.Success)),
-        |  shape = Shape(entry = List(Only), transitions = Nil),
+        |  name = "c20",
+        |  plan = Plan(entry = Only, edges = Nil),
         |  dispatchBudget = (_: Config) => 0,
         |  startInput = (_: Int) => ()
         |)
@@ -861,8 +856,8 @@ class ConsumerGraphSpec extends AnyFlatSpec with Matchers:
         |  )
         |  val self0: ZZCd = this
         |  val g: LoopGraph = LitterBox.graph(
-        |    workflow = Workflow[Unit]("classmixed", start = (_: Unit) => Next.Finish(LoopExit.Success)),
-        |    shape = Shape(entry = List(Start), transitions = List(Transition(self0.Start, OpenPr))),
+        |    name = "classmixed",
+        |    plan = Plan(entry = Start, edges = List(Edge.To(self0.Start, OpenPr, _ => Some(PrInputD())))),
         |    dispatchBudget = (_: Config) => 0, startInput = (_: Int) => ()
         |  )
         |""".stripMargin
@@ -902,8 +897,11 @@ class ConsumerGraphSpec extends AnyFlatSpec with Matchers:
         |    probe = _ => None, run = _ => NodeOutcome.Done(())
         |  )
         |  val g: LoopGraph = LitterBox.graph(
-        |    workflow = Workflow[Unit]("companion-merge", start = (_: Unit) => Next.Finish(LoopExit.Success)),
-        |    shape = Shape(entry = List(ZZXe.A, Start), transitions = List(Transition(Start, A))),
+        |    name = "companion-merge",
+        |    plan = Plan(
+        |      entry = Start,
+        |      edges = List(Edge.To(Start, A, _ => Some(PrInputE())), Edge.Exit(ZZXe.A, _ => Some(LoopExit.Success)))
+        |    ),
         |    dispatchBudget = (_: Config) => 0, startInput = (_: Int) => ()
         |  )
         |""".stripMargin
@@ -913,28 +911,77 @@ class ConsumerGraphSpec extends AnyFlatSpec with Matchers:
     errors.map(_.message).mkString("\n") should include("canonicalise to the same node identity")
   }
 
-  it should "refuse to typecheck two inline Node.apply calls sharing one literal name, one guarded and one not (issue #43 review round 3, BLOCKER 1, reproduction (f): an inline-construction MERGE)" in {
-    // `identifyRef` used to key an inline `Node.apply` on its bare literal `name` string, in the SAME
-    // namespace as a stable path's own key; two inline constructions both named `"A"` are therefore the
-    // same key here regardless of their input type, even when one genuinely requires review and the
-    // other does not. Before this fix, the plain one in `entry` marked the key visited and the
-    // marker-guarded one behind it in `transitions` was skipped: this snippet's own `errors` came back
-    // EMPTY against the pre-fix keying scheme. The fix has two parts working together here: `identifyRef`
-    // now keys an inline construction as `s"inline:$n"`, its own namespace, and `checkReconciled` catches
-    // the still-possible collision (two DIFFERENT inline constructions sharing one literal name) and
-    // hard-errors on the disagreement rather than silently merging them.
+  it should "refuse to typecheck a class and its own companion object each declaring a member of the same name, both agreeing on trust and guard (issue #67 review, companion key merge splits derived walk)" in {
+    // The MERGE reproduction above disagrees on `guard`, so `checkReconciled`'s own `(trust, guard)`
+    // comparison already catches it. Here `object ZZP`'s own `A` and `class ZZP`'s own `A` are both
+    // plain `Node[Unit, Unit]`, agreeing on every fact `checkReconciled` reads, while still being two
+    // genuinely different runtime objects: `canonical` strips the module class's own trailing `$`, so
+    // `this.A` and `ZZP.A` share one key regardless, and before this fix `checkReconciled` let an
+    // agreeing group straight through, `parsePlan` merged the two into one `NodeRef`, and this snippet
+    // compiled and validated clean. `Plan.workflowOf` (`Kit.scala`) still walks by REFERENCE IDENTITY,
+    // so the object `Start`'s own edge produces, the class's `A`, is never `eq` to the object the
+    // `Edge.Exit` names, the object's own `A`, and a real run dead ends into `Machine.infraFault` on
+    // its very first tick, after `Start` and `A` already ran. This is caught now regardless of
+    // agreement, because two references built from two different defining symbols are never the same
+    // runtime `Node`, whatever they happen to agree on.
+    val errors = scala.compiletime.testing.typeCheckErrors(
+      """
+        |import in.rcard.litterbox._
+        |
+        |object ZZP:
+        |  val A: Node[Unit, Unit] = Node(
+        |    name = "A-object", cost = Cost.NoDispatch, timeout = Timeout.Unbounded,
+        |    probe = _ => None, run = _ => NodeOutcome.Done(())
+        |  )
+        |
+        |class ZZP:
+        |  val A: Node[Unit, Unit] = Node(
+        |    name = "A-class", cost = Cost.NoDispatch, timeout = Timeout.Unbounded,
+        |    probe = _ => None, run = _ => NodeOutcome.Done(())
+        |  )
+        |  val Start: Node[Unit, Unit] = Node(
+        |    name = "Start", cost = Cost.NoDispatch, timeout = Timeout.Unbounded,
+        |    probe = _ => None, run = _ => NodeOutcome.Done(())
+        |  )
+        |  val g: LoopGraph = LitterBox.graph(
+        |    name = "companion-split",
+        |    plan = Plan(
+        |      entry = Start,
+        |      edges = List(Edge.To(Start, A, _ => Some(())), Edge.Exit(ZZP.A, _ => Some(LoopExit.Success)))
+        |    ),
+        |    dispatchBudget = (_: Config) => 0, startInput = (_: Int) => ()
+        |  )
+        |""".stripMargin
+    )
+
+    errors should not be empty
+    errors.map(_.message).mkString("\n") should include("canonicalise to the same node identity")
+  }
+
+  it should "refuse to typecheck two inline Node.apply calls sharing one literal name, one guarded and one not (issue #43 review round 3, BLOCKER 1, reproduction (f): an inline-construction MERGE, now caught earlier by issue #67 review's InlineNodeInPlan check)" in {
+    // `identifyRef` keys an inline `Node.apply` on its bare literal `name` string, in its own
+    // `inline:` namespace; three inline constructions all named `"A"` are therefore one macro identity
+    // here regardless of input type, even though one genuinely requires review and the other two do
+    // not. Before issue #67 review's own fix, that MERGE was caught only by `checkReconciled`, once it
+    // found the disagreement, so this snippet's own message named a key conflict. `parsePlan` now
+    // refuses every inline construction in a `Plan` outright (`ParseFailure.InlineNodeInPlan`'s own
+    // doc, `KitMacro.scala`, has the reasoning: `Plan.workflowOf` walks by REFERENCE IDENTITY, and an
+    // inline call is never the same runtime object twice, agreeing or not), so this snippet is refused
+    // for that reason now, before `checkReconciled` ever runs, and the message names the FIRST inline
+    // reference this walk visits, `entry`'s own `"A"`, rather than the pair that disagrees.
     val errors = scala.compiletime.testing.typeCheckErrors(
       """
         |import in.rcard.litterbox._
         |
         |case class PrInputF() extends RequiresReviewInput
         |val myGraph: LoopGraph = LitterBox.graph(
-        |  workflow = Workflow[Unit]("inline-merge", start = (_: Unit) => Next.Finish(LoopExit.Success)),
-        |  shape = Shape(
-        |    entry = List(Node(name = "A", cost = Cost.NoDispatch, timeout = Timeout.Unbounded, probe = _ => None, run = _ => NodeOutcome.Done(()))),
-        |    transitions = List(Transition(
+        |  name = "inline-merge",
+        |  plan = Plan(
+        |    entry = Node(name = "A", cost = Cost.NoDispatch, timeout = Timeout.Unbounded, probe = _ => None, run = _ => NodeOutcome.Done(())),
+        |    edges = List(Edge.To(
         |      Node(name = "A", cost = Cost.NoDispatch, timeout = Timeout.Unbounded, probe = _ => None, run = _ => NodeOutcome.Done(())),
-        |      Node[PrInputF, Unit](name = "A", cost = Cost.NoDispatch, timeout = Timeout.Unbounded, probe = _ => None, run = _ => NodeOutcome.Done(()))
+        |      Node[PrInputF, Unit](name = "A", cost = Cost.NoDispatch, timeout = Timeout.Unbounded, probe = _ => None, run = _ => NodeOutcome.Done(())),
+        |      (_: Unit) => Some(PrInputF())
         |    ))
         |  ),
         |  dispatchBudget = (_: Config) => 0, startInput = (_: Int) => ()
@@ -943,7 +990,44 @@ class ConsumerGraphSpec extends AnyFlatSpec with Matchers:
     )
 
     errors should not be empty
-    errors.map(_.message).mkString("\n") should include("canonicalise to the same node identity")
+    errors.map(_.message).mkString("\n") should include("inline Node(name = \"...\", ...) construction")
+  }
+
+  it should "refuse to typecheck a single node built by two agreeing inline Node.apply calls, once as a Plan's own entry and once as an Edge.Exit's own from (issue #67 review, walk identity splits node macro merges)" in {
+    // The failure this pins is narrower and quieter than the MERGE reproduction above, and existed
+    // before this fix even though the two references never disagree on anything `checkReconciled`
+    // reads: `identifyRef` keys both inline `Node("ProbeOnly", ...)` calls to the identical
+    // `inline:ProbeOnly`, so, before this fix, this literal compiled clean (no key ever collided with
+    // a DIFFERENT `(trust, guard)` pair) and `Runner.validate` also passed (the derived `Shape` is
+    // `Shape(List(entryNode), Nil)`, no transition for its own BFS to ever fault on). `Plan.workflowOf`
+    // (`Kit.scala`) is where the gap actually bites: it links an edge to the node it leaves by
+    // REFERENCE IDENTITY, `Edge.source(e) eq from`, and the object built at `entry` and the object
+    // built again at the `Edge.Exit`'s own `from` are two DIFFERENT allocations, so a real tick
+    // reaching `ProbeOnly` finds no edge whose source matches it and dead ends into
+    // `Machine.infraFault`, a graph that compiled clean and validated clean nonetheless failing its
+    // very first tick. `InlineNodeInPlan` refuses this outright now, before either agreement or
+    // disagreement is ever asked about.
+    val errors = scala.compiletime.testing.typeCheckErrors(
+      """
+        |import in.rcard.litterbox._
+        |
+        |val probeDupInline: LoopGraph = LitterBox.graph(
+        |  name = "probeDupInline",
+        |  plan = Plan(
+        |    entry = Node(name = "ProbeOnly", cost = Cost.NoDispatch, timeout = Timeout.Unbounded, probe = _ => None, run = _ => NodeOutcome.Done(())),
+        |    edges = List(Edge.Exit(
+        |      Node(name = "ProbeOnly", cost = Cost.NoDispatch, timeout = Timeout.Unbounded, probe = _ => None, run = _ => NodeOutcome.Done(())),
+        |      _ => Some(LoopExit.Success)
+        |    ))
+        |  ),
+        |  dispatchBudget = (_: Config) => 0, startInput = (_: Int) => ()
+        |)
+        |""".stripMargin
+    )
+
+    errors should not be empty
+    errors.map(_.message).mkString("\n") should include("inline Node(name = \"...\", ...) construction")
+    errors.map(_.message).mkString("\n") should include("ProbeOnly")
   }
 
   // Reproductions (a) (a wildcard-imported bare reference mixed with a qualified one), (b) (a
@@ -1007,8 +1091,8 @@ class ConsumerGraphSpec extends AnyFlatSpec with Matchers:
         |
         |val n1h: N1H.type = N1H
         |val g: LoopGraph = LitterBox.graph(
-        |  workflow = Workflow[Unit]("n1", start = (_: Unit) => Next.Finish(LoopExit.Success)),
-        |  shape = Shape(entry = List(N1H.Start), transitions = List(Transition(n1h.Start, N1H.OpenPr))),
+        |  name = "n1",
+        |  plan = Plan(entry = N1H.Start, edges = List(Edge.To(n1h.Start, N1H.OpenPr, _ => Some(PrInputN1())))),
         |  dispatchBudget = (_: Config) => 0, startInput = (_: Int) => ()
         |)
         |""".stripMargin
@@ -1038,8 +1122,8 @@ class ConsumerGraphSpec extends AnyFlatSpec with Matchers:
         |val n2a: N2H = N2H()
         |val n2b: N2H = n2a
         |val g: LoopGraph = LitterBox.graph(
-        |  workflow = Workflow[Unit]("n2", start = (_: Unit) => Next.Finish(LoopExit.Success)),
-        |  shape = Shape(entry = List(n2a.Start), transitions = List(Transition(n2b.Start, n2a.OpenPr))),
+        |  name = "n2",
+        |  plan = Plan(entry = n2a.Start, edges = List(Edge.To(n2b.Start, n2a.OpenPr, _ => Some(PrInputN2())))),
         |  dispatchBudget = (_: Config) => 0, startInput = (_: Int) => ()
         |)
         |""".stripMargin
@@ -1068,8 +1152,8 @@ class ConsumerGraphSpec extends AnyFlatSpec with Matchers:
         |  val self0: N12C = this
         |  object Inner:
         |    val g: LoopGraph = LitterBox.graph(
-        |      workflow = Workflow[Unit]("n12", start = (_: Unit) => Next.Finish(LoopExit.Success)),
-        |      shape = Shape(entry = List(Start), transitions = List(Transition(self0.Start, OpenPr))),
+        |      name = "n12",
+        |      plan = Plan(entry = Start, edges = List(Edge.To(self0.Start, OpenPr, _ => Some(PrInputN12())))),
         |      dispatchBudget = (_: Config) => 0, startInput = (_: Int) => ()
         |    )
         |""".stripMargin
@@ -1099,8 +1183,8 @@ class ConsumerGraphSpec extends AnyFlatSpec with Matchers:
         |  )
         |  val self0: N13Base = this
         |  val g: LoopGraph = LitterBox.graph(
-        |    workflow = Workflow[Unit]("n13", start = (_: Unit) => Next.Finish(LoopExit.Success)),
-        |    shape = Shape(entry = List(Start), transitions = List(Transition(self0.Start, OpenPr))),
+        |    name = "n13",
+        |    plan = Plan(entry = Start, edges = List(Edge.To(self0.Start, OpenPr, _ => Some(PrInputN13())))),
         |    dispatchBudget = (_: Config) => 0, startInput = (_: Int) => ()
         |  )
         |""".stripMargin
@@ -1123,7 +1207,7 @@ class ConsumerGraphSpec extends AnyFlatSpec with Matchers:
   // ---- n19Start and n19Same are not two facts to reconcile, only one value read twice, so it still -----
   // ---- finds this violation even though the macro cannot.
 
-  it should "compile a literal Shape whose only path into a marker-guarded node crosses the marker-guarded node through a SECOND val aliased to the first, silently missing the violation (issue #43 review round 4, family 2: one Node value bound under two stable paths, the residual Tier 1/Tier 2 cannot close by keying)" in {
+  it should "compile a literal Plan whose only path into a marker-guarded node crosses the marker-guarded node through a SECOND val aliased to the first, silently missing the violation (issue #43 review round 4, family 2: one Node value bound under two stable paths, the residual Tier 1/Tier 2 cannot close by keying)" in {
     // This is the exact shape `README.md`'s own residual paragraph documents, kept in sync with it
     // rather than merely asserted here: `n19Same` is not a second `Node`, it is `n19Start` itself,
     // read back out through a second `val`. `stablePathKey`'s own `canonical` keys each `val` on its
@@ -1147,8 +1231,8 @@ class ConsumerGraphSpec extends AnyFlatSpec with Matchers:
         |  probe = _ => None, run = _ => NodeOutcome.Done(())
         |)
         |val g: LoopGraph = LitterBox.graph(
-        |  workflow = Workflow[Unit]("n19", start = (_: Unit) => Next.Finish(LoopExit.Success)),
-        |  shape = Shape(entry = List(n19Start), transitions = List(Transition(n19Same, n19Open))),
+        |  name = "n19",
+        |  plan = Plan(entry = n19Start, edges = List(Edge.To(n19Same, n19Open, _ => Some(ZZInN19())))),
         |  dispatchBudget = (_: Config) => 0, startInput = (_: Int) => ()
         |)
         |""".stripMargin
@@ -1161,7 +1245,7 @@ class ConsumerGraphSpec extends AnyFlatSpec with Matchers:
     errors shouldBe empty
   }
 
-  it should "control for the test above: refuse to typecheck the IDENTICAL shape once the alias is removed and every reference spells the same val consistently" in {
+  it should "control for the test above: refuse to typecheck the IDENTICAL plan once the alias is removed and every reference spells the same val consistently" in {
     val errors = scala.compiletime.testing.typeCheckErrors(
       """
         |import in.rcard.litterbox._
@@ -1177,8 +1261,8 @@ class ConsumerGraphSpec extends AnyFlatSpec with Matchers:
         |  probe = _ => None, run = _ => NodeOutcome.Done(())
         |)
         |val g: LoopGraph = LitterBox.graph(
-        |  workflow = Workflow[Unit]("n19-control", start = (_: Unit) => Next.Finish(LoopExit.Success)),
-        |  shape = Shape(entry = List(n19bStart), transitions = List(Transition(n19bStart, n19bOpen))),
+        |  name = "n19-control",
+        |  plan = Plan(entry = n19bStart, edges = List(Edge.To(n19bStart, n19bOpen, _ => Some(ZZInN19b())))),
         |  dispatchBudget = (_: Config) => 0, startInput = (_: Int) => ()
         |)
         |""".stripMargin

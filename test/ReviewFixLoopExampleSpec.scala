@@ -48,6 +48,25 @@ class ReviewFixLoopExampleSpec extends AnyFlatSpec with Matchers:
     val exit = w.runGraph(com.example.reviewfix.graph)
 
     exit shouldBe LoopExit.Success
+    // `Plan.workflowOf` (`Kit.scala`) threads the example's own `stages` argument onto the built
+    // `Workflow` as a plain parameter now, not a field copied off a `Workflow` the consumer handed
+    // in whole, so nothing here proves that plumbing survives except reading it back off what
+    // `Machine.runOnce` actually declared. The literal below is the example's own `StageSet`
+    // (`test/ReviewFixLoopExample.scala`), read back rather than reached for by reference, the same
+    // discipline test 14 in `ConsumerGraphRunSpec` already holds itself to for a declared `Shape`.
+    w.declaredStages should contain(
+      StageSet(
+        stages = List(
+          Stage("IMPLEMENT", "impl", 1),
+          Stage("FAST_GATE", "gate", 1),
+          Stage("REVIEW", "review", 2),
+          Stage("FIX", "fix", 2, badge = true),
+          Stage("PR", "pr", 2)
+        ),
+        anchor = Some("IMPLEMENT"),
+        terminal = Some("PR")
+      )
+    )
     w.callCount("dispatch IMPL") shouldBe 1
     reviewDispatches(w) shouldBe List(s"dispatch REVIEW reviewFile=$logDir/issue-999-r1.review.md model=")
     // The cycle never entered its fixing half: an approval on round 1 is the one path through this

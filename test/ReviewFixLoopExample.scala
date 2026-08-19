@@ -45,7 +45,14 @@ final case class Work(
     gateRedLog: Option[String]
 )
 
-/** `Review`'s input. Plain: reaching the reviewer needs no prior review. */
+/** What travels into `Gate` and out of it into `Review`: the work so far, and which round of the
+  * cycle is about to be reviewed. Plain: reaching the reviewer needs no prior review.
+  *
+  * The round number rides in this value rather than being captured by a closure because the graph is
+  * a table now (issue #67), and an edge sees nothing but the output of the node it leaves. Making the
+  * counter part of the data is what lets the same `Gate -> Review` edge serve both the first pass and
+  * every later one, stated once.
+  */
 final case class ReviewRound(work: Work, round: Int)
 
 /** What the reviewer answered, once parsed. Travels wrapped in `AgentDispatch.Judged`, which is
@@ -62,6 +69,12 @@ final case class FixRound(work: Work, round: Int, findings: List[String]) extend
 
 /** `OpenPr`'s input: `needsHuman` is true when the rounds ran out with findings still open. */
 final case class PrRequest(work: Work, needsHuman: Boolean)
+
+/** `OpenPr`'s output. Carries `needsHuman` back out again so the edge that ends the run can pick the
+  * `LoopExit` from the value alone: which exit this graph reaches is a fact about how the cycle
+  * ended, and the only place an edge can read such a fact is the output of the node it leaves.
+  */
+final case class PrOpened(pr: Int, needsHuman: Boolean)
 
 // ---------------------------------------------------------------------------------------------
 // Helpers. Nothing here is library API: `Machine.renderTemplate`, `Machine.touchesProtected` and
@@ -266,15 +279,16 @@ val Implement: Node[Work, Work] = Node(
   * would be rejected at compile time. The red log travels on `Work` into the review prompt
   * instead, and the reviewer's findings are what the fixer acts on.
   */
-val Gate: Node[Work, Work] = Node(
+val Gate: Node[ReviewRound, ReviewRound] = Node(
   name = "Gate",
   cost = Cost.NoDispatch,
   timeout = Timeout.Unbounded,
   probe = _ => None,
-  run = (work: Work) =>
+  run = (pending: ReviewRound) =>
     val caps    = summon[Caps]
     val cfg     = caps.cfg
     val fault   = summon[Fault]
+    val work    = pending.work
     val gateLog = artifact(work.issue, ".gate.log")
     emit(work.issue, "FAST_GATE", "start", 0, gateLog)
     caps.gates.run("FAST", cfg.gateCmd, cfg.gateTimeout, gateLog) match
@@ -283,10 +297,10 @@ val Gate: Node[Work, Work] = Node(
       case GateResult.Red =>
         emit(work.issue, "FAST_GATE", "red", 0, gateLog)
         caps.logger.log(s"FAST gate RED — the reviewer will see $gateLog")
-        NodeOutcome.Done(work.copy(gateRedLog = Some(gateLog)))
+        NodeOutcome.Done(pending.copy(work = work.copy(gateRedLog = Some(gateLog))))
       case GateResult.Green =>
         emit(work.issue, "FAST_GATE", "ok", 0, gateLog)
-        NodeOutcome.Done(work.copy(gateRedLog = None))
+        NodeOutcome.Done(pending.copy(work = work.copy(gateRedLog = None)))
 )
 
 /** One adversarial review. Output is `AgentDispatch.Judged`, which is what earns this node
@@ -337,7 +351,7 @@ val Review: Node[ReviewRound, AgentDispatch.Judged[Reviewed]] = Node(
   * of the N dispatches this body makes. Size `budgets.repair` for MaxRounds * findings, or cap
   * `findings` here.
   */
-val Fix: Node[FixRound, Work] = Node(
+val Fix: Node[FixRound, ReviewRound] = Node(
   name = "Fix",
   cost = Cost.OneDispatch,
   timeout = Timeout.Unbounded,
@@ -375,13 +389,15 @@ val Fix: Node[FixRound, Work] = Node(
           caps.logger.log(s"the fixer produced no changes for: $finding")
           acc
     }
-    NodeOutcome.Done(fixed)
+    // The round is incremented HERE, on the way out, because the edge back into `Gate` reads its
+    // next round from this value and nowhere else.
+    NodeOutcome.Done(ReviewRound(fixed, fix.round + 1))
 )
 
 /** Commit, push, open the PR. Adopts an OPEN PR already on the branch rather than trusting a
   * stored position, so a crashed tick that already opened one does not try again.
   */
-val OpenPr: Node[PrRequest, Int] = Node(
+val OpenPr: Node[PrRequest, PrOpened] = Node(
   name = "OpenPr",
   cost = Cost.NoDispatch,
   timeout = Timeout.Unbounded,
@@ -411,50 +427,69 @@ val OpenPr: Node[PrRequest, Int] = Node(
       }
       emit(work.issue, "PR", "ok", 0, "", s"pr=$pr")
       caps.logger.log(s"opened PR #$pr for issue #${work.issue}")
-      NodeOutcome.Done(pr)
+      NodeOutcome.Done(PrOpened(pr, req.needsHuman))
 )
 
 // ---------------------------------------------------------------------------------------------
 // The graph.
 // ---------------------------------------------------------------------------------------------
 
-/** The bounded cycle. Recursion, not a loop: each `andThen` closure decides the next edge from the
-  * value the node it followed actually produced, so `round` is carried in the edge itself and
-  * nothing mutable holds it.
+/** The whole graph, written once (issue #67, RFC #26 decision 5): each edge names where it leaves,
+  * where it arrives, and what the arriving node is handed, and nothing states any of that a second
+  * time. `LitterBox.graph` derives the walk the runner executes AND the `Shape` its validator and its
+  * compile time macro read from this one table, so the check and the run can no longer describe
+  * different graphs.
+  *
+  * The cycle is an ordinary edge back to a node already named, `Fix -> Gate`, not a recursive
+  * function: a table can name a node it has already named, which is what makes a bounded loop
+  * expressible as data at all. What bounds it is the round number riding in `ReviewRound`, read by
+  * the two edges leaving `Review`.
+  *
+  * Those two edges are ALTERNATIVES and answer `None` for the value that is not theirs: findings
+  * still open with rounds left goes to `Fix`, everything else goes to `OpenPr`, which is also where
+  * the `needsHuman` decision is made and handed on. Written as a literal right here, out of top level
+  * `val`s, because this is what the macro reads to prove no path reaches `Fix` without crossing
+  * `Review`.
   */
-def reviewCycle(work: Work, round: Int): Next =
-  Next.Goto(
-    Review,
-    ReviewRound(work, round),
-    judged =>
-      val reviewed = judged.value
-      if reviewed.findings.isEmpty then
-        Next.Goto(OpenPr, PrRequest(reviewed.work, needsHuman = false), _ => Next.Finish(LoopExit.Success))
-      else if round >= MaxRounds then
-        Next.Goto(OpenPr, PrRequest(reviewed.work, needsHuman = true), _ => Next.Finish(LoopExit.NeedsHuman))
-      else
-        Next.Goto(
-          Fix,
-          FixRound(reviewed.work, round, reviewed.findings),
-          fixedWork => Next.Goto(Gate, fixedWork, gated => reviewCycle(gated, round + 1))
-        )
-  )
-
-val workflow: Workflow[Int] = Workflow[Int](
+val graph: LoopGraph = LitterBox.graph(
   name = "review-fix-cycle",
-  // Read outside in, the same shape `reviewCycle` above has: every `Next.Goto` closure takes the
-  // value the node it follows produced and picks the next edge from it.
-  start = (tick: Int) =>
-    Next.Goto(
-      Setup,
-      tick,
-      work =>
-        Next.Goto(
-          Implement,
-          work,
-          implemented => Next.Goto(Gate, implemented, gated => reviewCycle(gated, 1))
-        )
-    ),
+  plan = Plan(
+    entry = Setup,
+    edges = List(
+      Edge.To(Setup, Implement, (work: Work) => Some(work)),
+      Edge.To(Implement, Gate, (work: Work) => Some(ReviewRound(work, 1))),
+      Edge.To(Gate, Review, (pending: ReviewRound) => Some(pending)),
+      Edge.To(
+        Review,
+        Fix,
+        (judged: AgentDispatch.Judged[Reviewed]) =>
+          val reviewed = judged.value
+          if reviewed.findings.nonEmpty && reviewed.round < MaxRounds then
+            Some(FixRound(reviewed.work, reviewed.round, reviewed.findings))
+          else None
+      ),
+      Edge.To(
+        Review,
+        OpenPr,
+        (judged: AgentDispatch.Judged[Reviewed]) =>
+          val reviewed = judged.value
+          if reviewed.findings.isEmpty then Some(PrRequest(reviewed.work, needsHuman = false))
+          else if reviewed.round >= MaxRounds then Some(PrRequest(reviewed.work, needsHuman = true))
+          else None
+      ),
+      Edge.To(Fix, Gate, (pending: ReviewRound) => Some(pending)),
+      Edge.Exit(
+        OpenPr,
+        (opened: PrOpened) =>
+          Some(if opened.needsHuman then LoopExit.NeedsHuman else LoopExit.Success)
+      )
+    )
+  ),
+  // One IMPLEMENT + MaxRounds * (one REVIEW + one FIX node start). The FIX node dispatches once
+  // per finding and every one of those is charged, so raise `budgets.repair` if your reviewer is
+  // wordy: the runner refuses the NEXT node once this runs out, mid-cycle.
+  dispatchBudget = (cfg: Config) => 1 + MaxRounds * (1 + cfg.repairBudget),
+  startInput = (tick: Int) => tick,
   stages = StageSet(
     stages = List(
       Stage("IMPLEMENT", "impl", 1),
@@ -466,28 +501,6 @@ val workflow: Workflow[Int] = Workflow[Int](
     anchor = Some("IMPLEMENT"),
     terminal = Some("PR")
   )
-)
-
-val graph: LoopGraph = LitterBox.graph(
-  workflow = workflow,
-  // Written as a literal right here, and only out of top-level `val`s: this is what the macro
-  // reads to prove no path reaches `Fix` without crossing `Review`.
-  shape = Shape(
-    entry = List(Setup),
-    transitions = List(
-      Transition(Setup, Implement),
-      Transition(Implement, Gate),
-      Transition(Gate, Review),
-      Transition(Review, Fix),
-      Transition(Fix, Gate),
-      Transition(Review, OpenPr)
-    )
-  ),
-  // One IMPLEMENT + MaxRounds * (one REVIEW + one FIX node start). The FIX node dispatches once
-  // per finding and every one of those is charged, so raise `budgets.repair` if your reviewer is
-  // wordy: the runner refuses the NEXT node once this runs out, mid-cycle.
-  dispatchBudget = (cfg: Config) => 1 + MaxRounds * (1 + cfg.repairBudget),
-  startInput = (tick: Int) => tick
 )
 
 @main def loop(args: String*): Unit = LitterBox.run(graph, args)

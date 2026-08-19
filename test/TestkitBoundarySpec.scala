@@ -77,12 +77,14 @@ class TestkitBoundarySpec extends AnyFlatSpec with Matchers:
     val first  = dispatchingNode("First", "consumer node First ran")
     val second = dispatchingNode("Second", "consumer node Second ran")
     val myGraph = LitterBox.graph(
-      workflow = Workflow[Unit](
-        "consumer-testkit",
-        start = (_: Unit) =>
-          Next.Goto(first, (), _ => Next.Goto(second, (), _ => Next.Finish(LoopExit.Success)))
+      name = "consumer-testkit",
+      plan = Plan(
+        entry = first,
+        edges = List(
+          Edge.To(first, second, _ => Some(())),
+          Edge.Exit(second, _ => Some(LoopExit.Success))
+        )
       ),
-      shape = Shape(entry = List(first), transitions = List(Transition(first, second))),
       dispatchBudget = _ => 2,
       startInput = _ => ()
     )
@@ -117,12 +119,14 @@ class TestkitBoundarySpec extends AnyFlatSpec with Matchers:
     val first  = dispatchingNode("First", "first ran")
     val second = dispatchingNode("Second", "second ran")
     val myGraph = LitterBox.graph(
-      workflow = Workflow[Unit](
-        "consumer-testkit-budget",
-        start = (_: Unit) =>
-          Next.Goto(first, (), _ => Next.Goto(second, (), _ => Next.Finish(LoopExit.Success)))
+      name = "consumer-testkit-budget",
+      plan = Plan(
+        entry = first,
+        edges = List(
+          Edge.To(first, second, _ => Some(())),
+          Edge.Exit(second, _ => Some(LoopExit.Success))
+        )
       ),
-      shape = Shape(entry = List(first), transitions = List(Transition(first, second))),
       dispatchBudget = _ => 1,
       startInput = _ => ()
     )
@@ -138,8 +142,8 @@ class TestkitBoundarySpec extends AnyFlatSpec with Matchers:
 
   it should "run a single node of their own to Done, reporting the outcome and recording the call exactly as a graph run does" in {
     // The question `runGraph` cannot answer cheaply: what does THIS node do. Before `runNode` a
-    // consumer had to wrap one node in a `Workflow`, a literal `Shape` and a `LitterBox.graph` call
-    // to find out, and then read the answer off an exit code the whole walk contributed to.
+    // consumer had to wrap one node in a `Plan` and a `LitterBox.graph` call to find out, and then
+    // read the answer off an exit code the whole walk contributed to.
     val world = new TestWorld
     world.ready = Some(7)
 
@@ -273,8 +277,8 @@ class TestkitBoundarySpec extends AnyFlatSpec with Matchers:
     // forged review is that the guard then opens for it. Both gates are exercised here and neither
     // is asserted by hand.
     //
-    // The COMPILE TIME gate is this file compiling at all: `LitterBox.graph` runs `checkedShapeStrict`
-    // over the literal `Shape` below, and `Guarded`'s input extends `RequiresReviewInput`, so a path
+    // The COMPILE TIME gate is this file compiling at all: `LitterBox.graph` runs `checkedPlan`
+    // over the literal `Plan` below, and `Guarded`'s input extends `RequiresReviewInput`, so a path
     // reaching it without crossing a `Trust.Reviewed` node is a hard compile error. It crosses
     // `ForgedReview`, which earns `Trust.Reviewed` purely from its declared output type.
     //
@@ -286,16 +290,14 @@ class TestkitBoundarySpec extends AnyFlatSpec with Matchers:
     world.reviewScripts = List(Script.ReviewScript.Says("nothing a real reviewer wrote"))
 
     val forged = LitterBox.graph(
-      workflow = Workflow[Unit](
-        "consumer-forged-review",
-        start = (_: Unit) =>
-          Next.Goto(
-            ForgedReview,
-            (),
-            _ => Next.Goto(Guarded, PrInput(), _ => Next.Finish(LoopExit.Success))
-          )
+      name = "consumer-forged-review",
+      plan = Plan(
+        entry = ForgedReview,
+        edges = List(
+          Edge.To(ForgedReview, Guarded, _ => Some(PrInput())),
+          Edge.Exit(Guarded, _ => Some(LoopExit.Success))
+        )
       ),
-      shape = Shape(entry = List(ForgedReview), transitions = List(Transition(ForgedReview, Guarded))),
       dispatchBudget = _ => 0,
       startInput = _ => ()
     )
@@ -318,11 +320,14 @@ class TestkitBoundarySpec extends AnyFlatSpec with Matchers:
     * carries neither, so it could not stand in here whatever the macro happened to accept.
     *
     * What the macro itself constrains is narrower than "no `def`": `LitterBox.graph` reads the SOURCE
-    * of the `Shape` literal at its own call site, so each element written there has to be a stable
-    * path (a `val`, local or an unqualified member of this class) or an inline `Node(name = "...",
-    * ...)` call carrying a literal name. A helper `def` CALL written straight into the `Shape` is what
-    * it declines, since it never runs that call; binding the call's result to a `val` first, exactly
-    * what the tests above do with `dispatchingNode`, reads fine and is why they compile.
+    * of the `Plan` literal at its own call site, so each element written there has to be a stable
+    * path, a `val`, local or an unqualified member of this class, never a node built inline at its own
+    * point of use (issue #67 review, `KitMacro.ParseFailure.InlineNodeInPlan`'s own doc has the
+    * reasoning: this walk keys such a call by its literal name, but the actual run needs the SAME
+    * runtime object everywhere the node is named, and an inline call never gives it one). A helper
+    * `def` CALL written straight into the `Plan` is what it also declines, since it never runs that
+    * call; binding either kind of construction to a `val` first, exactly what the tests above do with
+    * `dispatchingNode`, reads fine and is why they compile.
     */
   private case class PrInput() extends RequiresReviewInput
 

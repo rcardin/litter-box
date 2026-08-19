@@ -509,9 +509,9 @@ final class TestWorld:
     *
     * Why it exists at all, given [[runGraph]] already runs a consumer's graph: a node author's first
     * question about a node they just wrote is what THAT node does, and answering it through a graph
-    * means writing a `Workflow`, a literal `Shape` and a `LitterBox.graph` call around a single node,
-    * then reading its behaviour back out of an exit code that every other node on the walk also
-    * contributed to. Before this method the only way to step one node was `Runner.step` itself, which
+    * means writing a `Plan` and a `LitterBox.graph` call around a single node, then reading its
+    * behaviour back out of an exit code that every other node on the walk also contributed to. Before
+    * this method the only way to step one node was `Runner.step` itself, which
     * a consumer cannot call: it takes a `using Runner.Ledger` whose constructor is `private[litterbox]`
     * (that type's own doc has why), so the call does not compile outside this package no matter what
     * else the testkit exposes. This method lives inside `in.rcard.litterbox`, mints the ledger here,

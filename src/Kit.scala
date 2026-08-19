@@ -307,7 +307,7 @@ enum Guard:
   * decision 16's compile time half). `Guard` alone (above) cannot be read off a `Ref`'s own static
   * type: `guard` is an ordinary constructor argument on `Node.apply`, invisible to anything that only
   * sees `Node[I, O]`, the same limit `Guard`'s own doc already names. This marker is what
-  * `KitMacro.checkShapeImpl` (`KitMacro.scala`) reads instead, through a plain subtype test against a
+  * `KitMacro.checkGraph` (`KitMacro.scala`) reads instead, through a plain subtype test against a
   * node reference's own INPUT type, since that type is visible in the AST even though the value
   * `Node.apply` was called with is not.
   *
@@ -363,12 +363,12 @@ enum Guard:
   * BOTH directions: a node passing `guard = Guard.RequiresReview` without extending this marker was
   * invisible to the macro (issue #43 review round 5, FINDING 1, below, NARROWS this one to the case
   * where the construction is written inline in the shape, and leaves it standing everywhere else;
-  * `checkedShapeStrict`'s own doc, below, has the runtime backstop that covered it in the meantime and
+  * `checkedPlan`'s own doc, below, has the runtime backstop that covered it in the meantime and
   * still covers what round 5 does not reach); and
   * a node extending this marker while `guard` was left `Guard.Open`, `Machine.OpenPr`/`Machine.Merge`'s
   * own deliberate shape at the time (their own doc has the reason a `guard` there would reject the
   * shipped graph itself), was invisible to `Runner.validate`, which read `guard`, never this marker, a
-  * gap issue #43 review round 4 found seven real files could exploit silently (`KitMacro.checkShapeImpl`'s
+  * gap issue #43 review round 4 found seven real files could exploit silently (`KitMacro.checkGraph`'s
   * own doc has the mechanism, `stablePathKey`'s own doc names the specific families).
   *
   * That second divergence is what issue #43 review round 4's Tier 2 closed, and what the macro
@@ -388,7 +388,7 @@ enum Guard:
   * even though `Runner.validate` correctly treated it as guarded. `Guard`'s own scaladoc above states
   * plainly that declaring the guard "is the node author's own job", so leaving that documented, author
   * declared form with no compile time check of its own, only a runtime backstop, is the gap issue #43
-  * review round 5 (FINDING 1) NARROWS: `KitMacro.checkShapeImpl`'s own `nodeFacts` now also reads a
+  * review round 5 (FINDING 1) NARROWS: `KitMacro.checkGraph`'s own `nodeFacts` now also reads a
   * literal `guard = Guard.RequiresReview` argument straight off the reference's own source text
   * (`explicitRequiresReviewGuard`, `KitMacro.scala`), named or positional, since `guard` is the only
   * parameter of `Node.apply` typed `Guard` at all so nothing else a literal `Guard.RequiresReview` could
@@ -436,7 +436,7 @@ trait RequiresReviewInput
   * however many additional fields or supertypes it carries alongside it, genuinely does state
   * "reaching this node requires a review", so a subtype bound is the correct test here.
   *
-  * This is the SAME expression `KitMacro.checkShapeImpl`'s own `nodeFacts` runs when it reads the
+  * This is the SAME expression `KitMacro.checkGraph`'s own `nodeFacts` runs when it reads the
   * identical fact off a node reference's own static type at compile time, and both now live in
   * `KitMacro.scala` for exactly that reason: the real `Node`'s own `guard` field and the macro's
   * structural read of `I` derive one fact one way, never two independently drifting rules that could
@@ -532,7 +532,7 @@ object Node:
     * Concretely: whenever `I` extends `RequiresReviewInput`, the real `guard` is `Guard.RequiresReview`
     * regardless of what the `guard` ARGUMENT was written as, so a node whose input type extends that
     * marker is stamped guarded even if its author left `guard` at the default, closing the reverse
-    * divergence `RequiresReviewInput`'s own doc names, the one `KitMacro.checkShapeImpl`'s compile time
+    * divergence `RequiresReviewInput`'s own doc names, the one `KitMacro.checkGraph`'s compile time
     * walk always caught but `Runner.validate` never did before issue #43 review round 4. Whenever `I`
     * does not extend it, the real `guard` is exactly the hand written `guard` argument,
     * `Guard.RequiresReview` preserved unchanged when the author wrote it that way, never downgraded to
@@ -626,7 +626,11 @@ final case class Transition(from: Node[?, ?], to: Node[?, ?])
   *
   * Hand declaring this alongside the closures it describes is the acknowledged weakness of this
   * issue's cheap half: nothing here stops a `Shape` from drifting out of sync with what its own
-  * closures actually do, the same way a stale comment can drift from the code beside it. Issue #39's
+  * closures actually do, the same way a stale comment can drift from the code beside it. That
+  * weakness is now confined to the graphs that still declare both by hand, `Machine.shippedWorkflow`
+  * and anything composing `Runner.run` directly: a CONSUMER graph authored through `LitterBox.graph`
+  * writes one `Plan` (issue #67) and has this `Shape` derived from it, so there is no second
+  * declaration there to drift. Issue #39's
   * compile time macro, `checkedShape` below, does NOT close this gap (issue #39 review, MAJOR 5,
   * correcting an earlier, aspirational version of this paragraph): it walks the SAME hand written
   * `Shape` literal `Runner.validate` reads, at compile time instead of at startup, never the `Next`
@@ -653,18 +657,281 @@ final case class Transition(from: Node[?, ?], to: Node[?, ?])
   */
 final case class Shape(entry: List[Node[?, ?]], transitions: List[Transition])
 
+/** One edge of a [[Plan]], and the whole reason a consumer no longer states their graph twice (issue
+  * #67): an edge carries BOTH facts about itself, which two nodes it joins and how the arriving
+  * node's own input is computed from the departing node's output, so a `Plan` is at once the data
+  * `Runner.validate` and the compile time macro walk, and the control flow `Runner.run` executes.
+  * Before this existed the two facts lived apart, `Next.Goto` closures for the walk and a hand
+  * written `Shape` for the checks, and nothing made them agree.
+  *
+  * The direction of derivation is forced, not chosen: `Next.Goto.andThen` is an opaque `O => Next`
+  * over an erased `O` (`Next`'s own doc), so a `Shape` cannot be recovered from closures without
+  * RUNNING them, and running a real graph's closures fires real git and GitHub side effects. Data can
+  * always be turned into closures; closures can never be turned back into data. So the readable side
+  * wins and the walk is derived from it.
+  *
+  * `input` answers with an `Option` because every edge leaving one node is an ALTERNATIVE, never a
+  * sequence: a node that branches on what it produced declares one edge per destination, and each
+  * edge decides from that produced value alone whether it is the one taken. `Runner` takes the first
+  * edge, in declaration order, that answers `Some`, so a consumer reads their own precedence off the
+  * order they wrote rather than out of a rule stated somewhere else.
+  *
+  * Whatever a later node needs to know therefore has to ride in the values the nodes themselves
+  * produce, since an edge sees nothing but the output of the node it leaves. That is the price of
+  * making the table the single statement of the graph, and it is a price worth naming out loud: a
+  * counter threaded through a cycle (`test/ReviewFixLoopExample.scala`'s own round number) lives in
+  * the node's own output type, where the graph can see it, instead of being captured invisibly inside
+  * a closure.
+  */
+enum Edge:
+  /** `to`, not a second `Plan`: a graph with a cycle in it (a review and fix loop is the ordinary
+    * case) has to be able to name a node it has already named, and a nested structure could only ever
+    * describe a tree.
+    */
+  case To[F, T](from: Node[?, F], to: Node[T, ?], input: F => Option[T]) extends Edge
+
+  /** A run ends at a declared edge like any other, rather than at a node that happens to have no
+    * successor, because which `LoopExit` a graph ends with is a decision a consumer makes about their
+    * own graph, and an absent edge could only ever mean one hardcoded answer.
+    */
+  case Exit[F](from: Node[?, F], exit: F => Option[LoopExit]) extends Edge
+
+object Edge:
+  /** The node an edge leaves, as `Plan`'s own derivations need it: both cases carry a `from`, but
+    * each carries it at its own case-specific type, so there is no single inherited member to read
+    * and this match is what stands in for one.
+    */
+  private[litterbox] def source(e: Edge): Node[?, ?] = e match
+    case t: Edge.To[?, ?] => t.from
+    case x: Edge.Exit[?]  => x.from
+
+  /** Applies one edge to the value the node it leaves actually produced, answering `None` when this
+    * edge is not the one this value takes.
+    *
+    * The casts here are the single place the erasure `Next.Goto` has always carried is paid for, kept
+    * in one function rather than spread through the walk that calls it: `Edge` is existential in the
+    * output type of `from` for the same reason `Transition` and `Next.Goto` are (a graph holds nodes
+    * of many shapes and there is no common supertype for them), so the value handed in here cannot be
+    * typed as anything narrower than `Any` by a caller that walks a heterogeneous list. It is safe
+    * for a reason the type system cannot state: `out` is only ever the output `Runner.step` obtained
+    * from `from` itself, and `from`'s own type is what `input` was declared against when the edge was
+    * built.
+    */
+  private[litterbox] def advance(e: Edge, out: Any, andThen: Node[?, ?] => Any => Next): Option[Next] =
+    e match
+      case t: Edge.To[?, ?] =>
+        t.input
+          .asInstanceOf[Any => Option[Any]](out)
+          .map(i => Next.Goto(t.to.asInstanceOf[Node[Any, Any]], i, andThen(t.to)))
+      case x: Edge.Exit[?] =>
+        x.exit.asInstanceOf[Any => Option[LoopExit]](out).map(exit => Next.Finish(exit))
+
+/** The one representation a consumer writes for their own graph (issue #67, RFC #26 decision 5, "users
+  * write data, not control flow"): where the walk begins, and every edge it may take. `LitterBox.graph`
+  * derives BOTH halves of what the runner needs from this single value, the `Workflow` it executes and
+  * the `Shape` `Runner.validate` and the compile time macro read, so the two can no longer disagree
+  * about which edges exist.
+  *
+  * One `entry`, not `Shape`'s own list of them: a tick begins by handing `startInput`'s value to one
+  * node, so a second entry would be a node the walk could never actually start from, declared
+  * reachable to the validator alone.
+  */
+final case class Plan[I](entry: Node[I, ?], edges: List[Edge])
+
+object Plan:
+  /** What `Runner.validate` and `Machine.runOnce` walk, read off the same value the runner executes
+    * rather than off a second one a consumer wrote beside it. Never empty: the entry node is always
+    * declared, so a derived `Shape` can never come back as the `Shape(Nil, Nil)` `validate` reads as
+    * trivially valid, the failure mode that would silently turn a rejection into a pass.
+    *
+    * `edges.collect { case Edge.To(...) => ... }` on purpose drops an `Edge.Exit`'s own `from`
+    * entirely: a `Transition` states which node can follow which, and an exit is the one edge that has
+    * no follower, so the equivalent statement for it would be a `Transition` to nowhere, a shape
+    * `Transition` cannot express (issue #67 review). That is not the same claim as "an exit source
+    * needs no check at all": [[declarationViolations]] below is where that check now lives, reading
+    * `plan.edges` directly rather than the `Shape` this method derives, precisely because this method's
+    * own output has nowhere to carry it.
+    */
+  private[litterbox] def shapeOf(plan: Plan[?]): Shape =
+    Shape(
+      entry = List(plan.entry),
+      transitions = plan.edges.collect { case Edge.To(from, to, _) => Transition(from, to) }
+    )
+
+  /** Declaration hygiene violations a `Plan` can carry that no other check catches, both because
+    * `Runner.validate` and the compile time macro (`KitMacro.checkGraph`) read a `Plan` through two
+    * DIFFERENT lenses, neither of which is the one [[workflowOf]] actually walks by (issue #67 review,
+    * two rounds naming two failure modes of the same root cause):
+    *
+    *   - Two references inside `plan` sharing one `name` while being genuinely distinct `Node` values
+    *     (never `eq`). `workflowOf` walks each one's own outgoing edges separately, since it can never
+    *     confuse two different objects for one; `shapeOf` above cannot keep that distinction, a
+    *     `Transition` holds a bare `Node[?, ?]`, and `Runner.validate` groups the `Shape` it derives by
+    *     `name` alone (`Runner.validate`'s own `byFrom`), so two same-named nodes collapse into one
+    *     validator-side identity. A node reached by EITHER one is then read as having crossed every
+    *     edge either one declared, which can invent an edge neither node actually has (a direct path
+    *     into a guarded node that skips the reviewer one of the two genuinely sits behind), or, just as
+    *     dangerous the other way, invent a review neither node earned. Either is a false verdict about a
+    *     graph the real walk runs correctly.
+    *   - A node named only as the `from` of an `Edge.Exit`, unreachable from `plan.entry` over the
+    *     plan's own `Edge.To` edges. `shapeOf`'s own doc above has the reason such a node contributes no
+    *     `Transition`: it is invisible to `Runner.validate` entirely, where the identical typo written
+    *     as an `Edge.To`'s destination instead IS caught, by that same validator's own unreachable-node
+    *     check. An `Edge.Exit` should not be a quieter way to make the identical mistake.
+    *
+    * Read by [[workflowOf]] itself, before it derives a single closure: a `Plan` carrying either shape
+    * of violation faults through the same `Machine.infraFault` channel every other declaration problem
+    * in this file already uses, and it does so strictly before `Runner.validate` ever sees the `Shape`
+    * this same `Plan` derives, on every path that reaches one (`Machine.runOnce` builds a `Workflow`
+    * off `graph.workflow(...)` before it reads `graph.shape(cfg)`, and `Runner.run` receives an
+    * already-built `Workflow` as its own argument, evaluated before its body ever calls
+    * `validate(wf.shape)`), so the false-verdict failure mode named above can never actually surface as
+    * a `Runner.validate` rejection or a `Runner.validate` false pass: this check runs first and names
+    * the real problem instead.
+    *
+    * Deliberately narrower than "every fact `Runner.validate` reads": nothing here re-checks
+    * `cost`/`timeout`/`trust`/`guard` agreement (`Runner.validate`'s own duplicate name check already
+    * owns that fact, unconditionally, on every `Shape` including this one's own derived `shapeOf(plan)`),
+    * and nothing here re-checks whether an `Edge.To` destination is reachable (the identical case
+    * `Runner.validate`'s own unreachable-node check already owns, since `shapeOf` keeps every `Edge.To`
+    * in the `Shape` it derives). Both of those stay exactly where they already were; this method exists
+    * only for the two facts a derived `Shape` cannot state at all.
+    */
+  private[litterbox] def declarationViolations(plan: Plan[?]): List[String] =
+    val declaredRefs: List[Node[?, ?]] =
+      plan.entry :: plan.edges.flatMap { e =>
+        Edge.source(e) :: (e match
+          case t: Edge.To[?, ?] => List(t.to)
+          case _: Edge.Exit[?]  => Nil
+        )
+      }
+
+    val duplicateNameViolations = declaredRefs.map(_.name).distinct.flatMap { nodeName =>
+      val distinctByIdentity =
+        declaredRefs.filter(_.name == nodeName).foldLeft(List.empty[Node[?, ?]]) { (acc, n) =>
+          if acc.exists(_ eq n) then acc else n :: acc
+        }
+      if distinctByIdentity.size > 1 then
+        List(
+          s"name '$nodeName' is declared by ${distinctByIdentity.size} distinct nodes that are not " +
+            "the same object: this Plan's own derived walk links edges by node identity while " +
+            "Runner.validate reads declared names, so every distinct node in a Plan needs its own name"
+        )
+      else Nil
+    }
+
+    def outgoingTo(from: Node[?, ?]): List[Node[?, ?]] =
+      plan.edges.collect { case t: Edge.To[?, ?] if t.from eq from => t.to }
+
+    @scala.annotation.tailrec
+    def reachableFrom(frontier: List[Node[?, ?]], visited: List[Node[?, ?]]): List[Node[?, ?]] =
+      frontier match
+        case Nil => visited
+        case n :: rest =>
+          if visited.exists(_ eq n) then reachableFrom(rest, visited)
+          else reachableFrom(outgoingTo(n) ::: rest, n :: visited)
+
+    val reachable = reachableFrom(List(plan.entry), Nil)
+
+    val unreachableExitViolations = plan.edges.collect {
+      case x: Edge.Exit[?] if !reachable.exists(_ eq x.from) =>
+        s"node '${x.from.name}' is the source of an Edge.Exit but is unreachable from this Plan's " +
+          "own entry over its own Edge.To edges, so it can never run: check for a typo naming the " +
+          "wrong node"
+    }.distinct
+
+    duplicateNameViolations ++ unreachableExitViolations
+
+  /** The walk, derived from the same edges [[shapeOf]] declares.
+    *
+    * Which edges leave a node is decided by reference identity, `Edge.source(e) eq from`, never by
+    * `name` (an earlier version of this method used `name`, review round found the failure mode
+    * below by running it, not by reading it). `from` is always the exact `Node` value `Runner.step`
+    * just finished running, the same object an edge naming it as its own `to` was built against, so
+    * identity is a fact this walk can always answer honestly, with no second identity scheme to
+    * invent. `name` cannot make that promise: two distinct `Node` values are free to share one name,
+    * `Runner.validate`'s own duplicate name check only refuses that when the two also disagree on
+    * cost, timeout, trust or guard (that check's own doc), so two nodes agreeing on those four facts
+    * while doing genuinely different work pass validation cleanly and yet, under a name keyed walk,
+    * every edge either one declared filtered in for BOTH, so the second node's own edges were never
+    * reached at all and the walk silently followed the first node's edges back onto itself, a real
+    * graph cycling forever with no consumer ever declaring one. Identity carries no such gap: two
+    * distinct `Node` values are never `eq`, however many facts they happen to agree on, and one `Node`
+    * value read back through a second `val` (the alias residual `checkReconciled`'s own doc,
+    * `KitMacro.scala`, names for the compile time walk) stays `eq` to itself, so nothing this walk
+    * needs from the alias case is lost by the change. This method no longer merely tolerates that
+    * name/identity gap by walking around it, though (issue #67 review, second round): a `Plan` that
+    * carries it at all is refused outright, below, before this walk is ever built, so `Runner.validate`
+    * downstream is never handed a `Shape` that gap could make it misread either way (pinned by
+    * `test/ConsumerGraphRunSpec.scala`'s own dup-name rejection test).
+    *
+    * A node the walk reaches whose every outgoing edge declines the value it produced is a fault, not
+    * a quiet success: the alternative is inventing a `LoopExit` the consumer never declared. It goes
+    * through `Machine.infraFault`, the one fault channel every other failure in this loop already
+    * uses, which is why this derivation needs `caps` and `faulting` and therefore happens inside
+    * `LoopGraph.workflow`, the one place a tick's own capabilities exist.
+    *
+    * [[declarationViolations]] runs first, for the identical reason: a bad declaration is a fact about
+    * `plan` itself, true before a single edge of this walk is ever taken, so checking it after the walk
+    * had already started would be too late to mean "rejected before executing any node" (the same
+    * ordering argument `Runner.run`'s own doc makes for `validate(wf.shape)` against `wf.start`).
+    *
+    * Reference identity is a promise this walk can keep only about a runtime VALUE, never about the
+    * SOURCE a consumer wrote (issue #67 review, walk identity splits node macro merges): an inline
+    * `Node(name = "X", ...)` call allocates a fresh object at every place it is written, so two
+    * writings of the identical call are never `eq`, however confidently `KitMacro`'s own canonical key
+    * treats them as one node. A `Plan` written that way used to compile clean and validate clean,
+    * `KitMacro.checkGraph` and `Runner.validate` both keyed by name or by canonical path, neither ever
+    * asking whether the value behind that key was constructed once or many times, and then dead end
+    * into `Machine.infraFault` on its very first tick, the exact gap this doc's own reasoning above
+    * already exposed without naming it. `KitMacro.parsePlan` now refuses an inline construction inside
+    * a `Plan` outright (`KitMacro.ParseFailure.InlineNodeInPlan`'s own doc, `KitMacro.scala`, has the
+    * full reasoning), so every reference this walk ever reads by name is, by construction, a stable
+    * path read back through the same `val` or `object` member every time, which is exactly the case
+    * this doc's own paragraph above already proves stays `eq` to itself.
+    */
+  private[litterbox] def workflowOf[I](
+      name: String,
+      plan: Plan[I],
+      stages: StageSet
+  )(using caps: Caps, faulting: Faulting): Workflow[I] =
+    val declViolations = declarationViolations(plan)
+    if declViolations.nonEmpty then
+      Machine.infraFault(
+        s"graph '$name' plan is not well declared: ${declViolations.mkString("; ")}"
+      )(using caps.logger, caps.notifier)(using faulting)
+    def andThen(from: Node[?, ?]): Any => Next =
+      out =>
+        plan.edges.iterator
+          .filter(e => Edge.source(e) eq from)
+          .map(e => Edge.advance(e, out, andThen))
+          .collectFirst { case Some(next) => next }
+          .getOrElse(
+            Machine.infraFault(
+              s"graph '$name' declares no edge out of '${from.name}' that accepts the value it " +
+                "produced, so this walk has nowhere left to go: add an Edge.To or an Edge.Exit " +
+                s"leaving '${from.name}' that answers Some for that value"
+            )(using caps.logger, caps.notifier)(using faulting)
+          )
+    Workflow(
+      name = name,
+      start = (i: I) => Next.Goto(plan.entry.asInstanceOf[Node[I, Any]], i, andThen(plan.entry)),
+      shape = shapeOf(plan),
+      stages = stages
+    )
+
 /** The compile time half of RFC #26 decision 16 (issue #39). Restated plainly, correcting an earlier,
   * too strong version of this paragraph (issue #39 review, MAJOR 5): this does NOT narrow the drift
   * gap `Shape`'s own doc names above, between a declared `Shape` and the `Next` closures it claims to
-  * describe; `KitMacro.checkShapeImpl` (`KitMacro.scala`) reads the exact SAME hand written `Shape`
+  * describe; `KitMacro.checkGraph` (`KitMacro.scala`) reads the exact SAME hand written `Shape`
   * literal `Runner.validate` already reads, never the closures, for the identical reason
   * `Runner.validate` cannot either. What this genuinely buys is finding the SAME declared violation
   * `Runner.validate` would find at startup, earlier, at compile time: a `Shape` value written as a
   * literal `Shape(entry = ..., transitions = ...)` expression right here, at the call site, naming its
   * nodes directly rather than through a variable or a function call, gets walked by
-  * `KitMacro.checkShapeImpl`, over the same BFS `Runner.validate` runs, restated at compile time,
+  * `KitMacro.checkGraph`, over the same BFS `Runner.validate` runs, restated at compile time,
   * reading a node's identity and its `trust` the identical way `Runner.validate` reads them too
-  * (`KitMacro.checkShapeImpl`'s own doc, `KitMacro.scala`, has the two respects in which the two walks
+  * (`KitMacro.checkGraph`'s own doc, `KitMacro.scala`, has the two respects in which the two walks
   * still are not identical, neither one by oversight), and compilation aborts, through
   * `quotes.reflect.report.errorAndAbort`, naming the offending path and the guarded node it reaches,
   * the moment it finds a path into a node whose input type extends `RequiresReviewInput` (above) that
@@ -674,7 +941,7 @@ final case class Shape(entry: List[Node[?, ?]], transitions: List[Transition])
   * parameter would already be a runtime value, an opaque `Shape` reference, by the time any macro
   * ran. Passing anything that is not a literal `Shape(...)` call written at the call site itself,
   * a variable holding a `Shape`, the result of a function, `Machine.shippedShape(cfg)`, is not an
-  * error: `KitMacro.checkShapeImpl`'s own doc states plainly that failing to recognise the shape this
+  * error: `KitMacro.checkGraph`'s own doc states plainly that failing to recognise the shape this
   * way falls back to returning it unchanged, so the graph is simply left for `Runner.validate` to
   * catch at startup instead, exactly as it always was before this issue.
   *
@@ -721,113 +988,56 @@ final case class Shape(entry: List[Node[?, ?]], transitions: List[Transition])
   * report a violation neither one alone would have produced. That risk predates this paragraph, is
   * unrelated to the marker/`guard` fact this paragraph reasons about, and stays exactly as it was.
   *
-  * Issue #39's own acceptance criterion, "an unreviewed graph fails to compile", is delivered by this
-  * function for a CONSUMER authored `Shape` literal that marks its own review-requiring nodes with
-  * `RequiresReviewInput` (issue #39 review round 2, M2, stated here rather than left for a reader to
-  * work out from the shipped call site alone): that is what lets the walk above find a path worth
-  * rejecting in the first place. `Machine.shippedShape` does not call this function at all (issue #39
+  * Issue #39's own acceptance criterion, "an unreviewed graph fails to compile", is delivered for a
+  * CONSUMER authored graph by [[checkedPlan]] below rather than by this function (issue #67): a
+  * consumer no longer writes a `Shape` at all, so the literal that gets walked for them is their
+  * `Plan`. This function remains the OPT IN door onto the identical walk, for a caller composing
+  * `Runner.run` by hand who wants the same check on a `Shape` they wrote themselves, and it still
+  * needs that literal to mark its own review-requiring nodes with `RequiresReviewInput` (issue #39
+  * review round 2, M2) for the walk to find a path worth rejecting in the first place. `Machine.shippedShape` does not call this function at all (issue #39
   * review round 3, M3, `Machine.shippedShape`'s own doc has the full reason): its graph declares no
   * node whose input type extends `RequiresReviewInput`, so this function could never find a path
   * worth rejecting there either way, and wrapping its literal would have proven only that the
   * expression stayed macro parseable, nothing about review reachability for that graph. The criterion
   * still holds for the shipped pipeline; `Runner.validate`, unchanged, is what discharges it there.
   */
-inline def checkedShape(inline shape: Shape): Shape = ${ KitMacro.checkShapeImpl('shape, strict = false) }
+inline def checkedShape(inline shape: Shape): Shape = ${ KitMacro.checkShapeImpl('shape) }
 
-/** The strict half of [[checkedShape]] (issue #43 review, BLOCKER 1): identical macro, identical BFS,
-  * but a `shapeExpr` this walk cannot read as a literal `Shape(...)` at all, the exact case
-  * `checkedShape` falls back on and returns unchanged, is a HARD compile time error here instead,
-  * never a silent no-op. [[LitterBox.graph]] (`src/LitterBox.scala`) is this function's only caller,
-  * and the reason is specific to that one entry point: its whole selling point over hand assembling a
-  * `LoopGraph` is that the mandatory-macro guarantee applies UNCONDITIONALLY, not opt in the way
-  * `checkedShape` itself has always been (that function's own doc, above).
+/** The strict, mandatory half of [[checkedShape]], reading a consumer's own [[Plan]] literal instead
+  * of a `Shape` written beside it (issue #67, replacing the `checkedShapeStrict` this file used to
+  * carry): identical macro, identical BFS, identical node identity rules, but the edges it walks are
+  * the same edges the runner will walk, because a `Plan` is the only place those edges are written
+  * down at all. [[LitterBox.graph]] (`src/LitterBox.scala`) is this function's only caller.
   *
-  * The justification for erroring here, rather than falling back the way `checkedShape` does, has
-  * changed since this function was first written, and this paragraph now states the CURRENT one, not
-  * the original one, which claimed something stronger than turned out to be true (issue #43 review
-  * round 4, correcting the version of this paragraph that shipped after BLOCKER 1 above): a consumer
-  * node whose input type extends `RequiresReviewInput` while its own `guard` argument was left at the
-  * default `Guard.Open`, exactly the shape every shipped `OpenPr`/`Merge`-style node takes
-  * (`RequiresReviewInput`'s own doc has the reason those two never extend the marker themselves), USED
-  * to have no other check watching it at all: `Runner.validate` read only the hand written `guard`
-  * field, never this marker, so a graph reaching that node with no reviewer on the path passed
-  * `Runner.validate` silently, forever, the moment this macro declined for an unrelated reason (`shape`
-  * written as a `val` instead of a literal). That is no longer the whole story: issue #43 review round
-  * 4's Tier 2 (`RequiresReviewInput`'s own doc, `markerRequiresReview`'s own doc alongside `TrustOf`, `Node.apply`'s
-  * own doc) made `Node.apply` itself derive `Guard.RequiresReview` on the REAL constructed `Node`
-  * whenever its input type carries this marker, regardless of what `guard` was written as, so
-  * `Runner.validate`, reading that real field at startup, now correctly flags exactly the graph this
-  * paragraph used to say it could never catch. Confirmed against this working tree (issue #43 review
-  * round 4): the identical `val myShape = Shape(...)` reproduction that used to compile clean under
-  * `checkedShape`'s own lenient behaviour AND pass `Runner.validate` silently at runtime now still
-  * compiles clean under the macro (a `val`, not a literal, is still outside what any of this walk can
-  * read), but `Runner.validate` on that same shape now reports the violation, because the `OpenPr`-like
-  * node it reaches really does carry `Guard.RequiresReview` now, not `Guard.Open`.
+  * A `plan` this walk cannot read as a literal `Plan(...)` at the call site is a HARD compile time
+  * error here, never the silent fallback `checkedShape` gives its own callers, and it stays one for
+  * two reasons that outlive every widening of what this walk can read. RFC #26 decision 16's own
+  * thesis is that catching a violation before `scala-cli package` even finishes beats catching the
+  * identical one at `Runner.validate`'s startup check, on every graph this macro CAN read, so falling
+  * back would trade an earlier failure for a later one for nothing. And two alias families remain that
+  * no widening closes, named in full at `KitMacro.stablePathKey`'s and `KitMacro.checkReconciled`'s own
+  * docs (an instance-qualified receiver, declined outright; one `Node` value bound under two stable
+  * paths, which this walk cannot even detect it read twice): for those, `Runner.validate` at startup is
+  * not a backstop for a fact read differently but the only check that ever runs against the graph's
+  * real values, which is what makes them survivable rather than silent, and never a reason to make the
+  * compile time check optional.
   *
-  * So `Runner.validate` genuinely is a backstop for this entry point now, for the ONE fact Tier 2
-  * closed, the marker/`guard` divergence. It is still not a substitute for the compile time check this
-  * function performs, and erroring here on a non-literal `shape` remains the right call for two
-  * independent reasons that survive Tier 2 unchanged: first, RFC #26 decision 16's own thesis is that
-  * catching a violation at COMPILE time, before `scala-cli package` even finishes, before any node ever
-  * runs, is strictly better than catching the identical violation at STARTUP, so falling back to
-  * "`Runner.validate` will catch it eventually" here would trade an earlier, cheaper failure for a
-  * later, more expensive one for no reason, on every graph this macro CAN read; second, and more
-  * sharply, two alias families remain that no amount of widening this walk closes, named in full at
-  * `stablePathKey`'s own doc and at `checkReconciled`'s own doc (`KitMacro.scala`), one where a node
-  * reference is deliberately declined outright (an instance-qualified receiver, `KitMacro.scala`, issue
-  * #43 review round 4, Tier 1) and one where this walk cannot even detect that a check is INCOMPLETE
-  * (one `Node` value bound under two different stable paths, `checkReconciled`'s own doc has the
-  * mechanism): for both, `Runner.validate` is not merely a backstop for a fact the macro read
-  * differently, it is the ONLY check that ever runs against the graph's real, single, already-resolved
-  * `Node` values, so it remaining a mandatory part of every tick (`Machine.runOnce`, unconditionally,
-  * unchanged by this branch) is what makes those two residuals survivable rather than silent holes,
-  * never a reason to make the compile time check here optional.
-  *
-  * This is RFC #26 decision 16's own recorded consequence, not a new limitation invented for this fix:
-  * "graphs cannot be assembled dynamically" through `LitterBox.graph` was already accepted when
-  * compile time checking was chosen over a purely runtime one. A consumer who genuinely cannot write a
-  * literal `Shape` at the `LitterBox.graph` call site (built from a loop, read from configuration, ...)
-  * cannot use this entry point at all; nothing in this library builds a `LoopGraph` any other public
-  * way, so that consumer's only option is a plain `Runner.run` call of their own, ineligible for this
-  * guarantee in exchange for the freedom `checkedShape`'s own lenient fallback still affords everyone
-  * else.
-  *
-  * `checkedShape` and `checkedShapeStrict` are two SEPARATE functions, not one flag-carrying one, so a
-  * reader of either call site sees which contract it made without having to go read a boolean argument
-  * to find out, and adding this function did not touch `checkedShape`'s own BODY, `strict = false` at
-  * its own splice site is untouched by this addition. But `checkedShape` is NOT unchanged in what it
-  * ACCEPTS, and an earlier version of this paragraph, and two others beside it, said otherwise in
-  * capitals (issue #43 review round 2, MAJOR M3, `KitMacro.literalListElements`'s own doc has the full
-  * correction): `checkShapeImpl`, the walk BOTH functions splice, `Kit.scala`'s only two callers of it,
-  * was widened, alongside this fix, to recognise `Nil` (and, one round later, `List.empty`, a `This`
-  * prefixed stable path, out-of-order named arguments, and a local `val`-bound `Transition`) as literal
-  * pieces it can read rather than fall back on. That walk is SHARED, so every one of those widenings
-  * changes what `checkedShape` itself can read too, not only `checkedShapeStrict`: a `Shape` whose only
-  * previously unreadable piece was, say, a `Nil` transitions list used to fall back silently under
-  * `checkedShape`, and now gets fully parsed there as well, which means it can newly fail to compile
-  * under `checkedShape` if that parse finds a genuine review-reachability violation, confirmed by
-  * compiling the identical `checkedShape(Shape(entry = List(OpenPr), transitions = Nil))` snippet
-  * against the tree immediately before this fix and against this one: clean before, a compile error
-  * naming the violation after. The direction is safe, strictly more checking, never less, so nothing
-  * `checkedShape` used to accept before this fix is rejected now for a reason unrelated to a genuine
-  * violation, but "safe direction" and "unchanged" are different claims, and `checkedShape` is a
-  * published, public `inline def`, shipped in `0.2.0` with no stability promise beyond the blanket `0.x`
-  * one `README.md`'s version policy section states, so a direct caller of `checkedShape` itself can have
-  * working code newly fail to compile after upgrading past this fix, not only a `LitterBox.graph` caller.
-  * `Machine.shippedShape` never calls either function at all (that function's own doc has the reason),
-  * so this cannot move the shipped pipeline's own behaviour; `test/GraphMacroSpec.scala` pins the new
-  * behaviour on `checkedShape` itself so it reads as a decision made with eyes open.
+  * This is RFC #26 decision 16's own recorded consequence made to bite at exactly one entry point,
+  * "graphs cannot be assembled dynamically": a consumer who genuinely cannot write a literal `Plan`
+  * here composes `Runner.run` directly instead, outside the compile time half of the guarantee and
+  * still inside `Runner.validate`'s own.
   */
-inline def checkedShapeStrict(inline shape: Shape): Shape =
-  ${ KitMacro.checkShapeImpl('shape, strict = true) }
+inline def checkedPlan[I](inline plan: Plan[I]): Plan[I] =
+  ${ KitMacro.checkPlanImpl[I]('plan) }
 
 /** A named graph: `start` computes the first `Next` from the workflow's own input. The user (whoever
   * builds a `Workflow` value) owns every transition `start`/`andThen` describe; only the `Runner`
   * ever actually walks them, so budget/timeout accounting stays in exactly one place regardless of
-  * how many nodes a graph grows to. That "user" is no longer only this file (issue #43): a foreign
-  * package builds one of these directly, through `LitterBox.graph` (`src/LitterBox.scala`), the
-  * public smart constructor that hands it to a `LoopGraph` without widening anything this trait or
-  * `Runner` itself keeps closed.
+  * how many nodes a graph grows to. Who that "user" is narrowed again in issue #67: a foreign package
+  * reaches this type through `LitterBox.graph` (`src/LitterBox.scala`), which DERIVES one of these
+  * from the consumer's own `Plan` rather than asking them to write the closures themselves, so a
+  * hand-built `Workflow` is now either the shipped graph's own or a caller's who composes
+  * `Runner.run` directly, outside the compile time guarantee.
   *
   * The result type is fixed to `LoopExit` (RFC #26 decision 10: terminal outcomes are a closed set),
   * not a type parameter on `Workflow` itself: a free result type would infect every shape that
@@ -845,22 +1055,16 @@ inline def checkedShapeStrict(inline shape: Shape): Shape =
   * finding no violation on `Shape(Nil, Nil)` means nothing was walked, not that nothing is wrong.
   * `Machine.shippedWorkflow` is the one caller that supplies a real one.
   *
-  * A `Workflow` built through `LitterBox.graph` (`src/LitterBox.scala`, issue #43) is the ONE case
-  * where setting this field yourself does not do what it looks like it does: `LitterBox.graph`'s own
-  * `shape` PARAMETER, never this field, is the `Shape` its own macro checks and the one the resulting
-  * `LoopGraph.shape(cfg)` reports, and `graphImpl` (`src/LitterBox.scala`) OVERWRITES whatever was set
-  * here with that parameter, unconditionally and with no diagnostic (issue #43 review round 2, MAJOR
-  * M1, correcting an earlier round of this same review sequence that instead made a non-default value
-  * here a hard `require` failure at graph-construction time, found on the NEXT round to bypass this
-  * codebase's one fault channel entirely, `LitterBox.graph`'s own scaladoc has the full reasoning for
-  * reverting that). Concretely: `Workflow(..., shape = a)` handed to `LitterBox.graph(shape = b, ...)`
-  * produces a graph whose `shape` is `b`, and `a` is discarded, silently, because the macro that ever
-  * ran against a literal `Shape` at all ran against `b`, the `inline shape` parameter, never against
-  * whatever expression built `a`. A consumer authoring their own graph through `LitterBox.graph`
-  * therefore has no reason to set this field at all; it exists on `Workflow` for callers that build one
-  * WITHOUT `LitterBox.graph` (`Machine.shippedWorkflow`, or a consumer composing `Runner.run` directly,
-  * outside the macro guarantee, `LitterBox.graph`'s own doc names that path), where it is read straight
-  * through with no second `shape` argument to lose to.
+  * A `Workflow` built through `LitterBox.graph` (`src/LitterBox.scala`, issue #67) never has this
+  * field set by a consumer at all, because a consumer never builds that `Workflow`: they write one
+  * `Plan`, and the factory derives both the `Workflow` and this field from it. That closes a trap this
+  * paragraph used to have to describe instead of remove: the factory took a `Workflow` and a `Shape`
+  * as two separate parameters and silently OVERWROTE whatever was set here with the second one, so a
+  * consumer who filled this field in lost it with no diagnostic, and a `require` guarding that was
+  * tried and reverted for bypassing this codebase's one fault channel entirely (issue #43 review round
+  * 2, MAJOR M1). This field now belongs exclusively to callers that build a `Workflow` WITHOUT
+  * `LitterBox.graph`, `Machine.shippedWorkflow` and anyone composing `Runner.run` directly, where it
+  * is read straight through with no second declaration to lose to.
   *
   * `stages` (issue #40) is the same spirit as `shape`: data a consumer of the graph reads, never
   * control flow the walk itself branches on. `Runner.run`/`Runner.step` never look at it; it exists
