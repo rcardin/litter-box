@@ -84,6 +84,17 @@ show, are unaffected. `TrustOf[O]` deliberately stays an ordinary `using` parame
 for yourself; that residual, and the runtime check that catches it, are documented on `Trust` and
 `Runner.step` (`Kit.scala`).
 
+`LitterBox.graph` changes shape in the next release after `0.3.0` (issue #67), and this is the
+largest source-breaking change on this list. It used to take a `Workflow` full of `Next.Goto`
+closures AND a hand-written `Shape` restating the same edges; it now takes a `name`, ONE `Plan`
+naming each edge exactly once, and an optional `stages`, and derives both the walk and the `Shape`
+from that single value. `Plan` and `Edge` are new; `checkedShapeStrict` is gone, replaced by
+`checkedPlan`; `Shape`, `Transition`, `Next` and `Workflow` all stay exactly as they were, for the
+shipped graph and for anyone composing `Runner.run` directly. A `loop.scala` written against
+`0.1.0` through `0.3.0` has to be rewritten onto the new call, which is the point: the old signature
+made it possible for the graph that was checked and the graph that ran to be two different graphs,
+and no additive change can take that possibility away.
+
 ## Install
 
 Every published version is on the [releases page](https://github.com/rcardin/litter-box/releases);
@@ -147,17 +158,34 @@ import in.rcard.litterbox.*
 @main def loop(args: String*): Unit =
   LitterBox.run(
     LitterBox.graph(
-      workflow       = Workflow("my-loop", start = myStart, stages = myStages),
-      shape          = Shape(entry = List(Pick), transitions = List(Transition(Pick, Review))),
+      name           = "my-loop",
+      plan           = Plan(
+        entry = Pick,
+        edges = List(
+          Edge.To(Pick, Review, picked => Some(picked)),
+          Edge.Exit(Review, _ => Some(LoopExit.Success))
+        )
+      ),
       dispatchBudget = cfg => cfg.repairBudget + 1,
-      startInput     = n => MyStart(n)
+      startInput     = n => MyStart(n),
+      stages         = myStages
     ),
     args
   )
 ```
 
-Your own `Node`s, `Workflow` and `Shape` are ordinary values built from the public kit
-(`in.rcard.litterbox.{Node, Workflow, Shape, Transition, Next}`); `dispatchBudget` is always a
+Your own `Node`s and your `Plan` are ordinary values built from the public kit
+(`in.rcard.litterbox.{Node, Plan, Edge}`). The `Plan` is the ONE place your graph's edges are written
+down: `LitterBox.graph` derives from it both the walk the runner executes and the `Shape` the startup
+validator and the compile-time check read, so the graph that is checked and the graph that runs cannot
+be two different graphs. Each edge says where it leaves, where it arrives, and how the arriving node's
+input is computed from the departing node's output; the `Option` it answers with is what lets one node
+declare several outgoing edges as alternatives, the first one answering `Some`, in the order you wrote
+them, being the edge taken. A node whose every outgoing edge declines what it produced is an infra
+fault (rc 50), never a quiet success. One consequence worth knowing up front: an edge sees nothing but
+the output of the node it leaves, so anything a later edge needs, a round counter in a review/fix
+cycle, say, has to ride in the values your nodes produce rather than being captured in a closure.
+`dispatchBudget` is always a
 `Config => Int`, never a `Ledger` you build yourself, because the runner, not the graph, owns the
 counter and the timeout clock for every node it walks. That function shape means `dispatchBudget` CAN
 read `.litter-box/config.conf` at runtime, the way the sketch above reads `cfg.repairBudget`; it does
@@ -183,7 +211,7 @@ for the fuller reasoning and why it is left to its own issue). Declare `Cost.One
 every node that dispatches, and keep dispatch calls to one per node, if you want `dispatchBudget` to be
 the ceiling it looks like.
 
-`shape` above has to be written exactly like that, a literal `Shape(entry = ..., transitions = ...)`
+`plan` above has to be written exactly like that, a literal `Plan(entry = ..., edges = ...)`
 expression right at this call site, never a `val` you build first and pass by name. `LitterBox.graph`
 compile-time checks that every path into a node whose own input type extends `RequiresReviewInput`
 crosses a reviewer first, the same macro `checkedShape` runs, but unconditionally rather than opt in:
@@ -192,42 +220,51 @@ instead, rather than silently skipping the check the way an opt-in macro would. 
 combines them with an OR, the same combination `Node.apply` performs on the real constructed value: the
 INPUT TYPE, whether it extends `RequiresReviewInput`, and the hand-written `guard =
 Guard.RequiresReview` argument you can also pass to `Node`, named or positional, in the one place the
-macro can see one. The two halves do not reach equally far, and the difference is worth knowing before
-you lean on either. The marker half is read off the reference's own static type, so it fires through a
-plain `val` reference exactly as well as through an inline construction. The explicit-argument half is
-read off the SOURCE of a `Node(name = "...", ...)` call written inline in the shape itself, so it fires
-only there: a node you bind to a `val` first and then name in `entry`/`transitions` presents this check
-with the reference alone, never the initializer that built it, so a `guard = Guard.RequiresReview` you
-wrote on that `val` stays invisible at compile time and is caught only by `Runner.validate` at startup,
+macro can see one. The two halves do not reach equally far, and, since issue #67 review made every node
+named in a `Plan` refuse to compile if it is written as an inline `Node(...)` call rather than bound to
+a `val` first (the `plan` paragraph below has the reasoning), only one of them can ever fire through
+`LitterBox.graph` at all now. The marker half is read off the reference's own static type, so it fires
+through a plain `val` reference exactly as it always did. The argument half needs the SOURCE of
+an inline `Node(name = "...", ...)` call to read a `guard = Guard.RequiresReview` argument off, and a
+`Plan` never has one of those to read: this check sees only the `val` reference itself, never the
+initializer that built it, so a `guard = Guard.RequiresReview` you wrote when you declared that `val`
+stays invisible to `LitterBox.graph` at compile time and is caught only by `Runner.validate` at startup,
 which reads the constructed node's real `guard` field rather than the source that produced it
 (`ARCHITECTURE.md` has the fuller reasoning for why the two checks read different facts on purpose).
 The reverse used to be a real gap and no longer is: a node whose input type DOES extend
 `RequiresReviewInput` gets `Guard.RequiresReview` stamped onto its real `guard` field by `Node.apply`
 itself now, regardless of whether you wrote `guard = ...` at all, so both the compile-time macro
 (reading the marker) and `Runner.validate` at startup (reading the now-consistent field) catch a node
-like that; before this, only the compile-time macro could, and only if `shape` was written as a literal
-here. If your shape genuinely cannot be written as a literal (built in a loop, read from
+like that; before this, only the compile-time macro could, and only if the graph was written as a
+literal here. If your graph genuinely cannot be written as a literal (built in a loop, read from
 configuration, ...),
 `LitterBox.graph` is not for you; compose `Runner.run` directly instead, outside the compile-time half
 of this guarantee, though `Runner.validate` still runs against whatever `Shape` you hand `Runner.run`.
 
-Three different compile errors can fire here, worded differently on purpose so none is mistaken for
-another (issue #43 review round 3, BLOCKER 1, adding the third): `shape` was not recognisably a
-`Shape(...)` literal at all (a `val`, a function result, an indirection of any kind); `shape` genuinely
-was a literal written right here but one piece inside it (a node reference, a `Transition`, a list) was
-not written in a form the check can read; or every piece WAS readable but two different references
-canonicalise to the identical node identity while disagreeing on whether that node needs review, most
-often a `class` and its own companion `object` each declaring a member of the same name, or two inline
-`Node(name = "...", ...)` calls sharing one literal name. The forms it can read: a node or `Transition`
-referred to through a stable path (a top-level `val`, an `object` member, or an unqualified `val`
-member of an enclosing `class`, `this.A` written bare as `A`); an inline `Node(name = "...", ...)` call
-carrying a literal name; an inline `Transition(from, to)` call; a `Transition` bound to a `val` local to
-the same block as the `LitterBox.graph` call that uses it; a list written as `List(...)`,
-`List.empty`, `List.empty[...]`, or `Nil`; and `Shape`'s own two named arguments in either order. What
+Four different compile errors can fire here, worded differently on purpose so none is mistaken for
+another (issue #43 review round 3, BLOCKER 1, adding the third; issue #67 review, adding the fourth):
+`plan` was not recognisably a `Plan(...)` literal at all (a `val`, a function result, an indirection of
+any kind); `plan` genuinely was a literal written right here but one piece inside it (a node reference,
+an `Edge`, a list) was not written in a form the check can read; every piece WAS readable but two
+different references canonicalise to the identical node identity while disagreeing on whether that node
+needs review, most often a `class` and its own companion `object` each declaring a member of the same
+name; or one readable reference named a node built by an inline `Node(name = "...", ...)` call, refused
+outright rather than accepted, because `Runner`'s own walk of a `Plan` links one edge to the next by
+which runtime OBJECT a node is, never by this check's own canonical name, and an inline call allocates a
+fresh object at every place it is written, so the identical `Node(name = "X", ...)` written twice, or
+even once with nothing else naming that same object, is never the value a real run needs. The forms it
+can read: a node or `Edge` referred to through a stable path (a top-level `val`, an `object` member, or
+an unqualified `val` member of an enclosing `class`, `this.A` written bare as `A`); an inline
+`Edge.To(from, to, input)` or `Edge.Exit(from, exit)` call; an `Edge` bound to a `val` local to the same
+block as the `LitterBox.graph` call that uses it; a list written as `List(...)`, `List.empty`,
+`List.empty[...]`, or `Nil`; and `Plan`'s own two named arguments in either order. A node itself has to
+be bound to a top level `val` or an `object` member first, never written as an inline `Node(...)` call
+at its point of use in the `Plan`; `checkedShape` still reads an inline `Node(...)` call directly, since
+a `Shape` alone is never walked by runtime object identity the way a `Plan` is. What
 it cannot read, and never will: a node built by a `def`, because this check reasons about the SOURCE
 written at this call site, never about a value it would have to run code to get. That includes a
 config-parameterised node-building idiom (`def openPr(cfg: Config): Node[...] = ...`, used as
-`Node(openPr(cfg))` in `entry`/`transitions`): `LitterBox.graph` cannot express that shape, on purpose,
+`openPr(cfg)` in `entry`/`edges`): `LitterBox.graph` cannot express that shape, on purpose,
 RFC #26 decision 16 records "graphs cannot be assembled dynamically" as a deliberate consequence of
 this whole compile-time route, not an oversight left for a later issue. Read the config value you need
 inside the node's own `probe`/`run` body instead (both already receive an ambient `Config`, derivable
@@ -246,8 +283,8 @@ instance-qualified receiver rather than guess at some and not others. Two things
 first, an idiom like `a.node`/`b.node` on two truly distinct instances is safe to write but is not
 CHECKED by `LitterBox.graph`'s macro at all (it falls straight to the "could not identify" error), so
 lean on `Runner.validate` at startup for a shape built that way, or restructure the reference onto a
-top-level `val`, an `object` member, or an inline `Node(name = "...", ...)` call, every one of which
-this check reads directly; second, one `Node` VALUE bound under two different top-level `val`s (`val
+top-level `val` or an `object` member, either of which this check reads directly; second, one `Node`
+VALUE bound under two different top-level `val`s (`val
 a = mkNode(); val b = a`) is unreadable for a related but distinct reason, not an instance-qualified
 receiver at all, but two ordinary stable paths that happen to alias the same value: this check keys each
 `val` on its own declaration, so `a` and `b` key differently even though they are the same `Node` at
@@ -341,12 +378,14 @@ def myLoopRunsBothNodes(): Unit =
 
   val exit = world.runGraph(
     LitterBox.graph(
-      workflow = Workflow[Unit](
-        "my-loop",
-        start = (_: Unit) =>
-          Next.Goto(First, (), _ => Next.Goto(Second, (), _ => Next.Finish(LoopExit.Success)))
+      name = "my-loop",
+      plan = Plan(
+        entry = First,
+        edges = List(
+          Edge.To(First, Second, _ => Some(())),
+          Edge.Exit(Second, _ => Some(LoopExit.Success))
+        )
       ),
-      shape = Shape(entry = List(First), transitions = List(Transition(First, Second))),
       dispatchBudget = _ => 1,
       startInput = _ => ()
     )
@@ -357,17 +396,18 @@ def myLoopRunsBothNodes(): Unit =
   assert(world.logged("Second ran"))
 ```
 
-`First` and `Second` are named in the `Shape` literal through plain `val` references, and that is the
-actual constraint: `LitterBox.graph` reads the SOURCE of the `Shape` at its own call site, so every
-element written there has to be a stable path (a top level `val`, an `object` member, or an unqualified
-`val` member of the enclosing `class`) or an inline `Node(name = "...", ...)` call carrying a literal
-name. A helper `def` CALL written straight into the `Shape`, `entry = List(myNode("First"))`, is what
-it refuses, because it never runs that call; the same helper is fine when its result is bound to a
-`val` first and the `Shape` names the `val`. [Write your own loop](#write-your-own-loop) above has the
+`First` and `Second` are named in the `Plan` literal through plain `val` references, and that is the
+actual constraint: `LitterBox.graph` reads the SOURCE of the `Plan` at its own call site, so every
+element written there has to be a stable path, a top level `val`, an `object` member, or an unqualified
+`val` member of the enclosing `class`, never a node built inline at its point of use in the `Plan` and
+never a helper `def` CALL written straight into it, `entry = myNode("First")`: neither is a runtime
+object this walk, or `Runner`'s own walk of the `Plan` at runtime, could ever name a second time, and
+`Runner`'s own walk needs to. The same helper is fine when its result is bound to a `val` first and the
+`Plan` names the `val`. [Write your own loop](#write-your-own-loop) above has the
 full list of what that check can and cannot read.
 
 **One node on its own.** `runNode` is the unit-test sibling of `runGraph`: it steps exactly one `Node`,
-with no `Workflow`, no `Shape` and no `LitterBox.graph` call wrapped around it, so the answer you read
+with no `Plan` and no `LitterBox.graph` call wrapped around it, so the answer you read
 back is about that node and nothing else.
 
 ```scala

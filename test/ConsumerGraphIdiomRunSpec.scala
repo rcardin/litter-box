@@ -65,7 +65,7 @@ class ConsumerGraphIdiomRunSpec extends AnyFlatSpec with Matchers:
     startIdx should be < finishIdx
   }
 
-  it should "walk com.example.consumer.listEmptyGraph, whose Shape was declared with transitions = List.empty" in {
+  it should "walk com.example.consumer.listEmptyGraph, a lone entry node whose one edge ends the run" in {
     val world = new TestWorld
     val exit  = runOnce(world, com.example.consumer.listEmptyGraph)
 
@@ -73,7 +73,7 @@ class ConsumerGraphIdiomRunSpec extends AnyFlatSpec with Matchers:
     world.logLines.exists(_.contains("idiom empty transition list lone node ran")) shouldBe true
   }
 
-  it should "walk com.example.consumer.namedArgOrderGraph, whose Shape named entry and transitions out of declaration order" in {
+  it should "walk com.example.consumer.namedArgOrderGraph, whose Plan named entry and edges out of declaration order" in {
     val world = new TestWorld
     val exit  = runOnce(world, com.example.consumer.namedArgOrderGraph)
 
@@ -85,7 +85,7 @@ class ConsumerGraphIdiomRunSpec extends AnyFlatSpec with Matchers:
     aIdx should be < bIdx
   }
 
-  it should "walk com.example.consumer.localTransitionGraph, whose Transition was a local val bound in the same block as the LitterBox.graph call" in {
+  it should "walk com.example.consumer.localTransitionGraph, whose Edge was a local val bound in the same block as the LitterBox.graph call" in {
     val world = new TestWorld
     val exit  = runOnce(world, com.example.consumer.localTransitionGraph)
 

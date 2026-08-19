@@ -7,9 +7,9 @@ import in.rcard.litterbox.Caps.given
   * (`test/ConsumerGraphSpec.scala`) already pins, snippet by snippet through
   * `scala.compiletime.testing.typeCheckErrors`, that a foreign package can WRITE down every one of the
   * graph authoring idioms issue #43's review sequence found and fixed (a class member node referenced
-  * unqualified, `transitions = List.empty`, `Shape`'s named arguments out of declaration order, a
-  * local val bound `Transition`, a review node feeding a `Guard.RequiresReview` node, `startInput`
-  * calling `fault.raise` off the ambient `Fault`). What none of those snippets can pin, and what this
+  * unqualified, an empty edge list, `Plan`'s named arguments out of declaration order, a local val
+  * bound `Edge`, a review node feeding a `Guard.RequiresReview` node, `startInput` calling
+  * `fault.raise` off the ambient `Fault`). What none of those snippets can pin, and what this
   * file exists to close, is that the identical idioms survive being genuinely, separately compiled: a
   * snippet handed to `typeCheckErrors` resolves imports and package paths differently from a real top
   * level file, `ConsumerGraphSpec`'s own doc and `ConsumerBoundarySpec`'s own doc both establish that
@@ -62,18 +62,20 @@ class ClassMemberGraph:
       NodeOutcome.Done(())
   )
   val graph: LoopGraph = LitterBox.graph(
-    workflow = Workflow[Unit](
-      "idiomClassMember",
-      start = (_: Unit) => Next.Goto(Start, (), _ => Next.Goto(Finish, (), _ => Next.Finish(LoopExit.Success)))
+    name = "idiomClassMember",
+    plan = Plan(
+      entry = Start,
+      edges = List(Edge.To(Start, Finish, _ => Some(())), Edge.Exit(Finish, _ => Some(LoopExit.Success)))
     ),
-    shape = Shape(entry = List(Start), transitions = List(Transition(Start, Finish))),
     dispatchBudget = _ => 0,
     startInput = _ => ()
   )
 
 val classMemberGraph: LoopGraph = ClassMemberGraph().graph
 
-// ---- idiom 2: transitions = List.empty on a lone entry node (ConsumerGraphSpec's own test 14) ---------
+// ---- idiom 2: a lone entry node whose only edge ends the run (ConsumerGraphSpec's own test 14 is -----
+// ---- the empty edge list itself, which no graph that actually RUNS can carry: a walk that reaches ----
+// ---- a node with no edge left to take is a fault, so the runnable half of that idiom is this one) -----
 
 val loneNode: Node[Unit, Unit] = Node(
   name = "IdiomLoneNode",
@@ -86,16 +88,13 @@ val loneNode: Node[Unit, Unit] = Node(
 )
 
 val listEmptyGraph: LoopGraph = LitterBox.graph(
-  workflow = Workflow[Unit](
-    "idiomListEmpty",
-    start = (_: Unit) => Next.Goto(loneNode, (), _ => Next.Finish(LoopExit.Success))
-  ),
-  shape = Shape(entry = List(loneNode), transitions = List.empty),
+  name = "idiomListEmpty",
+  plan = Plan(entry = loneNode, edges = List(Edge.Exit(loneNode, _ => Some(LoopExit.Success)))),
   dispatchBudget = _ => 0,
   startInput = _ => ()
 )
 
-// ---- idiom 3: Shape's named arguments out of declaration order (ConsumerGraphSpec's own test 15) ------
+// ---- idiom 3: Plan's named arguments out of declaration order (ConsumerGraphSpec's own test 15) -------
 
 val orderA: Node[Unit, Unit] = Node(
   name = "IdiomOrderA",
@@ -117,16 +116,16 @@ val orderB: Node[Unit, Unit] = Node(
 )
 
 val namedArgOrderGraph: LoopGraph = LitterBox.graph(
-  workflow = Workflow[Unit](
-    "idiomNamedArgOrder",
-    start = (_: Unit) => Next.Goto(orderA, (), _ => Next.Goto(orderB, (), _ => Next.Finish(LoopExit.Success)))
+  name = "idiomNamedArgOrder",
+  plan = Plan(
+    edges = List(Edge.To(orderA, orderB, _ => Some(())), Edge.Exit(orderB, _ => Some(LoopExit.Success))),
+    entry = orderA
   ),
-  shape = Shape(transitions = List(Transition(orderA, orderB)), entry = List(orderA)),
   dispatchBudget = _ => 0,
   startInput = _ => ()
 )
 
-// ---- idiom 4: a local val bound Transition, declared inside the same block as the LitterBox.graph -----
+// ---- idiom 4: a local val bound Edge, declared inside the same block as the LitterBox.graph -----------
 // ---- call that uses it (ConsumerGraphSpec's own test 16) -----------------------------------------------
 
 val localA: Node[Unit, Unit] = Node(
@@ -149,13 +148,10 @@ val localB: Node[Unit, Unit] = Node(
 )
 
 def buildLocalTransitionGraph(): LoopGraph =
-  val t1 = Transition(localA, localB)
+  val t1 = Edge.To(localA, localB, (_: Unit) => Some(()))
   LitterBox.graph(
-    workflow = Workflow[Unit](
-      "idiomLocalTransition",
-      start = (_: Unit) => Next.Goto(localA, (), _ => Next.Goto(localB, (), _ => Next.Finish(LoopExit.Success)))
-    ),
-    shape = Shape(entry = List(localA), transitions = List(t1)),
+    name = "idiomLocalTransition",
+    plan = Plan(entry = localA, edges = List(t1, Edge.Exit(localB, _ => Some(LoopExit.Success)))),
     dispatchBudget = _ => 0,
     startInput = _ => ()
   )
@@ -192,11 +188,11 @@ object IdiomHolder:
 import IdiomHolder.*
 
 val wildcardImportGraph: LoopGraph = LitterBox.graph(
-  workflow = Workflow[Unit](
-    "idiomWildcardImport",
-    start = (_: Unit) => Next.Goto(WStart, (), _ => Next.Goto(WFinish, (), _ => Next.Finish(LoopExit.Success)))
+  name = "idiomWildcardImport",
+  plan = Plan(
+    entry = WStart,
+    edges = List(Edge.To(WStart, WFinish, _ => Some(())), Edge.Exit(WFinish, _ => Some(LoopExit.Success)))
   ),
-  shape = Shape(entry = List(WStart), transitions = List(Transition(WStart, WFinish))),
   dispatchBudget = (cfg: Config) => cfg.repairBudget,
   startInput = (_: Int) => ()
 )
@@ -227,18 +223,13 @@ val QFinish: Node[Unit, Unit] = Node(
 )
 
 val packageQualifiedGraph: LoopGraph = LitterBox.graph(
-  workflow = Workflow[Unit](
-    "idiomPackageQualified",
-    start = (_: Unit) =>
-      Next.Goto(
-        com.example.consumer.QStart,
-        (),
-        _ => Next.Goto(com.example.consumer.QFinish, (), _ => Next.Finish(LoopExit.Success))
-      )
-  ),
-  shape = Shape(
-    entry = List(com.example.consumer.QStart),
-    transitions = List(Transition(com.example.consumer.QStart, com.example.consumer.QFinish))
+  name = "idiomPackageQualified",
+  plan = Plan(
+    entry = com.example.consumer.QStart,
+    edges = List(
+      Edge.To(com.example.consumer.QStart, com.example.consumer.QFinish, _ => Some(())),
+      Edge.Exit(com.example.consumer.QFinish, _ => Some(LoopExit.Success))
+    )
   ),
   dispatchBudget = _ => 0,
   startInput = _ => ()
@@ -285,23 +276,14 @@ val IdiomOpenPr: Node[IdiomPrInput, Unit] = Node(
 )
 
 val reviewedGraph: LoopGraph = LitterBox.graph(
-  workflow = Workflow[Unit](
-    "idiomReviewed",
-    start = (_: Unit) =>
-      Next.Goto(
-        IdiomPick,
-        (),
-        _ =>
-          Next.Goto(
-            IdiomReview,
-            (),
-            _ => Next.Goto(IdiomOpenPr, IdiomPrInput(), _ => Next.Finish(LoopExit.Success))
-          )
-      )
-  ),
-  shape = Shape(
-    entry = List(IdiomPick),
-    transitions = List(Transition(IdiomPick, IdiomReview), Transition(IdiomReview, IdiomOpenPr))
+  name = "idiomReviewed",
+  plan = Plan(
+    entry = IdiomPick,
+    edges = List(
+      Edge.To(IdiomPick, IdiomReview, _ => Some(())),
+      Edge.To(IdiomReview, IdiomOpenPr, _ => Some(IdiomPrInput())),
+      Edge.Exit(IdiomOpenPr, _ => Some(LoopExit.Success))
+    )
   ),
   dispatchBudget = _ => 0,
   startInput = _ => ()
@@ -325,11 +307,11 @@ val faultGuardedNode: Node[Unit, Unit] = Node(
 )
 
 val faultStartInputGraph: LoopGraph = LitterBox.graph(
-  workflow = Workflow[Unit](
-    "idiomFaultStartInput",
-    start = (_: Unit) => Next.Goto(faultGuardedNode, (), _ => Next.Finish(LoopExit.Success))
+  name = "idiomFaultStartInput",
+  plan = Plan(
+    entry = faultGuardedNode,
+    edges = List(Edge.Exit(faultGuardedNode, _ => Some(LoopExit.Success)))
   ),
-  shape = Shape(entry = List(faultGuardedNode), transitions = Nil),
   dispatchBudget = _ => 0,
   startInput = (n: Int) =>
     if n < 0 then summon[Fault].raise("idiom negative tick number") else ()

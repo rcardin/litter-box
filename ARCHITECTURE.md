@@ -12,13 +12,17 @@ The central split, and the reason the whole suite runs in memory:
   has to wire each tier by name from its own `LiveGateRunner` rather than reuse one instance (the
   why is in the `HostGateRunner` scaladoc, issue #11).
 - `src/Kit.scala`: the graph kit, `Node`, `Workflow` and the `Runner` that walks one, plus the
-  startup validation phase (`Runner.validate`, issue #38): a hand-declared `Shape` (`entry` nodes and
+  startup validation phase (`Runner.validate`, issue #38): a `Shape` (`entry` nodes and
   `Transition`s) describing the same graph a workflow's `Next.Goto` closures encode, walked BEFORE
   `wf.start` ever runs, so a path into a `Guard.RequiresReview` node that never crosses a
   `Trust.Reviewed` one is rejected before a single node executes. `LitterBox.graph` (issue #43,
   `src/LitterBox.scala`) is the consumer entry point onto this kit: a foreign package builds its own
-  `Node`/`Workflow`/`Shape` and hands them to that factory, which returns a `LoopGraph` `LitterBox.run`
-  accepts.
+  `Node`s and ONE `Plan`, the table naming every edge between them (issue #67), and hands that to the
+  factory, which derives both the `Workflow` it walks and the `Shape` it validates from that one
+  value and returns a `LoopGraph` `LitterBox.run` accepts. The shipped graph keeps writing its
+  `Workflow` and its `Shape` by hand (`Machine.shippedWorkflow`/`Machine.shippedShape`), for the
+  reason `LitterBox.graph`'s own doc gives: a node built by a `def` reading `Config` at construction
+  time is exactly what a macro over a literal cannot read, and that is the shipped graph's idiom.
 - `src/Machine.scala` — `Machine.runOnce`, and the shipped `Workflow` (`Machine.shippedWorkflow`) it
   walks through `Runner.run`: pure decision logic. Touches the world through nothing but the
   capabilities. No direct filesystem, subprocess, or clock access.
@@ -47,6 +51,12 @@ nodes sharing a name but disagreeing on `cost`/`timeout`/`trust`/`guard`, an orp
 ever exercises that check. Issue #39's compile time macro, reading the literal graph the `Next.Goto`
 closures encode instead of a hand-declared `Shape`, is what would let a real guard on `OpenPr`/`Merge`
 be stated and checked honestly.
+
+All of that is about the SHIPPED graph, the one inhabitant that still writes its `Workflow` and its
+`Shape` as two hand-written values. A consumer graph authored through `LitterBox.graph` declares
+neither (issue #67): it writes one `Plan`, the table of its own edges, and the `Shape`
+`Runner.validate` walks for it is derived from exactly the edges the run itself takes, so the drift
+this section's own reasoning has to keep allowing for on the shipped graph cannot arise there.
 
 This claim was rechecked, not merely carried forward, after issue #43 review round 4's Tier 2 made
 `Node.apply` derive `Guard.RequiresReview` from a node's own input type extending
@@ -164,9 +174,9 @@ configuration**, so they live under `resources/` and travel inside the jar
   `Int => Fault ?=> I`, never `(Caps, Fault) ?=> I` (issue #43
   review, BLOCKER 2): `begin` runs before that real `Ledger` exists, so a `startInput` that could
   summon `Caps` could call `agents.*` on the live `AgentDispatch` outside every check budget, timeout
-  and trust ownership actually rest on. `shape` has to be a literal `Shape(...)` expression written
+  and trust ownership actually rest on. `plan` has to be a literal `Plan(...)` expression written
   directly at the `LitterBox.graph` call site, never a `val` passed by identifier (issue #43 review,
-  BLOCKER 1): the review-reachability macro this factory runs, `checkedShapeStrict`, is a hard compile
+  BLOCKER 1): the review-reachability macro this factory runs, `checkedPlan`, is a hard compile
   error on anything else, unlike `checkedShape`'s own opt-in, silently-falls-back behaviour. At the
   time this was written, the reason was that `Runner.validate` was not a reliable backstop for a node
   whose input type extends `RequiresReviewInput` while its own `guard` argument was left at
@@ -174,7 +184,7 @@ configuration**, so they live under `resources/` and travel inside the jar
   4's Tier 2 closed that specific gap (`Kit.scala`'s own doc on `markerRequiresReview`/`Node.apply`): `Node.apply`
   now derives `Guard.RequiresReview` on the real `Node` whenever the marker is present, regardless of
   what `guard` was written as, so `Runner.validate` reading that field at startup now agrees with the
-  macro on that one fact. The hard error on a non-literal `shape` stays, for two reasons that survive
+  macro on that one fact. The hard error on a non-literal `plan` stays, for two reasons that survive
   Tier 2: catching a violation at compile time is strictly earlier than catching the same one at
   startup, on every graph the macro CAN read; and two alias families remain that no widening of the
   macro's own walk closes (an instance-qualified receiver, declined outright rather than guessed at,
@@ -182,18 +192,26 @@ configuration**, so they live under `resources/` and travel inside the jar
   this walk cannot detect as incomplete at all), for which `Runner.validate` is not a backstop for a
   fact read differently, it is the only check that ever runs against the graph's real, already-resolved
   `Node` values (`KitMacro.checkReconciled`'s own doc, `KitMacro.scala`, has the mechanism for both).
-  That hard error is THREE differently worded errors, not one (issue #43 review round 2, BLOCKER B1,
-  part 1; issue #43 review round 3, BLOCKER 1, part 2, adding the third): `shape` not being recognisable
-  as a `Shape(...)` literal at all gets one message; `shape` being a genuine literal whose walk still
-  could not read one piece inside it gets another, naming that exact piece, so a consumer who already
-  wrote a literal is never told to do what they already did; and every piece being readable but two
-  different references canonicalising to the identical node identity while disagreeing on whether that
-  node needs review gets a third, naming both references, so a `class`/`object` companion pair or two
-  inline `Node(name = "...", ...)` calls sharing one literal name are never silently merged into one
-  node by whichever the reachability walk's own visited set happens to keep. That second walk was also
+  That hard error is FOUR differently worded errors, not one (issue #43 review round 2, BLOCKER B1,
+  part 1; issue #43 review round 3, BLOCKER 1, part 2, adding the third; issue #67 review, adding the
+  fourth): `plan` not being recognisable as a `Plan(...)` literal at all gets one message; `plan` being
+  a genuine literal whose walk still could not read one piece inside it gets another, naming that exact
+  piece, so a consumer who already wrote a literal is never told to do what they already did; every
+  piece being readable but two different references canonicalising to the identical node identity while
+  disagreeing on whether that node needs review gets a third, naming both references, so a
+  `class`/`object` companion pair are never silently merged into one node by whichever the reachability
+  walk's own visited set happens to keep; and one readable reference naming an inline `Node.apply`
+  construction gets a fourth, refused outright rather than only on a collision, because `Kit.scala`'s
+  own `Plan.workflowOf` links one edge to the next by which runtime OBJECT a node is, `Edge.source(e) eq
+  from`, never by this walk's own canonical name, and an inline call allocates a fresh object at every
+  place it is written, so the identical construction written twice is never one runtime value, and
+  written once is a node no edge can ever leave (`KitMacro.ParseFailure.InlineNodeInPlan`'s own doc,
+  `KitMacro.scala`, has the full reasoning, including why `checkedShape`'s own opt in walk, which never
+  links a `Shape` to a real run the way `Plan.workflowOf` does, keeps reading an inline construction
+  unchanged). That second walk was also
   widened in round 2 to read a `val` member of a class referenced unqualified (`this.A` written bare),
-  `List.empty`/`List.empty[...]` alongside `List(...)`/`Nil`, `Shape`'s own two named arguments in
-  either order, and a `Transition` bound to a `val` local to the same block as the `LitterBox.graph`
+  `List.empty`/`List.empty[...]` alongside `List(...)`/`Nil`, the literal's own two named arguments in
+  either order, and an edge bound to a `val` local to the same block as the `LitterBox.graph`
   call, and round 3 replaced the identity KEY that walk uses (three incompatible hand-built schemes
   collapsed into one canonical function, `KitMacro.scala`'s own `canonical`) after that key was found
   to both SPLIT one node into two, spelled two different ways, and MERGE two nodes into one, spelled the
@@ -212,7 +230,7 @@ configuration**, so they live under `resources/` and travel inside the jar
   node's own `probe`/`run` body instead (derivable there from the ambient `Caps`, `Caps.scala`'s own
   `given (using c: Caps): Config = c.cfg`), behind one plain top-level `val` standing for the node,
   never a `def` building a fresh `Node` per call. `src/LitterBox.scala`'s own doc on `LoopGraph` and
-  `KitMacro.checkShapeImpl`'s own doc have the fuller reasoning.
+  `KitMacro.checkGraph`'s own doc have the fuller reasoning.
 
 A tag publishes **two** Maven artifacts, not one (issue #42, RFC #26 decision 14). The library above,
 and `in.rcard::litter-box-testkit` (`LitterBox.TestkitCoordinate`), which is `test/Recorder.scala`

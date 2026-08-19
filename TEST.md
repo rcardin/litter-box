@@ -52,7 +52,7 @@ fails the day either half stops being true.
 
 `src/KitMacro.scala` is compiled and cached by the bloop/BSP daemon `scala-cli` starts by default, and
 that cache goes STALE in the dangerous direction for a macro edit (issue #43 review round 4): a macro
-change that makes `checkShapeImpl`'s own walk STRICTER, rejecting a shape it used to accept, is invisible
+change that makes `checkGraph`'s own walk STRICTER, rejecting a graph it used to accept, is invisible
 to the daemon until some CONSUMER file that calls the macro also changes, because bloop only re-expands a
 macro splice when the file containing that splice is itself recompiled, never merely because the macro's
 own implementation changed underneath it. Confirmed directly: with a violating consumer file already
@@ -64,7 +64,7 @@ The identical source state compiled with `scala-cli test . --server=false`, whic
 entirely and recompiles from scratch, correctly reported one violation throughout. A clean-looking test
 run against a macro change is therefore worthless evidence unless it ran with the daemon off: **pass
 `--server=false` on every `scala-cli compile`/`scala-cli test` invocation while verifying a change to
-`KitMacro.scala`, `Kit.scala`'s macro-adjacent code (`checkedShape`/`checkedShapeStrict`/`markerRequiresReview`,
+`KitMacro.scala`, `Kit.scala`'s macro-adjacent code (`checkedShape`/`checkedPlan`/`markerRequiresReview`,
 and `Node.apply` itself, which is an `inline def` reading that last one), or
 anything else a macro reads**, and prefer real, separately compiled top-level consumer files in a scratch
 `package com.example.consumer` over `scala.compiletime.testing.typeCheckErrors` snippets when confirming

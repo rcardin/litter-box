@@ -130,11 +130,11 @@ class GraphMacroSpec extends AnyFlatSpec with Matchers:
     violations.head should include("Guarded")
   }
 
-  // ---- checkedShape's own PARSING was widened alongside checkedShapeStrict's, and that is a ---------
+  // ---- checkedShape's own PARSING was widened alongside the mandatory check's, and that is a --------
   // ---- source-breaking change to checkedShape ITSELF, pinned here rather than left only in prose -----
   // ---- (issue #43 review round 2, MAJOR M3: three doc paragraphs said checkedShape was "UNCHANGED", -
   // ---- which was false, since literalListElements/stablePathKey/companionApplyArgs/parseTransition ---
-  // ---- are shared between checkedShape and checkedShapeStrict, never strict-only) --------------------
+  // ---- are shared between checkedShape and checkedPlan, never mandatory-check-only) ------------------
 
   it should "refuse to typecheck a literal Shape whose only unreadable piece was a Nil transitions list reaching an unreviewed guarded node, a shape that used to compile clean under checkedShape before this walk learned to read Nil" in {
     // `entry = List(OpenPr)` alone, `OpenPr` marker-guarded and unreviewed, `transitions = Nil`: the
@@ -147,9 +147,9 @@ class GraphMacroSpec extends AnyFlatSpec with Matchers:
     // `KitMacro.scala`, has the reasoning), `entry` included even though `entry` itself was perfectly
     // literal: so this exact snippet compiled clean under `checkedShape` before this fix, confirmed by
     // running it against the tree immediately before issue #43 review's own `Nil` fix and finding no
-    // error at all. It fails now, under `checkedShape` itself, its strict sibling `checkedShapeStrict`
-    // untouched by this particular test, because `Nil` recognition is not `checkedShapeStrict`-only, the
-    // exact fact three doc paragraphs got wrong (`Kit.scala`'s `checkedShape`/`checkedShapeStrict` doc,
+    // error at all. It fails now, under `checkedShape` itself, its mandatory sibling `checkedPlan`
+    // untouched by this particular test, because `Nil` recognition is not mandatory-check-only, the
+    // exact fact three doc paragraphs got wrong (`Kit.scala`'s `checkedShape`/`checkedPlan` doc,
     // `LitterBox.scala`'s `LitterBox.graph` doc, `KitMacro.literalListElements`'s own doc, all corrected
     // by this same review round).
     val errors = scala.compiletime.testing.typeCheckErrors(
