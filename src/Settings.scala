@@ -360,9 +360,11 @@ object Settings:
   private def optionalModel(conf: TsConfig, key: String): Either[String, Option[AgentModel]] =
     if !conf.hasPath(key) then Right(None)
     else
-      Option(conf.getString(key)).filter(_.nonEmpty) match
-        case None      => Right(None)
-        case Some(raw) => AgentModel.parse(raw).left.map(m => s"$ConfigPath: $key: $m").map(Some(_))
+      try
+        Option(conf.getString(key)).filter(_.nonEmpty) match
+          case None      => Right(None)
+          case Some(raw) => AgentModel.parse(raw).left.map(m => s"$ConfigPath: $key: $m").map(Some(_))
+      catch case e: ConfigException => Left(s"$ConfigPath: $key: ${e.getMessage}")
 
   private def models(conf: TsConfig): Either[String, AgentModels] =
     for
