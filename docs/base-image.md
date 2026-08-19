@@ -144,14 +144,15 @@ the proxied network, and would be refused with `403 Filtered` without an entry. 
 earns its place only when something touches that host at run time.
 
 This is a documented shape, not a sanctioned route out. Two facts contain it. The first is that
-`.litter-box/Dockerfile` is operator owned and not agent owned: the scaffolded protect floor is
-`[".litter-box/**", ".github/**"]` (`resources/scaffold/config.conf:54`) and a consumer can only
-widen it, so a worker patch that adds a `RUN` line to the image the loop builds is rejected before
-it is ever applied. The second is that the absence of proxy settings is not a promise of an open
-network. A daemon behind a corporate proxy, a BuildKit configuration that pins the build network,
-or a rootless daemon with egress rules of its own will constrain a build regardless. The claim here
-is narrower and exact: litter-box itself neither routes nor filters build traffic, so the allowlist
-is not what decides whether a build step reaches a host.
+`.litter-box/Dockerfile` is operator owned and not agent owned: the protect floor is
+`[".litter-box/**", ".github/**", "CONTEXT.md"]`, and `protectWithFloor`
+(`src/Settings.scala:229-236`) unions it under whatever a repo's own `protect` list says, so a
+consumer can only widen it. A worker patch that adds a `RUN` line to the image the loop builds is
+rejected before it is ever applied. The second is that the absence of proxy settings is not a
+promise of an open network. A daemon behind a corporate proxy, a BuildKit configuration that pins
+the build network, or a rootless daemon with egress rules of its own will constrain a build
+regardless. The claim here is narrower and exact: litter-box itself neither routes nor filters
+build traffic, so the allowlist is not what decides whether a build step reaches a host.
 
 ## Why the middle is a TODO and not a preset
 
