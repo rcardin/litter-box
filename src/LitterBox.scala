@@ -42,19 +42,21 @@ package in.rcard.litterbox
   * as a plain `Int`, computed as a function of `Config`, and the runner is still the only thing that
   * ever turns that number into a `Ledger` or spends against one.
   *
-  * "Owns budget accounting" is a claim about WHO holds the counter, not a claim about how tightly that
-  * counter bounds a node's own spend, and the two should not be read as the same promise (issue #43):
-  * `Runner.Ledger.canAfford` (`Kit.scala`) is checked once, before a node's
-  * own `probe`/`run` starts, never again while it runs, and `Cost.NoDispatch` is unconditionally
-  * affordable regardless of what remains, so a `Cost.NoDispatch` node is never gated by `dispatchBudget`
-  * at all, no matter how many times it actually calls `agents.*`, and a `Cost.OneDispatch` node that
-  * dispatches more than once inside one call is charged once per real dispatch (`chargeDispatch`,
-  * `Kit.scala`) but not interrupted mid-node once the ledger reaches zero, only refused at the START of
-  * whichever node runs next. `dispatchBudget`, precisely, bounds how many `Cost.OneDispatch` nodes may
-  * START, not how many dispatches a graph's own nodes can make in total. `Runner.Ledger`'s own doc
-  * (`Kit.scala`) has the mechanism; this is named here as a residual, in the same spirit as the
-  * `inline$graphImpl` residual `graph`'s own doc (below) names, because a consumer author reading only
-  * this trait's doc, never `Runner.Ledger`'s, should not have to independently discover it.
+  * "Owns budget accounting" means the runner holds the counter AND bounds every spend against it.
+  * Those were two different promises until issue #69, and a consumer author reading only this trait's
+  * doc should not have to discover the difference for themselves, so both checks are named here.
+  * `Runner.Ledger.canAfford` (`Kit.scala`) runs once, before a node's own `probe`/`run` starts, and
+  * decides whether a node declaring `Cost.OneDispatch` may START at all. Then every real dispatch any
+  * node makes, from `probe` or `run`, whatever `Cost` it declared, is metered at the capability
+  * itself, by the decorator `Runner.step` wraps `Caps.agents` in, and refused as an infra fault once
+  * nothing is left. So `dispatchBudget` bounds the TOTAL dispatches a graph's own nodes can make in
+  * one tick: a `Cost.NoDispatch` node that dispatches under `dispatchBudget = _ => 0` faults instead
+  * of spending freely, and a node that dispatches twice against a budget of one is refused the
+  * second. What a `Cost` still decides is the SHAPE of the refusal, which is reason enough to declare
+  * it honestly: an honest `Cost.OneDispatch` node the ledger cannot afford is PARKED before it runs
+  * at all, a resumable terminal that leaves the world untouched, where a misdeclared one is faulted
+  * partway through whatever its body had already begun. `Runner.Ledger`'s own doc (`Kit.scala`) has
+  * the mechanism.
   */
 sealed trait LoopGraph:
   /** The input type this graph's own walk begins from. Abstract, so `LoopGraph` itself stays
@@ -242,11 +244,13 @@ object LitterBox:
       // `pickAndSetup`'s own `using` clause carries no `AgentDispatch` at all, so nothing inside it
       // can call `agents.*` regardless of what `Cost` `Pick` declares or what `Ledger` it runs under;
       // that signature, not `Cost.NoDispatch`, is what actually enforces "spends nothing" here, since
-      // `Cost` alone only gates whether `Runner.step` lets a node START (`Cost`'s own doc), never
-      // what it can spend once running. A throwaway `Ledger(0)` is enough to satisfy `Runner.step`'s
-      // own signature here. The REAL, shared `Ledger` cannot be built before this call returns (issue
-      // #34 review finding F4): whether the tick is a resume is `Pick`'s own OUTPUT
-      // (`resumeAuthors`), not known any earlier, and the seed below needs it.
+      // `Cost` alone only gates whether `Runner.step` lets a node START (`Cost`'s own doc). The
+      // throwaway `Ledger(0)` below is a second, independent guard rather than a formality since
+      // issue #69: a dispatch made under an empty ledger is now refused at the capability, rc 50,
+      // instead of being absorbed, so this call could not spend even if that signature changed. The
+      // REAL, shared `Ledger` cannot be built before this call returns (issue #34 review finding
+      // F4): whether the tick is a resume is `Pick`'s own OUTPUT (`resumeAuthors`), not known any
+      // earlier, and the seed below needs it.
       Runner.step(Machine.Pick, Machine.PickInput(n, cur))(using caps, faulting, Runner.Ledger(0)) match
         case NodeOutcome.Stopped(exit) => NodeOutcome.Stopped(exit)
         case NodeOutcome.Done(setup) =>
@@ -377,10 +381,11 @@ object LitterBox:
     * section and the scaffolded `loop.scala` comment (`resources/scaffold/loop.scala.txt`) all point
     * back to this paragraph instead of restating it.
     *
-    * The number returned bounds how many `Cost.OneDispatch` nodes may START, not the total number of
-    * dispatches a graph's own nodes can make: `LoopGraph`'s own trait doc (above) has the precise
-    * statement of that residual, and `Runner.Ledger`'s own doc (`Kit.scala`) has the mechanism
-    * (`canAfford`/`chargeDispatch`).
+    * The number returned bounds the TOTAL dispatches this graph's own nodes may make in one tick,
+    * not merely how many `Cost.OneDispatch` nodes may START (issue #69): `LoopGraph`'s own trait doc
+    * (above) has the precise statement of both checks and of what declaring an honest `Cost` still
+    * buys, and `Runner.Ledger`'s own doc (`Kit.scala`) has the mechanism
+    * (`canAfford`/`tryChargeDispatch`).
     *
     * "Not a literal at all" is not the only way `checkedPlan` can abort on `plan`, and the two are
     * DELIBERATELY worded differently rather than sharing one message: `plan` can also be a genuine

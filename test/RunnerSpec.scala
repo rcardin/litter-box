@@ -134,7 +134,14 @@ class RunnerSpec extends AnyFlatSpec with Matchers:
     world.callCount("dispatch IMPL") shouldBe 2
   }
 
-  it should "saturate the ledger at zero, not go negative, when a node dispatches more than its exhausted budget allows" in {
+  it should "refuse the SECOND dispatch a Cost.OneDispatch node makes under a budget of exactly one, rather than merely leaving it uncharged, and never let remainingDispatches go negative" in {
+    // Before issue #69 this exact node ran to `Done`: `chargeDispatch` saturated at zero, so the
+    // second dispatch reached the agent for free and, after the fact, a spend and an overspend read
+    // identically off the counter. The counter still never goes negative, but now for the stronger
+    // reason: the second charge never happens because the dispatch it would have paid for never
+    // happens either. The refusal is asserted three ways, since any one alone is weak evidence: the
+    // agent saw exactly one call, the run ended at the fault channel rather than at a value, and the
+    // operator facing line names the node and what it tried to dispatch.
     val world  = new TestWorld
     val clock  = new FakeClock(List(0L))
     val ledger = Runner.Ledger(1)
@@ -145,8 +152,50 @@ class RunnerSpec extends AnyFlatSpec with Matchers:
       given l: Runner.Ledger = ledger
       Runner.step(node, ())
 
-    result shouldBe Right(NodeOutcome.Done(()))
+    result shouldBe Left(LoopExit.InfraFault)
     ledger.remainingDispatches shouldBe 0
+    world.callCount("dispatch IMPL") shouldBe 1
+    // Spelled out in full rather than read back off `Runner.refusedDispatchMessage`: this line is an
+    // operator facing contract, and a test that composed it the same way the code does would follow
+    // any rewording silently.
+    world.logLines should contain(
+      "node 'dispatching' attempted a dispatch (IMPL) with an exhausted dispatch budget, refused " +
+        "before it reached the agent: the runner meters every dispatch at the capability, so no " +
+        "node can spend past the budget its graph declared, whatever Cost it declares"
+    )
+    world.notifications should not be empty
+  }
+
+  it should "refuse a review dispatch on an exhausted ledger through the fault channel, so no AgentDispatch.Judged can exist without a real dispatch behind it" in {
+    // The trust half of issue #69, and the reason a refusal faults rather than answering the node
+    // with some `DispatchOutcome.Refused` case. `AgentDispatch.review` is the only minter of
+    // `Judged` (RFC #26 decision 7), so a refusal that RETURNED anything at all on this path would
+    // have to return a `Judged` with no cold session behind it, a strictly worse failure than the
+    // overspend this issue set out to stop. `Fault.raise` returns `Nothing`, so the mint below is
+    // unreachable at the type level, and this test is the runtime half: the scripted reviewer was
+    // never called, and the walk ended at the boundary rather than at a value.
+    val world  = new TestWorld
+    val clock  = new FakeClock(List(0L))
+    val ledger = Runner.Ledger(0)
+    val reviewing = Node[Unit, AgentDispatch.Judged[Unit]](
+      name = "reviewing-on-empty",
+      cost = Cost.NoDispatch, // the misdeclaration: honest here would be Cost.OneDispatch
+      timeout = Timeout.Unbounded,
+      probe = _ => None,
+      run = _ => NodeOutcome.Done(summon[AgentDispatch].review("prompt", "review-file").map(_ => ()))
+    )
+
+    val result = withFaulting:
+      given caps: Caps       = buildCaps(world, clock)
+      given l: Runner.Ledger = ledger
+      Runner.step(reviewing, ())
+
+    result shouldBe Left(LoopExit.InfraFault)
+    world.callCount("dispatch REVIEW") shouldBe 0
+    ledger.remainingDispatches shouldBe 0
+    world.logLines should contain(
+      Runner.refusedDispatchMessage("reviewing-on-empty", "REVIEW")
+    )
   }
 
   it should "charge a dispatch made from probe, not only one made from run" in {

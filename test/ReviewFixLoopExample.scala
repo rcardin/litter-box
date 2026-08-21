@@ -348,8 +348,9 @@ val Review: Node[ReviewRound, AgentDispatch.Judged[Reviewed]] = Node(
   *
   * `cost = Cost.OneDispatch` is the honest declaration the kit offers, and it is a floor, not a
   * ceiling: `dispatchBudget` gates whether this node may START, while the runner charges every one
-  * of the N dispatches this body makes. Size `budgets.repair` for MaxRounds * findings, or cap
-  * `findings` here.
+  * of the N dispatches this body makes and REFUSES the first one it cannot pay for, rc 50, rather
+  * than letting it through. Size `budgets.repair` for MaxRounds * findings, or cap `findings` here:
+  * an undersized budget stops this loop mid round, it does not quietly overspend.
   */
 val Fix: Node[FixRound, ReviewRound] = Node(
   name = "Fix",
@@ -487,7 +488,8 @@ val graph: LoopGraph = LitterBox.graph(
   ),
   // One IMPLEMENT + MaxRounds * (one REVIEW + one FIX node start). The FIX node dispatches once
   // per finding and every one of those is charged, so raise `budgets.repair` if your reviewer is
-  // wordy: the runner refuses the NEXT node once this runs out, mid-cycle.
+  // wordy: the runner refuses the dispatch itself the moment this runs out, mid node, and refuses
+  // the next Cost.OneDispatch node from starting at all.
   dispatchBudget = (cfg: Config) => 1 + MaxRounds * (1 + cfg.repairBudget),
   startInput = (tick: Int) => tick,
   stages = StageSet(

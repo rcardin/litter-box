@@ -257,7 +257,10 @@ val IdiomPick: Node[Unit, Unit] = Node(
 )
 val IdiomReview: Node[Unit, AgentDispatch.Judged[IdiomScore]] = Node(
   name = "IdiomReviewedReview",
-  cost = Cost.NoDispatch,
+  // `Cost.OneDispatch` against the graph's own budget of one, since issue #69: this node genuinely
+  // dispatches a review, and the runner meters every dispatch at the capability now, so an idiom
+  // declaring `Cost.NoDispatch` here would be an idiom that faults rc 50 the first time it runs.
+  cost = Cost.OneDispatch,
   timeout = Timeout.Unbounded,
   probe = _ => None,
   run = _ =>
@@ -285,7 +288,7 @@ val reviewedGraph: LoopGraph = LitterBox.graph(
       Edge.Exit(IdiomOpenPr, _ => Some(LoopExit.Success))
     )
   ),
-  dispatchBudget = _ => 0,
+  dispatchBudget = _ => 1,
   startInput = _ => ()
 )
 

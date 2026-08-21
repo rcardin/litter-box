@@ -1660,7 +1660,7 @@ object Machine:
     * dedicated `Runner.Ledger(1)`, never the shared repair-budget `ledger` `Gate`/`Repair` draw from,
     * and that split is deliberate, not an oversight this issue left behind: `Runner.step`'s charging
     * decorator charges a real dispatch for real regardless of what `cost` declares
-    * (`Runner.Ledger.chargeDispatch`'s own doc), so if `Review`'s dispatch charged the SAME `Ledger`
+    * (`Runner.Ledger.tryChargeDispatch`'s own doc), so if `Review`'s dispatch charged the SAME `Ledger`
     * `attemptRepairNext` reads for its own `self-repair: budget now N` line, that number would silently
     * drop by one for every review round preceding a repair, on every scenario that ever requests
     * changes. `test/golden/request-changes-repair.log` and `test/golden/missing-verdict.log` both pin
@@ -1886,7 +1886,8 @@ object Machine:
         // (issue #44's `AskHuman` probe-miss path, `askHumanRun`), and it never reaches `Repair` at
         // all doing so, so no golden anywhere in this suite pins a `node 'Repair' parked: ...` line;
         // a `node 'AskHuman' parked: ...` line is equally unreachable, since `AskHuman` declares
-        // `Cost.NoDispatch` (its own doc has the reason). Otherwise writes the fail file with the
+        // `Cost.NoDispatch` (its own doc has the reason), and the refusal issue #69 added one layer
+        // down cannot fire there either, since that node dispatches nothing at all. Otherwise writes the fail file with the
         // stage-specific content and dispatches a FIX round through `Repair`, a genuine `Next.Goto`
         // edge. `applied`/`stopped` are what used to be
         // `Right(true)`/`Right(false)` at this same call site: `applied` receives the fresh patch and
@@ -2081,7 +2082,7 @@ object Machine:
                 // `askHumanRun`, see that function's own doc). `decideRoute` only ever produces
                 // `Route.Parked` once `attemptRepairNext` has already found
                 // `ledger.remainingDispatches <= 0` (that function's own doc), and that fact never
-                // reverses (`Runner.Ledger.chargeDispatch` only ever decrements, never refunds), so
+                // reverses (`Runner.Ledger.tryChargeDispatch` only ever decrements, never refunds), so
                 // by the time ANY walk reaches this edge the shared `Ledger` this whole tick draws
                 // from is provably empty: a probe hit here can never be followed by a `Repair` round
                 // that actually runs, only by `Runner.step`'s own silent, bookkeeping-free auto-park
@@ -2849,7 +2850,10 @@ object Machine:
     * (`Kit.scala`) auto parks a `Cost.OneDispatch` node the moment the ledger is exhausted, with a
     * DIFFERENT log line than `askHumanRun`'s own ("node 'AskHuman' parked: dispatch budget
     * exhausted..." instead of "issue #N -> parked (...)"), a line that can therefore never appear in
-    * any golden this suite pins. `timeout = Timeout.Unbounded`: the code this node's `run` relocates
+    * any golden this suite pins. Since issue #69 that declaration buys only the right to START:
+    * a dispatch made from a `Cost.NoDispatch` node is refused rc 50 once the ledger is empty, so what
+    * keeps this node clear of the runner's budget entirely is that its `run` calls `gh`, `git` and
+    * `fs` and never `agents.*` at all, not the `Cost` it declares. `timeout = Timeout.Unbounded`: the code this node's `run` relocates
     * carried no node level bound of its own either, only the ordinary `gh`/`git` calls it always
     * made.
     *

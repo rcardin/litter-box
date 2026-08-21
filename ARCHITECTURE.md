@@ -172,21 +172,31 @@ configuration**, so they live under `resources/` and travel inside the jar
   real `Ledger`. Decision 17 also promises nothing is expressible in both `config.conf` and
   `loop.scala`; `LitterBox.graph`'s own doc (`src/LitterBox.scala`, on `graph`) names the one accepted
   exception a constant `dispatchBudget` value creates and is the one place that exception is written
-  out, not repeated here. Owning the counter is not the same as bounding every spend, and the two should not be
-  read as one promise (issue #43 review round 2, MAJOR M2): `Runner.Ledger.canAfford` only ever runs
-  once, before a node starts, so `dispatchBudget` precisely bounds how many `Cost.OneDispatch` nodes may
-  START, not the total dispatches a graph's nodes make; a `Cost.NoDispatch` node is never gated by it at
-  all regardless of how many times it actually calls `agents.*`, and a `Cost.OneDispatch` node that
-  dispatches more than once per call is charged per dispatch but never interrupted mid-node. This is a
-  documented residual (`Runner.Ledger`'s own doc, `LitterBox.graph`'s own doc, and `README.md`'s "Write
-  your own loop" section all name it), not a defect this branch left unfixed: making `Runner.step`'s own
-  `charging` decorator refuse or fault once the ledger reaches zero mid-node, rather than only gating the
-  next node's start, would change the SHIPPED graph's own runtime behaviour on exactly the budget
-  exhaustion paths `test/golden/*.log` pins for scenarios like `three-reds-needs-human`, and this
-  branch's own acceptance oracle is that no golden log line moves. Enforcing the ledger AT the decorator,
-  mid-node, is the stronger design and a real improvement; it was deliberately not attempted here,
-  because it is a runner-wide behaviour change that belongs in its own issue against `Runner.step`, not
-  smuggled into a branch whose job is widening the public API surface. `startInput` itself is
+  out, not repeated here. Owning the counter and bounding every spend were two different promises
+  until issue #69, and decision 9 asks for both, so the runner now performs both. `Runner.Ledger.canAfford`
+  still runs once, before a node starts, and refuses to let a `Cost.OneDispatch` node begin on an empty
+  ledger, parking the tick. Underneath it, `Runner.step`'s own `charging` decorator asks the ledger for
+  each real dispatch AT the moment it happens, whatever `Cost` the node declared, and raises an infra
+  fault instead of delegating when nothing is left. So `dispatchBudget` bounds the total dispatches a
+  graph's nodes can make, not merely how many `Cost.OneDispatch` nodes may start, and a misdeclared
+  `Cost.NoDispatch` node no longer dispatches freely under a budget of zero. `Cost` is therefore an
+  assertion the runner checks, not a declaration it trusts; what an honest `Cost` still buys is the
+  shape of the refusal, park before the node runs rather than fault partway through it, which is the
+  reason to keep declaring it accurately (`Runner.Ledger`'s own doc, `LitterBox.graph`'s own doc, and
+  `README.md`'s "Write your own loop" section all state it in those terms).
+  No golden log line moved with that change, which is the check that says the SHIPPED graph never
+  relied on the hole: `Machine.Implement` and `Machine.Repair` both declare `Cost.OneDispatch` and
+  dispatch once, `Machine.Review` runs against its own dedicated `Runner.Ledger(1)`, the repair loop
+  tests `ledger.remainingDispatches` itself before every FIX round, and the resume path is only ever
+  taken when `cfg.repairBudget` is greater than zero, so no shipped node ever asked for a dispatch the
+  ledger could not pay for. The refusal deliberately faults rather than answering the node with a
+  "refused" value: a value would be a channel from the runner back INTO a node, letting it probe the
+  counter it must not see, and on the review path anything returned would be an `AgentDispatch.Judged`
+  minted with no cold session behind it (decision 7), a strictly worse failure than the overspend.
+  Pre emptive TIMEOUT interruption was considered in the same issue and declined, with the reasons
+  recorded on `Timeout.After` and `Runner.step`: the real bound already sits at the subprocess
+  boundary, an interrupted node leaves the world half written where a killed child does not, and node
+  bodies write unsynchronised shared state that a second thread would make concurrent. `startInput` itself is
   `Int => Fault ?=> I`, never `(Caps, Fault) ?=> I` (issue #43
   review, BLOCKER 2): `begin` runs before that real `Ledger` exists, so a `startInput` that could
   summon `Caps` could call `agents.*` on the live `AgentDispatch` outside every check budget, timeout
