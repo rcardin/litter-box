@@ -23,6 +23,14 @@ The central split, and the reason the whole suite runs in memory:
   `Workflow` and its `Shape` by hand (`Machine.shippedWorkflow`/`Machine.shippedShape`), for the
   reason `LitterBox.graph`'s own doc gives: a node built by a `def` reading `Config` at construction
   time is exactly what a macro over a literal cannot read, and that is the shipped graph's idiom.
+  One further shipped node is now public too, and deliberately only one more (issue #68), alongside
+  `Machine.AskHuman` (issue #44): `Machine.Gate` is a public,
+  parameterless `val`, so a consumer's own `Plan` literal can name it and compose the real FAST gate
+  into a graph of their own instead of reimplementing it. That node's own scaladoc is where the
+  decision lives: which node, why one more rather than a family, why every shipped node other than
+  `Gate` and `AskHuman` stays private, and what a consumer takes on by wiring it in. Nothing about `shippedWorkflow` or
+  `shippedShape` moved for it; both simply name `Gate` where they used to call `Gate(cfg)`, since that
+  parameter was never read.
 - `src/Machine.scala` — `Machine.runOnce`, and the shipped `Workflow` (`Machine.shippedWorkflow`) it
   walks through `Runner.run`: pure decision logic. Touches the world through nothing but the
   capabilities. No direct filesystem, subprocess, or clock access.
@@ -67,7 +75,15 @@ what a node author wrote. It does not, confirmed by grepping every shipped node'
 `RequiresReviewInput`: none extends it, `OpenPr`/`Merge` included, so this paragraph's claim that
 `Runner.validate` never exercises the review-reachability half of its own check on the shipped graph
 is still true after Tier 2, for the same reason it was true before, `Machine.shippedShape`'s own doc
-restates.
+restates. Issue #68 made one shipped node public without changing that fact, and the consequence is
+stated rather than left implicit: `Machine.Gate` carries `Guard.Open`, so `Runner.validate` will accept
+a consumer graph routing into it with no reviewer anywhere on the path. That is safe for THAT node
+because everything it does is stage the tree and run the operator's own gate command, never a push, a
+PR or a merge, and it is precisely why the widening stopped at one node rather than reaching the ones
+that do publish outward. Adding `RequiresReviewInput` to a shipped node's input type to make its guard
+honest is not the missing fix but the poisonous one, for the reason this section already gives: the
+derivation stamps the REAL node, `Runner.validate` reads it at startup against `Machine.shippedShape`,
+and the shipped graph would then reject itself on every tick.
 
 Infra faults short-circuit through `boundary.Label[LoopExit]` (aliased `Faulting` in `Machine`).
 That is a type-level guarantee, not a convention: no code after a fault can run, so no fault path can

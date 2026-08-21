@@ -987,6 +987,11 @@ object Machine:
     * `private[litterbox]` (issue #43), for the identical reason `PickInput`'s own doc above states:
     * `LitterBox.shipped.begin` is the one caller outside this file, and package-private is the
     * narrowest modifier that reaches it without exposing this node beyond `in.rcard.litterbox`.
+    *
+    * Still `private[litterbox]` after issue #68 widened `Gate` (that node's own doc has the decision
+    * and the reason it is one node rather than all of them): PICK is not a step a consumer graph could
+    * wire anywhere in any case, because `LitterBox.shipped.begin` owns it together with the resume
+    * aware ledger seed it computes, so exposing the node without that seed would hand out half a step.
     */
   private[litterbox] val Pick: Node[PickInput, PickAndSetup.Ready] =
     Node(
@@ -1123,6 +1128,12 @@ object Machine:
     * than a git read that would always agree with it, so the code says exactly what it does: this
     * node always dispatches, the same as the straight-line code it replaced always did, with no path
     * through it that silently skips an issue's implementation.
+    *
+    * Stays private after issue #68 (`Gate`'s own doc has the decision and the criteria): this node's
+    * `timeout` reads `Config` at CONSTRUCTION time, so it cannot become the parameterless `val` a
+    * `Plan` literal can name directly, and the `def(cfg: Config)` it has to stay is the decision 17
+    * violation that doc describes, whether or not a consumer bound one call of it to their own
+    * top-level `val` first the way `AskHuman`'s own corrected doc describes for the identical shape.
     */
   private def Implement(cfg: Config): Node[ImplementInput, StageVerdict] =
     Node(
@@ -1141,8 +1152,15 @@ object Machine:
     * the caller (`shippedWorkflow`'s own `cycle`/`attemptRepairNext` pair, see their doc) passes down, so the gate
     * run and the repair round it triggers always agree on which pass they are, by construction,
     * not by two sites reading the same mutable cell in the right order.
+    *
+    * Public, like `AskHumanInput` and unlike every other shipped node's input type, because `Gate`
+    * itself is (issue #68; that node's own doc has the decision and the 0.x promise that comes with
+    * it): a consumer graph naming
+    * `Gate` in its own `Plan` has to be able to build the value it feeds it, and this is that value.
+    * Its first field being a `Cursor` is the sharpest consequence of exposing this node at all, and
+    * `Gate`'s own doc is where that is written down rather than repeated here.
     */
-  private final case class GateInput(cur: Cursor, issue: Int, pass: Int)
+  final case class GateInput(cur: Cursor, issue: Int, pass: Int)
 
   /** What one FAST gate run concluded, for the caller to route on. `GateResult.Timeout` is
     * deliberately not a case here: RFC #26 decision 12 / issue #34's own acceptance criterion is
@@ -1155,8 +1173,15 @@ object Machine:
     * a second time: `attemptRepairNext` (`shippedWorkflow`'s own nested method) needs that exact
     * path to build the FIX prompt's failure content, and re-computing the same `artifact(...)` call
     * a second time at a second call site is exactly the kind of duplication that drifts.
+    *
+    * Public, and deliberately NOT replaced by the already public `GateResult` when it became so
+    * (issue #68): `GateResult` carries a `Timeout` case, and handing a consumer that type as `Gate`'s
+    * OUTPUT would reopen the exact hole the first paragraph above closes, a gate timeout becoming an
+    * ordinary value a caller can branch on rather than the infra fault RFC #26 decision 12 requires it
+    * to stay. A two case enum a consumer must match exhaustively is what makes "a timeout never
+    * reaches you here" a fact of the type rather than a promise in a comment.
     */
-  private enum GateVerdict:
+  enum GateVerdict:
     case Red(gateLog: String)
     case Green
 
@@ -1225,8 +1250,108 @@ object Machine:
     * `probe = _ => None`: same reasoning as `Implement`'s, sharpened for a gate specifically, since
     * a FAST gate result is a fact about the CURRENT working tree, not a stored position, and RFC #26
     * decision 6 is exactly the rule that forbids latching one.
+    *
+    * Public, and the second node in this file to be, after `AskHuman` (issue #44), which issue #68
+    * leaves untouched. RFC #26 decision 12 promises the shipped
+    * pipeline is rebuilt as a `Workflow` value ON THE PUBLIC API. Before this, `AskHuman` was that promise's
+    * only inhabitant, and naming one needs-human parking step is not the same as being able to compose
+    * the pipeline itself: a consumer who wants the shipped loop with, say, its FAST gate reused still
+    * had to reimplement the other seven nodes, which is RFC objection 4 landing exactly as it was
+    * predicted to. `Gate` is the answer to
+    * "which further node, if any, becomes public", and the answer is deliberately ONE more node rather
+    * than a blanket widening, because exposing a node necessarily exposes its input and its output types too.
+    *
+    * `Gate` is the node that can be exposed without paying for it anywhere, and each of the four
+    * reasons is a fact about THIS node rather than a preference:
+    *
+    *   - It reads nothing at construction time. `cfg` was a parameter this body never used: every
+    *     capability `runFastGate` needs, `Config` included, is resolved inside the node's own `run`
+    *     body off the ambient `Caps` (`Caps.scala`'s own `given (using c: Caps): Config = c.cfg`).
+    *     Dropping the parameter is therefore not a behaviour change, and it lets a `Plan` literal name
+    *     this node directly, with no consumer-side `val` standing between the two: `Plan.workflowOf`
+    *     (`Kit.scala`) links an edge to the node it leaves by REFERENCE IDENTITY, `Edge.source(e) eq
+    *     from`, so writing `Gate` a second or third time in the same `Plan` literal still reads the one
+    *     object this file declares, where writing `Gate(cfg)` a second or third time would have minted
+    *     a fresh one each time. A `def(cfg: Config)` node is not unusable from a `Plan`; a consumer can
+    *     bind one call of it to their own top-level `val` first, exactly as `AskHuman`'s own corrected
+    *     doc describes. A parameterless `val` simply removes that extra step, for a parameter this
+    *     body never read anyway.
+    *   - Being a `val` also keeps decision 17 intact. A `def(cfg: Config)` node exposed to a consumer
+    *     makes their `loop.scala` able to write `Machine.Gate(Config())`, which silently takes
+    *     `Config`'s own literal field defaults instead of the operator's `.litter-box/config.conf`
+    *     (only `Settings.load` ever reads that file), so a knob would become expressible in both
+    *     places, precisely what decision 17 forbids and what `LitterBox.graph`'s own `dispatchBudget`
+    *     doc records as the ONE accepted exception. This node creates no second exception.
+    *   - It publishes nothing outward. `Guard`'s own doc draws that line, and the threat model
+    *     question a public node raises is real: `Runner.validate` reads a node's `guard` field, and no
+    *     shipped node's input type extends `RequiresReviewInput`, so ANY shipped node exposed today
+    *     carries `Guard.Open` and a consumer may wire it onto a path no reviewer crosses. For `Gate`
+    *     that is harmless by construction, because everything it does is `git.addAll()` plus the
+    *     operator's own `gate.cmd` inside the sandbox: it never opens a PR, never merges, never posts,
+    *     never pushes. Adding the marker to make the guard honest is not available anyway, and is the
+    *     poisonous fix rather than the missing one: `Node.apply` derives `Guard.RequiresReview` from
+    *     the input type on the REAL node, which `Runner.validate` then reads against
+    *     `Machine.shippedShape` at startup, and ARCHITECTURE.md records that the shipped graph reaches
+    *     several nodes by legitimate rejection paths that never cross `Review`, so a guard on the
+    *     wrong shipped node makes the shipped graph reject itself on every tick for every user.
+    *   - Its output can be handed over without weakening it. `GateVerdict` is public now, and
+    *     `GateResult` was deliberately not substituted for it (that enum's own doc has why).
+    *
+    * Why each sibling node stays private, since the decision this issue asks for is the whole set and
+    * not only the one name that moved. `AskHuman` is the one sibling that is not private, already public
+    * since issue #44 for a needs-human parking step, not this issue's own doing; its own doc has why it
+    * became public and what its shape costs a consumer. `Repair` is the other node issue #68 named as a plausible
+    * candidate and it stays private, for a reason that is structural rather than cautious: its
+    * `timeout = Timeout.After(implementNodeTimeoutSeconds(cfg))` reads `Config` AT CONSTRUCTION TIME, so it cannot become a parameterless `val` without
+    * changing its declared bound, and as a `def(cfg: Config)` it is the decision 17 violation the
+    * second bullet above describes, whether or not a consumer bound it to a `val` first. `Implement`
+    * is private for the identical reason. `Review` is a parameterless `def` that mints a fresh `Node`
+    * per read; a consumer could bind one read of it to a top-level `val` the same way `AskHuman`'s own
+    * corrected doc describes for a `def(cfg: Config)` node, so it stays private for SCOPE alone, not
+    * because `Plan.workflowOf` cannot reach it: issue #68 deliberately widened one node, not every
+    * node whose body happens to read no `Config`, and nothing about `Review` needs proving from
+    * outside `shippedWorkflow`'s own edges. `Pick` is owned by
+    * `LitterBox.shipped.begin` along with the resume aware ledger seed, so it is not a node a consumer
+    * could wire anywhere in any case. `CommitAndPush`, `OpenPr`, `Merge` and everything downstream of
+    * review are the nodes that DO publish outward, `CommitAndPush` with a real `git push` (its own
+    * doc has why), so they are exactly the ones whose `Guard.Open` would matter, and
+    * they stay private until a guard on them can be stated honestly (ARCHITECTURE.md's startup
+    * validation section has what that needs). `CiWait`, `RouteDecision` and `PostMergeCleanup` stay
+    * private simply because nothing needs naming them from outside.
+    *
+    * What a consumer takes on by wiring this node in, neither of which the type system states for
+    * them. `GateInput` carries a `Machine.Cursor`, so this graph, not the loop, decides what `iter`,
+    * `issue`, `pass` and `budget` are for every `StatusEvent` this node emits: `emit` copies those
+    * four fields straight into the event and `resources/observe/lib/banner.sh` reads them back off
+    * `status.jsonl`. A consumer graph that leaves `issue` empty or `iter` at zero degrades `watch.sh`'s
+    * live view for reasons nothing in the loop reports, since no code anywhere validates a `Cursor`.
+    * `pass` is separately the value the gate log path is built from, `-pass$pass.gate.log`, so two
+    * gate runs sharing a `pass` overwrite one another's log. `GateInput` also carries the issue
+    * number TWICE, once inside `cur.issue` (a `String`, the value `emit` copies into
+    * `StatusEvent.issue`) and once as the separate `issue` field (an `Int`, the value `artifact`
+    * builds the gate log path from), and unlike `pass` the node never reconciles the two: `runFastGate`
+    * sets `cur.pass = pass` but never touches `cur.issue`, so a consumer who constructs `GateInput`
+    * with a `cur.issue` that does not name the same issue as `issue` gets a `FAST_GATE` status event
+    * naming one issue while its own `logfile` field names another, with nothing in the loop reporting
+    * the mismatch; a consumer must set both to the same number.
+    *
+    * The node also emits the phase string `FAST_GATE`, which only `Machine.shippedStages` declares. A
+    * consumer graph that hands `LitterBox.graph` a different `StageSet`, or the empty default, gets
+    * those events in `status.jsonl` all the same, and `watch.sh` simply draws no chip for a phase its
+    * declared stage set never mentioned (`shippedStages`'s own doc has why the banner only ever draws
+    * what was declared). Declaring a `Stage("FAST_GATE", ...)` of their own is how a consumer gets the
+    * chip back; nothing about this node requires it.
+    *
+    * The 0.x promise this new surface carries is the same one the rest of the kit carries and no
+    * stronger: this name, `GateInput` and `GateVerdict` all sit under the `0.x` no stability promise
+    * policy README states once for the whole consumer surface, so a shape change can land under a
+    * consumer between two `0.x` versions and
+    * pinning an exact version is the only guarantee against it. What is promised for as long as the
+    * name exists is the semantics stated above: a timeout is a fault and never a `GateVerdict`, this
+    * node never publishes outward, and it reads its `Config` per tick off the ambient `Caps` rather
+    * than off anything a graph author wrote down.
     */
-  private def Gate(cfg: Config): Node[GateInput, GateVerdict] =
+  val Gate: Node[GateInput, GateVerdict] =
     Node(
       name = "Gate",
       cost = Cost.NoDispatch,
@@ -1389,6 +1514,15 @@ object Machine:
     * `attemptRepairNext` does, and the `Ledger` `runOnce` seeds this node with is resume-aware for
     * exactly this reason (`runOnce`'s own comment on the seed): a resumed tick never runs `Implement`, so its seed carries no
     * `Implement`-sized headroom for this node to spend against for free.
+    *
+    * Stays private after issue #68, and it was the other node that issue named as a plausible
+    * candidate, so the reason is worth stating here rather than only at `Gate`: `timeout =
+    * Timeout.After(implementNodeTimeoutSeconds(cfg))` reads `Config` at CONSTRUCTION time, which is
+    * exactly what `Gate` turned out not to do. There is no parameterless `val` shape for this node
+    * that keeps its declared bound, and the `def(cfg: Config)` shape it must keep is one a consumer
+    * COULD bind to their own top-level `val` and name in a `Plan`, which is exactly the problem: doing
+    * so would let a consumer's own `loop.scala` re express a knob `config.conf` owns (`Gate`'s own doc
+    * has both arguments in full).
     */
   private def Repair(cfg: Config): Node[RepairInput, StageVerdict] =
     Node(
@@ -1550,7 +1684,15 @@ object Machine:
     * `Node[ReviewInput, AgentDispatch.Judged[Verdict]]`, not `Node[ReviewInput, Verdict]` (issue #35
     * review finding 2): `runReview` already carries the token this far, so the node's own output type
     * says so too, rather than unwrapping with `.value` here and losing it one call earlier than it
-    * needs to be lost. No `cfg` parameter, unlike `Gate`: nothing in this node's body reads it.
+    * needs to be lost. No `cfg` parameter: nothing in this node's body reads one, the same fact that
+    * later let `Gate` become a parameterless `val` (issue #68).
+    *
+    * This node did NOT follow it there, and stays private, but not because `Plan.workflowOf` cannot
+    * reach it: a consumer could bind one read of this `def` to their own top-level `val`, the same
+    * workaround `AskHuman`'s own corrected doc describes for a `def(cfg: Config)` node, and that `val`
+    * would key exactly the way `Gate` does. It stays private on SCOPE alone: issue #68 deliberately
+    * widened one node, rather than every node whose body happens to read no `Config` (`Gate`'s own doc
+    * has the scope).
     */
   private def Review: Node[ReviewInput, AgentDispatch.Judged[Verdict]] =
     Node(
@@ -1782,14 +1924,14 @@ object Machine:
         // since `terminal` was untouched and ran only after the whole phase returned. Now `finish`
         // below IS this cycle's own terminal, and it does produce a real `LoopExit`, so the retry edge
         // can be a literal `Next.Goto` at last). `cycle(p, state)` builds and returns exactly one
-        // `Next.Goto(Gate(cfg), ...)` value; the repetition a `while` loop used to own happens instead
+        // `Next.Goto(Gate, ...)` value; the repetition a `while` loop used to own happens instead
         // when `Runner.run`'s own `@tailrec` walk later calls back into whichever `andThen` closure
         // this call built, which may itself call `cycle` again for the next pass. No stack frame from
         // THIS call survives that: `cycle` returns after constructing one value, so a chain of any
         // length is exactly as stack-safe as `Runner.run`'s own walk (`Kit.scala`'s doc on `run`).
         def cycle(p: Int, state: CycleState): Next =
           Next.Goto(
-            Gate(cfg),
+            Gate,
             GateInput(cur, issue, p),
             {
               case GateVerdict.Red(gateLog) =>
@@ -2254,13 +2396,13 @@ object Machine:
     Shape(
       entry = List(Implement(cfg), Repair(cfg)),
       transitions = List(
-        Transition(Implement(cfg), Gate(cfg)),
+        Transition(Implement(cfg), Gate),
         Transition(Implement(cfg), RouteDecision),
-        Transition(Gate(cfg), Repair(cfg)),
-        Transition(Gate(cfg), RouteDecision),
-        Transition(Repair(cfg), Gate(cfg)),
+        Transition(Gate, Repair(cfg)),
+        Transition(Gate, RouteDecision),
+        Transition(Repair(cfg), Gate),
         Transition(Repair(cfg), RouteDecision),
-        Transition(Gate(cfg), Review),
+        Transition(Gate, Review),
         Transition(Review, Repair(cfg)),
         Transition(Review, RouteDecision),
         Transition(RouteDecision, CommitAndPush),
@@ -2409,6 +2551,9 @@ object Machine:
     * `probe = _ => None`: a route is a fact about `outcome`/`isClass1`/`failureKind`, all already
     * decided by the time this node runs, never a stored position to rediscover (RFC #26 decision 6),
     * the same reasoning `Pick`'s own `probe` doc gives.
+    *
+    * Stays private after issue #68: this node routes on `Route`, a vocabulary that means something
+    * only to `shippedWorkflow`'s own edges, so nothing about it needs naming from outside them.
     */
   private val RouteDecision: Node[RouteInput, Route] =
     Node(
@@ -2753,12 +2898,37 @@ object Machine:
     * first one made public enough to notice it, and closing the gap for one node closes it for all of
     * them, since none of them needed anything AskHuman-specific to reach `LitterBox.graph`.
     *
-    * Public, unlike every sibling node in this file (`Gate`, `Repair`, `Review`, ..., all `private`
-    * or `private[litterbox]`): issue #44's own acceptance criterion 1 is that `AskHuman` is usable in
-    * a CONSUMER graph, outside this package entirely, and every sibling node stays `Machine`-internal
-    * because nothing about them needs proving, or naming, from outside `shippedWorkflow`'s own edges.
+    * Public, and, until issue #68, the ONLY public node in this file: issue #44's own acceptance
+    * criterion 1 is that `AskHuman` is usable in a CONSUMER graph, outside this package entirely.
     * `AskHumanInput`/`AskHumanReply` are public for the same reason: a consumer graph naming `AskHuman`
     * has to be able to name its input and output types too.
+    *
+    * An earlier version of this paragraph also claimed that every SIBLING node stays `Machine`
+    * internal, which issue #68 made false and this sentence replaces rather than leaves standing:
+    * `Gate` is public too now, along with `GateInput` and `GateVerdict`, and that node's own doc is
+    * where the decision, its scope (one node, not a blanket widening), the reason each remaining
+    * sibling stays private, and the 0.x promise the new names carry are all written down. Nothing
+    * about this node changed with it.
+    *
+    * The two public nodes differ in one shape a consumer notices immediately: `AskHuman` is still a
+    * `def(cfg: Config)`, `Gate` is a parameterless `val`. `KitMacro`'s own `isStablePathLink` declines
+    * to key a `def` call written INLINE, since a `def` body may build a fresh value per call and
+    * `Plan.workflowOf` links edges by reference identity, so writing `AskHuman(cfg)` directly inside a
+    * `Plan` literal does not compile. That is not the same claim as "this node cannot be composed
+    * through `LitterBox.graph`", and an earlier version of this paragraph said exactly that, which is
+    * false: binding the one call to a consumer's own top-level `val`, and naming THAT `val` in the
+    * `Plan`, is a stable path the macro keys the same way it keys `Gate`, and it does not look inside
+    * the `val`'s initialiser to see that a `Config` built it. `test/ConsumerAskHumanPlan.scala` is the
+    * real, separately compiled proof: it binds `AskHuman(Config())` to one top-level `val` and
+    * composes that `val` into a `Plan` handed to `LitterBox.graph`, from `com.example.consumer`, and
+    * it compiles clean. `RunnerSpec` still drives this node end to end, through `Runner.run`, from
+    * INSIDE `in.rcard.litterbox` itself, proving the node's own body genuinely runs;
+    * `ConsumerBoundarySpec`'s own `typeCheckErrors` snippet separately pins that `AskHuman`,
+    * `AskHumanInput` and `AskHumanReply` can be NAMED from `com.example.consumer`. `Gate` is a `val`
+    * so a consumer never has to take the extra bind-to-a-`val` step at all, not because the step makes
+    * the node unusable, and this node was NOT reshaped to match: dropping a parameter is a source
+    * breaking change for whoever issue #44 already shipped this signature to, and issue #68's own
+    * scope is which nodes BECOME public, not re cutting the one that already was.
     */
   def AskHuman(cfg: Config): Node[AskHumanInput, AskHumanReply] =
     Node(
@@ -2788,6 +2958,12 @@ object Machine:
     * guard against: a resumed tick only ever reaches this node after `Implement`/`Repair` produced a
     * FRESH cumulative patch, so a second commit here is simply THIS iteration's own commit, never a
     * replay of an earlier one.
+    *
+    * Stays private after issue #68: unlike `Gate` this node PUBLISHES outward, a real `git push`, and
+    * every shipped node carries `Guard.Open` because no shipped input type extends
+    * `RequiresReviewInput` (`Gate`'s own doc has why adding the marker to fix that is the poisonous
+    * fix rather than the missing one), so a public node here is one a consumer could wire onto a path
+    * no reviewer ever crosses.
     */
   private val CommitAndPush: Node[CommitPushInput, Unit] =
     Node(
@@ -2913,6 +3089,12 @@ object Machine:
     * node's own probe/adoption logic above is what actually stands between an unattended run and a
     * bad PR body on this route; `Runner.validate`'s reachability check is simply not the tool for
     * that job here.
+    *
+    * Stays private after issue #68, and this node is the clearest case of why the widening was one
+    * node rather than a family: everything the paragraphs above say about a guard that cannot honestly
+    * be declared on this node in THIS shape applies unchanged to a consumer's shape, where the
+    * legitimate rejection paths that justify `Guard.Open` here do not exist and nothing would stand
+    * between an unreviewed patch and a published PR.
     */
   private val OpenPr: Node[OpenPrInput, Int] =
     Node(
@@ -3024,6 +3206,9 @@ object Machine:
     * for, and a green-then-resumed one must be re-watched, never adopted from stale memory. The same
     * reasoning about WHAT removes `in-progress`, but not this same conclusion, is relevant to
     * `PostMergeCleanup` below; see that node's own doc for why its own gap is different in kind.
+    *
+    * Stays private after issue #68: it is downstream of review, which that issue puts out of scope
+    * outright, and nothing about it needs naming from outside `shippedWorkflow`'s own edges.
     */
   private val CiWait: Node[CiWaitInput, Unit] =
     Node(
@@ -3107,6 +3292,11 @@ object Machine:
     * limit of the cheap half is stated for good, so it does not get silently rediscovered a second
     * time. `Guard.RequiresReview` remains real and tested for a graph whose merge node genuinely has
     * no other, legitimate way in.
+    *
+    * Stays private after issue #68, for the reason the paragraph above already spells out at length:
+    * this node merges, the guard that would make it safe to hand to an arbitrary consumer graph cannot
+    * be declared on it in the shipped shape without the shipped shape rejecting itself, and a public
+    * node with `Guard.Open` is a node a consumer may wire onto a path no reviewer crosses.
     */
   private val Merge: Node[MergeInput, Unit] =
     Node(
@@ -3168,6 +3358,9 @@ object Machine:
     * the kind of signature this file's own guidance (RFC #26, "if your design needs ... say so and
     * stop rather than widening") warns against forcing in; it just is not the reason a second visit
     * cannot happen.
+    *
+    * Stays private after issue #68: downstream of review, out of that issue's scope outright, and
+    * nothing needs naming it from outside `shippedWorkflow`'s own edges.
     */
   private val PostMergeCleanup: Node[PostMergeCleanupInput, Unit] =
     Node(

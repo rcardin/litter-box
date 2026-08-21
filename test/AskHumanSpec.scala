@@ -5,8 +5,8 @@ import org.scalatest.matchers.should.Matchers
 
 /** `Machine.AskHuman` in isolation (issue #44): the one node in `Machine.scala` proven directly
   * against `Runner.step`, rather than only indirectly through `Machine.shippedWorkflow`'s own edges
-  * the way every sibling node (`Gate`, `Repair`, `Review`, ...) is (`RunnerSpec`'s own doc explains
-  * why those stay untested in isolation). This file's job is the acceptance criteria issue #44 states
+  * the way every other node in that file (`Implement`, `Repair`, `Review`, ...) is (`RunnerSpec`'s
+  * own doc explains why those stay untested in isolation). This file's job is the acceptance criteria issue #44 states
   * about the node itself: a probe hit never runs `askHumanRun` (no second comment, no budget spent)
   * and hands the reply TEXT onward, a probe miss posts the question and parks, a `gh` read failure is
   * never silently read as "no reply" NOR silently acted on as one by posting a marker over a reply the

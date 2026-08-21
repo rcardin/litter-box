@@ -183,6 +183,75 @@ class ConsumerBoundarySpec extends AnyFlatSpec with Matchers:
       errors shouldBe empty
     }
 
+  it should "refuse to typecheck a foreign package naming any shipped node issue #68 deliberately " +
+    "left private, or the shipped graph's own whole values" in {
+    // The other half of issue #68's decision, and the half a positive proof cannot state: the answer
+    // was ONE node, not a blanket widening, so every node the decision left private has to still BE
+    // private. `Machine.Gate`'s own scaladoc records the reason for each of these; this is the pin
+    // that the reasons still match the code. One snippet rather than twelve because `typeCheckErrors`
+    // takes a statically known string and collects every error it finds, so the count below is what
+    // makes this a pin on ALL of them rather than on whichever one the compiler happens to report
+    // first.
+    val errors = scala.compiletime.testing.typeCheckErrors(
+      """
+        |import in.rcard.litterbox._
+        |
+        |val a = Machine.Repair(Config())
+        |val b = Machine.Implement(Config())
+        |val c = Machine.Review
+        |val d = Machine.OpenPr
+        |val e = Machine.Merge
+        |val f = Machine.CommitAndPush
+        |val g = Machine.RouteDecision
+        |val h = Machine.CiWait
+        |val i = Machine.PostMergeCleanup
+        |val j = Machine.Pick
+        |val k = Machine.shippedStages
+        |val l = Machine.shippedShape(Config())
+        |""".stripMargin
+    )
+
+    errors.size shouldBe 12
+    val messages = errors.map(_.message).mkString("\n")
+    List(
+      "Repair",
+      "Implement",
+      "Review",
+      "OpenPr",
+      "Merge",
+      "CommitAndPush",
+      "RouteDecision",
+      "CiWait",
+      "PostMergeCleanup",
+      "Pick",
+      "shippedStages",
+      "shippedShape"
+    ).foreach { name =>
+      withClue(s"$name is reachable from com.example.consumer: ") { messages should include(name) }
+    }
+  }
+
+  it should "typecheck a foreign package naming Machine.Gate, Machine.GateInput and " +
+    "Machine.GateVerdict, the one shipped node issue #68 opened" in {
+    // The naming half of issue #68's acceptance criterion 1, kept next to the negative pin above so
+    // the two are read together. `test/ConsumerShippedNodes.scala` is the real, separately compiled
+    // proof that this node COMPOSES into a `Plan`, which TEST.md records a snippet can never stand in
+    // for; this snippet is narrower on purpose, pinning only that the three names resolve from a
+    // package this library does not own.
+    val errors = scala.compiletime.testing.typeCheckErrors(
+      """
+        |import in.rcard.litterbox._
+        |
+        |val gate: Node[Machine.GateInput, Machine.GateVerdict] = Machine.Gate
+        |val input = Machine.GateInput(Machine.Cursor(), issue = 1, pass = 1)
+        |val verdicts: List[Machine.GateVerdict] =
+        |  List(Machine.GateVerdict.Green, Machine.GateVerdict.Red("logs/issue-1-pass1.gate.log"))
+        |""".stripMargin
+    )
+
+    errors shouldBe empty
+  }
+
   it should "refuse to typecheck a consumer constructing LiveAgentDispatch directly" in {
     // Round three finding 2: `LiveAgentDispatch` (`src/Live.scala`) used to be a public class with a
     // public constructor, so a consumer needed no implementation of `AgentDispatch` at all, only the
