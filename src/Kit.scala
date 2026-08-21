@@ -39,7 +39,7 @@ import scala.util.boundary
 // both gone, folded into `Machine.shippedWorkflow`, one `Workflow[Machine.ShippedStart]` value built
 // from this file's own public shapes (`Node`, `Next.Goto`, `Next.Finish`, `Workflow`) and
 // walked by `Runner.run`. The former hand-recursion (`runCycle`, described above) becomes a plain
-// function, `cycle`, that builds one real `Next.Goto(Gate(cfg), ...)` value and returns; the
+// function, `cycle`, that builds one real `Next.Goto(Gate, ...)` value and returns; the
 // repetition a `while` loop, then a recursion, used to own now happens because `Runner.run`'s own
 // `@tailrec` walk calls back into whichever `andThen` closure that value carries, which may itself
 // call `cycle` again. `RouteDecision` through `PostMergeCleanup` fold into the SAME graph, ending in a
@@ -1337,7 +1337,7 @@ object Runner:
     *     same name silently merge their edges and inherit whichever instance a given walk happened
     *     to reach first (issue #38 review finding 6). `name` ALONE is deliberately not enough to
     *     call two `Node` values duplicates, though: `Machine.shippedWorkflow` legitimately declares
-    *     the same conceptual node (`Gate(cfg)`, say) more than once across its own
+    *     the same conceptual node (`Repair(cfg)`, say) more than once across its own
     *     `entry`/`transitions`, and every one of those calls builds a fresh `Node` with fresh
     *     `probe`/`run` closures that are never `==` to one another (functions compare by reference,
     *     not by behaviour), comparing on the closures would flag that legitimate, load-bearing

@@ -388,7 +388,7 @@ class GraphValidationSpec extends AnyFlatSpec with Matchers:
   }
 
   it should "not flag two declarations sharing a name as duplicates when they agree on cost, timeout, trust and guard" in {
-    // `Machine.shippedWorkflow` legitimately declares the same conceptual node (`Gate(cfg)`, say)
+    // `Machine.shippedWorkflow` legitimately declares the same conceptual node (`Repair(cfg)`, say)
     // more than once across its own entry/transitions; each call builds a fresh, non-`==` `Node`
     // value. This is the positive control for the duplicate-name check just below: reusing a name
     // for the SAME conceptual node must never be flagged.

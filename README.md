@@ -277,7 +277,9 @@ RFC #26 decision 16 records "graphs cannot be assembled dynamically" as a delibe
 this whole compile-time route, not an oversight left for a later issue. Read the config value you need
 inside the node's own `probe`/`run` body instead (both already receive an ambient `Config`, derivable
 from the `Caps` every node body is handed), behind one plain, top-level `val` standing for the node,
-rather than a `def` that builds a differently configured `Node` per call. A few more forms read like
+rather than a `def` that builds a differently configured `Node` per call. `Machine.Gate`, one of the two
+shipped nodes this library exposes for your own graph to compose, is written that way for exactly this
+reason. A few more forms read like
 something on the readable list above but are not. An `export`ed member (`export Source.*`) reads like
 an `object` member at the call site but is a compiler-synthesised `def` forwarder, never a `val`, so it
 is unreadable for the identical reason a `def`-built node is; refer to the original `val` on `Source`
@@ -312,9 +314,40 @@ stashed value back and call a capability through it, a real dispatch, running ou
 result: every `Judged` obtained this way was minted honestly by a real dispatch, only outside the
 accounting a same-tick capability call would have gone through.
 
+**Composing a shipped node.** Your graph does not have to be built entirely out of your own nodes.
+`Machine.Gate`, the shipped pipeline's own FAST gate, is public and is an ordinary `val`, so a `Plan`
+literal can name it exactly like one of yours:
+
+```scala
+Edge.To(MyStart, Machine.Gate, (i: Machine.GateInput) => Some(i)),
+Edge.To(Machine.Gate, MyRepair, { case Machine.GateVerdict.Red(log) => Some(log); case _ => None }),
+Edge.To(Machine.Gate, MyReview, { case Machine.GateVerdict.Green => Some(()); case _ => None })
+```
+
+It stages the working tree, runs your configured `gate.cmd` in the sandbox, logs the verdict and hands
+you back `Machine.GateVerdict.Green` or `Machine.GateVerdict.Red(gateLogPath)`. A gate TIMEOUT never
+arrives as a value: it is an infra fault and short circuits the tick, which is why the verdict type is
+its own two case enum rather than the three case `GateResult`. Three things to know before you wire it
+in. You build the `Machine.GateInput`, and it carries a `Machine.Cursor` whose `iter`, `issue`, `pass`
+and `budget` fields are copied verbatim into every `status.jsonl` event this node emits, so leaving
+`issue` empty or `iter` at zero quietly degrades `litter-box watch`; `pass` is also what the gate log
+filename is built from, so two gate runs sharing a `pass` overwrite one another's log. The node emits
+the phase string `FAST_GATE`, which only the shipped pipeline's own stage set declares, so unless your
+`stages` argument declares a `Stage("FAST_GATE", ...)` of its own the events are written but the banner
+draws no chip for them. And it carries no review guard, because it publishes nothing outward: it is
+safe to place anywhere in your graph, unlike the shipped nodes that open PRs or merge, which is exactly
+why it is one of the two shipped nodes that are public, the other being `Machine.AskHuman`, a needs-human
+parking step made public by issue #44 before this one. `Machine.Gate`'s own scaladoc records the full
+decision, including why every other shipped node stays private.
+
 This whole surface sits under the same `0.x` no-stability-promise policy as everything else in this
 project (see [Version policy](#version-policy) above): pin an exact version if a shape change landing
-under you would be a problem.
+under you would be a problem. That covers `Machine.Gate`, `Machine.GateInput` and
+`Machine.GateVerdict` too, on exactly the same terms and with no extra promise attached to them for
+being lifted out of the shipped pipeline. What IS promised for as long as those names exist is what
+they mean, not their shape: a gate timeout stays an infra fault and never becomes a `GateVerdict` case,
+the node never publishes outward, and it reads your `config.conf` per tick rather than at the moment
+your graph is built.
 
 **A full worked graph, compiled and walked by this repo's own suite.**
 [`test/ReviewFixLoopExample.scala`](test/ReviewFixLoopExample.scala) is a complete consumer
