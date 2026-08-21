@@ -193,7 +193,7 @@ configuration**, so they live under `resources/` and travel inside the jar
   "refused" value: a value would be a channel from the runner back INTO a node, letting it probe the
   counter it must not see, and on the review path anything returned would be an `AgentDispatch.Judged`
   minted with no cold session behind it (decision 7), a strictly worse failure than the overspend.
-  Pre emptive TIMEOUT interruption was considered in the same issue and declined, with the reasons
+  Pre-emptive TIMEOUT interruption was considered in the same issue and declined, with the reasons
   recorded on `Timeout.After` and `Runner.step`: the real bound already sits at the subprocess
   boundary, an interrupted node leaves the world half written where a killed child does not, and node
   bodies write unsynchronised shared state that a second thread would make concurrent. `startInput` itself is

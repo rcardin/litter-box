@@ -225,11 +225,12 @@ class RunnerSpec extends AnyFlatSpec with Matchers:
   it should "fault, not park, an honest Cost.OneDispatch node whose probe itself dispatches on an empty ledger" in {
     // `canAfford` only ever runs on the probe-miss branch, after `probe` has already returned
     // (`Runner.step`'s own doc), so a node whose `probe` dispatches reaches the charging decorator
-    // before that gate is ever consulted. `Cost.OneDispatch` still promises the node may START (the
-    // ledger here is exhausted, not merely tight), it is silent on a probe that spends on its way to
-    // answering `Some`/`None`, and the decorator refuses that spend exactly like any other real
-    // dispatch: rc 50 through the fault channel, never `LoopExit.Parked`, whatever `Cost` the node
-    // declared (`canAfford`'s own doc).
+    // before that gate is ever consulted. On this ledger `canAfford(Cost.OneDispatch)` is false, so
+    // the park it buys is exactly what the node would have got had its `probe` missed without
+    // spending; declaring the `Cost` honestly cannot save a probe that dispatches, because the gate
+    // that honours the declaration comes after `probe` returns. The decorator refuses that spend
+    // exactly like any other real dispatch: rc 50 through the fault channel, never `LoopExit.Parked`,
+    // whatever `Cost` the node declared (`canAfford`'s own doc).
     val world  = new TestWorld
     val clock  = new FakeClock(List(0L))
     val ledger = Runner.Ledger(0)

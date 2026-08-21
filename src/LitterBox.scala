@@ -45,17 +45,22 @@ package in.rcard.litterbox
   * "Owns budget accounting" means the runner holds the counter AND bounds every spend against it.
   * Those were two different promises until issue #69, and a consumer author reading only this trait's
   * doc should not have to discover the difference for themselves, so both checks are named here.
-  * `Runner.Ledger.canAfford` (`Kit.scala`) runs once, before a node's own `probe`/`run` starts, and
-  * decides whether a node declaring `Cost.OneDispatch` may START at all. Then every real dispatch any
+  * `Runner.Ledger.canAfford` (`Kit.scala`) runs once per tick, on the probe miss branch of
+  * `Runner.step`, after a node's own `probe` has already executed and before its `run` starts, and
+  * decides whether a node declaring `Cost.OneDispatch` may START its `run` at all. Then every real dispatch any
   * node makes, from `probe` or `run`, whatever `Cost` it declared, is metered at the capability
   * itself, by the decorator `Runner.step` wraps `Caps.agents` in, and refused as an infra fault once
   * nothing is left. So `dispatchBudget` bounds the TOTAL dispatches a graph's own nodes can make in
   * one tick: a `Cost.NoDispatch` node that dispatches under `dispatchBudget = _ => 0` faults instead
   * of spending freely, and a node that dispatches twice against a budget of one is refused the
   * second. What a `Cost` still decides is the SHAPE of the refusal, which is reason enough to declare
-  * it honestly: an honest `Cost.OneDispatch` node the ledger cannot afford is PARKED before it runs
-  * at all, a resumable terminal that leaves the world untouched, where a misdeclared one is faulted
-  * partway through whatever its body had already begun. `Runner.Ledger`'s own doc (`Kit.scala`) has
+  * it honestly: an honest `Cost.OneDispatch` node whose `probe` answers `None` without itself
+  * dispatching, and whose `run` the ledger then cannot afford, is PARKED before that `run` starts, a
+  * resumable terminal that leaves the world untouched, where a misdeclared one is faulted partway
+  * through whatever its body had already begun. The park covers `run` only. A node whose own `probe`
+  * dispatches is metered at the capability like any other real dispatch, so on an empty ledger it
+  * faults, rc 50, however honest its `Cost`, and whatever that `probe` did before the dispatch call
+  * has already happened. `Runner.Ledger`'s own doc (`Kit.scala`) has
   * the mechanism.
   */
 sealed trait LoopGraph:

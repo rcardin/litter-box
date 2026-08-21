@@ -197,8 +197,9 @@ author not to do rather than something it makes impossible. `LitterBox.graph`'s 
 (`src/LitterBox.scala`) states this once; nothing here restates it further.
 
 Precisely what `dispatchBudget` bounds, stated exactly: it is a hard ceiling on the TOTAL dispatches
-your graph's nodes may make in one tick, and it is enforced in two places. Before a node starts, a
-node declaring `Cost.OneDispatch` is refused, and the tick parks, if nothing is left. Then every real
+your graph's nodes may make in one tick, and it is enforced in two places. Before a node's `run`
+starts, on the branch where its `probe` answered `None`, a node declaring `Cost.OneDispatch` is
+refused, and the tick parks, if nothing is left. Then every real
 `agents.*` call any node makes, from `probe` or from `run`, whatever `Cost` that node declared, is
 charged at the capability itself and REFUSED once the counter is empty, as an infra fault (rc 50) that
 never reaches the agent. So `dispatchBudget = _ => 0` stops a `Cost.NoDispatch` node from dispatching
@@ -213,9 +214,13 @@ on the review path there is no value to catch your way back to at all: a refusal
 cold dispatch behind it.
 
 Declaring `Cost` honestly still matters, and now for a sharper reason than tidiness: `Cost` decides
-the SHAPE of the refusal. An honest `Cost.OneDispatch` node the budget cannot afford is parked before
-it runs at all, a resumable terminal that leaves the world untouched. A node that declares
-`Cost.NoDispatch` and dispatches anyway is faulted partway through whatever its body already did.
+the SHAPE of the refusal. An honest `Cost.OneDispatch` node whose `probe` answers `None` without
+itself dispatching, and whose `run` the budget then cannot afford, is parked before that `run` starts,
+a resumable terminal that leaves the world untouched. A node that declares `Cost.NoDispatch` and
+dispatches anyway is faulted partway through whatever its body already did. The park covers `run`
+only: a node whose own `probe` dispatches is charged at the capability like any other real dispatch,
+so on an empty budget it faults (rc 50) however honest its `Cost`, and whatever that `probe` did on
+its way to the dispatch call has already happened.
 Declare `Cost.OneDispatch` on every node that dispatches, size `dispatchBudget` for the dispatches
 your nodes really make, and the budget behaves exactly like the ceiling it looks like.
 
