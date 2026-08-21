@@ -191,7 +191,9 @@ object LitterBox:
     * classpath can mint an `AgentDispatch.Judged` out of a scripted fake and clear
     * `Guard.RequiresReview` with it: `src/Caps.scala`'s fourth guarantee paragraph states that
     * residual in full, and it is the reason the fakes ship as their own artifact rather than inside
-    * the library jar everyone already depends on.
+    * the library jar everyone already depends on. Starting the loop with the testkit reachable in
+    * the JVM is refused outright since issue #71 (`Main.refuseTestkitOnClasspath`), which catches
+    * this rule written the wrong way round and nothing else.
     */
   val TestkitCoordinate: String = s"in.rcard::litter-box-testkit:$Version"
 

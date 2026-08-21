@@ -285,9 +285,18 @@ rather than a packaging preference. `TestWorld` satisfies `AgentDispatchImpl` fr
 scripted fake, which then clears `Guard.RequiresReview` at both the `LitterBox.graph` macro and
 `Runner.step`'s runtime class check, because the token is real. There is no type level defence: a
 testkit that could not mint could not drive a review node, which is the thing a node author most needs
-to test. Artifact scoping is the whole control. `src/Caps.scala`'s `AgentDispatch` doc states the
-residual in full and `test/TestkitBoundarySpec.scala` reproduces it from a foreign package, so it
-fails the day the claim stops being true. `docs/maven-central-setup.md` covers the release mechanics,
+to test. Artifact scoping is the control, and since issue #71 a startup check backs it: the loop branch
+of `Main.dispatch`, the one door `lb` and `LitterBox.run` share, calls
+`Main.refuseTestkitOnClasspath` before any node runs and ends startup at rc 1 when
+`in.rcard.litterbox.TestWorld` is loadable in the JVM about to start. Only that branch, so `init`,
+`eject`, `watch`, `tail` and `help` still work in the repository whose declaration is being fixed.
+The decision is a pure function over a class lookup passed in, because this repository compiles
+`test/` beside `src/` and could not otherwise assert the refusing answer without ending the suite's
+own JVM. It detects the `dep` written where `test.dep` was meant and nothing beyond it: a renamed or
+shaded testkit passes, and so does production code that calls `TestWorld` without going through
+startup. `src/Caps.scala`'s `AgentDispatch` doc states the residual in full and
+`test/TestkitBoundarySpec.scala` reproduces it from a foreign package, so it fails the day the claim
+stops being true. `docs/maven-central-setup.md` covers the release mechanics,
 including why the testkit compiles against a locally staged library before anything reaches Central.
 
 ### The log contract
