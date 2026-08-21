@@ -168,7 +168,15 @@ trait Git:
   def commit(message: String): Unit
   def push(branch: String): Unit
 
-/** Worker/fixer/reviewer dispatch outcome: the only bit the loop reads is rc==124. */
+/** Worker/fixer/reviewer dispatch outcome: the only bit the loop reads is rc==124.
+  *
+  * Both cases describe a subprocess that actually RAN, and issue #69 deliberately did not add a third
+  * meaning "the runner refused this dispatch, the budget is empty". A refusal is not an outcome a node
+  * gets to read: it raises an infra fault inside `Runner.charging` (`Kit.scala`, that method's own doc
+  * has both reasons, the decisive one being that `review` below is the only minter of `Judged`, so a
+  * refusal that RETURNED anything on that path would mint a trust token with no cold session behind
+  * it).
+  */
 enum DispatchOutcome:
   case Done
   case TimedOut

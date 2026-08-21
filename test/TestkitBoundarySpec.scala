@@ -298,7 +298,7 @@ class TestkitBoundarySpec extends AnyFlatSpec with Matchers:
           Edge.Exit(Guarded, _ => Some(LoopExit.Success))
         )
       ),
-      dispatchBudget = _ => 0,
+      dispatchBudget = _ => 1,
       startInput = _ => ()
     )
 
@@ -333,7 +333,12 @@ class TestkitBoundarySpec extends AnyFlatSpec with Matchers:
 
   private val ForgedReview: Node[Unit, AgentDispatch.Judged[Unit]] = Node(
     name = "ForgedReview",
-    cost = Cost.NoDispatch,
+    // `Cost.OneDispatch`, and a budget of one on the graph below, since issue #69: this node really
+    // does dispatch, and the runner now meters every dispatch at the capability rather than trusting
+    // the declared `Cost`, so a node declaring `NoDispatch` while dispatching is refused rc 50. The
+    // residual this test pins is about WHO may mint a `Judged`, not about spending, and it is pinned
+    // exactly as it was once the graph declares its own dispatch honestly.
+    cost = Cost.OneDispatch,
     timeout = Timeout.Unbounded,
     probe = _ => None,
     run = _ =>

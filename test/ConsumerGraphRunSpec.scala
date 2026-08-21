@@ -225,21 +225,20 @@ class ConsumerGraphRunSpec extends AnyFlatSpec with Matchers:
     )
   }
 
-  // ---- 15: dispatchBudget bounds Cost.OneDispatch STARTS, not total spend (issue #43 review round ----
-  // ---- 2, MAJOR M2): a Cost.NoDispatch node dispatching under dispatchBudget = _ => 0 still ----------
-  // ---- completes, pinning the documented residual rather than leaving it only asserted in prose ------
+  // ---- 15: dispatchBudget bounds TOTAL SPEND, not only how many Cost.OneDispatch nodes may START ----
+  // ---- (issue #69, RFC #26 decision 9): the runner meters every dispatch AT the capability, so a -----
+  // ---- Cost.NoDispatch node that dispatches anyway is refused rather than let through ----------------
 
-  it should "let a Cost.NoDispatch node dispatch through AgentDispatch even when dispatchBudget declares zero, pinning the documented residual that dispatchBudget bounds Cost.OneDispatch starts, never total spend" in {
-    // This is NOT an endorsement of the behaviour it pins, and it is not a bug this branch left
-    // unfixed either: `Runner.Ledger.canAfford(Cost.NoDispatch)` is unconditionally `true`
-    // (`Kit.scala`), checked once, before this node's own `run` starts, and nothing inside `run`
-    // consults the ledger again, so a node that DECLARES `Cost.NoDispatch` while its own body actually
-    // calls `agents.*` spends outside the budget entirely, regardless of what `dispatchBudget` returns.
-    // `LoopGraph`'s own trait doc (`src/LitterBox.scala`) and `README.md`'s "Write your own loop"
-    // section both name this residual and the reason a stricter, mid-node-enforced ledger was
-    // deliberately not attempted on this branch (it would move the shipped graph's own golden-log-pinned
-    // budget-exhaustion behaviour). This test exists so that residual is a checked fact, not only a
-    // claim in prose that could quietly stop being true.
+  it should "refuse at the capability the dispatch a Cost.NoDispatch node makes under dispatchBudget = _ => 0, so a misdeclared Cost cannot buy budget the graph never declared" in {
+    // This used to pin the opposite fact, and named it a documented residual: `canAfford` answers
+    // `true` unconditionally for `Cost.NoDispatch` and runs once, before `run` starts, so a node
+    // declaring `Cost.NoDispatch` while its body actually dispatches used to spend outside the budget
+    // entirely. Issue #69 closed that against decision 9's own promise, at the only place that can
+    // see a real dispatch rather than a claim about one: `Runner.charging`, the decorator wrapping
+    // `Caps.agents`, now asks the ledger BEFORE delegating and faults when nothing is left. `Cost` is
+    // therefore an assertion the runner checks at every dispatch, not a declaration it trusts, and
+    // the refusal is loud: rc 50 through the same `Machine.infraFault` channel as every other fault,
+    // never a value the node's own body could read and branch on.
     val misdeclared = Node[Unit, Unit](
       name = "Misdeclared",
       cost = Cost.NoDispatch,
@@ -250,7 +249,7 @@ class ConsumerGraphRunSpec extends AnyFlatSpec with Matchers:
         NodeOutcome.Done(())
     )
     val myGraph = LitterBox.graph(
-      name = "consumer-nodispatch-residual",
+      name = "consumer-nodispatch-refused",
       plan =
         Plan(entry = misdeclared, edges = List(Edge.Exit(misdeclared, _ => Some(LoopExit.Success)))),
       dispatchBudget = _ => 0,
@@ -260,8 +259,12 @@ class ConsumerGraphRunSpec extends AnyFlatSpec with Matchers:
     val world = new TestWorld
     val exit  = runOnce(world, myGraph)
 
-    exit shouldBe LoopExit.Success
-    world.callCount("dispatch IMPL") shouldBe 1
+    exit shouldBe LoopExit.InfraFault
+    world.callCount("dispatch IMPL") shouldBe 0
+    // Loud, not merely stopped: the operator gets the fault line naming the node and what it tried
+    // to dispatch, plus the rc 50 notification every other infra fault in this loop fires.
+    world.logLines should contain(Runner.refusedDispatchMessage("Misdeclared", "IMPL"))
+    world.notifications should not be empty
   }
 
   // ---- 16: issue #67, the single representation: the graph below names each edge in exactly one ------

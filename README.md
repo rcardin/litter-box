@@ -196,20 +196,33 @@ the one way a budget number can still land in `loop.scala` instead, something de
 author not to do rather than something it makes impossible. `LitterBox.graph`'s own scaladoc
 (`src/LitterBox.scala`) states this once; nothing here restates it further.
 
-Precisely what `dispatchBudget` bounds, stated exactly rather than left to sound like a hard spending
-cap: it bounds how many `Cost.OneDispatch` nodes may START. A node that goes on to dispatch MORE than
-once inside its own `run`/`probe` (any node can call `agents.*` more than once; nothing enforces "one
-`Cost.OneDispatch` node, one dispatch") is charged once per real dispatch, not stopped mid-node once the
-budget reaches zero; the runner notices only at the START of the NEXT node, which is refused if nothing
-is left. And a node declaring `Cost.NoDispatch` is never gated by this budget at all, at any point,
-regardless of how many times it actually dispatches: `dispatchBudget = _ => 0` does not stop a
-`Cost.NoDispatch` node from dispatching freely. This is a documented residual, not a bug your graph can
-route around by accident and not one worth chasing on this branch: making the runner's own `charging`
-decorator refuse mid-node once the ledger is exhausted would change the shipped pipeline's own behaviour
-on exactly the budget-exhaustion paths its golden log tests pin (see [ARCHITECTURE.md](ARCHITECTURE.md)
-for the fuller reasoning and why it is left to its own issue). Declare `Cost.OneDispatch` honestly on
-every node that dispatches, and keep dispatch calls to one per node, if you want `dispatchBudget` to be
-the ceiling it looks like.
+Precisely what `dispatchBudget` bounds, stated exactly: it is a hard ceiling on the TOTAL dispatches
+your graph's nodes may make in one tick, and it is enforced in two places. Before a node's `run`
+starts, on the branch where its `probe` answered `None`, a node declaring `Cost.OneDispatch` is
+refused, and the tick parks, if nothing is left. Then every real
+`agents.*` call any node makes, from `probe` or from `run`, whatever `Cost` that node declared, is
+charged at the capability itself and REFUSED once the counter is empty, as an infra fault (rc 50) that
+never reaches the agent. So `dispatchBudget = _ => 0` stops a `Cost.NoDispatch` node from dispatching
+at all, and a node that dispatches three times against a budget of one gets one dispatch and a fault,
+not three dispatches and a silent overspend. A refusal is signalled as an infra fault, not a value
+your node's own code can pattern match on, but the fault itself travels through `boundary.break`, an
+ordinary `RuntimeException` underneath, so a node body that wraps its own dispatch call in a broad
+catch can still observe the refusal and keep running past it rather than the tick abandoning outright.
+What a catch can never recover is the dispatch itself, refused before it ever reaches the agent, and
+on the review path there is no value to catch your way back to at all: a refusal there raises before
+`AgentDispatch.review` ever mints, so `AgentDispatch.Judged` stays impossible to obtain without a real
+cold dispatch behind it.
+
+Declaring `Cost` honestly still matters, and now for a sharper reason than tidiness: `Cost` decides
+the SHAPE of the refusal. An honest `Cost.OneDispatch` node whose `probe` answers `None` without
+itself dispatching, and whose `run` the budget then cannot afford, is parked before that `run` starts,
+a resumable terminal that leaves the world untouched. A node that declares `Cost.NoDispatch` and
+dispatches anyway is faulted partway through whatever its body already did. The park covers `run`
+only: a node whose own `probe` dispatches is charged at the capability like any other real dispatch,
+so on an empty budget it faults (rc 50) however honest its `Cost`, and whatever that `probe` did on
+its way to the dispatch call has already happened.
+Declare `Cost.OneDispatch` on every node that dispatches, size `dispatchBudget` for the dispatches
+your nodes really make, and the budget behaves exactly like the ceiling it looks like.
 
 `plan` above has to be written exactly like that, a literal `Plan(entry = ..., edges = ...)`
 expression right at this call site, never a `val` you build first and pass by name. `LitterBox.graph`

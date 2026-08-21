@@ -44,7 +44,8 @@ object Script:
   * actually needs to assert on and the outcome alone cannot answer it: a node declaring
   * `Cost.OneDispatch` that never dispatches, and one that dispatches three times, both return the
   * same `Done`, and only the counter tells them apart (`Runner.Ledger`'s own doc: the declared `Cost`
-  * is a ceiling on STARTING, the real charge happens per real dispatch).
+  * decides whether a node may START, while every real dispatch is charged, and refused once nothing
+  * is left, at the capability itself).
   *
   * `remainingDispatches` is a plain `Int`, named exactly after `Runner.Ledger.remainingDispatches`
   * and read off the very ledger the run used, never the ledger itself. That is the whole reason this
