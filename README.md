@@ -392,8 +392,16 @@ purpose, so its `agents` really is an `AgentDispatch` and `world.agents.review(.
 an `AgentDispatch.Judged`, out of a scripted fake with no reviewer behind it. That value clears
 `Guard.RequiresReview` at both gates, because it is not an imitation of a trust token, it is one. On a
 test classpath that is the entire point, running against a fake world is what you asked for. On your
-main compile classpath it is a review you forged for yourself, and nothing in this library can detect
-it or refuse it. `src/Caps.scala`'s `AgentDispatch` scaladoc states this residual in full.
+main compile classpath it is a review you forged for yourself.
+
+Starting the loop with the testkit reachable is refused. `lb` and `LitterBox.run` both check, on the
+loop subcommand only, whether the testkit is loadable in the JVM about to run; if it is, startup logs
+a `FATAL` naming this rule and exits 1, before any node runs. `init`, `eject`, `watch`, `tail` and
+`--help` are untouched, so the commands you need in order to fix the declaration keep working. Read
+that check for what it is: it catches `dep` written where `test.dep` was meant, and nothing more. A
+renamed or shaded copy of the testkit passes it, and so does your own production code calling
+`TestWorld` directly instead of starting the loop. `src/Caps.scala`'s `AgentDispatch` scaladoc states
+the residual in full.
 
 **The version pairing.** The testkit and the library are released together from one tag and pin to
 each other exactly. Unlike `LitterBox.graph`, the testkit hands you the capability traits themselves,

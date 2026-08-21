@@ -243,7 +243,19 @@ enum DispatchOutcome:
   * `//> using test.dep in.rcard::litter-box-testkit:<version>` puts them on the test classpath only,
   * where running against a fake world is the whole intent; a consumer who writes `dep` instead of
   * `test.dep` has put the mint on their production compile classpath and hands themselves a forged
-  * review. Nothing in this library can detect that or refuse it. README's Testkit section and
+  * review.
+  *
+  * That mistake is now DETECTED, at the one point a run can look at its own classpath:
+  * `Main.refuseTestkitOnClasspath`, wired into the loop branch of `Main.dispatch` (issue #71), asks
+  * whether `in.rcard.litterbox.TestWorld` is loadable in the JVM about to start the loop, and if it
+  * is, startup ends at rc 1 with a message naming the `test.dep` rule, before any node has run.
+  * What that check is NOT, said here so the paragraph above is not read as closed: it detects the
+  * honest misconfiguration and defends against nothing. It asks about one class name, so a shaded,
+  * relocated or renamed testkit passes it unnoticed. It sits on the supported startup door, so a
+  * consumer whose production code holds a `TestWorld` and calls `world.agents.review(...)` or
+  * `TestWorld.runGraph` itself never reaches it. And it leaves the other three parts of this
+  * guarantee exactly where they were. Artifact scoping is still the control; this is the tripwire
+  * on the way a consumer most plausibly gets it wrong. README's Testkit section and
   * `LitterBox.TestkitCoordinate`'s own scaladoc repeat the `test.dep` rule at the two other points a
   * reader meets the artifact.
   */

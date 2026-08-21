@@ -410,9 +410,29 @@ object Main:
 
   // ---- fatal preflight die() (loop.sh:142: `die() { log "FATAL: $*"; exit 1; }`) -----------
 
-  private def die(msg: String): Nothing =
+  /** rc 1, named rather than written twice, because `refuseTestkitOnClasspath` has to be able to
+    * state which exit code its refusal ends on without being able to call `die` in a test that has
+    * to survive the answer (issue #71). One constant is what keeps the value that function reports
+    * and the value `die` exits with from becoming two facts that can drift.
+    *
+    * The testkit refusal joins this code rather than `die50`'s, and the choice is recorded here
+    * beside the meanings both codes already carry: a testkit on the main classpath is a declaration
+    * in a build file that will say exactly the same thing on the next attempt, which is what rc 1
+    * has always meant here for a missing `gh` or an unrunnable gate command. rc 50 promises the
+    * opposite, an environment that may well be fine by the next tick, and an autonomous scheduler
+    * reading that promise off a permanent misconfiguration retries it forever.
+    */
+  private[litterbox] val BrokenInstallRc: Int = 1
+
+  /** `rc` defaults to `BrokenInstallRc` because every existing caller means that code, but the
+    * default is not the whole story once `StartupRefusal` exists: `refuseTestkitOnClasspath` (issue
+    * #71) decides its own exit code as a value, and a `die` that could only ever exit one way would
+    * force that decision to be asserted again here instead of read from the value that made it, leaving
+    * `StartupRefusal.rc` a field the test suite pins but production never consults.
+    */
+  private def die(msg: String, rc: Int = BrokenInstallRc): Nothing =
     LiveLog.log(s"FATAL: $msg")
-    sys.exit(1)
+    sys.exit(rc)
 
   /** The two startup failures that are INFRA faults rather than misconfiguration-of-the-loop: a CWD
     * outside any git work tree, and a repo with no `.litter-box/config.conf`. Both exit 50, the same
@@ -595,6 +615,70 @@ object Main:
         pb.inheritIO()
         pb.start().waitFor()
 
+  // ---- the testkit belongs on a TEST classpath, and a run says so (issue #71) -----------------
+
+  /** What a startup check decided to refuse, as a value rather than as a call to `sys.exit`, so the
+    * decision can be pinned by a test in a JVM that has to survive reading it (issue #71). The whole
+    * hazard this exists for is a classpath the running JVM already has, which means the only place a
+    * check can look is the running JVM, which means an unsplit check could only ever be verified by
+    * reading it.
+    */
+  private[litterbox] final case class StartupRefusal(message: String, rc: Int)
+
+  /** The class the testkit reachability probe asks about. `TestWorld` rather than a package name,
+    * because a package is not a thing the JVM can be asked about at all, and rather than one of
+    * `Script`/`FakeClock`, because `TestWorld` is the type that owns the mint the refusal is about:
+    * it satisfies `AgentDispatchImpl` from inside this package, so it is the member of the testkit
+    * whose presence on a main classpath is the misconfiguration.
+    *
+    * `MainSpec` loads this exact name in this repository's own test JVM, where `test/Recorder.scala`
+    * compiles next to `src/`, so renaming or moving that type fails the build instead of quietly
+    * turning the probe into one that can never fire again.
+    */
+  private[litterbox] val TestkitProbeClass: String = "in.rcard.litterbox.TestWorld"
+
+  /** Why a runtime probe exists at all for something `src/Caps.scala` records as unfixable at the
+    * type level: the testkit really can mint an `AgentDispatch.Judged`, RFC #26 decision 14 requires
+    * that it can, and artifact scoping was until now the only control, enforced by documentation
+    * alone. A consumer who writes `dep` where the rule says `test.dep` therefore had a forged review
+    * on their production classpath with nothing anywhere noticing. This notices.
+    *
+    * What it is and what it is not: a detector for the common misconfiguration, not a defence. A
+    * consumer who shades, relocates or renames the testkit walks past it, and so does production
+    * code that calls `TestWorld.runGraph` directly instead of starting the loop through the
+    * supported door. It closes the honest mistake, and `src/Caps.scala` states what is left.
+    *
+    * `reachable` is a parameter rather than a `Class.forName` written inline for the reason the
+    * repository compiles `src/` and `test/` together: `in.rcard.litterbox.TestWorld` is always
+    * loadable inside `scala-cli test .`, so a test can pin both answers only if it can supply both.
+    */
+  private[litterbox] def refuseTestkitOnClasspath(
+      reachable: String => Boolean
+  ): Option[StartupRefusal] =
+    Option.when(reachable(TestkitProbeClass))(
+      StartupRefusal(
+        s"the testkit is reachable on this run's main classpath (${LitterBox.TestkitCoordinate}), " +
+          "which puts a scripted review mint in production code. Declare it as test.dep rather " +
+          "than dep so it leaves the main classpath, then start the loop again.",
+        BrokenInstallRc
+      )
+    )
+
+  /** The lookup `refuseTestkitOnClasspath` runs with in production: does the JVM that is about to
+    * start the loop already have this class. Asks the loader that loaded this object rather than the
+    * thread context loader, because the question is about the classpath the loop's own code was
+    * resolved against, which is the classpath a `dep` line in the consumer's build produced; a
+    * context loader is whatever an embedding host last set and answers a different question.
+    *
+    * Loads without initializing, since a probe that ran a testkit class's static initializer would
+    * have side effects of its own on a path whose entire job is to decide whether to proceed.
+    */
+  private[litterbox] def liveClassReachable(name: String): Boolean =
+    try
+      val _ = Class.forName(name, false, getClass.getClassLoader)
+      true
+    catch case _: ClassNotFoundException => false
+
   /** Everything `litter-box` (the `lb` binary) does with one `argv`, against one `LoopGraph` (issue
     * #43). `private[litterbox]`, not `private`: `LitterBox.run` (`src/LitterBox.scala`) is a second
     * caller, in a different top-level object of this same package, standing in for a consumer who
@@ -617,7 +701,15 @@ object Main:
       case Right(Command.Init(force))           => sys.exit(runInit(force))
       case Right(Command.Eject(what, force))    => sys.exit(runEject(what, force))
       case Right(Command.Observe(tool, target)) => sys.exit(runObserve(tool, target))
-      case Right(Command.Loop(dryRun))          => runLoop(dryRun, graph)
+      case Right(Command.Loop(dryRun)) =>
+        // In THIS function because it is the one door `lb` itself and a consumer calling
+        // `LitterBox.run` both come through, so no consumer authored graph can be started around
+        // it; in the loop branch of it rather than above the parse because `init`, `eject`,
+        // `watch`/`tail` and `help` touch no graph, mint no review, and are exactly what an
+        // operator reaches for while fixing the misconfiguration being reported (issue #71).
+        refuseTestkitOnClasspath(liveClassReachable) match
+          case Some(refusal) => die(refusal.message, refusal.rc)
+          case None          => runLoop(dryRun, graph)
 
   @main def litterBoxLoop(args: String*): Unit = dispatch(LitterBox.shipped, args)
 

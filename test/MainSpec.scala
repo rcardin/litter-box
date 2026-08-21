@@ -1,5 +1,6 @@
 package in.rcard.litterbox
 
+import in.rcard.litterbox.testsupport.RepoTree
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 
@@ -693,4 +694,88 @@ class MainSpec extends AnyFlatSpec with Matchers:
     // the constructor default (`AgentModels()`) standing in, the recorder would see `<absent>`
     // rather than the model IMPL_MODEL=opus named above.
     readString(root.resolve("logs/i.log")) should include("MODEL=[claude-opus-5]")
+  }
+
+  // ===============================================================================================
+  // refuseTestkitOnClasspath: the testkit is a test dependency, and a run says so (GitHub issue #71)
+  // ===============================================================================================
+
+  "refuseTestkitOnClasspath" should "refuse when the probed testkit class is reachable" in {
+    val refusal = Main.refuseTestkitOnClasspath(_ == Main.TestkitProbeClass)
+
+    val message = refusal.fold(fail("expected a refusal for a reachable testkit"))(_.message)
+    // The operator is told the rule by name, which artifact broke it, and what to do about it.
+    message should include("test.dep")
+    message should include(LitterBox.TestkitCoordinate)
+    message should include("main classpath")
+  }
+
+  it should "let a run with no testkit in sight continue" in {
+    // The false positive is the expensive answer here: a probe that fires on a correctly scoped
+    // consumer halts a working loop at startup, which is a worse outcome than the misconfiguration.
+    Main.refuseTestkitOnClasspath(_ => false) shouldBe None
+  }
+
+  /** The half of the check that no amount of scripting can prove: that the name being probed is a
+    * name the testkit really answers to. This repository compiles `test/Recorder.scala` next to
+    * `src/`, so its own test JVM is the one place the production probe can be pointed at a real
+    * classpath and observed saying yes.
+    */
+  it should "probe a class name this repository's own testkit really defines" in {
+    Class.forName(Main.TestkitProbeClass, false, getClass.getClassLoader) shouldBe classOf[TestWorld]
+
+    Main.liveClassReachable(Main.TestkitProbeClass) shouldBe true
+    Main.liveClassReachable("in.rcard.litterbox.NoSuchTypeLivesUnderThisName") shouldBe false
+  }
+
+  /** rc 1 rather than rc 50, and pinned here because an operator and an autonomous scheduler both
+    * read the exit code before they read the message. A testkit on the main classpath is a build
+    * declaration that will say the same thing on every retry, which is what rc 1 already means for
+    * a missing `gh` or an unrunnable gate command; rc 50 promises the opposite, an environment that
+    * may well be fixed by the time the next tick starts, and a scheduler acting on that promise
+    * loops on this forever.
+    */
+  it should "refuse with the broken install exit code, never the retryable infra one" in {
+    val refusal = Main
+      .refuseTestkitOnClasspath(_ => true)
+      .getOrElse(fail("expected a refusal for a reachable testkit"))
+
+    refusal.rc shouldBe 1
+    refusal.rc should not be LoopExit.InfraFault.rc
+  }
+
+  /** `refusal.rc` is only behaviour if `dispatch` reads it, and `dispatch`'s Loop branch cannot be
+    * driven directly here, since the branch under test ends in `sys.exit`, which would take this
+    * suite's own JVM down with it. That rules out proving the wiring by calling it, so this pins the
+    * wiring the same way `TestkitPublishSpec` pins `scripts/publish-testkit.sh`'s call sites: by
+    * reading the source `dispatch` actually compiles from and asserting on the exact call, so a
+    * change back to a hardcoded rc (`die(refusal.message)` or a stray `die50(refusal.message)`)
+    * fails the build instead of leaving `StartupRefusal.rc` a field nothing consults.
+    *
+    * The `die` call alone is not enough to pin: it reads the same whether `dispatch` feeds it from
+    * `refuseTestkitOnClasspath(liveClassReachable)` or from a lookup rewritten to `_ => false`, so a
+    * regression that silences the check in production leaves this same substring standing. The
+    * assertion below therefore covers the whole wired expression, the call together with the case
+    * that consumes it, so the live lookup itself is what is pinned, not only what it hands off to.
+    *
+    * Placement is pinned the same way. `refuseTestkitOnClasspath` reads identically whether it sits
+    * in the `Loop` branch or above `Cli.parse` entirely, so a move that starts refusing `init`,
+    * `eject`, `watch`, `tail` and `help` too would still satisfy an assertion on the call alone. The
+    * ordering check against `Cli.parse(args.toList) match` is what catches that move.
+    */
+  it should "have dispatch pass the refusal's own rc to die, not a hardcoded one" in {
+    val mainSource = RepoTree
+      .file("src/Main.scala")
+      .getOrElse(fail("could not locate src/Main.scala from the JVM cwd"))
+
+    val source = Files.readString(mainSource)
+    val lines  = source.linesIterator.map(_.trim).toIndexedSeq
+
+    val wiredIdx = lines.indexOf("refuseTestkitOnClasspath(liveClassReachable) match")
+    wiredIdx should be >= 0
+    lines(wiredIdx + 1) shouldBe "case Some(refusal) => die(refusal.message, refusal.rc)"
+
+    val parseIdx = source.indexOf("Cli.parse(args.toList) match")
+    parseIdx should be >= 0
+    source.indexOf("refuseTestkitOnClasspath(liveClassReachable)") should be > parseIdx
   }
