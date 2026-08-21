@@ -222,6 +222,39 @@ class RunnerSpec extends AnyFlatSpec with Matchers:
     world.callCount("dispatch IMPL") shouldBe 1
   }
 
+  it should "fault, not park, an honest Cost.OneDispatch node whose probe itself dispatches on an empty ledger" in {
+    // `canAfford` only ever runs on the probe-miss branch, after `probe` has already returned
+    // (`Runner.step`'s own doc), so a node whose `probe` dispatches reaches the charging decorator
+    // before that gate is ever consulted. `Cost.OneDispatch` still promises the node may START (the
+    // ledger here is exhausted, not merely tight), it is silent on a probe that spends on its way to
+    // answering `Some`/`None`, and the decorator refuses that spend exactly like any other real
+    // dispatch: rc 50 through the fault channel, never `LoopExit.Parked`, whatever `Cost` the node
+    // declared (`canAfford`'s own doc).
+    val world  = new TestWorld
+    val clock  = new FakeClock(List(0L))
+    val ledger = Runner.Ledger(0)
+    val probingHonestly = Node[Unit, Int](
+      name = "probing-honestly",
+      cost = Cost.OneDispatch,
+      timeout = Timeout.Unbounded,
+      probe = _ =>
+        summon[AgentDispatch].worker(Role.IMPL, "prompt", "patch", "log", None)
+        None,
+      run = _ => NodeOutcome.Done(0)
+    )
+
+    val result = withFaulting:
+      given caps: Caps       = buildCaps(world, clock)
+      given l: Runner.Ledger = ledger
+      Runner.step(probingHonestly, ())
+
+    result shouldBe Left(LoopExit.InfraFault)
+    world.callCount("dispatch IMPL") shouldBe 0
+    world.logLines should contain(
+      Runner.refusedDispatchMessage("probing-honestly", "IMPL")
+    )
+  }
+
   it should "charge a dispatch made through review, not only one made through worker" in {
     val world  = new TestWorld
     val clock  = new FakeClock(List(0L))
@@ -244,6 +277,41 @@ class RunnerSpec extends AnyFlatSpec with Matchers:
     result shouldBe Right(NodeOutcome.Done(()))
     ledger.remainingDispatches shouldBe 0
     world.callCount("dispatch REVIEW") shouldBe 1
+  }
+
+  // ---- concurrent dispatch (Ledger.tryChargeDispatch is not a node-facing operation, but nothing on
+  // the public Node surface forbids a consumer node from calling the ambient AgentDispatch off a
+  // thread it spawns itself, so the counter has to hold even then) -------------------------------
+
+  it should "never let concurrent tryChargeDispatch callers claim more successes in total than the budget they started from, no matter how many times each one retries" in {
+    // A single attempt per thread almost never lands two threads inside the same few-nanosecond
+    // read-check-write window (tried, on this machine: 300 threads racing a `Ledger(1)` over 500
+    // rounds, zero violations), so it is a weak way to PROVE the race even though it is a real one.
+    // Looping each thread until the ledger reports empty widens that window from "two instructions"
+    // to "however long the whole run takes", which is what actually turns the race in
+    // `tryChargeDispatch` (read `remaining`, decide, write it back, none of it synchronised or even
+    // `volatile`) into something this test reliably observes rather than only argues for: on the
+    // code this test was written against, this exact `budget` spread over 8 threads consistently
+    // finished with tens of thousands more reported successes than the budget held, both from lost
+    // decrements racing each other and from a thread's own loop condition reading a stale,
+    // never-invalidated `remaining` because nothing published the other threads' writes to it.
+    val budget = 20000
+    val ledger = Runner.Ledger(budget)
+    val successes = new java.util.concurrent.atomic.AtomicInteger(0)
+
+    val threads = (1 to 8).map { _ =>
+      val t = new Thread(() =>
+        var keepGoing = true
+        while keepGoing do
+          if ledger.tryChargeDispatch() then successes.incrementAndGet(): Unit else keepGoing = false
+      )
+      t.start()
+      t
+    }
+    threads.foreach(_.join())
+
+    successes.get() shouldBe budget
+    ledger.remainingDispatches shouldBe 0
   }
 
   // ---- Judged is minted only by AgentDispatch.review, never fabricated by LIBRARY code (issue #35) --

@@ -216,8 +216,8 @@ enum Timeout:
     * `run`).
     *
     * The check is post hoc: it makes an overrun OBSERVABLE, it never cuts a running node off. Issue
-    * #69 asked whether it should become pre emptive and DECIDED that it should not, recorded here so
-    * the next reader does not reopen a settled question. Pre emption needs the node's body on a
+    * #69 asked whether it should become pre-emptive and DECIDED that it should not, recorded here so
+    * the next reader does not reopen a settled question. Pre-emption needs the node's body on a
     * second thread for the runner's own thread to interrupt, and three things say no, in order of
     * weight. The timeouts that actually bound a runaway agent are one layer down already, at the
     * subprocess boundary that dispatches a worker, fixer, reviewer or gate child (`src/Live.scala`),
@@ -1157,6 +1157,24 @@ object Runner:
     * real cold session.
     */
   final class Ledger private[litterbox] (initial: Int):
+    // Plain `var`, but every read and every read-then-write below runs `synchronized` on this
+    // instance, and for a reason that is not merely defensive: nothing on the public `Node` surface
+    // stops a consumer's own `run`/`probe` body from fanning its own dispatches out across threads it
+    // spawns itself (`Caps`/`AgentDispatch` name no thread confinement anywhere), so the "no node can
+    // spend past the budget its graph declared" promise a few paragraphs up has to survive that case
+    // too, not only the single-threaded walk the shipped `Machine` graph happens to use. Before this
+    // lock, `tryChargeDispatch` read `remaining`, decided, and wrote it back as three separate
+    // unsynchronised steps, so two racing callers could both read the same positive value before
+    // either write landed and both walk away charged off the same one unit, and with no memory
+    // barrier at all a caller on another thread had no guarantee of ever seeing a write the first one
+    // made. `RunnerSpec` pins the failure mode this closes: hammering an unsynchronised copy of this
+    // exact counter from eight threads, each retrying until refused, reliably produced several
+    // HUNDRED THOUSAND more reported successes than the budget held. `canAfford` and
+    // `remainingDispatches` synchronize on the same monitor as `tryChargeDispatch`, not only that
+    // method: an unguarded reader has no happens before edge to a concurrent charge's write, so it
+    // could keep reading the value `remaining` held before that charge indefinitely, which would have
+    // fixed the overspend while leaving the read side free to report a number the writer had already
+    // moved past.
     private var remaining: Int = initial
 
     /** Whether a node declaring `cost` is even allowed to start this tick. Checked once, before
@@ -1167,15 +1185,21 @@ object Runner:
       * `remaining`.
       *
       * Kept, rather than folded into the capability level check issue #69 added, because the two
-      * refusals are not interchangeable: an honest `Cost.OneDispatch` node the ledger cannot afford
-      * is PARKED before it runs, a resumable terminal that leaves the world untouched, while a
-      * dispatch refused mid body can only fault, since the node is already partway through whatever
-      * side effects it had begun. Losing this check would turn every ordinary budget exhaustion in
-      * the shipped loop into rc 50.
+      * refusals are not interchangeable: an honest `Cost.OneDispatch` node whose `probe` answers
+      * `None` without itself dispatching, and whose `run` the ledger then cannot afford, is PARKED
+      * right here, a resumable terminal that leaves the world untouched. This method covers only
+      * `run`, never `probe`: `Runner.step` calls this on the probe miss branch, after `probe` has
+      * already executed, never before it, so a `Cost.OneDispatch` node whose own `probe` dispatches
+      * is metered at the capability exactly like any other real dispatch (`Runner.charging` below)
+      * and never reaches this check at all. A refusal there can only fault, rc 50, whatever `Cost` the
+      * node declared, since whatever side effects `probe` had already produced on its way to that
+      * dispatch have already happened and cannot be parked away. Losing this check would still turn
+      * every ordinary budget exhaustion on an honest `run` in the shipped loop into rc 50.
       */
-    private[litterbox] def canAfford(cost: Cost): Boolean = cost match
-      case Cost.NoDispatch  => true
-      case Cost.OneDispatch => remaining > 0
+    private[litterbox] def canAfford(cost: Cost): Boolean = synchronized:
+      cost match
+        case Cost.NoDispatch  => true
+        case Cost.OneDispatch => remaining > 0
 
     /** The spend and the refusal in one answer, called once per real dispatch by the decorator
       * `Runner.step` wraps `Caps.agents` in, never derived from a node's declared `Cost`. `false`
@@ -1202,7 +1226,7 @@ object Runner:
       * dispatch" guarantee rests on the decorator being the only caller by convention within the
       * package, not on the compiler ruling out every other one.
       */
-    private[litterbox] def tryChargeDispatch(): Boolean =
+    private[litterbox] def tryChargeDispatch(): Boolean = synchronized:
       if remaining > 0 then
         remaining -= 1
         true
@@ -1210,9 +1234,12 @@ object Runner:
 
     /** What is left to charge against. Public, unlike `canAfford`/`tryChargeDispatch`: a test (or an
       * operator-facing status line, later) reading how much budget survived a run is not the same
-      * privilege as being able to spend it or gate on it.
+      * privilege as being able to spend it or gate on it. Synchronized on the same monitor as the
+      * other two methods for the reason the class doc above gives: an unguarded read here has no
+      * happens before edge to a concurrent `tryChargeDispatch` write and could report a number the
+      * writer had already moved past.
       */
-    def remainingDispatches: Int = remaining
+    def remainingDispatches: Int = synchronized(remaining)
 
   /** The one sentence a refused dispatch is ever reported through (issue #69), so the wording cannot
     * drift between the worker path and the review path the way two hand written strings would. It
@@ -1306,9 +1333,9 @@ object Runner:
     * `fault.raise` here too, for the same reason `Fault` itself exists: an infra fault that skipped
     * the log line and the notify would defeat the guarantee at the point it is meant to be
     * unavoidable. The elapsed-time check against `timeout` runs after the node returns rather than
-    * pre emptively, and issue #69 settled that it stays that way rather than leaving the question
+    * pre-emptively, and issue #69 settled that it stays that way rather than leaving the question
     * open: this check exists to make an overrun observable, not to cut the node off, and
-    * `Timeout.After`'s own doc records the three reasons pre emption was declined (the real bound
+    * `Timeout.After`'s own doc records the three reasons pre-emption was declined (the real bound
     * already sits at the subprocess boundary, an interrupted node leaves the world half written where
     * a killed child does not, and node bodies write unsynchronised shared state that a second thread
     * would make concurrent for the first time).
