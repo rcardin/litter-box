@@ -106,10 +106,10 @@ private[litterbox] type Faulting = boundary.Label[LoopExit]
   * position (issue #32 review finding 1). A node holding the raw `Faulting` label could call
   * `boundary.break` with whatever `LoopExit` it liked, including `Success`, and skip the log line,
   * the notify and the `Runner`'s own ledger/timeout accounting entirely, since none of those run
-  * after a `break`. `Fault` offers exactly one operation, `raise`, and that operation always goes
-  * through `Machine.infraFault`, the same channel and the same log/notify behaviour every other fault
-  * in this loop already uses, so the only terminal a node can ever produce through this channel is an
-  * infra fault, never a forged one.
+  * after a `break`. `Fault` offers exactly one operation, `raise`, and that operation IS the one
+  * fault body this loop has, the same log line, the same notify and the same abandon every other
+  * fault already goes through, so the only terminal a node can ever produce through this channel is
+  * an infra fault, never a forged one.
   *
   * `logger`/`notify` are captured here, at construction, by `Runner.step`, rather than taken as a
   * `using` clause on `raise` itself (issue #32 review round 2 finding 1): a `using` clause on `raise`
@@ -132,23 +132,31 @@ final class Fault private[litterbox] (
     notify: Notify
 ):
 
-  /** Abandons the current node with an infra fault, reusing `Machine.infraFault`'s wording and
-    * ordering (log line, then notify, then abandon) so a fault raised from inside a node reads
-    * identically, in the golden log stream, to every other fault this loop can produce. No second
-    * fault path exists to invent a different order or a different message by accident. Takes no
-    * `using` clause: `logger`/`notify` are already fixed at construction, so there is nothing left
-    * for a caller's own scope to override.
+  /** Abandons the current node with an infra fault: the fault line on the operator's log stream at
+    * the point of the fault, then the rc 50 notify seam, then the iteration abandoned. Every fault
+    * this loop can produce runs these three statements, so a fault raised from inside a node reads
+    * identically, in the golden log stream, to one raised anywhere else, and no second fault path
+    * exists to invent a different order or a different message by accident. Takes no `using` clause:
+    * `logger`/`notify` are already fixed at construction, so there is nothing left for a caller's own
+    * scope to override.
     *
-    * Also the route the kit's OWN fault sites take, not only a node's: `Plan.workflowOf` (an ill
-    * declared plan, or a node whose every outgoing edge declines the value it produced), `Runner.run`
-    * (an invalid `Shape`) and `Runner.step` (a node overrunning its declared timeout) all raise here
-    * rather than calling `Machine.infraFault` for themselves. Every one of those sites already held
-    * the run's real `logger`/`notifier`, so not a character of what they log or notify changes; what
-    * changes is that the whole kit now reaches the machine tier through this one body, leaving a
-    * single edge to cut before kit code names nothing but itself and the domain types.
+    * Constructs the `InfraFault` and logs `fault.reason` back off it, rather than logging the
+    * argument and reading the notice off the companion. `InfraFault`'s own doc claims one string per
+    * fault, carried and logged, never two that can drift apart, and a type nothing ever builds cannot
+    * make that claim true; routing the log line through the constructed value is what makes the
+    * carried string and the logged string the same string by construction instead of by convention.
+    *
+    * This is the whole loop's fault body, a node's faults and the kit's own alike (`Plan.workflowOf`
+    * on an ill declared plan or a dead ended walk, `Runner.run` on an invalid `Shape`, `Runner.step`
+    * on a node overrunning its declared timeout). `Machine.infraFault` is now a delegate INTO it, the
+    * application tier's local convenience over this channel rather than a second implementation of
+    * it, which is what leaves kit code naming nothing outside itself and the domain tier.
     */
   def raise(reason: String): Nothing =
-    Machine.infraFault(reason)(using logger, notify)(using label)
+    val fault = InfraFault(reason)
+    logger.log(fault.reason)
+    notify.notify(InfraFault.notice)
+    boundary.break(LoopExit.InfraFault)(using label)
 
 /** What running one `Node` concluded. Named `NodeOutcome`, not the RFC sketch's `Outcome`, because
   * `Outcome` already names an unrelated, unexported enum private to `Machine`
