@@ -138,6 +138,14 @@ final class Fault private[litterbox] (
     * fault path exists to invent a different order or a different message by accident. Takes no
     * `using` clause: `logger`/`notify` are already fixed at construction, so there is nothing left
     * for a caller's own scope to override.
+    *
+    * Also the route the kit's OWN fault sites take, not only a node's: `Plan.workflowOf` (an ill
+    * declared plan, or a node whose every outgoing edge declines the value it produced), `Runner.run`
+    * (an invalid `Shape`) and `Runner.step` (a node overrunning its declared timeout) all raise here
+    * rather than calling `Machine.infraFault` for themselves. Every one of those sites already held
+    * the run's real `logger`/`notifier`, so not a character of what they log or notify changes; what
+    * changes is that the whole kit now reaches the machine tier through this one body, leaving a
+    * single edge to cut before kit code names nothing but itself and the domain types.
     */
   def raise(reason: String): Nothing =
     Machine.infraFault(reason)(using logger, notify)(using label)
@@ -919,11 +927,18 @@ object Plan:
       plan: Plan[I],
       stages: StageSet
   )(using caps: Caps, faulting: Faulting): Workflow[I] =
+    // One binding for BOTH fault sites below, rather than a fresh `Fault` at each, and bound here at
+    // the top rather than inside either branch: a second construction is a second chance to pass a
+    // different pair of sinks, and the whole point of `Fault` is that the sinks a fault uses are
+    // fixed where the run's capabilities are known, never at the site that happens to raise. One val
+    // makes the two sites provably identical by reading, which is also the shape `Runner.step`
+    // already has.
+    val fault          = Fault(faulting, caps.logger, caps.notifier)
     val declViolations = declarationViolations(plan)
     if declViolations.nonEmpty then
-      Machine.infraFault(
+      fault.raise(
         s"graph '$name' plan is not well declared: ${declViolations.mkString("; ")}"
-      )(using caps.logger, caps.notifier)(using faulting)
+      )
     def andThen(from: Node[?, ?]): Any => Next =
       out =>
         plan.edges.iterator
@@ -931,11 +946,11 @@ object Plan:
           .map(e => Edge.advance(e, out, andThen))
           .collectFirst { case Some(next) => next }
           .getOrElse(
-            Machine.infraFault(
+            fault.raise(
               s"graph '$name' declares no edge out of '${from.name}' that accepts the value it " +
                 "produced, so this walk has nowhere left to go: add an Edge.To or an Edge.Exit " +
                 s"leaving '${from.name}' that answers Some for that value"
-            )(using caps.logger, caps.notifier)(using faulting)
+            )
           )
     Workflow(
       name = name,
@@ -1406,9 +1421,9 @@ object Runner:
       case Timeout.After(seconds) =>
         val elapsedMs = chargingCaps.clock.nowMillis() - startedAt
         if elapsedMs > seconds.toLong * 1000L then
-          Machine.infraFault(
+          fault.raise(
             s"node '${node.name}' overran its ${seconds}s timeout, an infra fault, not a code failure"
-          )(using chargingCaps.logger, chargingCaps.notifier)(using faulting)
+          )
 
     outcome
 
@@ -1623,9 +1638,9 @@ object Runner:
   ): LoopExit =
     val violations = validate(wf.shape)
     if violations.nonEmpty then
-      Machine.infraFault(
+      Fault(faulting, caps.logger, caps.notifier).raise(
         invalidShapeMessage(wf.name, violations)
-      )(using caps.logger, caps.notifier)(using faulting)
+      )
     else
       @tailrec
       def walk(next: Next): LoopExit = next match
