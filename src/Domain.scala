@@ -97,8 +97,9 @@ object InfraFault:
 
   /** The operator notice a fault fires alongside the log line: one sentence for the whole channel,
     * where `reason` is the half that varies per site. It is a constant beside the type rather than a
-    * literal at the raising site because `test/ScenarioSpec.scala` pins it verbatim at ten sites, so
-    * a second copy would be a second wording somebody has to keep in agreement with this one.
+    * literal at the raising site because `test/ScenarioSpec.scala` pins it verbatim at every scenario
+    * that reaches rc 50, so a second copy would be a second wording somebody has to keep in agreement
+    * with this one.
     *
     * It names the `in-progress` label from the domain tier, which reads at first like knowledge a
     * lower tier should not have. It is not: `Labels`, below, already fixes `active` as

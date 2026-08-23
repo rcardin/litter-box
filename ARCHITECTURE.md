@@ -31,6 +31,11 @@ The central split, and the reason the whole suite runs in memory:
   `Gate` and `AskHuman` stays private, and what a consumer takes on by wiring it in. Nothing about `shippedWorkflow` or
   `shippedShape` moved for it; both simply name `Gate` where they used to call `Gate(cfg)`, since that
   parameter was never read.
+  The kit is a TIER, and the dependency arrow into it runs one way: no code in `src/Kit.scala` or
+  `src/KitMacro.scala` may name anything declared outside those two files plus `src/Domain.scala` and
+  `src/Caps.scala`, since whatever the kit names is transitively part of the surface a consumer
+  depends on. `docs/adr/0001-framework-tier-is-kit-only.md` carries the reasoning and
+  `test/KitBoundarySpec.scala` holds it.
 - `src/Machine.scala` — `Machine.runOnce`, and the shipped `Workflow` (`Machine.shippedWorkflow`) it
   walks through `Runner.run`: pure decision logic. Touches the world through nothing but the
   capabilities. No direct filesystem, subprocess, or clock access.

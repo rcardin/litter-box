@@ -77,7 +77,7 @@ statements every fault in this loop runs, and `Machine.infraFault` is a delegate
 application tier keeps its local convenience over the channel instead of owning a second
 implementation of it. The kit's four other sites raise through a `Fault` they already hold or build.
 No log line, no notify and no exit code changed, which is what the unchanged goldens under
-`test/golden/` and `test/ScenarioSpec.scala`'s ten verbatim notify assertions say.
+`test/golden/` and `test/ScenarioSpec.scala`'s verbatim notify assertions say.
 
 **`LoopGraph` and `LitterBox.graph` are the consumer's front door and they are Tier 2 on purpose.**
 This is the counterintuitive part and the one a future reader is most likely to try to fix.
@@ -113,8 +113,11 @@ the original edge arrived, so a top level declaration added anywhere outside the
 to the kit the moment it is declared. A kit local identifier that innocently collides with such a
 name is a finding about the vocabulary to be resolved, never an exclusion to be added.
 
-**The tier model is not total over `src/`.** Seven files carry no tier at all: `Cli.scala`,
+**The tier model is not total over `src/`.** Seven files carry no tier LABEL: `Cli.scala`,
 `Init.scala`, `Observe.scala`, `Prompts.scala`, `Sandbox.scala`, `Settings.scala` and
-`Shipped.scala`. They parse arguments, scaffold, resolve templates and unpack resource trees, and no
-rule points at any of them, so assigning them a tier would state a fact nothing reads. Tiers exist
-here to make one arrow enforceable, not to give every file a label.
+`Shipped.scala`. They parse arguments, scaffold, resolve templates and unpack resource trees. The
+rule still reaches every one of them, and so does the check: the rule is phrased as a complement, and
+`KitBoundarySpec`'s denylist is derived from every `.scala` file under `src` that is not one of the
+four, so the kit may no more name `Settings` than it may name `Machine`. What these seven do not need
+is a NAME for their position, since nothing reads one. Tiers exist here to make one arrow
+enforceable, not to give every file a label.

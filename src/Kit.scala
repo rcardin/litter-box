@@ -171,9 +171,9 @@ enum NodeOutcome[+O]:
   case Done(value: O)
 
   /** A terminal reached early: the workflow finishes with `exit` and no later node runs. Never
-    * `LoopExit.InfraFault`: an infra fault goes through `infraFault` (`Machine.infraFault`), which
-    * logs the fault line and fires the rc-50 notify seam AT THE POINT of the fault, then abandons
-    * the iteration via `Fault.raise`; it never returns a value for this case to carry. Routing a
+    * `LoopExit.InfraFault`: an infra fault goes through `Fault.raise`, which logs the fault line and
+    * fires the rc-50 notify seam AT THE POINT of the fault, then abandons the iteration; it never
+    * returns a value for this case to carry. Routing a
     * fault back as an ordinary `Stopped` value instead would move both the log line and the notify
     * away from the point they actually happened, which is exactly what the golden log contract
     * forbids.
@@ -820,7 +820,7 @@ object Plan:
     *     check. An `Edge.Exit` should not be a quieter way to make the identical mistake.
     *
     * Read by [[workflowOf]] itself, before it derives a single closure: a `Plan` carrying either shape
-    * of violation faults through the same `Machine.infraFault` channel every other declaration problem
+    * of violation faults through the same `Fault.raise` channel every other declaration problem
     * in this file already uses, and it does so strictly before `Runner.validate` ever sees the `Shape`
     * this same `Plan` derives, on every path that reaches one (`Machine.runOnce` builds a `Workflow`
     * off `graph.workflow(...)` before it reads `graph.shape(cfg)`, and `Runner.run` receives an
@@ -907,8 +907,8 @@ object Plan:
     *
     * A node the walk reaches whose every outgoing edge declines the value it produced is a fault, not
     * a quiet success: the alternative is inventing a `LoopExit` the consumer never declared. It goes
-    * through `Machine.infraFault`, the one fault channel every other failure in this loop already
-    * uses, which is why this derivation needs `caps` and `faulting` and therefore happens inside
+    * through `Fault.raise`, the one fault body every other failure in this loop already runs,
+    * which is why this derivation needs `caps` and `faulting` and therefore happens inside
     * `LoopGraph.workflow`, the one place a tick's own capabilities exist.
     *
     * [[declarationViolations]] runs first, for the identical reason: a bad declaration is a fact about
@@ -1149,7 +1149,7 @@ final case class Workflow[I](
   * Emits no log line and no status event of its own, on any path: the only observable side effect a
   * `Runner` call can ever cause is a `Node`'s own `probe`/`run` body doing something (which already
   * happens through the ordinary capability calls the golden log contract already pins), or a fault
-  * going through `Machine.infraFault` (which logs and notifies exactly where every OTHER fault in
+  * going through `Fault.raise` (which logs and notifies exactly where every OTHER fault in
   * this loop already does). Adding a distinct trace of its own, "node started", "node finished",
   * would be new, runner-specific observability that no golden pins today; RFC decision 11 is where
   * that gets decided, not here.
@@ -1613,7 +1613,7 @@ object Runner:
     * violation is a fact about the graph's own declared shape, true before any node has run, so
     * checking it after even one node's side effects fired would be too late to mean "rejects a
     * graph before executing any node". On a violation this goes through the SAME fault channel
-    * every other fault in this loop already uses, `Machine.infraFault`, so it logs, notifies and
+    * every other fault in this loop already uses, `Fault.raise`, so it logs, notifies and
     * abandons the tick exactly like any other infra fault, never a second, differently shaped exit.
     * On a valid graph, `validate` returns `Nil` and this emits nothing at all: every golden log
     * this suite pins stays byte identical, since the only paths that ever produce a fresh log line
