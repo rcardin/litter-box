@@ -69,8 +69,9 @@ import scala.util.matching.Regex
   * things is a real finding about the vocabulary, and one ad hoc exclusion here is the first hole in
   * a check whose entire value is that it has none.
   *
-  * Three limits the check knowingly carries, stated together so the holes are counted in one place
-  * rather than discovered one at a time.
+  * Four limits the check knowingly carries, stated together so they are counted in one place rather
+  * than discovered one at a time. The first three are holes, shapes a real reference could pass
+  * through unseen. The fourth runs the other way and can only over deny.
   *
   *   - An ANONYMOUS `given` declares no name for the derivation to catch, and by construction the
   *     reference to it is resolved implicitly, so no source text check can see either end of it.
@@ -80,6 +81,12 @@ import scala.util.matching.Regex
   *     [[TopLevelDeclaration]] nor [[Identifier]] can tokenise either shape, so a declaration written
   *     either way would be neither denied nor discoverable as a violation. Neither shape is used
   *     anywhere in `src/` today.
+  *   - While a top level `extension` block is open, [[declaredNames]] reads every indented `def` as a
+  *     member of it, a `def` local to a member's own body included, and after a single line form it
+  *     stays open until the next column zero line. A name nobody declared at the top level can
+  *     therefore enter the denylist. That direction is deliberate: the worst an extra name does is
+  *     deny the kit a word and fail a run that names the line, where a missed name is a boundary
+  *     breach nothing ever sees.
   */
 class KitBoundarySpec extends AnyFlatSpec with Matchers:
 
@@ -207,6 +214,38 @@ class KitBoundarySpec extends AnyFlatSpec with Matchers:
     names should not contain "alsoIgnored"
   }
 
+  it should "derive a name from the single line form of a top level extension" in {
+    val planted =
+      """extension (i: Int) def isZero: Boolean = i == 0
+        |
+        |object After:
+        |  val alsoIgnored = 2
+        |""".stripMargin
+
+    val names = declaredNames(stripCommentsAndLiterals(planted))
+
+    // The member sits on the opening line itself, where nothing anchored at the start of a line can
+    // reach it, and it is a top level name every bit as much as one written under an indented block.
+    names should contain allOf ("isZero", "After")
+    names should not contain "alsoIgnored"
+  }
+
+  it should "derive a name from the same line brace form of a top level extension" in {
+    val planted =
+      """extension (i: Int) { def isZero: Boolean = i == 0 }
+        |
+        |object After:
+        |  val alsoIgnored = 2
+        |""".stripMargin
+
+    val names = declaredNames(stripCommentsAndLiterals(planted))
+
+    // Same reading as the single line form: the brace changes the layout, not the fact that `isZero`
+    // is declared at the top level of the file.
+    names should contain allOf ("isZero", "After")
+    names should not contain "alsoIgnored"
+  }
+
   it should "blank every construct that can hide an identifier, and no code beside them" in {
     // Written as escaped single line literals rather than a triple quoted block, because three of the
     // eight lines are ABOUT quoting and a block would have to escape its way out of itself anyway.
@@ -319,15 +358,29 @@ class KitBoundarySpec extends AnyFlatSpec with Matchers:
     outsideTiers.flatMap(path => declaredNames(stripCommentsAndLiterals(Files.readString(path)))).toSet
 
   /** Every top level declaration in one already stripped file, `object`, `enum`, `class`, `trait`,
-    * `type`, `val`, `var`, `def` and a named `given` matched by [[TopLevelDeclaration]], plus a name
-    * declared by an indented `def` inside a top level `extension` block. `extension` itself declares
-    * no name for [[TopLevelDeclaration]] to capture, since the name being extended is not a name the
-    * kit could reference the way it references a declaration, so this folds over the file's lines with
-    * one flag: a line whose prefix matches [[ExtensionOpen]] opens the block, every indented `def`
-    * line while the block is open contributes the name [[ExtensionMember]] captures, and the block
-    * closes at the next line that starts at column zero. That keeps "top level" read straight off the
-    * layout rather than reached for with a parser, the same reading [[TopLevelDeclaration]] itself
-    * already relies on.
+    * `type`, `val`, `var`, `def` and a named `given` matched by [[TopLevelDeclaration]], plus every
+    * `def` a top level `extension` declares. `extension` itself declares no name for
+    * [[TopLevelDeclaration]] to capture, since the name being extended is not a name the kit could
+    * reference the way it references a declaration, so this folds over the file's lines with one flag:
+    * a line whose prefix matches [[ExtensionOpen]] opens the block, and the block closes at the next
+    * line that starts at column zero. That keeps "top level" read straight off the layout rather than
+    * reached for with a parser, the same reading [[TopLevelDeclaration]] itself already relies on.
+    *
+    * Members are collected on BOTH sides of that opening line, because Scala writes an extension three
+    * ways and only one of them puts the member on a later line. `extension (i: Int) def isZero` and
+    * `extension (i: Int) { def isZero }` declare a top level name on the opening line itself, where
+    * nothing anchored at the start of a line can reach it, so the opening line is searched for
+    * [[ExtensionMember]] anywhere in it, while a following line contributes only when
+    * [[ExtensionMember]] matches its PREFIX.
+    *
+    * It over collects, knowingly, rather than being narrowed. Every indented `def` while the block is
+    * open contributes, a `def` local to a member's own body included, and after a single line form the
+    * flag stays up until the next column zero line, so a name nobody declared at the top level can
+    * reach the denylist. Telling a member apart from a local `def` in its body means tracking
+    * indentation depth through arbitrary Scala, which is the parser this whole check is written to
+    * avoid, and the two mistakes are not symmetrical: an extra name can only deny the kit a word and
+    * surface as a red run naming the line, where a missed name is a boundary breach that passes
+    * silently. So this one is stated rather than chased.
     */
   private def declaredNames(stripped: String): List[String] =
     val names       = List.newBuilder[String]
@@ -339,7 +392,9 @@ class KitBoundarySpec extends AnyFlatSpec with Matchers:
         TopLevelDeclaration.findPrefixMatchOf(line).foreach { m =>
           names += Option(m.group(1)).getOrElse(m.group(2))
         }
-        if ExtensionOpen.findPrefixMatchOf(line).isDefined then inExtension = true
+        if ExtensionOpen.findPrefixMatchOf(line).isDefined then
+          ExtensionMember.findAllMatchIn(line).foreach(m => names += m.group(1))
+          inExtension = true
     names.result()
 
   /** The `src` directory of this repository, located the same way for both the real scan and a test
@@ -375,11 +430,12 @@ class KitBoundarySpec extends AnyFlatSpec with Matchers:
   /** Everything Scala 3 lets a file declare at column zero as a SINGLE LINE match: `object`, `enum`,
     * `class`, `trait`, `type`, `val`, `var`, `def` and a NAMED `given`, behind any run of modifiers
     * including an access modifier with its optional qualifier. Does not match `extension`, which
-    * declares no name of its own and opens an indented block instead; [[declaredNames]] tracks that
-    * block itself rather than teach this regex a second, non column zero shape. The keyword set is
-    * deliberately wider than what `src/` uses today: `private[litterbox] object LiveProc` was
-    * invisible to an earlier, narrower version of this regex, and a codebase this `given` based would
-    * hide a top level `given` the same way.
+    * declares no name of its own; the names are its members, and they sit either on the opening line,
+    * in the single line and same line brace forms, or under the indented block a bare opening line
+    * starts. [[declaredNames]] folds over those shapes itself rather than teach this regex a second,
+    * non column zero shape. The keyword set is deliberately wider than what `src/` uses today:
+    * `private[litterbox] object LiveProc` was invisible to an earlier, narrower version of this
+    * regex, and a codebase this `given` based would hide a top level `given` the same way.
     *
     * A named `given` is told from an anonymous one by the colon that a name forces:
     * `given ordering: Ordering[Byte] = ...` declares `ordering`, while `given Ordering[Byte] = ...`
@@ -406,8 +462,12 @@ class KitBoundarySpec extends AnyFlatSpec with Matchers:
       raw"private|protected|implicit|inline|lazy|override)(?:\[[A-Za-z0-9_]+\])?\s+)*" +
       raw"extension\b").r
 
-  /** An indented `def` inside a top level `extension` block, the one member shape [[declaredNames]]
-    * collects from inside such a block, matching every kit file's own idiom for one today.
+  /** A `def` declared by a top level `extension`, which is the only member shape such a block can
+    * hold. [[declaredNames]] applies it anywhere in the opening line, so the single line and the same
+    * line brace forms are read, and against the prefix of each following line while the block is open.
+    * No file under `src/` writes an `extension` at all today, so nothing currently in the denylist
+    * rests on this regex; it is here because the shape is legal at the top level and a derivation
+    * blind to it would fail open the day the first one lands.
     */
   private val ExtensionMember: Regex =
     (raw"\s+(?:(?:final|sealed|case|abstract|open|transparent|opaque|infix|" +
@@ -424,8 +484,8 @@ class KitBoundarySpec extends AnyFlatSpec with Matchers:
   /** The text of a string interpolation hole, `${...}`, captured without its braces so
     * [[interpolationViolations]] can tokenise what is inside. Does not nest, since a hole containing a
     * `}` of its own, a block expression spliced into a message, is not a shape either kit file uses
-    * today; [[Identifier]] would still find every denied token in whatever the un-nested match
-    * captures, so a nested hole degrades to under matching the tail of the expression rather than
+    * today; [[Identifier]] would still find every denied token in whatever text such a match does
+    * capture, so a nested hole degrades to under matching the tail of the expression rather than
     * missing it outright.
     */
   private val InterpolationHole: Regex = raw"\$$\{([^}]*)\}".r
