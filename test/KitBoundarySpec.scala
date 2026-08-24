@@ -46,6 +46,12 @@ import scala.util.matching.Regex
   * `Symbol.requiredModule("in.rcard.litterbox.Machine")` would breach the boundary in the hardest
   * possible way, invisibly, and this check is the only thing that would ever see it.
   *
+  * A second literal shape carries the identical risk. An interpolation hole, `s"...${Foo.bar}..."`,
+  * is executable Scala wearing a literal's clothes exactly as a resolved symbol string is, so
+  * [[interpolationViolations]] reads the RAW source too and tokenises every hole's own text against
+  * the same denylist, rather than teaching `stripCommentsAndLiterals` to step back into a hole, which
+  * would mean tracking brace depth through arbitrary Scala and stop being a lexer.
+  *
   * The denylist is DERIVED from the source tree, never written down here, because a hand written list
   * fails open in exactly the way this edge arrived in the first place: someone adds a top level
   * `object` to a file outside the two tiers, the kit names it, and a list nobody remembered to
@@ -66,17 +72,14 @@ import scala.util.matching.Regex
   * Three limits the check knowingly carries, stated together so the holes are counted in one place
   * rather than discovered one at a time.
   *
-  *   - An interpolation hole is blanked along with the literal that contains it, so a reference
-  *     smuggled inside `s"...${Foo.bar}..."` is missed. This is the widest of the three: the two kit
-  *     files hold twenty eight such holes already, nearly all inside fault and compile error
-  *     messages, so interpolating a value from outside the tiers into one of those messages is the
-  *     realistic way it would be opened. Teaching the stripper to step back into a hole means
-  *     tracking brace depth through arbitrary Scala, which is the point at which this stops being a
-  *     lexer and starts being a parser.
   *   - An ANONYMOUS `given` declares no name for the derivation to catch, and by construction the
   *     reference to it is resolved implicitly, so no source text check can see either end of it.
   *   - A `given` whose name and type are split across lines is not read as a declaration, since
   *     [[TopLevelDeclaration]] matches within one line.
+  *   - A backticked name or a symbolic operator name is invisible to this check at both ends: neither
+  *     [[TopLevelDeclaration]] nor [[Identifier]] can tokenise either shape, so a declaration written
+  *     either way would be neither denied nor discoverable as a violation. Neither shape is used
+  *     anywhere in `src/` today.
   */
 class KitBoundarySpec extends AnyFlatSpec with Matchers:
 
@@ -123,7 +126,8 @@ class KitBoundarySpec extends AnyFlatSpec with Matchers:
         stripped should include(CodeAnchors(file))
       }
 
-      scan(relative, stripped, denied) ++ macroResolvedViolations(relative, source, denied)
+      scan(relative, stripped, denied) ++ macroResolvedViolations(relative, source, denied) ++
+        interpolationViolations(relative, source, denied)
     }
 
     withClue(report(violations)) {
@@ -144,6 +148,63 @@ class KitBoundarySpec extends AnyFlatSpec with Matchers:
 
     scan("planted.scala", stripCommentsAndLiterals(planted), Set("Machine")) shouldBe
       List(("planted.scala", 5, "Machine"))
+  }
+
+  it should "see a denied name spliced into an interpolation hole, which the ordinary scan misses" in {
+    val planted =
+      """object Sample:
+        |  def go(): Nothing = fault.raise(s"boom ${Machine.infraFault}")
+        |""".stripMargin
+
+    // The ordinary scan is blind to it: the stripper blanks the interpolated literal end to end,
+    // hole included, so `Machine` never reaches a single identifier token.
+    scan("planted.scala", stripCommentsAndLiterals(planted), Set("Machine")) shouldBe empty
+
+    // interpolationViolations reads the raw source instead, which is where the reference still lives.
+    interpolationViolations("planted.scala", planted, Set("Machine")) shouldBe
+      List(("planted.scala", 2, "Machine"))
+  }
+
+  it should "deny a name declared in a file whose basename matches an allowed root file but whose " +
+    "path does not" in {
+      val root = Files.createTempDirectory("kit-boundary-basename")
+      try
+        Files.writeString(root.resolve("Domain.scala"), "object ExemptRoot\n")
+        val nested = Files.createDirectories(root.resolve("internal"))
+        Files.writeString(nested.resolve("Domain.scala"), "object Registry\n")
+
+        val denied = deniedNames(root)
+
+        // The nested file shares a basename with an allowed root file, `Domain.scala`, but is not
+        // one of the four the kit is allowed to name, so its declaration must stay in the denylist.
+        denied should contain("Registry")
+        // The root file is one of the four, so its declaration must stay exempt.
+        denied should not contain "ExemptRoot"
+      finally
+        Files.walk(root).iterator.asScala.toList.sortBy(_.toString).reverse.foreach(Files.delete)
+    }
+
+  it should "derive a name from an indented def inside a top level extension block" in {
+    val planted =
+      """object Before:
+        |  val ignored = 1
+        |
+        |extension (state: RunState)
+        |  def isBlocked: Boolean = true
+        |
+        |  private def helper: Int = 2
+        |
+        |object After:
+        |  val alsoIgnored = 2
+        |""".stripMargin
+
+    val names = declaredNames(stripCommentsAndLiterals(planted))
+
+    // `extension` itself declares no name; `isBlocked` and `helper` are declared inside its indented
+    // block, and `Before`/`After` prove the block correctly closes at the next column zero line.
+    names should contain allOf ("Before", "isBlocked", "helper", "After")
+    names should not contain "ignored"
+    names should not contain "alsoIgnored"
   }
 
   it should "blank every construct that can hide an identifier, and no code beside them" in {
@@ -214,36 +275,87 @@ class KitBoundarySpec extends AnyFlatSpec with Matchers:
       if denied.contains(name)
     yield (relative, idx + 1, name)
 
+  /** A denied name spliced into a string interpolation hole, `s"...${Foo.bar}..."`. Reads the RAW
+    * source for the same reason [[macroResolvedViolations]] does: the ordinary scan runs after
+    * [[stripCommentsAndLiterals]], which blanks an interpolated literal end to end, hole included, so
+    * a reference living inside the hole never reaches a single identifier token there. Teaching the
+    * stripper to step back into a hole would mean tracking brace depth through arbitrary Scala, the
+    * point at which this stops being a lexer and starts being a parser, so this reads the hole's own
+    * text directly instead and tokenises it against the same denylist.
+    */
+  private def interpolationViolations(
+      relative: String,
+      source: String,
+      denied: Set[String]
+  ): List[(String, Int, String)] =
+    for
+      (line, idx) <- source.linesIterator.zipWithIndex.toList
+      hole        <- InterpolationHole.findAllMatchIn(line).map(_.group(1))
+      token       <- Identifier.findAllMatchIn(hole).map(_.matched)
+      if denied.contains(token)
+    yield (relative, idx + 1, token)
+
   private def report(violations: List[(String, Int, String)]): String =
     val lines = violations.map((file, line, name) => s"  $file:$line names $name").mkString("\n")
     s"the kit tier names ${violations.map(_._3).distinct.size} declaration(s) from outside itself " +
       s"and the domain tier:\n$lines\n"
 
   /** The names of every top level declaration in `src/`, minus the four files the kit is allowed to
-    * name. Anchored at column zero so that "top level" is read straight off the layout: a nested
-    * member is indented, and a nested member is not something the kit could name unqualified anyway.
+    * name. Compared by the path RELATIVE TO `src/`, never by basename: [[AllowedTierFiles]] denotes
+    * the four files sitting at the `src` root, not any file merely sharing one of their tails, so
+    * `src/internal/Domain.scala` relativizes to `internal/Domain.scala`, misses the exemption and
+    * stays in the denylist exactly as any other Tier 2 file would. Anchored at column zero so that
+    * "top level" is read straight off the layout: a nested member is indented, and a nested member is
+    * not something the kit could name unqualified anyway.
     */
-  private def deniedNames(): Set[String] =
-    val outsideTiers = srcFiles().filterNot(p => AllowedTierFiles.contains(p.getFileName.toString))
+  private def deniedNames(): Set[String] = deniedNames(srcDir())
+
+  private def deniedNames(dir: Path): Set[String] =
+    val outsideTiers =
+      srcFiles(dir).filterNot(p => AllowedTierFiles.contains(dir.relativize(p).toString))
     withClue("expected src/ to hold files outside the kit and domain tiers: ") {
       outsideTiers should not be empty
     }
-    outsideTiers.flatMap { path =>
-      stripCommentsAndLiterals(Files.readString(path)).linesIterator
-        .map(TopLevelDeclaration.findPrefixMatchOf)
-        .collect { case Some(m) => Option(m.group(1)).getOrElse(m.group(2)) }
-    }.toSet
+    outsideTiers.flatMap(path => declaredNames(stripCommentsAndLiterals(Files.readString(path)))).toSet
 
-  /** Every `.scala` file under `src`, at any depth. A walk rather than one directory level, so that
+  /** Every top level declaration in one already stripped file, `object`, `enum`, `class`, `trait`,
+    * `type`, `val`, `var`, `def` and a named `given` matched by [[TopLevelDeclaration]], plus a name
+    * declared by an indented `def` inside a top level `extension` block. `extension` itself declares
+    * no name for [[TopLevelDeclaration]] to capture, since the name being extended is not a name the
+    * kit could reference the way it references a declaration, so this folds over the file's lines with
+    * one flag: a line whose prefix matches [[ExtensionOpen]] opens the block, every indented `def`
+    * line while the block is open contributes the name [[ExtensionMember]] captures, and the block
+    * closes at the next line that starts at column zero. That keeps "top level" read straight off the
+    * layout rather than reached for with a parser, the same reading [[TopLevelDeclaration]] itself
+    * already relies on.
+    */
+  private def declaredNames(stripped: String): List[String] =
+    val names       = List.newBuilder[String]
+    var inExtension = false
+    for line <- stripped.linesIterator do
+      if inExtension && line.headOption.exists(!_.isWhitespace) then inExtension = false
+      if inExtension then ExtensionMember.findPrefixMatchOf(line).foreach(m => names += m.group(1))
+      else
+        TopLevelDeclaration.findPrefixMatchOf(line).foreach { m =>
+          names += Option(m.group(1)).getOrElse(m.group(2))
+        }
+        if ExtensionOpen.findPrefixMatchOf(line).isDefined then inExtension = true
+    names.result()
+
+  /** The `src` directory of this repository, located the same way for both the real scan and a test
+    * fixture pointed at a temporary tree, so the two never resolve `src` two different ways.
+    */
+  private def srcDir(): Path =
+    RepoTree.dir("src").getOrElse(fail("could not locate src by walking up from the JVM cwd"))
+
+  /** Every `.scala` file under `dir`, at any depth. A walk rather than one directory level, so that
     * the day someone adds `src/live/Proc.scala` its declarations are denied to the kit as
     * automatically as `src/Live.scala`'s are today; a one level listing would pass on the tree
     * happening to be flat rather than on the check being right. Dot directories are skipped:
     * `src/.scala-build` and `src/.bsp` are scala-cli's own build output, not this repository's
     * source.
     */
-  private def srcFiles(): List[Path] =
-    val dir =
-      RepoTree.dir("src").getOrElse(fail("could not locate src by walking up from the JVM cwd"))
+  private def srcFiles(dir: Path): List[Path] =
     val stream = Files.walk(dir)
     try
       stream.iterator.asScala.toList
@@ -260,16 +372,24 @@ class KitBoundarySpec extends AnyFlatSpec with Matchers:
         .getOrElse(fail(s"could not locate $relative by walking up from the JVM cwd"))
     )
 
-  /** Anything Scala 3 lets a file declare at column zero: `object`, `enum`, `class`, `trait`, `type`,
-    * `val`, `var`, `def` and a NAMED `given`, behind any run of modifiers including an access
-    * modifier with its optional qualifier. The keyword set is deliberately wider than what `src/`
-    * uses today: `private[litterbox] object LiveProc` was invisible to an earlier, narrower version
-    * of this regex, and a codebase this `given` based would hide a top level `given` the same way.
+  /** Everything Scala 3 lets a file declare at column zero as a SINGLE LINE match: `object`, `enum`,
+    * `class`, `trait`, `type`, `val`, `var`, `def` and a NAMED `given`, behind any run of modifiers
+    * including an access modifier with its optional qualifier. Does not match `extension`, which
+    * declares no name of its own and opens an indented block instead; [[declaredNames]] tracks that
+    * block itself rather than teach this regex a second, non column zero shape. The keyword set is
+    * deliberately wider than what `src/` uses today: `private[litterbox] object LiveProc` was
+    * invisible to an earlier, narrower version of this regex, and a codebase this `given` based would
+    * hide a top level `given` the same way.
     *
     * A named `given` is told from an anonymous one by the colon that a name forces:
     * `given ordering: Ordering[Byte] = ...` declares `ordering`, while `given Ordering[Byte] = ...`
     * declares nothing and would otherwise contribute `Ordering`, a type it merely references, to the
     * denylist.
+    *
+    * A backticked name or a symbolic operator name never matches the `[A-Za-z_][A-Za-z0-9_]*` capture
+    * here, and [[Identifier]] cannot tokenise either shape back out of the kit's own code either, so a
+    * declaration written either way is neither denied nor discoverable as a violation, counted as a
+    * limit below rather than chased: neither shape is used anywhere in `src/` today.
     */
   private val TopLevelDeclaration: Regex =
     (raw"(?:(?:final|sealed|case|abstract|open|transparent|opaque|infix|" +
@@ -277,12 +397,38 @@ class KitBoundarySpec extends AnyFlatSpec with Matchers:
       raw"(?:(?:object|enum|class|trait|type|val|var|def)\s+([A-Za-z_][A-Za-z0-9_]*)" +
       raw"|given\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:\[[^\]]*\])?\s*(?:\([^)]*\))?\s*:)").r
 
+  /** The opening line of a top level `extension` block, told apart from ordinary code by the keyword
+    * alone: `extension` declares no name of its own, so unlike [[TopLevelDeclaration]] this has no
+    * capture group, only a boundary [[declaredNames]] folds against.
+    */
+  private val ExtensionOpen: Regex =
+    (raw"(?:(?:final|sealed|case|abstract|open|transparent|opaque|infix|" +
+      raw"private|protected|implicit|inline|lazy|override)(?:\[[A-Za-z0-9_]+\])?\s+)*" +
+      raw"extension\b").r
+
+  /** An indented `def` inside a top level `extension` block, the one member shape [[declaredNames]]
+    * collects from inside such a block, matching every kit file's own idiom for one today.
+    */
+  private val ExtensionMember: Regex =
+    (raw"\s+(?:(?:final|sealed|case|abstract|open|transparent|opaque|infix|" +
+      raw"private|protected|implicit|inline|lazy|override)(?:\[[A-Za-z0-9_]+\])?\s+)*" +
+      raw"def\s+([A-Za-z_][A-Za-z0-9_]*)").r
+
   /** A symbol this package resolves by fully qualified name from a macro. Only the head name is
     * captured, since `in.rcard.litterbox.Edge.To` is a reference to `Edge` as far as the tier
     * question goes, and `To` is a member the denylist never held.
     */
   private val MacroResolvedSymbol: Regex =
     raw"""Symbol\.required(?:Module|Class|Method|Field)\("in\.rcard\.litterbox\.([A-Za-z_][A-Za-z0-9_]*)""".r
+
+  /** The text of a string interpolation hole, `${...}`, captured without its braces so
+    * [[interpolationViolations]] can tokenise what is inside. Does not nest, since a hole containing a
+    * `}` of its own, a block expression spliced into a message, is not a shape either kit file uses
+    * today; [[Identifier]] would still find every denied token in whatever the un-nested match
+    * captures, so a nested hole degrades to under matching the tail of the expression rather than
+    * missing it outright.
+    */
+  private val InterpolationHole: Regex = raw"\$$\{([^}]*)\}".r
 
   /** A Scala identifier as this check cares about it. `$` is part of the token rather than a break so
     * that a compiler generated `Machine$1` is not read as a reference to `Machine`.
