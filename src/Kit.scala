@@ -106,10 +106,10 @@ private[litterbox] type Faulting = boundary.Label[LoopExit]
   * position (issue #32 review finding 1). A node holding the raw `Faulting` label could call
   * `boundary.break` with whatever `LoopExit` it liked, including `Success`, and skip the log line,
   * the notify and the `Runner`'s own ledger/timeout accounting entirely, since none of those run
-  * after a `break`. `Fault` offers exactly one operation, `raise`, and that operation always goes
-  * through `Machine.infraFault`, the same channel and the same log/notify behaviour every other fault
-  * in this loop already uses, so the only terminal a node can ever produce through this channel is an
-  * infra fault, never a forged one.
+  * after a `break`. `Fault` offers exactly one operation, `raise`, and that operation IS the one
+  * fault body this loop has, the same log line, the same notify and the same abandon every other
+  * fault already goes through, so the only terminal a node can ever produce through this channel is
+  * an infra fault, never a forged one.
   *
   * `logger`/`notify` are captured here, at construction, by `Runner.step`, rather than taken as a
   * `using` clause on `raise` itself (issue #32 review round 2 finding 1): a `using` clause on `raise`
@@ -132,15 +132,31 @@ final class Fault private[litterbox] (
     notify: Notify
 ):
 
-  /** Abandons the current node with an infra fault, reusing `Machine.infraFault`'s wording and
-    * ordering (log line, then notify, then abandon) so a fault raised from inside a node reads
-    * identically, in the golden log stream, to every other fault this loop can produce. No second
-    * fault path exists to invent a different order or a different message by accident. Takes no
-    * `using` clause: `logger`/`notify` are already fixed at construction, so there is nothing left
-    * for a caller's own scope to override.
+  /** Abandons the current node with an infra fault: the fault line on the operator's log stream at
+    * the point of the fault, then the rc 50 notify seam, then the iteration abandoned. Every fault
+    * this loop can produce runs these three statements, so a fault raised from inside a node reads
+    * identically, in the golden log stream, to one raised anywhere else, and no second fault path
+    * exists to invent a different order or a different message by accident. Takes no `using` clause:
+    * `logger`/`notify` are already fixed at construction, so there is nothing left for a caller's own
+    * scope to override.
+    *
+    * Constructs the `InfraFault` and logs `fault.reason` back off it, rather than logging the
+    * argument and reading the notice off the companion. `InfraFault`'s own doc claims one string per
+    * fault, carried and logged, never two that can drift apart, and a type nothing ever builds cannot
+    * make that claim true; routing the log line through the constructed value is what makes the
+    * carried string and the logged string the same string by construction instead of by convention.
+    *
+    * This is the whole loop's fault body, a node's faults and the kit's own alike (`Plan.workflowOf`
+    * on an ill declared plan or a dead ended walk, `Runner.run` on an invalid `Shape`, `Runner.step`
+    * on a node overrunning its declared timeout). `Machine.infraFault` is now a delegate INTO it, the
+    * application tier's local convenience over this channel rather than a second implementation of
+    * it, which is what leaves kit code naming nothing outside itself and the domain tier.
     */
   def raise(reason: String): Nothing =
-    Machine.infraFault(reason)(using logger, notify)(using label)
+    val fault = InfraFault(reason)
+    logger.log(fault.reason)
+    notify.notify(InfraFault.notice)
+    boundary.break(LoopExit.InfraFault)(using label)
 
 /** What running one `Node` concluded. Named `NodeOutcome`, not the RFC sketch's `Outcome`, because
   * `Outcome` already names an unrelated, unexported enum private to `Machine`
@@ -155,9 +171,9 @@ enum NodeOutcome[+O]:
   case Done(value: O)
 
   /** A terminal reached early: the workflow finishes with `exit` and no later node runs. Never
-    * `LoopExit.InfraFault`: an infra fault goes through `infraFault` (`Machine.infraFault`), which
-    * logs the fault line and fires the rc-50 notify seam AT THE POINT of the fault, then abandons
-    * the iteration via `Fault.raise`; it never returns a value for this case to carry. Routing a
+    * `LoopExit.InfraFault`: an infra fault goes through `Fault.raise`, which logs the fault line and
+    * fires the rc-50 notify seam AT THE POINT of the fault, then abandons the iteration; it never
+    * returns a value for this case to carry. Routing a
     * fault back as an ordinary `Stopped` value instead would move both the log line and the notify
     * away from the point they actually happened, which is exactly what the golden log contract
     * forbids.
@@ -804,7 +820,7 @@ object Plan:
     *     check. An `Edge.Exit` should not be a quieter way to make the identical mistake.
     *
     * Read by [[workflowOf]] itself, before it derives a single closure: a `Plan` carrying either shape
-    * of violation faults through the same `Machine.infraFault` channel every other declaration problem
+    * of violation faults through the same `Fault.raise` channel every other declaration problem
     * in this file already uses, and it does so strictly before `Runner.validate` ever sees the `Shape`
     * this same `Plan` derives, on every path that reaches one (`Machine.runOnce` builds a `Workflow`
     * off `graph.workflow(...)` before it reads `graph.shape(cfg)`, and `Runner.run` receives an
@@ -891,8 +907,8 @@ object Plan:
     *
     * A node the walk reaches whose every outgoing edge declines the value it produced is a fault, not
     * a quiet success: the alternative is inventing a `LoopExit` the consumer never declared. It goes
-    * through `Machine.infraFault`, the one fault channel every other failure in this loop already
-    * uses, which is why this derivation needs `caps` and `faulting` and therefore happens inside
+    * through `Fault.raise`, the one fault body every other failure in this loop already runs,
+    * which is why this derivation needs `caps` and `faulting` and therefore happens inside
     * `LoopGraph.workflow`, the one place a tick's own capabilities exist.
     *
     * [[declarationViolations]] runs first, for the identical reason: a bad declaration is a fact about
@@ -919,11 +935,18 @@ object Plan:
       plan: Plan[I],
       stages: StageSet
   )(using caps: Caps, faulting: Faulting): Workflow[I] =
+    // One binding for BOTH fault sites below, rather than a fresh `Fault` at each, and bound here at
+    // the top rather than inside either branch: a second construction is a second chance to pass a
+    // different pair of sinks, and the whole point of `Fault` is that the sinks a fault uses are
+    // fixed where the run's capabilities are known, never at the site that happens to raise. One val
+    // makes the two sites provably identical by reading, which is also the shape `Runner.step`
+    // already has.
+    val fault          = Fault(faulting, caps.logger, caps.notifier)
     val declViolations = declarationViolations(plan)
     if declViolations.nonEmpty then
-      Machine.infraFault(
+      fault.raise(
         s"graph '$name' plan is not well declared: ${declViolations.mkString("; ")}"
-      )(using caps.logger, caps.notifier)(using faulting)
+      )
     def andThen(from: Node[?, ?]): Any => Next =
       out =>
         plan.edges.iterator
@@ -931,11 +954,11 @@ object Plan:
           .map(e => Edge.advance(e, out, andThen))
           .collectFirst { case Some(next) => next }
           .getOrElse(
-            Machine.infraFault(
+            fault.raise(
               s"graph '$name' declares no edge out of '${from.name}' that accepts the value it " +
                 "produced, so this walk has nowhere left to go: add an Edge.To or an Edge.Exit " +
                 s"leaving '${from.name}' that answers Some for that value"
-            )(using caps.logger, caps.notifier)(using faulting)
+            )
           )
     Workflow(
       name = name,
@@ -1126,7 +1149,7 @@ final case class Workflow[I](
   * Emits no log line and no status event of its own, on any path: the only observable side effect a
   * `Runner` call can ever cause is a `Node`'s own `probe`/`run` body doing something (which already
   * happens through the ordinary capability calls the golden log contract already pins), or a fault
-  * going through `Machine.infraFault` (which logs and notifies exactly where every OTHER fault in
+  * going through `Fault.raise` (which logs and notifies exactly where every OTHER fault in
   * this loop already does). Adding a distinct trace of its own, "node started", "node finished",
   * would be new, runner-specific observability that no golden pins today; RFC decision 11 is where
   * that gets decided, not here.
@@ -1406,9 +1429,9 @@ object Runner:
       case Timeout.After(seconds) =>
         val elapsedMs = chargingCaps.clock.nowMillis() - startedAt
         if elapsedMs > seconds.toLong * 1000L then
-          Machine.infraFault(
+          fault.raise(
             s"node '${node.name}' overran its ${seconds}s timeout, an infra fault, not a code failure"
-          )(using chargingCaps.logger, chargingCaps.notifier)(using faulting)
+          )
 
     outcome
 
@@ -1590,7 +1613,7 @@ object Runner:
     * violation is a fact about the graph's own declared shape, true before any node has run, so
     * checking it after even one node's side effects fired would be too late to mean "rejects a
     * graph before executing any node". On a violation this goes through the SAME fault channel
-    * every other fault in this loop already uses, `Machine.infraFault`, so it logs, notifies and
+    * every other fault in this loop already uses, `Fault.raise`, so it logs, notifies and
     * abandons the tick exactly like any other infra fault, never a second, differently shaped exit.
     * On a valid graph, `validate` returns `Nil` and this emits nothing at all: every golden log
     * this suite pins stays byte identical, since the only paths that ever produce a fresh log line
@@ -1623,9 +1646,9 @@ object Runner:
   ): LoopExit =
     val violations = validate(wf.shape)
     if violations.nonEmpty then
-      Machine.infraFault(
+      Fault(faulting, caps.logger, caps.notifier).raise(
         invalidShapeMessage(wf.name, violations)
-      )(using caps.logger, caps.notifier)(using faulting)
+      )
     else
       @tailrec
       def walk(next: Next): LoopExit = next match

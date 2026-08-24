@@ -80,17 +80,35 @@ enum FailureKind(val text: String):
   case OversizedPatch extends FailureKind("oversized-patch")
   case EmptyFix       extends FailureKind("empty-fix")
 
-/** The typed infra-fault channel. Raised through `Raise[InfraFault]`; the driver folds it to rc 50.
+/** The typed infra-fault channel. The effect library that once carried it is gone; what raises one
+  * now is a `boundary` that breaks to `LoopExit.InfraFault`, which the driver folds to rc 50.
   * By construction no code after a raise can run, so no fault path can decrement the repair budget
   * or dispatch a FIX — the v3 invariant as a type-level property.
   *
-  * `reason` is the bash `log()` line for that fault, copied verbatim from loop.sh, and
-  * `Machine.infraFault` writes it to the `Log` capability at the point of the raise. The parity
+  * `reason` is the bash `log()` line for that fault, copied verbatim from loop.sh, and `Fault.raise`
+  * (`src/Kit.scala`) writes it to the `Log` capability at the point of the raise. The parity
   * oracle greps some of these (`half-finished worker must not reach the gates`,
   * `infra fault, not a code failure`), so the wording is asserted behaviour: one string per fault,
   * carried and logged, never two that can drift apart.
   */
 final case class InfraFault(reason: String)
+
+object InfraFault:
+
+  /** The operator notice a fault fires alongside the log line: one sentence for the whole channel,
+    * where `reason` is the half that varies per site. It is a constant beside the type rather than a
+    * literal at the raising site because `test/ScenarioSpec.scala` pins it verbatim at every scenario
+    * that reaches rc 50, so a second copy would be a second wording somebody has to keep in agreement
+    * with this one.
+    *
+    * It names the `in-progress` label from the domain tier, which reads at first like knowledge a
+    * lower tier should not have. It is not: `Labels`, below, already fixes `active` as
+    * `in-progress`, and `LoopExit.InfraFault`'s own doc already records that the issue is left there
+    * so the next tick resumes it. That the issue survives the exit is the whole reason rc 50 is an
+    * inspection code rather than a failure, so the notice would be lying by omission without it.
+    */
+  val notice: String =
+    "harness: infra fault — loop exited rc=50 for inspection (issue stays in-progress)"
 
 /** Agent dispatch role (worker seam: IMPL_CMD vs FIX_CMD). */
 enum Role:

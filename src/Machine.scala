@@ -1,7 +1,6 @@
 package in.rcard.litterbox
 
 import scala.util.boundary
-import scala.util.boundary.break
 
 // `Faulting` (the infra-fault short-circuit channel) moved to `src/Kit.scala`, `private[litterbox]`
 // now rather than `private` here, so `Runner.step` (also in that file) can name it too (issue #32).
@@ -357,19 +356,23 @@ object Machine:
     * it moves here — the observable order (fault line, then notify, then the terminal DONE event
     * `runOnce` emits) is unchanged.
     *
-    * `private[litterbox]`, not `private`, since issue #32: `Runner.step` (`src/Kit.scala`) reports a
-    * node's timeout overrun through this exact helper rather than inventing a second fault path with
-    * its own wording, so a `Runner`-caused fault reads identically to every other fault site in this
-    * file, both in the log and in the notify text.
+    * Plain `private`, and a delegate INTO `Fault.raise` (`src/Kit.scala`) rather than the body
+    * itself, since the framework tier became kit only. Issue #32 had widened this to
+    * `private[litterbox]` for one reason: `Runner.step` reported a node's timeout overrun through
+    * this exact helper so a `Runner`-caused fault could not drift from the ones here. The kit reaches
+    * that same channel from its own side now, and owns the body, so the reason for the wider access
+    * has gone with it. The narrower modifier is what makes "no caller outside this file is left" a
+    * fact the compiler checks rather than a claim this paragraph asserts.
+    *
+    * It survives at all, rather than being inlined away at each site, because every site below
+    * already holds the `Faulting`, `Log` and `Notify` a `Fault` is built from, and a construction
+    * written out per site is a chance per site to hand it a different pair of sinks than the run is
+    * really wired to, which is the one thing `Fault` exists to prevent.
     */
-  private[litterbox] def infraFault(reason: String)(using logger: Log, notify: Notify)(using
-      Faulting
+  private def infraFault(reason: String)(using logger: Log, notify: Notify)(using
+      faulting: Faulting
   ): Nothing =
-    logger.log(reason)
-    notify.notify(
-      "harness: infra fault — loop exited rc=50 for inspection (issue stays in-progress)"
-    )
-    break(LoopExit.InfraFault)
+    Fault(faulting, logger, notify).raise(reason)
 
   /** One driver tick: bounds the infra-fault channel, so a fault anywhere inside this method lands
     * as `LoopExit.InfraFault` (rc 50), and emits the terminal DONE status event, exactly like the

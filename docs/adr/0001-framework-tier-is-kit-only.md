@@ -1,0 +1,123 @@
+# 1. The framework tier is the kit only
+
+## Status
+
+Accepted, 23 August 2026.
+
+## Context
+
+`src/Kit.scala` and `src/KitMacro.scala` are the framework. A consumer who authors their own loop
+writes `Node`s and one `Plan`, hands them to `LitterBox.graph`, and compiles against that kit; the
+macro reads their literal at compile time and the `Runner` walks their graph at run time. Whatever
+the kit names is therefore, transitively, part of the surface they depend on, whether or not anyone
+meant to publish it.
+
+The kit called `Machine.infraFault` at five sites: inside `Fault.raise`, twice inside
+`Plan.workflowOf` (an ill declared plan, a walk that dead ends), inside `Runner.step` (a node
+overrunning its declared timeout) and inside `Runner.run` (an invalid `Shape`). `Machine` is not a
+lower layer the kit rests on. It is the shipped pipeline, one graph among the many the kit exists to
+run, and by the kit's own framing merely its first consumer. Every one of those five references
+pointed the dependency arrow backwards, from the framework into one of its inhabitants.
+
+`Fault` is the sharpest instance. That type exists for exactly one reason, stated in its own
+scaladoc: a node holding the raw `boundary.Label[LoopExit]` could `break` with whatever `LoopExit`
+it liked, `Success` included, skipping the fault line, the rc 50 notify and the runner's own
+accounting, so `Fault` offers one operation and that operation IS the loop's single fault body. Its
+entire implementation was a one line delegate into the application. The type whose whole claim is
+that this loop has one fault body did not contain that body, and the guarantee it advertised was
+held somewhere it could not see.
+
+`Runner.step` used both channels inside one method. It built a `Fault` at the top, raised through
+that value twice (a `Trust.Reviewed` node returning an unjudged value, a node returning
+`Stopped(LoopExit.InfraFault)` directly), then reached past it to call `Machine.infraFault` directly
+on the timeout overrun with the same `fault` still in scope. Two spellings of one operation, four
+lines apart, is what an unstated rule looks like from the inside.
+
+Nothing here was a compiler error waiting to happen. `Kit` and `Machine` are members of the same
+package, so all five references are legal Scala and always were. Nor did the edge arrive through
+carelessness: it accumulated one good local reason at a time, across three issues (#32 gave the kit
+its `Fault` and its timeout check, #38 gave `Runner.run` its startup validation, #67 gave
+`Plan.workflowOf` its derivation), each time because the author needed a fault and the only fault
+body in the codebase was in `Machine`. An arrow like that can only be reversed by a decision, and
+kept reversed by a check.
+
+## Decision
+
+Three tiers, and a tier is a property of a FILE:
+
+- **Tier 0, the domain**: `src/Domain.scala`, `src/Caps.scala`. The closed types and the capability
+  traits.
+- **Tier 1, the kit**: `src/Kit.scala`, `src/KitMacro.scala`. The framework a consumer compiles
+  against.
+- **Tier 2, the application**: `src/Machine.scala`, `src/LitterBox.scala`, `src/Main.scala`,
+  `src/Live.scala`. The shipped graph, the front door, the wiring that runs a graph and the real
+  side effects behind the capabilities.
+
+One rule, and it runs one way: **no code in Tier 1 may name anything declared outside Tier 0 union
+Tier 1.** Tier 2 is unconstrained and names both tiers below it freely. There is no rule pointing
+the other way because there is no problem in that direction: an application depending on its
+framework is the arrangement, not the defect.
+
+Tier is carried by the file rather than by a package, a marker trait or a naming convention.
+`private[litterbox]` is load bearing across this whole codebase (`LoopGraph`'s every member,
+`Runner.Ledger`'s constructor, `Fault.label`), so a package per tier would have to widen exactly the
+access those decisions closed, trading a real boundary for a nominal one. A file, by contrast, needs
+no compiler cooperation to identify, which matters because the rule is enforced by reading source
+text.
+
+The rule binds CODE. It deliberately does not bind comments or string literals. Naming a construct
+in order to explain it, or in order to diagnose it, creates no dependency; only a reference the
+compiler resolves does. The exemption is part of the decision, not a limitation of how the check
+happens to be written.
+
+## Consequences
+
+**The fault body moved down, and nothing about a fault moved.** `Fault.raise` now contains the three
+statements every fault in this loop runs, and `Machine.infraFault` is a delegate into it: the
+application tier keeps its local convenience over the channel instead of owning a second
+implementation of it. The kit's four other sites raise through a `Fault` they already hold or build.
+No log line, no notify and no exit code changed, which is what the unchanged goldens under
+`test/golden/` and `test/ScenarioSpec.scala`'s verbatim notify assertions say.
+
+**`LoopGraph` and `LitterBox.graph` are the consumer's front door and they are Tier 2 on purpose.**
+This is the counterintuitive part and the one a future reader is most likely to try to fix.
+`src/LitterBox.scala` holds framework shaped things (the `LoopGraph` trait, the `graph` factory that
+builds its second inhabitant, `run`) in the same file as one application instance (`shipped`, whose
+code names `Machine` nine times). Splitting the file was considered and rejected. `graph` can only
+return a `new LoopGraph` because it lives in the same file the `sealed` trait does, which is the
+whole mechanism letting a consumer author a graph without the trait's surface being widened by one
+member; and a split would not even produce a Tier 1 clean `LoopGraph`, since `begin`'s own abstract
+signature names `Machine.Cursor`, as does the inhabitant `graph` returns. The file level cut states
+the true position honestly: this is the coordinate a consumer depends on, it is not framework, and
+the kit holds nothing of it.
+
+**`src/KitMacro.scala` names `LitterBox.graph` in six compile error strings, and that is not a
+violation.** Those messages report on a specific call the consumer wrote, and a diagnostic that
+cannot say which call failed is worth less than the coupling it avoids. Parameterising the name
+would build a seam across which nothing varies, since exactly one entry point exists. If a second
+one ever arrives, someone edits six strings, and that day is cheaper than every day of carrying the
+seam before it.
+
+**`src/Kit.scala` still opens with seventy three comment lines narrating the shipped pipeline's own
+edit history.** Under the rule that prose is exempt this costs nothing mechanically, but it does
+mean the framework's first page reads as the story of one of its consumers. Known, deliberately
+left, and not spec enforced: it is a writing job, not a dependency.
+
+**`test/KitBoundarySpec.scala` is what stops the edge coming back.** A spec is needed because the
+compiler has no opinion here: same package, legal references, and a reviewer who sees one new fault
+site sees a reasonable line of code, exactly as every site that arrived before it was. So the check
+reads the source text, strips comments and string literals into spaces (line numbers survive, so a
+failure names the line), and derives its denylist from the tree rather than listing forbidden names
+by hand. Derivation is the part that matters: a hand written list fails open in precisely the way
+the original edge arrived, so a top level declaration added anywhere outside the two tiers is denied
+to the kit the moment it is declared. A kit local identifier that innocently collides with such a
+name is a finding about the vocabulary to be resolved, never an exclusion to be added.
+
+**The tier model is not total over `src/`.** Seven files carry no tier LABEL: `Cli.scala`,
+`Init.scala`, `Observe.scala`, `Prompts.scala`, `Sandbox.scala`, `Settings.scala` and
+`Shipped.scala`. They parse arguments, scaffold, resolve templates and unpack resource trees. The
+rule still reaches every one of them, and so does the check: the rule is phrased as a complement, and
+`KitBoundarySpec`'s denylist is derived from every `.scala` file under `src` that is not one of the
+four, so the kit may no more name `Settings` than it may name `Machine`. What these seven do not need
+is a NAME for their position, since nothing reads one. Tiers exist here to make one arrow
+enforceable, not to give every file a label.

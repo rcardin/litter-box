@@ -36,6 +36,15 @@ dependency is a design decision, not a convenience.
 
 Never use `@nowarn` or any other suppression to get past a warning. Fix the cause.
 
+`src/Kit.scala` and `src/KitMacro.scala` are the framework tier. No code in either may name anything
+declared outside those two files plus `src/Domain.scala` and `src/Caps.scala`; comments and string
+literals are exempt. Whatever the kit names becomes, transitively, part of the surface a consumer
+authoring their own graph depends on, so a kit that reaches into `Machine` publishes the shipped
+pipeline's own machinery as framework by accident. If you need a fault from kit code, raise it
+through `Fault.raise`, which lives in the kit and IS the loop's one fault body; do not reach for
+`Machine.infraFault`, which is private to its own file. `docs/adr/0001-framework-tier-is-kit-only.md`
+has the reasoning and `test/KitBoundarySpec.scala` fails the gate on a breach.
+
 ## Anything that has bitten you
 
 Scaladoc explains WHY a decision was made, never what the code does. The codebase is read mostly by
