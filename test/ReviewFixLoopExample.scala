@@ -77,8 +77,11 @@ final case class PrRequest(work: Work, needsHuman: Boolean)
 final case class PrOpened(pr: Int, needsHuman: Boolean)
 
 // ---------------------------------------------------------------------------------------------
-// Helpers. Nothing here is library API: `Machine.renderTemplate`, `Machine.touchesProtected` and
-// `Settings.isProtected` are all `private[litterbox]`, so a consumer graph restates them.
+// Helpers. `Machine.renderTemplate` is `private[litterbox]`, so `splice` below restates it. The
+// patch guard is NOT restated: `PatchGuard.stage` is public library API, and calling it is the
+// point. An earlier version of this file rewrote the guard by hand and got it weaker (prefix
+// matching where the real guard runs a JDK glob), which is exactly what a consumer copying this
+// file would have inherited.
 // ---------------------------------------------------------------------------------------------
 
 val MaxRounds = 3
@@ -141,14 +144,6 @@ def parseFindings(text: String): List[String] =
     .filter(_.nonEmpty)
     .toList
 
-/** The patch guard, restated. Prefix matching on the `**` glob shape `protect` uses, which is
-  * narrower than the library's own JDK-glob matcher: widen it if your `protect` list uses `*`
-  * anywhere but at the end.
-  */
-def touchesProtected(protect: List[String], numstat: String): Boolean =
-  val paths = numstat.linesIterator.toList.flatMap(line => NumstatRow.parse(line).map(_.path))
-  paths.exists(p => protect.exists(g => p.startsWith(g.stripSuffix("**").stripSuffix("*"))))
-
 def emit(
     issue: Int,
     phase: String,
@@ -189,17 +184,20 @@ def stagePatch(
     case DispatchOutcome.TimedOut =>
       fault.raise(s"$role dispatch timed out — infra fault, no budget spent")
     case DispatchOutcome.Done => ()
-  caps.git.resetHardCleanToOriginMain()
-  if caps.fs.sizeBytes(patchOut) == 0 then None
-  else
-    val numstat = caps.git.applyNumstat(patchOut)
-    if caps.fs.sizeBytes(patchOut) > cfg.maxPatchBytes then
+  // The dispatch is this graph's to make, since what it costs is charged against this node's own
+  // `Cost`; everything after it belongs to the library's guard, which resets to the pristine base,
+  // rules on the patch, and either applies it or stages a rejection marker in its place. Calling it
+  // is what keeps this example's protect matching identical to the shipped loop's rather than an
+  // approximation of it.
+  PatchGuard.stage(patchOut) match
+    case Staged.Empty     => None
+    case Staged.Oversize  =>
       fault.raise(s"patch guard: $patchOut exceeds the ${cfg.maxPatchBytes}-byte cap — not applied")
-    if touchesProtected(cfg.protect, numstat) then
+    case Staged.Protected =>
       fault.raise(s"patch guard: $patchOut touches a protected path — not applied")
-    if !caps.git.applyIndex(patchOut) then
+    case Staged.ApplyFail =>
       fault.raise(s"git apply refused $patchOut — infra fault, no budget spent")
-    Some(patchOut)
+    case Staged.Ok(patch) => Some(patch)
 
 // ---------------------------------------------------------------------------------------------
 // The nodes. Every one is a top-level `val`: `LitterBox.graph`'s macro reads the SOURCE of the

@@ -36,6 +36,17 @@ The central split, and the reason the whole suite runs in memory:
   `src/Caps.scala`, since whatever the kit names is transitively part of the surface a consumer
   depends on. `docs/adr/0001-framework-tier-is-kit-only.md` carries the reasoning and
   `test/KitBoundarySpec.scala` holds it.
+- `src/PatchGuard.scala`: the patch guard, tier 1 alongside the kit (`docs/adr/0001-framework-tier-is-kit-only.md`
+  carries the tier rule and the amendment that added this third file). `PatchGuard.stage` is the whole
+  patch seam, reset to the pristine base, rule on the patch, then apply it or stage `PATCH-REJECTED.md`
+  in its place, and `PatchGuard.rule` is that ruling on its own, pure over the size cap and the
+  `protect` globs. Both are public, because the alternative is what this repository actually had: the
+  guard `private` inside `Machine` and `test/ReviewFixLoopExample.scala` restating it by hand with a
+  prefix matcher weaker than the real one. The agent dispatch stays OUT of it (that is the node's
+  `Cost` and the runner's metering), and so do the status emit and the per role log narration (they
+  need a `Cursor` and carry the IMPL/FIX announce/silent split, which is routing). The glob matcher
+  moved here out of `Settings` because tier 1 may not name `Settings`; `Settings.protectWithFloor`
+  stayed there, since which patterns are in the list is config layering.
 - `src/Machine.scala` — `Machine.runOnce`, and the shipped `Workflow` (`Machine.shippedWorkflow`) it
   walks through `Runner.run`: pure decision logic. Touches the world through nothing but the
   capabilities. No direct filesystem, subprocess, or clock access.
@@ -98,7 +109,9 @@ burn repair budget or dispatch a FIX.
 
 `src/Domain.scala` holds the closed types: `LoopExit` (the eight terminal states and their process
 exit codes 0/10/11/20/30/40/50/60 — the rc contract shared with `watch.sh`, never change a meaning),
-`StageResult`, `GateResult`, `Verdict`, `FailureKind` (whose `text` strings appear verbatim in logs,
+`Ruling` and `Staged` (what the patch guard concluded, and what it then did; two types rather than the
+one `StageResult` they replace, since the dispatch timeout that used to be a case of it now belongs to
+the caller, `src/PatchGuard.scala`), `GateResult`, `Verdict`, `FailureKind` (whose `text` strings appear verbatim in logs,
 commits and PR notes), `InfraFault`, `Role`, `Template`, `Config`.
 
 ### Configuration layering

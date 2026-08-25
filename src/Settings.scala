@@ -3,7 +3,7 @@ package in.rcard.litterbox
 import com.typesafe.config.{Config as TsConfig, ConfigException, ConfigFactory, ConfigParseOptions}
 
 import java.nio.charset.StandardCharsets
-import java.nio.file.{FileSystems, Files, Path, PathMatcher}
+import java.nio.file.{Files, Path}
 import scala.jdk.CollectionConverters.*
 import scala.util.control.NonFatal
 
@@ -222,7 +222,7 @@ object Settings:
     * so widen its own guard, which is the single edit no patch may ever make.
     *
     * Unioning rather than merging makes the list monotone — a consumer entry can only ever ADD
-    * protection, never take any away — which is what `Machine.touchesProtected`'s scaladoc and the
+    * protection, never take any away — which is what `PatchGuard.touchesProtected`'s scaladoc and the
     * README already promise. The cost is that a repo cannot un-protect `.github` or `CONTEXT.md` by
     * omission; that is the intended trade, since both are the loop grading its own work.
     */
@@ -234,36 +234,6 @@ object Settings:
     */
   private lazy val protectFloor: List[String] =
     reference.getStringList("protect").asScala.toList
-
-  /** Compiles one `protect` entry into a matcher over repo-relative paths.
-    *
-    * `glob:` semantics are the JDK's (`FileSystems.getDefault.getPathMatcher`), which is what the
-    * schema's double-star notation already assumes: a single star stops at a directory separator, a
-    * double star crosses it. So the entry `.github` followed by `/` and a double star matches
-    * `.github/workflows/ci.yml`; `CONTEXT.md` matches only itself; and `src` + `/` + `*.scala`
-    * would match `src/Main.scala` but not `src/a/B.scala`.
-    */
-  private[litterbox] def matcher(pattern: String): PathMatcher =
-    matchers.computeIfAbsent(pattern, p => FileSystems.getDefault.getPathMatcher(s"glob:$p"))
-
-  /** Compiled once per pattern. `isProtected` runs the whole `protect` list against every path in a
-    * numstat, so without this a thousand-file patch recompiles the same handful of globs a thousand
-    * times. Bounded by the config's own list, so it cannot grow without bound.
-    */
-  private val matchers = new java.util.concurrent.ConcurrentHashMap[String, PathMatcher]()
-
-  /** Whether a repo-relative path is covered by any `protect` glob.
-    *
-    * Total on junk input: a path `java.nio` refuses to parse (an empty string, an NUL byte) is
-    * reported as NOT protected rather than throwing — the caller is the patch guard, and a throw
-    * there would abort the iteration instead of rejecting the patch. It cannot widen the hole,
-    * because `git apply --index` still has to accept the same path afterwards.
-    */
-  private[litterbox] def isProtected(protect: List[String], path: String): Boolean =
-    try
-      val p = Path.of(path)
-      protect.exists(pat => matcher(pat).matches(p))
-    catch case _: java.nio.file.InvalidPathException => false
 
   // ---- sandbox naming --------------------------------------------------------------------------
 

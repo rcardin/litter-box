@@ -42,16 +42,40 @@ enum LoopExit(val rc: Int):
     */
   case Parked extends LoopExit(60)
 
-/** What the patch seam (dispatch -> reset -> inspect -> apply) concluded for one agent patch. */
-enum StageResult:
+/** What the patch guard concluded about one agent patch, before anything was done about it.
+  *
+  * Separate from [[Staged]], which is what the guard then DID, because the ruling is decidable from
+  * two facts alone (the size of the patch, the paths it names) while staging also depends on whether
+  * `git apply --index` accepts it. A test can drive the whole ruling with a table of strings.
+  *
+  * Named without naming the module that produces it, deliberately: this file is the domain tier, the
+  * one every tier above it names, and a doc link pointing UP at a caller would read as though the
+  * type belonged to that caller rather than to the vocabulary. The guard's own file is where the
+  * mechanism is written down.
+  */
+enum Ruling:
+  /** Nothing to refuse: within the size cap and touching no protected path. */
+  case Clean
+
+  /** Over `Config.maxPatchBytes`. */
+  case Oversized
+
+  /** Touches a path covered by a `Config.protect` glob. */
+  case Protected
+
+/** What the patch seam (reset -> inspect -> apply) DID with one agent patch.
+  *
+  * Carries no `Timeout` case, unlike the `StageResult` it replaces: the agent dispatch sits outside
+  * the guard now, so a dispatch timeout is a fact the CALLER holds and never a value the guard can
+  * return. A public return type carrying a case its own function cannot produce is an interface that
+  * lies about what may come back.
+  */
+enum Staged:
   /** Patch inspected, applied and staged; `patch` is the artifact tamper/reviewer read. */
   case Ok(patch: String)
 
   /** The agent produced no diff. */
   case Empty
-
-  /** Dispatch hit ITER_TIMEOUT — infra fault, never a gate failure. */
-  case Timeout
 
   /** `git apply --index` refused the patch — infra fault, NO budget spent. */
   case ApplyFail
