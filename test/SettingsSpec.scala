@@ -403,67 +403,40 @@ class SettingsSpec extends AnyFlatSpec with Matchers:
   }
 
   // ===============================================================================================
-  // 5. protect globs and the patch guard
+  // 5. the protect list and its floor
   // ===============================================================================================
 
-  /** `Machine.touchesProtected` is the patch guard's whole decision, and it is reached through
-    * `git apply --numstat` output rather than a list of paths, so the glob semantics are asserted
-    * through that exact shape ("<added>\t<deleted>\t<path>", see `NumstatRow.parse`) instead of
-    * through `Settings.isProtected` alone. Anything that broke the numstat parsing would otherwise
-    * leave the guard waving patches through with a green glob test.
+  /** The protect list is data this file's own parsing produces, so what stays here are the tests
+    * whose subject is the LIST: the floor union, and a consumer's entries landing on top of it.
+    * Everything whose subject is the MATCH moved to `PatchGuardSpec` with the matcher itself.
+    *
+    * Asserted through `git apply --numstat` output rather than a list of paths, since that is the
+    * exact shape the guard reads ("<added>\t<deleted>\t<path>", see `NumstatRow.parse`).
     */
   private def numstat(paths: String*): String =
     paths.map(p => s"1\t0\t$p").mkString("\n")
-
-  "the protect guard" should "match a double-star entry across directory levels" in {
-    // The case issue #3 names explicitly: `.github` followed by `/` and a double star has to cover
-    // a workflow file nested two levels down, or the agent can rewrite CI and grade its own work.
-    Machine.touchesProtected(
-      List(".github/**"),
-      numstat(".github/workflows/ci.yml")
-    ) shouldBe true
-  }
-
-  it should "not let a single-star entry cross a directory separator" in {
-    // JDK glob semantics, which the schema's notation already assumes. If a single star crossed
-    // separators there would be no way left to write a shallow-only rule.
-    Machine.touchesProtected(List("src/*.scala"), numstat("src/Main.scala")) shouldBe true
-    Machine.touchesProtected(List("src/*.scala"), numstat("src/a/B.scala")) shouldBe false
-  }
-
-  it should "treat a bare filename entry as an exact match, not a suffix match" in {
-    Machine.touchesProtected(List("CONTEXT.md"), numstat("CONTEXT.md")) shouldBe true
-    Machine.touchesProtected(List("CONTEXT.md"), numstat("docs/CONTEXT.md")) shouldBe false
-  }
-
-  it should "report a path covered by nothing in the list as unprotected" in {
-    Machine.touchesProtected(
-      List(".litter-box/**", ".github/**", "CONTEXT.md"),
-      numstat("src/Main.scala")
-    ) shouldBe false
-  }
 
   /** The CONFIGURED list is what the guard consults ON TOP of the reference floor: a repo that
     * protects `secrets/` gets `secrets/` too, but does not stop protecting `.github/` by writing the
     * key. This is the patch-guard half of the issue #3 rule.
     */
-  it should "consult the configured protect list on top of the reference one" in {
+  "the protect list" should "be consulted on top of the reference one" in {
     val protect = nonDefaultConfig.protect
 
-    Machine.touchesProtected(protect, numstat("secrets/deploy.key")) shouldBe true
-    Machine.touchesProtected(protect, numstat("Makefile")) shouldBe true
-    Machine.touchesProtected(protect, numstat(".github/workflows/ci.yml")) shouldBe true
+    PatchGuard.touchesProtected(protect, numstat("secrets/deploy.key")) shouldBe true
+    PatchGuard.touchesProtected(protect, numstat("Makefile")) shouldBe true
+    PatchGuard.touchesProtected(protect, numstat(".github/workflows/ci.yml")) shouldBe true
 
     // Still a real list and not "protect everything": a path nobody named stays writable.
-    Machine.touchesProtected(protect, numstat("src/Main.scala")) shouldBe false
+    PatchGuard.touchesProtected(protect, numstat("src/Main.scala")) shouldBe false
   }
 
   /** THE FLOOR, and the reason it exists. HOCON list semantics are REPLACE, not merge, so before
     * `Settings.protectWithFloor` a consumer repo that wrote ANY `protect` list silently dropped the
     * `.litter-box` double-star entry with it. That is not one path among others: it is the one that stops
     * the agent under harness from editing `.litter-box/config.conf`, i.e. from rewriting the guard
-    * that is judging its own patch. The list below is a plausible consumer list — it names the repo's
-    * own secrets and nothing of the loop's — and the assertion is that it cannot open that door.
+    * that is judging its own patch. The list below is a plausible consumer list, naming the repo's
+    * own secrets and nothing of the loop's, and the assertion is that it cannot open that door.
     */
   it should "protect .litter-box even when the consumer list omits it entirely" in {
     val cfg = parseOk(
@@ -472,15 +445,15 @@ class SettingsSpec extends AnyFlatSpec with Matchers:
         .withFallback(Settings.referenceOnly)
     )
 
-    Machine.touchesProtected(cfg.protect, numstat(Settings.ConfigPath)) shouldBe true
-    Machine.touchesProtected(cfg.protect, numstat(".litter-box/logs/status.jsonl")) shouldBe true
+    PatchGuard.touchesProtected(cfg.protect, numstat(Settings.ConfigPath)) shouldBe true
+    PatchGuard.touchesProtected(cfg.protect, numstat(".litter-box/logs/status.jsonl")) shouldBe true
 
     // The consumer's own entry still takes effect, so the floor added to the list rather than
     // replacing it in the other direction.
-    Machine.touchesProtected(cfg.protect, numstat("secrets/deploy.key")) shouldBe true
+    PatchGuard.touchesProtected(cfg.protect, numstat("secrets/deploy.key")) shouldBe true
   }
 
-  /** A consumer list that repeats a floor entry must not double it: `isProtected` runs every entry
+  /** A consumer list that repeats a floor entry must not double it: the guard runs every entry
     * against every numstat path, so duplicates are pure cost, and a config that reads back the
     * `.github` entry twice invites someone to "fix" it by dropping the floor.
     */
@@ -493,35 +466,6 @@ class SettingsSpec extends AnyFlatSpec with Matchers:
 
     cfg.protect.distinct shouldBe cfg.protect
     cfg.protect should contain(".litter-box/**")
-  }
-
-  it should "reject a multi-row numstat as soon as ONE row is protected" in {
-    Machine.touchesProtected(
-      List(".github/**"),
-      numstat("src/Main.scala", ".github/workflows/ci.yml", "README.md")
-    ) shouldBe true
-  }
-
-  /** Totality on junk input, and the reason it is not a throw: the caller is the patch guard, and an
-    * exception there aborts the whole iteration (an infra fault, budget untouched, issue stuck)
-    * instead of doing the one thing the guard exists to do, which is to reject the patch. Reporting
-    * "not protected" cannot widen the hole either, because `git apply --index` still has to accept
-    * the same unparseable path afterwards, and it will not.
-    */
-  "Settings.isProtected" should "be total on a path java.nio refuses to parse" in {
-    // An embedded NUL byte is the portable way to make java.nio refuse outright: `Path.of` throws
-    // InvalidPathException instead of returning anything. Built from a char rather than written as
-    // a literal so the file stays plain text.
-    val unparseable = "src/" + 0.toChar + "broken.scala"
-
-    noException should be thrownBy {
-      Settings.isProtected(List("**"), unparseable) shouldBe false
-    }
-    Settings.isProtected(List("**"), unparseable) shouldBe false
-
-    // Sanity, so the assertion above is about the parse failure and not about a glob that happens
-    // to match nothing: the very same glob does cover a path that parses.
-    Settings.isProtected(List("**"), "src/Main.scala") shouldBe true
   }
 
   // ===============================================================================================

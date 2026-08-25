@@ -2388,10 +2388,10 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
         ".litter-box/config.conf" // the guard list now protects the file that defines it
       )
     protectedPaths.foreach(p =>
-      withClue(p) { Machine.touchesProtected(protect, numstat(p)) shouldBe true }
+      withClue(p) { PatchGuard.touchesProtected(protect, numstat(p)) shouldBe true }
     )
     List("src/main/scala/A.scala", "src/test/scala/ATest.scala", "build.sbt", "README.md")
-      .foreach(p => withClue(p) { Machine.touchesProtected(protect, numstat(p)) shouldBe false })
+      .foreach(p => withClue(p) { PatchGuard.touchesProtected(protect, numstat(p)) shouldBe false })
   }
 
   // ---- Scenario T: oversized patch -> marker, gate SKIPPED, needs-human + audit PR ---------

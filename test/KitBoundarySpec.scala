@@ -90,8 +90,15 @@ import scala.util.matching.Regex
   */
 class KitBoundarySpec extends AnyFlatSpec with Matchers:
 
-  /** The kit tier: the files the rule binds. */
-  private val KitTier = List("Kit.scala", "KitMacro.scala")
+  /** The kit tier: the files the rule binds.
+    *
+    * `PatchGuard.scala` joined the two original files when the patch guard became a module of its
+    * own. It is bound by the same rule for the same reason: a consumer authoring their own graph
+    * calls `PatchGuard.stage`, so whatever that file names is transitively part of the surface they
+    * depend on. Its arrival is also why the glob matcher moved out of `Settings` rather than being
+    * reached for from tier 1, since `Settings` is on the denylist this spec derives.
+    */
+  private val KitTier = List("Kit.scala", "KitMacro.scala", "PatchGuard.scala")
 
   /** The domain tier, plus the kit itself: the files a kit reference is allowed to resolve into.
     * Derived from [[KitTier]] rather than restated, so the two cannot drift: writing the kit half
@@ -278,7 +285,11 @@ class KitBoundarySpec extends AnyFlatSpec with Matchers:
     * likely to be moved by an unrelated edit.
     */
   private val CodeAnchors =
-    Map("Kit.scala" -> "def workflowOf", "KitMacro.scala" -> "object KitMacro")
+    Map(
+      "Kit.scala"        -> "def workflowOf",
+      "KitMacro.scala"   -> "object KitMacro",
+      "PatchGuard.scala" -> "def stage"
+    )
 
   /** Every whole word occurrence of a denied name in one file's stripped source, as (file, line,
     * name). Tokenising the line and asking whether the token is denied, rather than searching for

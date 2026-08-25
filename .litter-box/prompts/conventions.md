@@ -36,14 +36,18 @@ dependency is a design decision, not a convenience.
 
 Never use `@nowarn` or any other suppression to get past a warning. Fix the cause.
 
-`src/Kit.scala` and `src/KitMacro.scala` are the framework tier. No code in either may name anything
-declared outside those two files plus `src/Domain.scala` and `src/Caps.scala`; comments and string
-literals are exempt. Whatever the kit names becomes, transitively, part of the surface a consumer
+`src/Kit.scala`, `src/KitMacro.scala` and `src/PatchGuard.scala` are the framework tier. No code in
+any of them may name anything declared outside those three files plus `src/Domain.scala` and
+`src/Caps.scala`; comments and string literals are exempt. Whatever the kit names becomes, transitively, part of the surface a consumer
 authoring their own graph depends on, so a kit that reaches into `Machine` publishes the shipped
 pipeline's own machinery as framework by accident. If you need a fault from kit code, raise it
 through `Fault.raise`, which lives in the kit and IS the loop's one fault body; do not reach for
 `Machine.infraFault`, which is private to its own file. `docs/adr/0001-framework-tier-is-kit-only.md`
-has the reasoning and `test/KitBoundarySpec.scala` fails the gate on a breach.
+has the reasoning, including the amendment that added `PatchGuard.scala`, and
+`test/KitBoundarySpec.scala` fails the gate on a breach. The patch guard itself is public
+(`PatchGuard.stage`, `PatchGuard.rule`, `PatchGuard.touchesProtected`): never restate it, in this
+repository or in an example, since a hand written copy of it is how the protect globs silently got
+weaker once already.
 
 ## Anything that has bitten you
 

@@ -353,10 +353,45 @@ why it is one of the two shipped nodes that are public, the other being `Machine
 parking step made public by issue #44 before this one. `Machine.Gate`'s own scaladoc records the full
 decision, including why every other shipped node stays private.
 
+**The patch guard.** Every graph that dispatches an agent has to decide what that agent's patch may
+be allowed to touch, and you do not write that decision yourself. `PatchGuard.stage` is the whole
+patch seam and it is public:
+
+```scala
+caps.agents.worker(Role.IMPL, promptFile, patchOut, logFile, currentPatch) match
+  case DispatchOutcome.TimedOut => fault.raise("IMPL dispatch timed out")
+  case DispatchOutcome.Done     => ()
+
+PatchGuard.stage(patchOut) match
+  case Staged.Ok(patch)  => // applied to the index; carry `patch` onward
+  case Staged.Empty      => // the agent produced no diff
+  case Staged.Oversize   => // over `patch.max-bytes`; PATCH-REJECTED.md staged instead
+  case Staged.Protected  => // touches a `protect` glob; PATCH-REJECTED.md staged instead
+  case Staged.ApplyFail  => // git apply refused it; an infra fault at every shipped call site
+```
+
+It resets the working tree to the pristine base BEFORE it reads anything about the patch, rules on the
+patch against your `patch.max-bytes` and your `protect` list, and then either applies it with
+`git apply --index` or stages a `PATCH-REJECTED.md` marker in its place, so a rejected patch is never
+on the branch and the audit PR still has a diff to open with. It logs its own two `patch guard:` lines
+and raises nothing: what a refusal MEANS is yours to decide from the `Staged` value you get back.
+
+The dispatch stays yours, deliberately: what it costs is charged against your node's own `Cost`. So
+does the routing, which is why nothing here emits a `status.jsonl` event or decides what a rejection
+should do next.
+
+`PatchGuard.rule(bytes, numstat)` is the same ruling with no capabilities, answering `Ruling.Clean`,
+`Ruling.Oversized` or `Ruling.Protected`, if you want to assert on the decision in a unit test without
+a `TestWorld` around it. `PatchGuard.touchesProtected(protect, numstat)` is the glob matching alone,
+JDK `glob:` semantics: a single star stops at a directory separator, a double star crosses it, and a
+bare filename is an exact match rather than a prefix. Do not reimplement it. The `protect` list your
+config carries has already been unioned with the reference floor, so `.litter-box/**` is covered
+whether or not you named it.
+
 This whole surface sits under the same `0.x` no-stability-promise policy as everything else in this
 project (see [Version policy](#version-policy) above): pin an exact version if a shape change landing
-under you would be a problem. That covers `Machine.Gate`, `Machine.GateInput` and
-`Machine.GateVerdict` too, on exactly the same terms and with no extra promise attached to them for
+under you would be a problem. That covers `Machine.Gate`, `Machine.GateInput`,
+`Machine.GateVerdict`, `PatchGuard` and the `Ruling`/`Staged` types too, on exactly the same terms and with no extra promise attached to them for
 being lifted out of the shipped pipeline. What IS promised for as long as those names exist is what
 they mean, not their shape: a gate timeout stays an infra fault and never becomes a `GateVerdict` case,
 the node never publishes outward, and it reads your `config.conf` per tick rather than at the moment

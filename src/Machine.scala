@@ -1048,8 +1048,11 @@ object Machine:
     val implLog   = artifact(issue, s"-iter$n.claude.log")
     val implPatch = artifact(issue, s"-iter$n.impl.patch")
     emit(cur, "IMPL", "start", implLog)
-    stagePatch(Role.IMPL, workerPromptFile, implPatch, implLog, None) match
-      case StageResult.Empty =>
+    agents.worker(Role.IMPL, workerPromptFile, implPatch, implLog, None) match
+      case DispatchOutcome.TimedOut => dispatchTimedOut(cur, Role.IMPL, implLog)
+      case DispatchOutcome.Done     => ()
+    PatchGuard.stage(implPatch) match
+      case Staged.Empty =>
         emit(cur, "IMPL", "ok", implLog, "no diff")
         logger.log(
           "no changes produced by the iteration — leaving issue in-progress, not opening a PR"
@@ -1477,8 +1480,11 @@ object Machine:
     val fixLog   = artifact(issue, s"-pass$pass.fix.claude.log")
     val fixPatch = artifact(issue, s"-pass$pass.fix.patch")
     emit(cur, "FIX", "start", fixLog)
-    stagePatch(Role.FIX, fixPromptFile, fixPatch, fixLog, currentPatch) match
-      case StageResult.Empty =>
+    agents.worker(Role.FIX, fixPromptFile, fixPatch, fixLog, currentPatch) match
+      case DispatchOutcome.TimedOut => dispatchTimedOut(cur, Role.FIX, fixLog)
+      case DispatchOutcome.Done     => ()
+    PatchGuard.stage(fixPatch) match
+      case Staged.Empty =>
         // The fixer reverted all prior work — route to needs-human, never re-gate an empty tree.
         emit(cur, "FIX", "red", fixLog, "empty fix")
         logger.log("FIX produced no diff (the fixer reverted all prior work); routing to needs-human")
@@ -3605,17 +3611,32 @@ object Machine:
         applyFailMsg = "FIX patch did not apply (infra fault, no budget spent)"
       )
 
-  /** Shared shape of a stagePatch(...) result match, common to both the IMPL and FIX call sites:
-    * Timeout and ApplyFail both raise InfraFault (infra fault, no budget spent); Protected and
-    * Oversize both fail the outcome with the matching FailureKind; Ok emits the ok status and
-    * yields the applied patch. The Empty case is genuinely stage-specific (IMPL exits NothingMade,
-    * FIX routes to needs-human) and is handled by each call site before it delegates the rest here.
+  /** The dispatch half of what `stagePatch` used to do in one function, and the reason it is a
+    * function of its own now: the agent dispatch stays with this graph while the patch seam itself
+    * moved to `PatchGuard` (that object's doc has why), so the one outcome the guard can no longer
+    * report, a worker that never came back, is narrated here instead. Same status event, same
+    * per-role message, same infra fault as the `StageResult.Timeout` branch this replaces.
+    */
+  private def dispatchTimedOut(cur: Cursor, role: Role, logFile: String)(using
+      log: StatusLog,
+      logger: Log,
+      notify: Notify
+  )(using Faulting): Nothing =
+    val policy = policyOf(role)
+    emit(cur, policy.stage, "red", logFile, "timeout")
+    infraFault(policy.timeoutMsg)
+
+  /** Shared shape of a `PatchGuard.stage(...)` result match, common to both the IMPL and FIX call
+    * sites: ApplyFail raises InfraFault (infra fault, no budget spent); Protected and Oversize both
+    * fail the outcome with the matching FailureKind; Ok emits the ok status and yields the applied
+    * patch. The Empty case is genuinely stage-specific (IMPL exits NothingMade, FIX routes to
+    * needs-human) and is handled by each call site before it delegates the rest here.
     */
   private def handleStageResult(
       cur: Cursor,
       role: Role,
       logFile: String,
-      result: StageResult
+      result: Staged
   )(using log: StatusLog, logger: Log, notify: Notify)(using Faulting): StageVerdict =
     val policy = policyOf(role)
     val stage  = policy.stage
@@ -3625,117 +3646,23 @@ object Machine:
           logger.log(s"patch guard rejected $subject (${kind.text}) — routing to needs-human")
         case RejectionNarration.Silent => ()
     result match
-      case StageResult.Timeout =>
-        emit(cur, stage, "red", logFile, "timeout")
-        infraFault(policy.timeoutMsg)
-      case StageResult.ApplyFail =>
+      case Staged.ApplyFail =>
         emit(cur, stage, "red", logFile, "patch apply conflict")
         infraFault(policy.applyFailMsg)
-      case StageResult.Protected =>
+      case Staged.Protected =>
         emit(cur, stage, "red", logFile, "protected-path")
         logRejection(FailureKind.ProtectedPath)
         StageVerdict.Rejected(FailureKind.ProtectedPath)
-      case StageResult.Oversize =>
+      case Staged.Oversize =>
         emit(cur, stage, "red", logFile, "oversized patch")
         logRejection(FailureKind.OversizedPatch)
         StageVerdict.Rejected(FailureKind.OversizedPatch)
-      case StageResult.Ok(p) =>
+      case Staged.Ok(p) =>
         emit(cur, stage, "ok", logFile)
         StageVerdict.Applied(p)
-      case StageResult.Empty =>
+      case Staged.Empty =>
         // Unreachable: both call sites match Empty themselves before delegating here.
-        throw IllegalStateException("handleStageResult called with StageResult.Empty")
-
-  /** The patch seam: dispatch the agent, reset to the pristine base, inspect the patch, THEN apply
-    * it. The tree the agent edited is data to inspect, never trusted.
-    */
-  private def stagePatch(
-      role: Role,
-      promptFile: String,
-      patchOut: String,
-      logFile: String,
-      currentPatch: Option[String]
-  )(using
-      cfg: Config,
-      git: Git,
-      agents: AgentDispatch,
-      fs: HarnessFs,
-      logger: Log
-  ): StageResult =
-    agents.worker(role, promptFile, patchOut, logFile, currentPatch) match
-      case DispatchOutcome.TimedOut => return StageResult.Timeout
-      case DispatchOutcome.Done     => ()
-    // Reset to the pristine base BEFORE looking at the patch.
-    git.resetHardCleanToOriginMain()
-    if fs.sizeBytes(patchOut) == 0 then return StageResult.Empty
-    // Inspect, THEN apply. Fail-open is DELIBERATE and backstopped: an unparseable patch
-    // yields an empty numstat (guard passes) but `git apply --index` then refuses it, so a
-    // malformed patch never reaches the gates (ApplyFail = infra fault, no budget).
-    val numstat = git.applyNumstat(patchOut)
-    val bytes   = fs.sizeBytes(patchOut)
-    if bytes > cfg.maxPatchBytes then
-      logger.log(
-        s"patch guard: ${bytes}B exceeds the ${cfg.maxPatchBytes}B cap — rejecting oversized patch (not applied)"
-      )
-      writeRejectMarker(
-        s"Oversized patch: $bytes bytes exceeds the ${cfg.maxPatchBytes}-byte cap.",
-        numstat
-      )
-      return StageResult.Oversize
-    if touchesProtected(cfg.protect, numstat) then
-      logger.log(
-        s"patch guard: patch touches a protected path (${cfg.protect.mkString(", ")}) — rejecting (not applied)"
-      )
-      writeRejectMarker(
-        "Patch touches a protected path (CI workflow, loop code, docs, or a control/constitution file).",
-        numstat
-      )
-      return StageResult.Protected
-    if !git.applyIndex(patchOut) then
-      logger.log(
-        s"git apply refused the patch (see ${patchOut}.apply.err) — infra fault, no budget spent"
-      )
-      return StageResult.ApplyFail
-    StageResult.Ok(patchOut)
-
-  /** On a guard rejection the tree is left pristine — a hostile or oversized patch is NEVER
-    * applied. Stage a small tracked marker instead, so the terminal still has a diff to open the
-    * audit PR with. The marker, not the rejected change, lands on the throwaway branch.
-    */
-  private def writeRejectMarker(reason: String, numstat: String)(using
-      git: Git,
-      fs: HarnessFs
-  ): Unit =
-    fs.write(
-      "PATCH-REJECTED.md",
-      s"""# Patch rejected by the harness guard
-         |
-         |$reason
-         |
-         |This branch is opened for the audit trail ONLY and must NOT be merged. The rejected
-         |patch was never applied to the tree. Numstat of the rejected patch (added deleted path):
-         |
-         |```
-         |${numstat.linesIterator.take(100).mkString("\n")}
-         |```
-         |""".stripMargin
-    )
-    git.add("PATCH-REJECTED.md")
-
-  private[litterbox] def numstatPaths(numstat: String): List[String] =
-    numstat.linesIterator.toList.flatMap(line => NumstatRow.parse(line).map(_.path))
-
-  /** Whether a patch touches anything the consumer repo declared off-limits in `protect` — CI
-    * workflows, the loop's own installed files, the constitution, whatever that repo names.
-    *
-    * The list used to be a literal here, enumerating THIS repo's layout, which only worked while the
-    * loop and the repo it worked on were the same checkout. Now it arrives as globs off the config,
-    * so a consumer repo protects its own paths and the loop protects everything under
-    * `.litter-box` — including the config file that defines this very list, which is what stops an
-    * agent from widening its own guard.
-    */
-  private[litterbox] def touchesProtected(protect: List[String], numstat: String): Boolean =
-    numstatPaths(numstat).exists(p => Settings.isProtected(protect, p))
+        throw IllegalStateException("handleStageResult called with Staged.Empty")
 
   /** Test-tamper report over the applied patch's numstat, filtered to src/test and src/it. */
   private[litterbox] def tamperReport(numstat: String): String =

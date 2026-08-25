@@ -899,7 +899,7 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
     * Bash captures this with `$(git apply --numstat "$patch" 2>/dev/null)` (loop.sh:554), and
     * command substitution keeps whatever reached stdout no matter how the command exited. If the
     * port dropped stdout on a nonzero rc, rows git DID emit would vanish and
-    * `Machine.touchesProtected` — the guard whose job is to block writes to `.github/`, `sandbox/`,
+    * `PatchGuard.touchesProtected` — the guard whose job is to block writes to `.github/`, `sandbox/`,
     * `resources/` (the prompts, the sandbox scripts and the observability scripts), `docs/`,
     * project.scala, CONTEXT.md, PROMPT.md, STOP.md — would see an empty file list and wave the patch
     * through: failing open WIDER than bash, in the one guard where that matters most.
@@ -930,7 +930,7 @@ class LiveProcSpec extends AnyFlatSpec with Matchers:
     // stdout that reached the guard, not which paths a given repo chose to protect: `sandbox/**`
     // covers the first row of the fake numstat above, and `src/main/scala/Ok.scala` is deliberately
     // left unprotected so a `true` here can only come from a row that actually survived rc 128.
-    Machine.touchesProtected(List("sandbox/**", ".github/**", "CONTEXT.md"), numstat) shouldBe true
+    PatchGuard.touchesProtected(List("sandbox/**", ".github/**", "CONTEXT.md"), numstat) shouldBe true
   }
 
   "LiveGit.applyIndex" should "apply a valid patch (true) and stage it, and refuse a garbage patch (false)" in {

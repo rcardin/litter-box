@@ -47,8 +47,9 @@ Three tiers, and a tier is a property of a FILE:
 
 - **Tier 0, the domain**: `src/Domain.scala`, `src/Caps.scala`. The closed types and the capability
   traits.
-- **Tier 1, the kit**: `src/Kit.scala`, `src/KitMacro.scala`. The framework a consumer compiles
-  against.
+- **Tier 1, the kit**: `src/Kit.scala`, `src/KitMacro.scala`, `src/PatchGuard.scala`. The framework a
+  consumer compiles against. `PatchGuard.scala` joined the list after this ADR was accepted, under
+  the amendment recorded in Consequences below.
 - **Tier 2, the application**: `src/Machine.scala`, `src/LitterBox.scala`, `src/Main.scala`,
   `src/Live.scala`. The shipped graph, the front door, the wiring that runs a graph and the real
   side effects behind the capabilities.
@@ -121,3 +122,31 @@ rule still reaches every one of them, and so does the check: the rule is phrased
 four, so the kit may no more name `Settings` than it may name `Machine`. What these seven do not need
 is a NAME for their position, since nothing reads one. Tiers exist here to make one arrow
 enforceable, not to give every file a label.
+
+## Amendment, 24 August 2026: `src/PatchGuard.scala` joins tier 1
+
+The patch guard, the decision about what an agent patch may be allowed to reach the index, was a set
+of `private` helpers inside `src/Machine.scala`: `stagePatch`, `touchesProtected`, `numstatPaths` and
+`writeRejectMarker`, with the glob matcher itself a `private[litterbox]` member of `src/Settings.scala`.
+By the framing this ADR already sets out, that put the loop's own threat model inside one inhabitant
+of the kit rather than in the framework every inhabitant compiles against.
+
+The consequence was not hypothetical. `test/ReviewFixLoopExample.scala`, the one worked consumer graph
+this repository ships and the file a consumer copies, restated the guard by hand, and restated it
+WEAKER: prefix matching on a `**` suffix where the real guard runs a JDK glob, so a `protect` entry
+whose star is not at the end silently stopped protecting anything. Its own comment said so. A security
+decision reachable only through one graph's private helper is a security decision every other graph
+reimplements, and reimplements worse.
+
+`src/PatchGuard.scala` is therefore a tier 1 file, and the rule binds it unchanged: it names `Domain`,
+`Caps` and the kit, and nothing else. Two things follow from the rule rather than from preference. The
+glob matcher MOVED out of `Settings` rather than being called from tier 1, since `Settings` is on the
+denylist `test/KitBoundarySpec.scala` derives; `Settings.protectWithFloor` stayed, because deciding
+which patterns are in the list is config layering while deciding what a pattern MEANS is guard
+mechanics. And the agent dispatch did NOT move in: what a dispatch costs is the node's `Cost` and the
+runner's own metering, so a guard that dispatched would be spending a budget it cannot see.
+
+The tier rule itself does not change, and neither does its direction. What changed is that tier 1 now
+has three files, `test/KitBoundarySpec.scala` scans all three, and a fourth would be added the same
+way: by deciding it is framework, not by discovering that something in tier 2 was already being
+imported from tier 1.

@@ -3,9 +3,9 @@ package in.rcard.litterbox
 /** Capability traits (passed as `using` context parameters).
   *
   * Slice 1 provides only in-memory scripted handlers (test/Recorder.scala); the live
-  * subprocess/fs/gh handlers are slice 2 (Live.scala). Machine.runOnce, and the shipped Workflow
-  * (Machine.shippedWorkflow) it walks through Runner.run, are pure decision logic over these — they
-  * touch the world through nothing else.
+  * subprocess/fs/gh handlers are slice 2 (Live.scala). Every graph above this file, the shipped
+  * pipeline included, is pure decision logic over these traits and touches the world through
+  * nothing else.
   *
   * Deviation from the design doc's capability table: `pickIssue` is split into `inProgressIssue` /
   * `oldestReadyIssue` so the resume-in-progress-first decision stays in Machine (under test)
@@ -114,8 +114,8 @@ trait GitHub:
     * would risk labelling an issue `parked` with no marker on it at all, after which every comment
     * ever left on the issue reads as "the reply" on the next tick.
     *
-    * `false` = the underlying post failed (rc != 0); `Machine.shippedWorkflow`'s own `finish` (its
-    * `Route.Parked` branch) treats that as an infra fault rather than completing the park.
+    * `false` = the underlying post failed (rc != 0), which the shipped pipeline's own parking route
+    * treats as an infra fault rather than completing the park.
     */
   def issueComment(issue: Int, body: String): Boolean
 
