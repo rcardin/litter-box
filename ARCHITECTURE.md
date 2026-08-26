@@ -31,10 +31,11 @@ The central split, and the reason the whole suite runs in memory:
   `Gate` and `AskHuman` stays private, and what a consumer takes on by wiring it in. Nothing about `shippedWorkflow` or
   `shippedShape` moved for it; both simply name `Gate` where they used to call `Gate(cfg)`, since that
   parameter was never read.
-  The kit is a TIER, and the dependency arrow into it runs one way: no code in `src/Kit.scala` or
-  `src/KitMacro.scala` may name anything declared outside those two files plus `src/Domain.scala` and
-  `src/Caps.scala`, since whatever the kit names is transitively part of the surface a consumer
-  depends on. `docs/adr/0001-framework-tier-is-kit-only.md` carries the reasoning and
+  The kit is a TIER, and the dependency arrow into it runs one way: no code in a tier 1 file may name
+  anything declared outside tier 1 plus `src/Domain.scala` and `src/Caps.scala`, since whatever the
+  kit names is transitively part of the surface a consumer depends on. `src/Kit.scala` and
+  `src/KitMacro.scala` were the original two; `src/PatchGuard.scala` and `src/Reply.scala` each joined
+  under their own amendment, and each entry below says why. `docs/adr/0001-framework-tier-is-kit-only.md` carries the reasoning and
   `test/KitBoundarySpec.scala` holds it.
 - `src/PatchGuard.scala`: the patch guard, tier 1 alongside the kit (`docs/adr/0001-framework-tier-is-kit-only.md`
   carries the tier rule and the amendment that added this third file). `PatchGuard.stage` is the whole
@@ -47,6 +48,18 @@ The central split, and the reason the whole suite runs in memory:
   need a `Cursor` and carry the IMPL/FIX announce/silent split, which is routing). The glob matcher
   moved here out of `Settings` because tier 1 may not name `Settings`; `Settings.protectWithFloor`
   stayed there, since which patterns are in the list is config layering.
+- `src/Reply.scala`: the render half of the reply protocol, tier 1 alongside the kit
+  (`docs/adr/0001-framework-tier-is-kit-only.md` carries the tier rule and the amendment that added
+  this fourth file). `Reply.splice` takes the untrusted comment entries a thread holds and returns one
+  block of prompt text: escape the entry grammar, defuse a forged fence tag, then cap per entry,
+  joined by the separator it owns. The ORDER is the protection rather than the three steps, which is
+  the whole reason it is one function and not three: capping first can cut a forged entry boundary in
+  half and change whether it still parses, and an escape running after the cap cannot see the text
+  the cap already dropped. It was two hand written copies inside `Machine` before, at `runFixRound`
+  and at `AskHuman`'s own probe, only one of which carried the comment saying why the order is what it
+  is. Every step, the separator, the empty thread sentinel and both character budget constants are
+  private to it. The sentinel for a comment read that FAILED deliberately stayed in `runFixRound`,
+  since this function is handed what was read and cannot tell an empty thread from an unreadable one.
 - `src/Machine.scala` — `Machine.runOnce`, and the shipped `Workflow` (`Machine.shippedWorkflow`) it
   walks through `Runner.run`: pure decision logic. Touches the world through nothing but the
   capabilities. No direct filesystem, subprocess, or clock access.

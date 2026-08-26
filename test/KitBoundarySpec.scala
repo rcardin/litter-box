@@ -8,9 +8,9 @@ import java.nio.file.{Files, Path}
 import scala.jdk.CollectionConverters.*
 import scala.util.matching.Regex
 
-/** Pins the one directional rule that makes the framework tier kit only: no CODE in `src/Kit.scala`
-  * or `src/KitMacro.scala` may name anything declared outside those two files and `src/Domain.scala`
-  * plus `src/Caps.scala`.
+/** Pins the one directional rule that makes the framework tier kit only: no CODE in a kit tier file
+  * may name anything declared outside the kit tier and `src/Domain.scala` plus `src/Caps.scala`.
+  * [[KitTier]] is the list, and it is the only place that list is written down here.
   *
   * Tier applies to a FILE, not to a package or a marker trait, and that is the whole reason this
   * check has to exist as a spec at all. `Kit` and `Machine` are members of the same package, so every
@@ -97,8 +97,16 @@ class KitBoundarySpec extends AnyFlatSpec with Matchers:
     * calls `PatchGuard.stage`, so whatever that file names is transitively part of the surface they
     * depend on. Its arrival is also why the glob matcher moved out of `Settings` rather than being
     * reached for from tier 1, since `Settings` is on the denylist this spec derives.
+    *
+    * `Reply.scala` joined it next, on the same argument: a consumer node that puts a human's words
+    * in front of a worker calls `Reply.splice`. That file is also the sharpest case for why the rule
+    * has to be checked by reading source text rather than trusted to review. The shortest route to
+    * the escape it performs is the application tier's own entry parse, which is
+    * `private[litterbox]` and so compiles perfectly from the same package, which is precisely the
+    * reference this spec exists to catch. The duplicate parse that file carries instead is the rule
+    * being obeyed, not an oversight to tidy away.
     */
-  private val KitTier = List("Kit.scala", "KitMacro.scala", "PatchGuard.scala")
+  private val KitTier = List("Kit.scala", "KitMacro.scala", "PatchGuard.scala", "Reply.scala")
 
   /** The domain tier, plus the kit itself: the files a kit reference is allowed to resolve into.
     * Derived from [[KitTier]] rather than restated, so the two cannot drift: writing the kit half
@@ -190,9 +198,9 @@ class KitBoundarySpec extends AnyFlatSpec with Matchers:
         val denied = deniedNames(root)
 
         // The nested file shares a basename with an allowed root file, `Domain.scala`, but is not
-        // one of the four the kit is allowed to name, so its declaration must stay in the denylist.
+        // one of the root files the kit is allowed to name, so its declaration must stay in the denylist.
         denied should contain("Registry")
-        // The root file is one of the four, so its declaration must stay exempt.
+        // The root file is one of them, so its declaration must stay exempt.
         denied should not contain "ExemptRoot"
       finally
         Files.walk(root).iterator.asScala.toList.sortBy(_.toString).reverse.foreach(Files.delete)
@@ -288,7 +296,8 @@ class KitBoundarySpec extends AnyFlatSpec with Matchers:
     Map(
       "Kit.scala"        -> "def workflowOf",
       "KitMacro.scala"   -> "object KitMacro",
-      "PatchGuard.scala" -> "def stage"
+      "PatchGuard.scala" -> "def stage",
+      "Reply.scala"      -> "def splice"
     )
 
   /** Every whole word occurrence of a denied name in one file's stripped source, as (file, line,
@@ -350,9 +359,9 @@ class KitBoundarySpec extends AnyFlatSpec with Matchers:
     s"the kit tier names ${violations.map(_._3).distinct.size} declaration(s) from outside itself " +
       s"and the domain tier:\n$lines\n"
 
-  /** The names of every top level declaration in `src/`, minus the four files the kit is allowed to
+  /** The names of every top level declaration in `src/`, minus the files the kit is allowed to
     * name. Compared by the path RELATIVE TO `src/`, never by basename: [[AllowedTierFiles]] denotes
-    * the four files sitting at the `src` root, not any file merely sharing one of their tails, so
+    * files sitting at the `src` root, not any file merely sharing one of their tails, so
     * `src/internal/Domain.scala` relativizes to `internal/Domain.scala`, misses the exemption and
     * stays in the denylist exactly as any other Tier 2 file would. Anchored at column zero so that
     * "top level" is read straight off the layout: a nested member is indented, and a nested member is

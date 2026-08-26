@@ -8,9 +8,9 @@ both real config and a worked example). The load-bearing ones:
 - One runtime dependency (`com.typesafe:config`) and one test dependency (scalatest). Adding a
   dependency is a design decision, not a convenience.
 - Never use `@nowarn` or any other suppression to get past a warning. Fix the cause.
-- No code in `src/Kit.scala`, `src/KitMacro.scala` or `src/PatchGuard.scala` may name anything
-  declared outside those three files plus `src/Domain.scala` and `src/Caps.scala`. Comments and
-  string literals are exempt.
+- No code in `src/Kit.scala`, `src/KitMacro.scala`, `src/PatchGuard.scala` or `src/Reply.scala` may
+  name anything declared outside those four files plus `src/Domain.scala` and `src/Caps.scala`.
+  Comments and string literals are exempt.
   `docs/adr/0001-framework-tier-is-kit-only.md` has the reasoning, `test/KitBoundarySpec.scala`
   holds it, and the reason it needs writing down is that every fault site that broke it arrived for
   a good local reason and compiled clean.

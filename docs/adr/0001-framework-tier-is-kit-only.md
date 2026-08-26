@@ -47,9 +47,9 @@ Three tiers, and a tier is a property of a FILE:
 
 - **Tier 0, the domain**: `src/Domain.scala`, `src/Caps.scala`. The closed types and the capability
   traits.
-- **Tier 1, the kit**: `src/Kit.scala`, `src/KitMacro.scala`, `src/PatchGuard.scala`. The framework a
-  consumer compiles against. `PatchGuard.scala` joined the list after this ADR was accepted, under
-  the amendment recorded in Consequences below.
+- **Tier 1, the kit**: `src/Kit.scala`, `src/KitMacro.scala`, `src/PatchGuard.scala`,
+  `src/Reply.scala`. The framework a consumer compiles against. `PatchGuard.scala` and
+  `Reply.scala` joined the list after this ADR was accepted, each under its own amendment below.
 - **Tier 2, the application**: `src/Machine.scala`, `src/LitterBox.scala`, `src/Main.scala`,
   `src/Live.scala`. The shipped graph, the front door, the wiring that runs a graph and the real
   side effects behind the capabilities.
@@ -150,3 +150,49 @@ The tier rule itself does not change, and neither does its direction. What chang
 has three files, `test/KitBoundarySpec.scala` scans all three, and a fourth would be added the same
 way: by deciding it is framework, not by discovering that something in tier 2 was already being
 imported from tier 1.
+
+## Amendment, 25 August 2026: `src/Reply.scala` joins tier 1
+
+The render half of the reply protocol, turning untrusted comment entries into one block of prompt
+text, was written out by hand at two call sites inside `src/Machine.scala`: `runFixRound`, filling the
+`{{COMMENTS}}` slot of a FIX prompt, and `askHumanProbeResult`, building the text `AskHuman` hands to
+the next node. Both spelled the same three steps in the same order, escape the entry grammar, defuse a
+forged fence tag, then cap per entry, joined by the same separator. Only one of them carried the
+comment explaining why that order is what it is, and no test in the suite could tell one order from
+the other.
+
+The order IS the protection. Capping first can cut a forged entry boundary in half and change whether
+it still parses as one, and an escape that runs after the cap cannot see the text the cap already
+dropped. A protection carried by the ORDER of a composition, and restated wherever the composition is
+needed, has as many implementations as it has callers and no way to check that they agree. It took
+three review rounds to arrive at that order; the second call site copied it, and the next caller was
+free to copy it wrong.
+
+A consumer authoring their own graph had none of the implementations. Any node of theirs that puts a
+human's words in front of a worker faces exactly this question, and the only two answers in the
+codebase were private to one graph. That is the same argument that moved the patch guard, and it is
+answered the same way.
+
+`src/Reply.scala` is therefore a tier 1 file, added the way this ADR's previous amendment says a
+fourth one would be: by deciding it is framework, not by discovering that something in tier 2 was
+already being imported from tier 1. It exposes one function, the render half, pure over a list of
+strings, taking no capability and no config. Everything the composition is made of is private to it,
+the two character budget constants included, because a caller that can reach the steps can order them
+wrongly and a spec that drives the steps can watch each one behave perfectly while the composition
+around them is wrong, which is precisely the state this repository was in.
+
+Two things follow from the rule rather than from preference. The file carries its OWN copy of the
+entry parse rather than calling `Machine.parseEntry`, which is `private[litterbox]` and so would
+compile cleanly from the same package while being exactly the reference `test/KitBoundarySpec.scala`
+exists to catch. And the sentinel a caller renders when the comment read FAILED stayed in
+`runFixRound`: the render half is handed the entries that were read, so it cannot tell a thread with
+nothing in it from a thread nobody could see, and an answer to a question it was not asked is how two
+sentinels drift into meaning the same thing.
+
+What the extraction was allowed to change is nothing. The golden files under `test/golden/` are the
+proof, and they are untouched by the diff. What it added is one test the suite did not have: a forged
+boundary placed to straddle the cap, so that capping first and escaping first render visibly different
+text, and the assertion fails if the two steps are ever swapped back.
+
+The tier rule itself does not change, and neither does its direction. Tier 1 now has four files,
+`test/KitBoundarySpec.scala` scans all four, and a fifth would be added the same way.
