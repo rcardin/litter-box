@@ -49,7 +49,8 @@ Three tiers, and a tier is a property of a FILE:
   traits.
 - **Tier 1, the kit**: `src/Kit.scala`, `src/KitMacro.scala`, `src/PatchGuard.scala`,
   `src/Reply.scala`. The framework a consumer compiles against. `PatchGuard.scala` and
-  `Reply.scala` joined the list after this ADR was accepted, each under its own amendment below.
+  `Reply.scala` joined the list after this ADR was accepted, each under its own amendment below;
+  a third amendment records what `Reply.scala` holds now, without changing the list.
 - **Tier 2, the application**: `src/Machine.scala`, `src/LitterBox.scala`, `src/Main.scala`,
   `src/Live.scala`. The shipped graph, the front door, the wiring that runs a graph and the real
   side effects behind the capabilities.
@@ -196,3 +197,62 @@ text, and the assertion fails if the two steps are ever swapped back.
 
 The tier rule itself does not change, and neither does its direction. Tier 1 now has four files,
 `test/KitBoundarySpec.scala` scans all four, and a fifth would be added the same way.
+
+## Amendment, 26 August 2026: `src/Reply.scala` gains the selection half
+
+No tier changes here. `src/Reply.scala` is already a tier 1 file, added by the amendment above, and
+this records what it now holds, because the sentence in that amendment saying "It exposes one
+function, the render half" stopped being true. Appended rather than edited into that amendment's
+body, which is the pattern every prior touch of this document followed: the running enumeration in
+the Decision section is the only pre-existing text a later change rewrites, and accepted reasoning is
+left standing so a reader can see what was decided when.
+
+The selection half, deciding which entries on an issue thread count as a human answering, was seven
+names inside `src/Machine.scala`, all widened to `private[litterbox]` so specs could drive them one
+at a time. Driving them one at a time is precisely what the render half's extraction already
+diagnosed as the wrong test surface, and the same reasoning applies with a sharper edge here: the
+defect was never in a predicate. It was in an unstated PRECONDITION on how the predicates composed.
+
+The reply selection returned the WHOLE thread whenever it found no marker. That fallback is safe only
+for a caller holding evidence, read outside the function, that a marker was posted at some point. The
+pick phase held such evidence, the `parked` label, and said so in prose beside its call. The park
+node's probe held none, ran the first time an issue is ever parked, and compensated with a hand
+written pre check scanning the thread for a marker before it trusted anything the shared code
+returned. Two callers, two different proofs, both in comments. A third caller had nothing to read at
+all, and the failure mode if it guessed wrong is not a wrong log line: it is an issue's ordinary
+unrelated discussion read as an answer to a question nobody asked, dispatching a repair with a
+harness authored failure body claiming an attempt failed and was discarded when none did. That exact
+defect was found and closed once already, by issue #44.
+
+So the precondition becomes an argument. `Reply.Marker` is a closed two case type carrying the
+CALLER's claim about a marker the module cannot verify for itself, and it decides one thing: what an
+absent marker means. On a thread that contains a marker the two cases are byte identical, which is
+what makes the argument a claim rather than a mode. A closed type rather than a boolean because a
+boolean at a call site reads as nothing, and because the claim needs somewhere to carry its own
+statement of what counts as evidence.
+
+`Reply.since` answers with a record of three fields, the accepted entries, the ignored entries and
+the accepted authors, because both marker reading callers finished the same intermediate the same way
+and one of them needs the rejected entries for the operator line explaining why an issue stayed
+parked. No third result case was added: emptiness carries the distinction, and the two outcomes that
+need config or a capability to reach, an exhausted repair budget and an unreadable read, stay with
+the callers that have those. That is the tier rule doing its job rather than a preference.
+
+Two consequences follow from the rule, as they did last time. The park marker token, the parked body,
+the consumed body and the resume failure body all stay in `src/Machine.scala`: they are the shipped
+graph's own voice on an issue thread, and the module already takes the token as an argument, so
+nothing in tier 1 names them. And the file's duplicate entry parse, which the previous amendment
+recorded as the rule being obeyed rather than an oversight, is now the only copy in the repository,
+serving both halves. That last point is the one thing here worth watching. The previous amendment
+argued the two questions, who wrote this and what of this is safe to quote, must be free to move
+independently. Folding them onto one private parse is deliberate, and the cost is real: an edit that
+specialises the parse for one question silently changes the other. Specialise by adding a step, never
+by narrowing the parse.
+
+What this was allowed to change is one operator log line, which stopped enumerating the accepted
+associations now that the set is private, and nothing else. The golden files under `test/golden/` are
+the proof and are untouched by the diff.
+
+The tier rule itself does not change, and neither does its direction. Tier 1 still has four files,
+`test/KitBoundarySpec.scala` scans all four, and a fifth would be added the same way: by deciding it
+is framework, not by discovering that something in tier 2 was already being imported from tier 1.

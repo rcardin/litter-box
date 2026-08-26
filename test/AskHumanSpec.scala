@@ -167,16 +167,18 @@ class AskHumanSpec extends AnyFlatSpec with Matchers:
         case other => fail(s"expected a Done reply, got $other")
     }
 
-  // ---- the correctness trap: no marker yet must never trust replySince's own fallback ----------
+  // ---- the correctness trap: no marker yet must never trust Reply.since's Proven fallback -------
 
   it should "answer no reply (None-shaped, i.e. probe miss) when the issue carries ordinary prior " +
     "accepted-association comments but no park marker at all (issue #44's own correctness trap)" in {
-      // `replySince` hands back EVERY comment when no marker matches at all (its own doc): that
-      // fallback is safe at `pickAndSetup`'s call site only because that call site is already gated
-      // on the issue currently carrying the `parked` label, external proof a marker was posted at
-      // some point. `AskHuman.probe` has no such gate: it is reached the FIRST time this issue ever
-      // reaches `Route.Parked`, so an ordinary, unrelated OWNER/MEMBER/COLLABORATOR comment thread
-      // must not be misread as "the reply to a question never asked".
+      // `Reply.since` under `Reply.Marker.Proven` hands back EVERY comment when no marker matches at
+      // all (its own doc): that claim is safe at `pickAndSetup`'s call site only because that call
+      // site is already gated on the issue currently carrying the `parked` label, external proof a
+      // marker was posted at some point. `askHumanProbeResult` has no such gate, so it passes
+      // `Reply.Marker.Required` instead, which answers no reply whenever no marker is found. It is
+      // reached the FIRST time this issue ever reaches `Route.Parked`, so an ordinary, unrelated
+      // OWNER/MEMBER/COLLABORATOR comment thread must not be misread as "the reply to a question
+      // never asked".
       val world = TestWorld()
       world.viewerLoginAnswer = Some("litter-box")
       world.issueCommentBodies = Map(

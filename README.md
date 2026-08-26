@@ -415,10 +415,31 @@ so in words. A comment read that FAILED is yours to render, deliberately: this f
 entries that were read and cannot tell a thread with nothing in it from a thread nobody could see, and
 those two facts must not collapse into one string a worker reads the same way.
 
+**Deciding which comments are the reply.** `Reply` is both halves of the protocol, not just the
+render. `Reply.since(marker, viewer, comments, claim)` is the other one: it cuts the thread at the
+LAST comment from `viewer` whose body STARTS with `marker`, and answers a `Reply.Since` carrying the
+entries after it that count as a reply, the entries that do not, and the accepted authors,
+deduplicated in first seen order. Counting means an author association of `OWNER`, `MEMBER` or
+`COLLABORATOR` and a body that is not blank, so a drive by comment from an account your repository
+has never vouched for cannot resume anything. The marker token and the viewer login are yours to
+supply: this file is on the kit tier and may not read the shipped loop's own park marker.
+
+`claim` is the argument to read twice. It is your statement about a marker the function cannot verify
+for itself, and it decides one thing only: what an ABSENT marker means. `Reply.Marker.Required`
+answers no reply, and is the honest claim unless you hold evidence, read outside this call, that a
+marker was posted on this thread at some point. `Reply.Marker.Proven` says you do hold that evidence,
+and a thread with no marker then counts entirely as the reply. On a thread that DOES contain a marker
+the two answer identically. In the shipped loop the only such evidence is the `parked` label, which
+the pick phase confirms before it asks, because the one place that applies that label also posts the
+marker; the park node's own probe claims `Required`, because it runs the first time an issue is ever
+parked. Claiming `Proven` without evidence is how an issue's ordinary discussion gets read as an
+answer to a question nobody asked.
+
 This whole surface sits under the same `0.x` no-stability-promise policy as everything else in this
 project (see [Version policy](#version-policy) above): pin an exact version if a shape change landing
 under you would be a problem. That covers `Machine.Gate`, `Machine.GateInput`,
-`Machine.GateVerdict`, `PatchGuard`, the `Ruling`/`Staged` types and `Reply.splice` too, on exactly the same terms and with no extra promise attached to them for
+`Machine.GateVerdict`, `PatchGuard`, the `Ruling`/`Staged` types and all four of `Reply`'s public
+names (`since`, `splice`, `Marker` and `Since`) too, on exactly the same terms and with no extra promise attached to them for
 being lifted out of the shipped pipeline. What IS promised for as long as those names exist is what
 they mean, not their shape: a gate timeout stays an infra fault and never becomes a `GateVerdict` case,
 the node never publishes outward, and it reads your `config.conf` per tick rather than at the moment

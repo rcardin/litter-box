@@ -99,12 +99,15 @@ class KitBoundarySpec extends AnyFlatSpec with Matchers:
     * reached for from tier 1, since `Settings` is on the denylist this spec derives.
     *
     * `Reply.scala` joined it next, on the same argument: a consumer node that puts a human's words
-    * in front of a worker calls `Reply.splice`. That file is also the sharpest case for why the rule
-    * has to be checked by reading source text rather than trusted to review. The shortest route to
-    * the escape it performs is the application tier's own entry parse, which is
-    * `private[litterbox]` and so compiles perfectly from the same package, which is precisely the
-    * reference this spec exists to catch. The duplicate parse that file carries instead is the rule
-    * being obeyed, not an oversight to tidy away.
+    * in front of a worker calls `Reply.splice`, and one that waits for a human to answer calls
+    * `Reply.since`. That file is also the sharpest case for why the rule has to be checked by
+    * reading source text rather than trusted to review. When it arrived, the shortest route to the
+    * escape it performs was the application tier's own entry parse, `private[litterbox]` and so
+    * compiling perfectly from the same package, which is precisely the reference this spec exists to
+    * catch; it carried its own copy instead, and that copy is now the only one left (issue #84 moved
+    * the selection half here too and deleted the tier 2 original). The pull it recorded has not gone
+    * anywhere: the next thing this file needs that `Machine` already has will compile just as
+    * cleanly, and nothing but this check will notice.
     */
   private val KitTier = List("Kit.scala", "KitMacro.scala", "PatchGuard.scala", "Reply.scala")
 

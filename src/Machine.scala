@@ -115,12 +115,11 @@ object Machine:
   private[litterbox] def protectedList(protect: List[String]): String =
     protect.map(p => s"- `$p`").mkString("\n")
 
-  /** The substring `pickAndSetup`'s reply probe (`replySince`) and `AskHuman`'s own probe
-    * (`askHumanReply`) both search for on a later tick, to tell the harness's own bookkeeping
-    * comments apart from ordinary conversation. GitHub holds it, not a local file: a human who
-    * resets the branch or deletes the comment changes the answer the very next tick, which is the
-    * point (issue #28 / RFC #26 decision 6: parking is the terminal state of ONE tick, never a
-    * stored position).
+  /** The substring `pickAndSetup`'s reply probe and `AskHuman`'s own probe (`askHumanReply`) both
+    * hand to `Reply.since` on a later tick, to tell the harness's own bookkeeping comments apart
+    * from ordinary conversation. GitHub holds it, not a local file: a human who resets the branch or
+    * deletes the comment changes the answer the very next tick, which is the point (issue #28 /
+    * RFC #26 decision 6: parking is the terminal state of ONE tick, never a stored position).
     *
     * Two call sites post a comment starting with this marker (issue #44 fix, round 2, replacing an
     * earlier version of this doc that named a single one): `parkIssue`'s own probe-miss path
@@ -149,9 +148,9 @@ object Machine:
 
   /** The comment body `shippedWorkflow`'s own `start` posts (its `resumeAuthors` branch) the moment a
     * resumed reply is genuinely consumed by a dispatch that ran to completion (issue #44 fix, D2):
-    * starts with `ParkMarker`, like `ParkBody`, so `isMarkerEntry`/`replySince` read it as the SAME
-    * kind of boundary a park does, closing off the reply that came before it from ever being read as
-    * "the reply" again, without claiming the issue is parked (it is not; the loop is actively
+    * starts with `ParkMarker`, like `ParkBody`, so `Reply.since` reads it as the SAME kind of
+    * boundary a park does, closing off the reply that came before it from ever being read as "the
+    * reply" again, without claiming the issue is parked (it is not; the loop is actively
     * running a repair attempt over that reply when this posts). A distinct body from `ParkBody`
     * rather than reusing it verbatim: reusing wording that says "Parked, waiting on a human" at the
     * exact moment the loop is doing neither would read as a lie to anyone watching the issue thread.
@@ -191,73 +190,6 @@ object Machine:
        |comments section below; any other comment in that section is not part of this reply and
        |should be disregarded.
        |""".stripMargin
-
-  /** Every `Caps.GitHub.issueComments` entry is `"@login (association):\n<body>"`; this splits one
-    * back into `(login, association, body)`, or `None` if the entry does not have that shape at all
-    * (an `issueComments` implementation is trusted to always produce it, but a probe that is about
-    * to make a trust decision off the association should not assume the shape rather than check
-    * it).
-    */
-  private val AuthorPrefix = "^@(\\S+) \\(([A-Z_]+)\\):\\n".r
-
-  private[litterbox] def parseEntry(entry: String): Option[(String, String, String)] =
-    AuthorPrefix.findFirstMatchIn(entry).map(m => (m.group(1), m.group(2), entry.substring(m.end)))
-
-  /** Whether `entry` is the harness's own park marker comment: an ANCHORED match of `marker` at the
-    * start of the body (not `contains`: GitHub's Quote reply button copies the quoted comment's
-    * body verbatim, marker included, into the new comment, so an unanchored `contains` lets a
-    * human's Quote reply of the park marker match itself and silence the resume probe forever,
-    * issue #28 review finding 4) FROM THE VIEWER'S OWN LOGIN (`viewer`, `GitHub.viewerLogin`'s
-    * answer). Round two required an accepted association (`OWNER`/`MEMBER`/`COLLABORATOR`) here
-    * instead, which stopped a forged marker from an unvouched account but broke under a bot or
-    * GitHub App token: such a token's `authorAssociation` reads `NONE` even on the harness's own
-    * comment, so the genuine marker would never match, `replySince` would fall into the no marker
-    * arm, and the loop would treat the issue's entire comment history as a reply forever (issue
-    * #28 review finding 3, round 3). Login is provenance the harness actually controls: only the
-    * account `gh` is authenticated as can ever satisfy this check, no matter what association
-    * GitHub reports for it. A quoted marker is prefixed with `> ` by Quote reply and so never
-    * starts the body; only the harness's own marker comment satisfies both conditions.
-    */
-  private[litterbox] def isMarkerEntry(marker: String, viewer: String, entry: String): Boolean =
-    parseEntry(entry).exists((login, _, body) => login == viewer && body.startsWith(marker))
-
-  /** The reply set on a parked issue: everything strictly AFTER the LAST entry matching `marker`
-    * from `viewer` (`isMarkerEntry`) among `comments` (oldest first, `GitHub.issueComments`' own
-    * order). No marker anywhere in the list means there is no boundary left to respect: a human
-    * applied the `parked` label by hand, or deleted the marker comment, so every comment present
-    * counts as the reply, per the design this probe implements (issue #28).
-    */
-  private[litterbox] def replySince(marker: String, viewer: String, comments: List[String]): List[String] =
-    comments.lastIndexWhere(isMarkerEntry(marker, viewer, _)) match
-      case -1  => comments
-      case idx => comments.drop(idx + 1)
-
-  /** The associations a resume decision trusts. Any GitHub account can comment on a public issue;
-    * without this filter a drive-by `NONE`-association comment on a parked issue would resume it,
-    * burning a FIX, a repair budget and a reviewer dispatch at no cost to the commenter, repeatable
-    * forever (issue #28 review finding 5). `OWNER`/`MEMBER`/`COLLABORATOR` are the three
-    * associations GitHub grants to people the repo itself has given some standing to; every other
-    * association (`NONE`, `CONTRIBUTOR`, `FIRST_TIME_CONTRIBUTOR`, `FIRST_TIMER`, ...) is a public
-    * commenter the repo has not vouched for.
-    */
-  private[litterbox] val AcceptedReplyAssociations: Set[String] = Set("OWNER", "MEMBER", "COLLABORATOR")
-
-  /** Whether `entry` counts as a human reply that may resume a parked issue: from an accepted
-    * association (`AcceptedReplyAssociations`) AND not blank once the author prefix is stripped
-    * (issue #28 review finding 9: a whitespace-only reply must not burn a dispatch either). An
-    * entry that does not even parse (`parseEntry` returns `None`) is conservatively not a reply.
-    */
-  private[litterbox] def entryCountsAsReply(entry: String): Boolean =
-    parseEntry(entry).exists((_, assoc, body) => AcceptedReplyAssociations(assoc) && !body.isBlank)
-
-  /** The `@login` an entry's author prefix names, or `None` if the entry does not even parse. Used
-    * to name the accepted authors in `resumeFailureBody` (issue #28 review finding 3, round 2):
-    * only a login, never the entry's body, ever leaves `pickAndSetup`'s resume decision, so the
-    * comment TEXT still reaches the worker exclusively through `runFixRound`'s own fenced
-    * `{{COMMENTS}}` splice, never through this path.
-    */
-  private[litterbox] def authorLogin(entry: String): Option[String] =
-    parseEntry(entry).map(_._1)
 
   /** Logs an infra fault the way bash does — the message on the operator's log stream at the point
     * of the fault — fires the rc-50 notify seam, and abandons the iteration. Single helper rather
@@ -496,11 +428,12 @@ object Machine:
     // three counts that each reopen when the other two are fixed, so no combination of them holds
     // at once:
     //   - the in-flight issue is almost certainly NOT parked (a freshly picked issue, or one still
-    //     mid-IMPL) and so carries no park marker; `replySince`'s documented "no marker anywhere
-    //     means every comment counts as the reply" rule then hands the reply check the issue's
-    //     ENTIRE comment history, so one ordinary OWNER/MEMBER/COLLABORATOR comment reads as an
-    //     accepted resume reply and dispatches a FIX, with a harness-authored `{{FAILURE}}` claiming
-    //     a previous attempt failed its gates and was discarded, none of which happened;
+    //     mid-IMPL) and so carries no park marker; the `Reply.Marker.Proven` claim this phase makes,
+    //     "no marker anywhere means every comment counts as the reply", then hands the reply check
+    //     the issue's ENTIRE comment history, so one ordinary OWNER/MEMBER/COLLABORATOR comment
+    //     reads as an accepted resume reply and dispatches a FIX, with a harness-authored
+    //     `{{FAILURE}}` claiming a previous attempt failed its gates and was discarded, none of
+    //     which happened;
     //   - `activeAndParked`'s conditional removal of `parked` exists PRECISELY because the label may
     //     not exist at all in a consumer repo, where a nonexistent label fails `gh issue edit` as a
     //     unit, and a missing `parked` label is exactly one reason `parkedIssues()` can return
@@ -557,16 +490,23 @@ object Machine:
           )
           ReplyCheck.UnreadableComments
         case Some(comments) =>
-          val reply                  = replySince(ParkMarker, viewer, comments)
-          val (accepted, notCounted) = reply.partition(entryCountsAsReply)
-          if accepted.isEmpty && notCounted.nonEmpty then
+          // `Reply.Marker.Proven` is the claim this call site can honestly make and the other one
+          // (`askHumanProbeResult`) cannot: `p` came out of `parkedCandidates`, so it carries the
+          // `parked` label right now, and the only place that applies that label also posts the
+          // marker. That external fact is what makes "no marker anywhere means every comment counts"
+          // safe here, and it is why the claim is an argument rather than a comment: a human who
+          // hand applied the label, or deleted the marker comment, still gets their reply read.
+          val reply = Reply.since(ParkMarker, viewer, comments, Reply.Marker.Proven)
+          if reply.accepted.isEmpty && reply.ignored.nonEmpty then
             // A reply was posted but does not count (association not accepted, or blank once the
             // author prefix is stripped). Say so, so an operator watching the log is not left
-            // wondering why the issue is still parked (issue #28 review finding 5).
+            // wondering why the issue is still parked (issue #28 review finding 5). Which
+            // associations are accepted is `Reply`'s to know, so this line no longer enumerates
+            // them: a list restated here is a list that can disagree with the filter that ran.
             logger.log(
-              s"issue #$p: a reply was posted but is not from an accepted association (${AcceptedReplyAssociations.mkString(", ")}) or is blank, ignored, staying parked"
+              s"issue #$p: a reply was posted but is not from an accepted association or is blank, ignored, staying parked"
             )
-          if accepted.isEmpty then ReplyCheck.NotYet
+          if reply.accepted.isEmpty then ReplyCheck.NotYet
           else if cfg.repairBudget <= 0 then
             // Decided HERE, before any label mutation (issue #28 review finding 7, round 2): the
             // old code let pickAndSetup flip parked to active first and only discovered the
@@ -579,7 +519,7 @@ object Machine:
             )
             ReplyCheck.BudgetExhausted
           else
-            ReplyCheck.Accepted(accepted.flatMap(authorLogin).distinct)
+            ReplyCheck.Accepted(reply.authors)
 
     // `gh.viewerLogin()`, warning only when there was a candidate the harness might otherwise have
     // resumed (issue #28 review finding 3, round 3: without its own login the harness cannot tell
@@ -2013,7 +1953,7 @@ object Machine:
                 // fresh one through `parkIssue` (`askHumanRun`'s own doc), while a probe hit here calls
                 // `reparkKeepingReply` instead, which posts none at all. Posting one on a probe hit was
                 // the actual bug this round fixes: `ParkBody` starts with `ParkMarker`, so posting it over
-                // a reply the probe just found buries that reply behind a boundary `replySince` never
+                // a reply the probe just found buries that reply behind a boundary `Reply.since` never
                 // looks past again, silently discarding guidance a human already gave, while the log line
                 // this branch used to write claimed the opposite ("rather than spending it") of what the
                 // world now showed. Leaving the reply exactly where it is means the NEXT tick's ordinary
@@ -2564,22 +2504,21 @@ object Machine:
     * fresh from GitHub every call (RFC #26 decision 6: parking is the terminal state of ONE tick,
     * never a stored position), with no logging of its own so a caller re-deriving the same answer a
     * second time within one tick (`askHumanRun`'s own doc) never re-emits a line the first call
-    * already wrote. Reuses `isMarkerEntry`/`replySince`/`entryCountsAsReply`/`authorLogin`
-    * (`pickAndSetup`'s own predicate for "does this comment count as an accepted human reply")
-    * unchanged, rather than a second copy that could drift from it: there is exactly one
-    * implementation of that question in the whole codebase. `marker` travels as a parameter (issue
-    * #44 review, MAJOR), never `Machine.ParkMarker` read directly, so this answers exactly the
-    * question `AskHumanInput.marker` poses, whichever caller built it.
+    * already wrote. Asks `Reply.since`, the one implementation of "does this comment count as an
+    * accepted human reply" in the codebase, so this answer and `pickAndSetup`'s cannot drift apart.
+    * `marker` travels as a parameter (issue #44 review, MAJOR), never `Machine.ParkMarker` read
+    * directly, so this answers exactly the question `AskHumanInput.marker` poses, whichever caller
+    * built it.
     *
-    * `replySince`'s own fallback, "no marker anywhere means every comment counts as the reply", is
-    * safe at `pickAndSetup`'s call site only because that call site is already gated on `issue`
-    * currently carrying the `parked` label, external state that proves a marker was posted at some
-    * point (`replySince`'s own doc). This function carries no such gate: it is reached the FIRST time
-    * ANY issue reaches `Route.Parked`, before a marker has ever been posted for it, so trusting that
-    * fallback here would read an issue's ordinary, unrelated accepted-association discussion as the
-    * reply to a question nobody asked yet. `comments.exists(isMarkerEntry(...))` is checked first,
-    * and this answers `NoReply` unconditionally the moment it finds no marker at all, never falling
-    * into `replySince`'s "everything counts" arm.
+    * `Reply.Marker.Required` is the whole of the correctness trap issue #44 closed, and it used to
+    * be a hand written pre check here, scanning the thread for a marker before trusting the reply
+    * set at all (issue #84 turned that pre check into this argument). The other marker reading call site, `pickAndSetup`, is gated on the issue
+    * currently carrying the `parked` label, external state proving a marker was posted at some
+    * point, so it can honestly claim `Proven`. This function has no such gate: it is reached the
+    * FIRST time ANY issue reaches `Route.Parked`, before a marker has ever been posted for it, so
+    * claiming `Proven` here would read an issue's ordinary, unrelated accepted-association
+    * discussion as the reply to a question nobody asked yet, and dispatch a FIX with a harness
+    * authored failure body claiming an attempt failed and was discarded when none did.
     */
   private def askHumanProbeResult(issue: Int, marker: String)(using gh: GitHub): AskHumanProbe =
     gh.viewerLogin() match
@@ -2592,14 +2531,9 @@ object Machine:
           case None =>
             AskHumanProbe.Unreadable("could not read comments to check for a human reply (gh failed)")
           case Some(comments) =>
-            if !comments.exists(isMarkerEntry(marker, viewer, _)) then AskHumanProbe.NoReply
-            else
-              val accepted = replySince(marker, viewer, comments).filter(entryCountsAsReply)
-              if accepted.isEmpty then AskHumanProbe.NoReply
-              else
-                AskHumanProbe.Answered(
-                  AskHumanReply(accepted.flatMap(authorLogin).distinct, Reply.splice(accepted))
-                )
+            val reply = Reply.since(marker, viewer, comments, Reply.Marker.Required)
+            if reply.accepted.isEmpty then AskHumanProbe.NoReply
+            else AskHumanProbe.Answered(AskHumanReply(reply.authors, Reply.splice(reply.accepted)))
 
   /** `AskHuman`'s own `probe` field body: `askHumanProbeResult` narrowed to the `Option[O]` shape
     * `Node.probe` requires, with the one piece `askHumanProbeResult` deliberately does not do, the
@@ -2653,7 +2587,7 @@ object Machine:
     * Called from `askHumanRun`'s own probe-miss path below ONLY (issue #44 review, MAJOR, round 2 of
     * the fix): a probe HIT reaching `Route.Parked` calls `reparkKeepingReply` instead, never this
     * function, because posting a fresh marker here is exactly what would destroy a reply a probe hit
-    * just found (the review's own driven repro: `body` starts with `ParkMarker`, so `replySince` on
+    * just found (the review's own driven repro: `body` starts with `ParkMarker`, so `Reply.since` on
     * every later tick finds nothing after it, silently discarding guidance a human already gave).
     */
   private def parkIssue(cur: Cursor, issue: Int, body: String, kindText: String, gateStatus: String)(using

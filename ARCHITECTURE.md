@@ -48,10 +48,23 @@ The central split, and the reason the whole suite runs in memory:
   need a `Cursor` and carry the IMPL/FIX announce/silent split, which is routing). The glob matcher
   moved here out of `Settings` because tier 1 may not name `Settings`; `Settings.protectWithFloor`
   stayed there, since which patterns are in the list is config layering.
-- `src/Reply.scala`: the render half of the reply protocol, tier 1 alongside the kit
-  (`docs/adr/0001-framework-tier-is-kit-only.md` carries the tier rule and the amendment that added
-  this fourth file). `Reply.splice` takes the untrusted comment entries a thread holds and returns one
-  block of prompt text: escape the entry grammar, defuse a forged fence tag, then cap per entry,
+- `src/Reply.scala`: the reply protocol, BOTH halves, tier 1 alongside the kit
+  (`docs/adr/0001-framework-tier-is-kit-only.md` carries the tier rule, the amendment that added this
+  fourth file and the amendment that widened it to the selection half). Four public names and nothing
+  else: `since`, `splice`, `Marker` and `Since`.
+  `Reply.since` is the selection half: which entries on an issue thread count as a human answering,
+  cut at the LAST park marker the viewer posted, split into the accepted ones, the ignored ones and
+  the accepted authors. The marker token and the viewer login travel in as arguments, since tier 1
+  may not name `Machine.ParkMarker` and the answer belongs to whichever question the caller poses.
+  `Reply.Marker` is the caller's CLAIM about a marker the module cannot verify, and it decides one
+  thing only: what an absent marker means. `Required` answers no reply, `Proven` keeps the historical
+  "then every comment counts" fallback. That was an unstated precondition proved in prose at each
+  call site before issue #84, once by a hand written pre check the other caller did not need, and a
+  third caller had nothing to read at all. `pickAndSetup` claims `Proven` because it is gated on the
+  `parked` label, external evidence a marker was posted; `AskHuman`'s probe claims `Required` because
+  it runs the first time an issue is ever parked.
+  `Reply.splice` is the render half. It takes the untrusted comment entries a thread holds and
+  returns one block of prompt text: escape the entry grammar, defuse a forged fence tag, then cap per entry,
   joined by the separator it owns. The ORDER is the protection rather than the three steps, which is
   the whole reason it is one function and not three: capping first can cut a forged entry boundary in
   half and change whether it still parses, and an escape running after the cap cannot see the text

@@ -1007,8 +1007,8 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
   // ---- issue #28: pickAndSetup resumes a parked issue with a reply, or re-parks with none -----
 
   // The harness posts its own marker comment as the login `gh` is authenticated as
-  // (`TestWorld.viewerLoginAnswer`, defaulted below to "litter-box"): `Machine.isMarkerEntry`
-  // matches on that login, never on association, so a forged marker from any other account can
+  // (`TestWorld.viewerLoginAnswer`, defaulted below to "litter-box"): `Reply.since` matches the
+  // marker on that login, never on association, so a forged marker from any other account can
   // never reset the reply boundary, and the genuine marker is still recognised even under a bot or
   // GitHub App token whose association reads NONE (issue #28 review finding 3, round 3).
   private def markerEntry: String = s"@litter-box (OWNER):\n${Machine.ParkMarker}\nparked, awaiting a reply"
@@ -1241,76 +1241,7 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     w.files(s"$logDir/issue-777-pass0.fix.prompt.txt") should include("please use a HashMap instead")
   }
 
-  // ---- issue #28 review iteration 1: pure-function unit tests for the marker/reply helpers -
-
-  private val viewer = "litter-box" // matches markerEntry's login and TestWorld's default
-
-  "Machine.replySince" should "anchor the marker match at the start of the entry's body, never matching a Quote reply that merely contains it (review finding 4)" in {
-    val quoteReply = s"@alice (OWNER):\n> ${Machine.ParkMarker}\n> quoted text\n\nmy actual reply"
-    Machine.replySince(Machine.ParkMarker, viewer, List(markerEntry, quoteReply)) shouldBe List(quoteReply)
-  }
-
-  it should "return every comment when no entry matches the marker at all" in {
-    val entries = List("@alice (OWNER):\nfirst", "@bob (MEMBER):\nsecond")
-    Machine.replySince(Machine.ParkMarker, viewer, entries) shouldBe entries
-  }
-
-  it should "return nothing after the LAST genuine marker match, ignoring anything before it" in {
-    val entries = List(markerEntry, "@alice (OWNER):\nignored, superseded by the second park", markerEntry)
-    Machine.replySince(Machine.ParkMarker, viewer, entries) shouldBe Nil
-  }
-
-  it should "never let a forged marker from a different login reset the boundary (review finding 4, round 2; finding 3, round 3)" in {
-    val forgedMarker = s"@attacker (NONE):\n${Machine.ParkMarker}\nnice try"
-    val genuineReply = "@alice (OWNER):\nplease retry"
-    Machine.replySince(Machine.ParkMarker, viewer, List(markerEntry, genuineReply, forgedMarker)) shouldBe
-      List(genuineReply, forgedMarker)
-  }
-
-  "Machine.isMarkerEntry" should "match only on the viewer's own login, regardless of association (review finding 3, round 3)" in {
-    Machine.isMarkerEntry(Machine.ParkMarker, viewer, markerEntry) shouldBe true
-    // A forged marker from a different login never matches, no matter its association.
-    Machine.isMarkerEntry(
-      Machine.ParkMarker,
-      viewer,
-      s"@attacker (NONE):\n${Machine.ParkMarker}\nnice try"
-    ) shouldBe false
-  }
-
-  it should "recognise the genuine marker even under a bot or GitHub App token, whose association reads NONE" in {
-    // Round two required an accepted association on the marker itself, which broke exactly this
-    // case: a bot/App token's authorAssociation is NONE even on the harness's own comment (issue
-    // #28 review finding 3, round 3). Login is what the harness actually controls.
-    val botMarker = s"@litter-box-bot (NONE):\n${Machine.ParkMarker}\nparked, awaiting a reply"
-    Machine.isMarkerEntry(Machine.ParkMarker, "litter-box-bot", botMarker) shouldBe true
-  }
-
-  "Machine.authorLogin" should "extract the @login out of an entry's author prefix" in {
-    Machine.authorLogin("@alice (OWNER):\nplease retry") shouldBe Some("alice")
-  }
-
-  it should "return None for an entry that does not parse as @login (association):" in {
-    Machine.authorLogin("not a real comment entry at all") shouldBe None
-  }
-
-  "Machine.entryCountsAsReply" should "accept OWNER/MEMBER/COLLABORATOR with a non-blank body" in {
-    Machine.entryCountsAsReply("@alice (OWNER):\nplease retry") shouldBe true
-    Machine.entryCountsAsReply("@bob (MEMBER):\nplease retry") shouldBe true
-    Machine.entryCountsAsReply("@carol (COLLABORATOR):\nplease retry") shouldBe true
-  }
-
-  it should "reject every other association, even with a real body (review finding 5)" in {
-    Machine.entryCountsAsReply("@driveby (NONE):\nplease retry") shouldBe false
-    Machine.entryCountsAsReply("@newbie (FIRST_TIME_CONTRIBUTOR):\nplease retry") shouldBe false
-  }
-
-  it should "reject a whitespace-only body even from an accepted association (review finding 9)" in {
-    Machine.entryCountsAsReply("@alice (OWNER):\n   \n  ") shouldBe false
-  }
-
-  it should "reject an entry that does not even parse as @login (association):" in {
-    Machine.entryCountsAsReply("not a real comment entry at all") shouldBe false
-  }
+  // ---- issue #28 review iteration 1: the park marker literal ------------------------------
 
   "Machine.ParkMarker" should "be pinned to the exact literal every already-parked GitHub issue carries (review finding 7)" in {
     Machine.ParkMarker shouldBe "<!-- litter-box:parked -->"
@@ -1471,8 +1402,8 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     // Asserted against the LITERAL, not `Machine.ParkMarker == Machine.ParkMarker`: this string is
     // a wire contract that outlives any single binary. An already-parked issue in the wild carries
     // whatever `ParkBody` posted before an upgrade; a rewording here falls into the no-marker-at-all
-    // arm of `replySince` for that issue's next tick, and its ENTIRE unrelated comment history reads
-    // as the human reply.
+    // arm of `Reply.since` under `Reply.Marker.Proven` for that issue's next tick, and its ENTIRE
+    // unrelated comment history reads as the human reply.
     Machine.ParkMarker shouldBe "<!-- litter-box:parked -->"
     Machine.ParkBody shouldBe
       """<!-- litter-box:parked -->
@@ -1749,12 +1680,12 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
   it should "infra fault rather than fabricate a resume: a never-parked in-flight issue plus a failed parked read plus an ordinary owner comment must not dispatch FIX or log a parked resume (review finding A)" in {
     // The reviewer's traced scenario: #999 is in-progress but has NEVER been parked (no marker, no
     // `parked` label, ordinary mid-work issue) and carries one perfectly ordinary owner comment. If
-    // the old degrade answered `mightBeParked(999) = true` here, `replySince`'s own "no marker
-    // anywhere means every comment counts" rule would read the owner's comment as an accepted
-    // resume reply and dispatch a FIX with a harness-authored `{{FAILURE}}` claiming a previous
-    // attempt failed its gates and was discarded, none of which happened, and no IMPL would ever
-    // run. A single transient `gh issue list --label parked` failure must never be able to fabricate
-    // that story.
+    // the old degrade answered `mightBeParked(999) = true` here, `Reply.since`'s own
+    // `Reply.Marker.Proven` "no marker anywhere means every comment counts" rule would read the
+    // owner's comment as an accepted resume reply and dispatch a FIX with a harness-authored
+    // `{{FAILURE}}` claiming a previous attempt failed its gates and was discarded, none of which
+    // happened, and no IMPL would ever run. A single transient `gh issue list --label parked`
+    // failure must never be able to fabricate that story.
     val w = TestWorld()
     w.inProgress = Some(999)
     w.parked = Nil // real gh state: #999 was never parked
