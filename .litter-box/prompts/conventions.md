@@ -36,9 +36,9 @@ dependency is a design decision, not a convenience.
 
 Never use `@nowarn` or any other suppression to get past a warning. Fix the cause.
 
-`src/Kit.scala`, `src/KitMacro.scala` and `src/PatchGuard.scala` are the framework tier. No code in
-any of them may name anything declared outside those three files plus `src/Domain.scala` and
-`src/Caps.scala`; comments and string literals are exempt. Whatever the kit names becomes, transitively, part of the surface a consumer
+`src/Kit.scala`, `src/KitMacro.scala`, `src/PatchGuard.scala` and `src/Reply.scala` are the framework
+tier. No code in any of them may name anything declared outside those four files plus
+`src/Domain.scala` and `src/Caps.scala`; comments and string literals are exempt. Whatever the kit names becomes, transitively, part of the surface a consumer
 authoring their own graph depends on, so a kit that reaches into `Machine` publishes the shipped
 pipeline's own machinery as framework by accident. If you need a fault from kit code, raise it
 through `Fault.raise`, which lives in the kit and IS the loop's one fault body; do not reach for

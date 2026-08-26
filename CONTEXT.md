@@ -87,3 +87,26 @@ rather than re-gating an empty tree.
 **Parked** — the terminal state of a tick that ran out of repair budget on a generic failure: the issue
 is labelled and a marker comment is posted, and a human reply resumes it on a later tick. Parking is
 about ONE tick, never a stored position.
+
+## The reply protocol
+
+**Entry** — one element of `Caps.GitHub.issueComments`: the line `@login (association):` followed by the
+comment body. A grammar rather than a formatting choice, since attribution to an account is decided by
+reading it, which is why a comment BODY that contains that same shape is neutralised before entries are
+joined.
+
+**Reply** — the entries on a parked issue that count as a human answering: after the last park marker,
+from an association the repository has vouched for, and not blank once the author prefix is stripped.
+Everything else on the thread is noise, a drive by comment from an unvouched account included.
+`src/Reply.scala` is the one place that decides it, for every graph.
+
+**Marker claim** — what a caller asserts about a park marker the reply module cannot verify for itself.
+`Required` says a thread with no marker holds no reply. `Proven` says the caller has outside evidence
+that a marker was posted, so a thread with none is one a human edited and every comment counts. An
+argument rather than a mode, because the evidence is the CALLER's: today only the `parked` label is it.
+
+**Splice** — rendering entries into a prompt's fenced comment slot: escape the entry grammar, defuse a
+forged fence tag, then cap per entry, in that order. The ORDER is the protection, not the three steps.
+Capping first can cut a forged boundary in half and change whether it still parses; escaping after
+capping cannot see the text the cap already dropped. Per entry rather than over the joined string, so
+no commenter's text can evict another's.

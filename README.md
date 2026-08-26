@@ -388,10 +388,37 @@ bare filename is an exact match rather than a prefix. Do not reimplement it. The
 config carries has already been unioned with the reference floor, so `.litter-box/**` is covered
 whether or not you named it.
 
+**Putting a human's words in front of a worker.** If a node of yours reads issue comments and
+splices them into a prompt, do not build that block yourself. `Reply.splice` is public and is the one
+render half the shipped loop uses too:
+
+```scala
+val commentsSlot: String = caps.gh.issueComments(issue) match
+  case None          => "[harness: comments could not be read]" // your own sentinel, not Reply's
+  case Some(entries) => Reply.splice(entries) // neutralised and capped per entry; you still supply the fence
+```
+
+It takes the entries as `Caps.GitHub.issueComments` returns them, oldest first, and answers one block
+of prompt text. Every comment is text an attacker can write, so before joining anything it neutralises
+the entry grammar itself (a body that forges its own `@login (ASSOC):` line or a separator, trying to
+make the block read as if someone the repository trusts wrote the next paragraph), defuses a forged
+`<untrusted-comments>` fence tag (a body that closes the fence early and lands the rest as
+authoritative looking text at top level), and only THEN caps each entry to its own share of the
+harness's character budget. That order is the protection and it is why this is one call rather than
+three: capping first can cut a forged boundary in half and change whether it still parses, and
+escaping after capping cannot see the text the cap already dropped. Capping PER ENTRY rather than over
+the joined block is the other half: no commenter's length can push another commenter's text out of the
+prompt, whichever end of the thread they sit on.
+
+An empty list answers with the harness's own `[harness: no comments]` sentinel, so an empty slot says
+so in words. A comment read that FAILED is yours to render, deliberately: this function is handed the
+entries that were read and cannot tell a thread with nothing in it from a thread nobody could see, and
+those two facts must not collapse into one string a worker reads the same way.
+
 This whole surface sits under the same `0.x` no-stability-promise policy as everything else in this
 project (see [Version policy](#version-policy) above): pin an exact version if a shape change landing
 under you would be a problem. That covers `Machine.Gate`, `Machine.GateInput`,
-`Machine.GateVerdict`, `PatchGuard` and the `Ruling`/`Staged` types too, on exactly the same terms and with no extra promise attached to them for
+`Machine.GateVerdict`, `PatchGuard`, the `Ruling`/`Staged` types and `Reply.splice` too, on exactly the same terms and with no extra promise attached to them for
 being lifted out of the shipped pipeline. What IS promised for as long as those names exist is what
 they mean, not their shape: a gate timeout stays an infra fault and never becomes a `GateVerdict` case,
 the node never publishes outward, and it reads your `config.conf` per tick rather than at the moment

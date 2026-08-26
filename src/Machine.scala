@@ -115,92 +115,6 @@ object Machine:
   private[litterbox] def protectedList(protect: List[String]): String =
     protect.map(p => s"- `$p`").mkString("\n")
 
-  /** The `<untrusted-comments>` fence in fix-prompt.md is plain text, not a markup the model parses
-    * structurally. A comment body starting with the literal `</untrusted-comments>` string reads as
-    * the END of the untrusted section, landing whatever the commenter wrote after it as unmarked,
-    * seemingly-authoritative text at top level; a comment body containing the literal
-    * `<untrusted-comments>` OPENING string forges a second fence boundary inside the data. Encoding
-    * either tag's angle brackets as HTML entities keeps the forgery readable as data while making it
-    * impossible for spliced text to reproduce either of the fence's own strings. The genuine fence
-    * that ships in the skeleton is untouched: it never passes through this function, only the
-    * comment DATA does.
-    *
-    * `[\s\p{Z}]*` widens the whitespace class to every Unicode separator, not just the ASCII ones
-    * Java's `\s` matches (a non breaking space is a real-world bypass otherwise), and `[^>]*` after
-    * the tag name tolerates any junk up to the closing `>` rather than requiring the tag to be
-    * exactly whitespace-padded. The capturing group around the optional `/` is what tells the
-    * replacement which of the two strings to emit, so one pattern defuses both tags without
-    * duplicating the whitespace/junk tolerance twice.
-    */
-  private[litterbox] def defuseFenceCloser(s: String): String =
-    "(?i)<[\\s\\p{Z}]*(/?)[\\s\\p{Z}]*untrusted-comments[^>]*>".r.replaceAllIn(
-      s,
-      m => if m.group(1) == "/" then "&lt;/untrusted-comments&gt;" else "&lt;untrusted-comments&gt;"
-    )
-
-  /** Comment text is free form and, unlike the patch path (`cfg.maxPatchBytes`), unbounded. A
-    * constant here rather than a config key, same as every other cap in this file: this is the
-    * harness defending itself, not a knob a consumer tunes. Spent as a PER ENTRY share
-    * (`truncateEntry`/`commentShareChars`), not as one cap on the whole joined string: capping the
-    * join let whichever entry landed on the wrong side of the cutoff, regardless of who wrote it,
-    * evict another commenter's text from the FIX prompt entirely (issue #28 review finding 2,
-    * round 3; a round 2 fix that kept the newest text instead of the oldest moved which entry was
-    * vulnerable without closing the hole).
-    */
-  private[litterbox] val MaxCommentsChars = 20000
-
-  /** The floor `commentShareChars` gives any single entry, even when there are enough entries that
-    * an even split of `MaxCommentsChars` would round down to something unreadable. A floor, not a
-    * hard total cap: a thread with hundreds of entries can still exceed `MaxCommentsChars` overall,
-    * an acceptable trade against a share so thin no entry says anything legible.
-    */
-  private[litterbox] val MinCommentShareChars = 500
-
-  /** `shareChars` for `truncateEntry` when splitting `MaxCommentsChars` evenly across
-    * `entryCount` entries, floored at `MinCommentShareChars`.
-    */
-  private[litterbox] def commentShareChars(entryCount: Int): Int =
-    math.max(MaxCommentsChars / math.max(entryCount, 1), MinCommentShareChars)
-
-  /** Truncates one entry to `shareChars`, with its own truncation notice appended. Capping PER
-    * ENTRY (issue #28 review finding 2, round 3) means no single commenter's text, regardless of
-    * its position in the thread or its own length, can push another commenter's text out of the
-    * window: each entry's fate depends only on its own length, never on where it sits or how big
-    * its neighbours are.
-    */
-  private[litterbox] def truncateEntry(entry: String, shareChars: Int): String =
-    if entry.length <= shareChars then entry
-    else entry.take(shareChars) + s"\n\n[comment truncated by the harness at $shareChars characters]"
-
-  /** A full line matching the author-prefix grammar `@login (ASSOC):`, used only to spot a FORGED
-    * copy of it inside a comment body (`escapeEntryGrammar`); the genuine prefix `runFixRound`
-    * renders for each entry never runs through this check.
-    */
-  private val AuthorPrefixLine = "^@\\S+ \\([A-Z_]+\\):$".r
-
-  /** Neutralises, within a comment BODY only, never the trusted `@login (ASSOC):` prefix
-    * `runFixRound` itself renders, any line that could be mistaken for the entry grammar `runFixRound` uses to join
-    * comments into `{{COMMENTS}}`: the `---` separator, or a line shaped like another entry's own
-    * `@login (ASSOC):` prefix. Without this, an attacker's own comment body can embed
-    * `\n\n---\n\n@alice (OWNER):\n<whatever>` as plain text, and once joined with the real entries
-    * the rendered block is byte identical to a genuine entry from Alice, indistinguishable from it
-    * (issue #28 review finding 1, round 3). Neutralising by prefixing the offending line with a
-    * visible marker, rather than deleting it, keeps the text readable to an operator while denying
-    * it the exact shape the harness uses to attribute text to an account.
-    */
-  private[litterbox] def escapeEntryGrammar(entry: String): String =
-    parseEntry(entry) match
-      case None                       => entry
-      case Some((login, assoc, body)) =>
-        val escapedBody = body.linesIterator
-          .map { line =>
-            if line == "---" || AuthorPrefixLine.matches(line) then
-              s"[comment text, not a real entry boundary] $line"
-            else line
-          }
-          .mkString("\n")
-        s"@$login ($assoc):\n$escapedBody"
-
   /** The substring `pickAndSetup`'s reply probe (`replySince`) and `AskHuman`'s own probe
     * (`askHumanReply`) both search for on a later tick, to tell the harness's own bookkeeping
     * comments apart from ordinary conversation. GitHub holds it, not a local file: a human who
@@ -1440,18 +1354,14 @@ object Machine:
           )
         )
       case Some(Nil) =>
-        ("[harness: no comments]", None)
+        // `Reply.splice` owns the empty sentinel too, so the words a worker reads for an empty
+        // thread are decided in one place. The arm stays separate from the one below purely for the
+        // LOG line: folding the two together would announce a splice on every comment free
+        // iteration, which is a claim about the prompt that would not be true.
+        (Reply.splice(Nil), None)
       case Some(entries) =>
-        // Escape the entry grammar (issue #28 review finding 1, round 3), THEN defuse a forged
-        // fence tag, THEN cap PER ENTRY (issue #28 review finding 2, round 3), in that order:
-        // capping first could itself cut a forged boundary in half and change whether it still
-        // parses as one, and escaping after capping could not see the part of a line the cap
-        // already dropped.
-        val share = commentShareChars(entries.size)
         (
-          entries
-            .map(e => truncateEntry(defuseFenceCloser(escapeEntryGrammar(e)), share))
-            .mkString("\n\n---\n\n"),
+          Reply.splice(entries),
           Some(s"issue #$issue: third-party comments were spliced into the FIX prompt")
         )
     commentsLogLine.foreach(logger.log)
@@ -2618,15 +2528,15 @@ object Machine:
 
   /** `AskHuman`'s output on a probe hit (issue #44 review, MAJOR: acceptance criterion 3, "comment
     * text available to the next node", was met only on paper by the former `List[String]` of author
-    * logins alone). `text` is the accepted entries' own bodies, run through the SAME
-    * escape/defuse/truncate pipeline `runFixRound` already applies before splicing third-party
-    * comment text into a prompt (`escapeEntryGrammar`, then `defuseFenceCloser`, then
-    * `truncateEntry` at `commentShareChars`, joined by the same `\n\n---\n\n` separator): reusing
-    * that exact pipeline, rather than handing back raw comment bodies, is what keeps a consumer
-    * node's own splice from becoming an injection vector the same way `runFixRound`'s own doc
-    * explains for its `{{COMMENTS}}` slot (untrusted text must not become an instruction merely
-    * because it now arrives through a different node). `authors` is kept alongside `text`, not
-    * replaced by it: `resumeFailureBody` and this file's own log lines still need the accepted
+    * logins alone). `text` is the accepted entries rendered by `Reply.splice`, the SAME call
+    * `runFixRound` makes before third party comment text reaches its `{{COMMENTS}}` slot: going
+    * through that one render half, rather than handing back raw comment bodies or restating what it
+    * does, is what keeps a consumer node's own splice from becoming an injection vector the way
+    * `runFixRound`'s own doc explains (untrusted text must not become an instruction merely because
+    * it now arrives through a different node). Note WHICH list is rendered: the ACCEPTED entries, so
+    * the share each one gets is computed over the entries this reply is actually made of, never over
+    * the whole thread the filter has already discarded most of. `authors` is kept alongside `text`,
+    * not replaced by it: `resumeFailureBody` and this file's own log lines still need the accepted
     * logins alone, without re-deriving them by re-parsing `text`.
     */
   final case class AskHumanReply(authors: List[String], text: String)
@@ -2687,11 +2597,9 @@ object Machine:
               val accepted = replySince(marker, viewer, comments).filter(entryCountsAsReply)
               if accepted.isEmpty then AskHumanProbe.NoReply
               else
-                val share = commentShareChars(accepted.size)
-                val text = accepted
-                  .map(e => truncateEntry(defuseFenceCloser(escapeEntryGrammar(e)), share))
-                  .mkString("\n\n---\n\n")
-                AskHumanProbe.Answered(AskHumanReply(accepted.flatMap(authorLogin).distinct, text))
+                AskHumanProbe.Answered(
+                  AskHumanReply(accepted.flatMap(authorLogin).distinct, Reply.splice(accepted))
+                )
 
   /** `AskHuman`'s own `probe` field body: `askHumanProbeResult` narrowed to the `Option[O]` shape
     * `Node.probe` requires, with the one piece `askHumanProbeResult` deliberately does not do, the
