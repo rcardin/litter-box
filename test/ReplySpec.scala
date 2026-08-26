@@ -3,13 +3,16 @@ package in.rcard.litterbox
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 
-/** The render half of the reply protocol, driven only through its public surface.
+/** The reply protocol, both halves, driven only through its public surface.
   *
-  * Nothing here reaches a private step, and that is the point rather than a style preference: the
-  * three steps used to be spelled out at two call sites in `Machine`, and a spec that calls each
-  * step on its own can watch every step behave perfectly while the composition around them is
-  * wrong. Every assertion below therefore goes through `Reply.splice`, so it is the composition,
-  * not the parts, that is pinned.
+  * Nothing here reaches a private step or a private predicate, and that is the point rather than a
+  * style preference. The render half's three steps used to be spelled out at two call sites in
+  * `Machine`, and a spec that calls each step on its own can watch every step behave perfectly while
+  * the composition around them is wrong. The selection half was worse: seven names widened out of
+  * `Machine` purely so a spec could drive them one at a time, while the defect that mattered lived
+  * in an unstated precondition on how a CALLER gated and composed them, which no such spec could
+  * see. So every assertion below goes through `Reply.since` or `Reply.splice`, the same two calls a
+  * consumer has, and what is pinned is the answer, never the parts that reached it.
   */
 class ReplySpec extends AnyFlatSpec with Matchers:
 
@@ -131,3 +134,158 @@ class ReplySpec extends AnyFlatSpec with Matchers:
 
   it should "leave text that does not parse as an entry untouched" in:
     Reply.splice(List("not a real comment entry at all")) shouldBe "not a real comment entry at all"
+
+  // ---- the selection half: which entries on a thread count as a reply ----------------------
+
+  /** The park marker token travels in as an argument, so this spec picks its own rather than
+    * naming the shipped graph's constant: the module answers whichever question a caller poses,
+    * and a spec that reached for `Machine.ParkMarker` would be asserting on the shipped graph's
+    * vocabulary instead of on this module's contract.
+    */
+  private val marker = "<!-- test:parked -->"
+  private val viewer = "litter-box"
+  private val markerEntry = s"@$viewer (OWNER):\n$marker\nparked, awaiting a reply"
+
+  /** The claim is a statement about an ABSENT marker and nothing else. Asserting both cases over
+    * one thread that does contain a marker is what pins that: if the two ever diverge here, the
+    * argument has grown a second meaning nobody declared.
+    */
+  "since" should "answer identically under either claim when the thread does contain a marker" in:
+    val thread = List(markerEntry, "@alice (OWNER):\nplease retry", "@driveby (NONE):\nme too")
+
+    val required = Reply.since(marker, viewer, thread, Reply.Marker.Required)
+    val proven   = Reply.since(marker, viewer, thread, Reply.Marker.Proven)
+
+    required shouldBe proven
+    required.accepted shouldBe List("@alice (OWNER):\nplease retry")
+    required.ignored shouldBe List("@driveby (NONE):\nme too")
+    required.authors shouldBe List("alice")
+
+  /** The other half of the same pin, over the SAME reply entries with the marker taken away. This is
+    * the only thing the claim decides, and the two worst cases are not symmetric: `Required`
+    * answering nothing on a thread that has a reply costs a tick, while `Proven` answering
+    * everything on a thread that was never parked dispatches a repair over an issue's ordinary
+    * discussion with a harness authored failure claiming an attempt was discarded.
+    */
+  it should "answer nothing under Required and the whole thread under Proven when no marker is present" in:
+    val thread = List("@alice (OWNER):\nplease retry", "@driveby (NONE):\nme too")
+
+    Reply.since(marker, viewer, thread, Reply.Marker.Required) shouldBe Reply.Since(Nil, Nil, Nil)
+    Reply.since(marker, viewer, thread, Reply.Marker.Proven) shouldBe
+      Reply.Since(List("@alice (OWNER):\nplease retry"), List("@driveby (NONE):\nme too"), List("alice"))
+
+  /** A thread can be parked, replied to, resumed and parked again, so only the NEWEST boundary
+    * bounds a reply nobody has spent yet. Cutting at the first marker would hand back a reply the
+    * loop already acted on, dispatching a repair over guidance that has already been followed.
+    */
+  it should "cut at the LAST marker entry, leaving nothing at or before it in any field" in:
+    val thread = List(
+      "@driveby (NONE):\nold noise",
+      markerEntry,
+      "@alice (OWNER):\nsuperseded by the second park",
+      markerEntry
+    )
+
+    Reply.since(marker, viewer, thread, Reply.Marker.Proven) shouldBe Reply.Since(Nil, Nil, Nil)
+
+  /** GitHub's Quote reply button copies the quoted comment's body verbatim into the new comment, so
+    * a human quoting the park marker while replying would, under an unanchored `contains`, post an
+    * entry that matches the marker and closes off their own reply forever (issue #28 review finding
+    * 4). Quote reply prefixes each quoted line with `> `, so the marker never STARTS the body.
+    */
+  it should "never match a marker a reply merely quotes, only one that starts the body" in:
+    val quoteReply = s"@alice (OWNER):\n> $marker\n> quoted text\n\nmy actual reply"
+
+    Reply.since(marker, viewer, List(markerEntry, quoteReply), Reply.Marker.Proven).accepted shouldBe
+      List(quoteReply)
+
+  /** Login is provenance the harness controls; association is not. A forged marker from any other
+    * account must not move the boundary, or anyone able to comment could close off a reply the loop
+    * was waiting on (issue #28 review finding 4, round 2; finding 3, round 3).
+    */
+  it should "never let a marker from another login reset the boundary" in:
+    val forged  = s"@attacker (NONE):\n$marker\nnice try"
+    val genuine = "@alice (OWNER):\nplease retry"
+
+    val result = Reply.since(marker, viewer, List(markerEntry, genuine, forged), Reply.Marker.Proven)
+
+    result.accepted shouldBe List(genuine)
+    result.ignored shouldBe List(forged)
+
+  /** The converse of the login rule, and the reason it is a login rule at all: a bot or GitHub App
+    * token reads `NONE` on GitHub's `authorAssociation` even on the harness's OWN comment. An
+    * association check on the marker would never match under such a token, the selection would fall
+    * into the no marker arm, and every comment on the issue would read as a reply forever (issue #28
+    * review finding 3, round 3).
+    */
+  it should "recognise the viewer's own marker even when its association reads NONE" in:
+    val botMarker = s"@litter-box-bot (NONE):\n$marker\nparked, awaiting a reply"
+    val reply     = "@alice (OWNER):\nplease retry"
+
+    // Driven through Required, not Proven: under Proven, a marker that goes unrecognised falls into
+    // the whole thread arm rather than failing outright, so an implementation that wrongly demands an
+    // accepted association on the marker itself would still leave accepted at List(reply) here (the
+    // unrecognised botMarker lands in ignored instead) and this assertion would not catch it. Required
+    // answers Nil on a genuinely absent marker, so only a correctly recognised marker gets accepted to
+    // List(reply) at all.
+    Reply.since(marker, "litter-box-bot", List(botMarker, reply), Reply.Marker.Required).accepted shouldBe
+      List(reply)
+
+  /** Any GitHub account can comment on a public issue, so without this filter a drive by comment
+    * resumes a parked issue and burns a dispatch, a repair budget and a reviewer round at no cost to
+    * whoever posted it (issue #28 review finding 5). The rejected entries are not dropped: an
+    * operator has to be able to tell "nothing was posted" from "something was posted and did not
+    * count", which is what `ignored` is for.
+    */
+  it should "accept only OWNER, MEMBER and COLLABORATOR, ignoring every other association" in:
+    val thread = List(
+      markerEntry,
+      "@alice (OWNER):\nplease retry",
+      "@driveby (NONE):\nplease retry",
+      "@bob (MEMBER):\nplease retry",
+      "@newbie (FIRST_TIME_CONTRIBUTOR):\nplease retry",
+      "@carol (COLLABORATOR):\nplease retry"
+    )
+
+    val result = Reply.since(marker, viewer, thread, Reply.Marker.Proven)
+
+    result.accepted shouldBe List(
+      "@alice (OWNER):\nplease retry",
+      "@bob (MEMBER):\nplease retry",
+      "@carol (COLLABORATOR):\nplease retry"
+    )
+    result.ignored shouldBe List(
+      "@driveby (NONE):\nplease retry",
+      "@newbie (FIRST_TIME_CONTRIBUTOR):\nplease retry"
+    )
+    (result.accepted ++ result.ignored).toSet shouldBe thread.tail.toSet
+
+  /** An accidental empty reply must not burn a repair round either (issue #28 review finding 9), and
+    * an entry that does not carry an author prefix at all is a shape no `issueComments` adapter is
+    * supposed to produce, so a decision about to trust an association must check rather than assume.
+    */
+  it should "ignore a whitespace only body and an entry that does not parse at all" in:
+    val blank      = "@alice (OWNER):\n   \n  "
+    val unparsable = "not a real comment entry at all"
+
+    val result = Reply.since(marker, viewer, List(markerEntry, blank, unparsable), Reply.Marker.Proven)
+
+    result.accepted shouldBe Nil
+    result.ignored shouldBe List(blank, unparsable)
+    result.authors shouldBe Nil
+
+  /** The logins are spliced into a prompt the shipped graph writes and golden runs pin, so first
+    * seen order and deduplication are observable text rather than an implementation detail. Only
+    * ACCEPTED entries contribute: naming an ignored commenter would tell a worker to act on words
+    * the loop decided not to act on.
+    */
+  it should "name the accepted authors deduplicated, in first seen order" in:
+    val thread = List(
+      markerEntry,
+      "@bob (MEMBER):\nfirst",
+      "@alice (OWNER):\nsecond",
+      "@bob (MEMBER):\nthird",
+      "@driveby (NONE):\nnot me"
+    )
+
+    Reply.since(marker, viewer, thread, Reply.Marker.Proven).authors shouldBe List("bob", "alice")
