@@ -234,6 +234,18 @@ final class TestWorld:
     */
   var models: AgentModels = AgentModels()
 
+  /** The four queue label NAMES the run's `Config` asks for (`issues.labels`), as `editLabels`
+    * resolves them when it folds a successful flip back into the world (see that method).
+    *
+    * A field of the world stamped by [[runGraph]] / [[runNode]] out of the `Config` they are handed,
+    * exactly like [[models]] above and for the same reason: the capability instances below are built
+    * once, before any `Config` exists at a call site, and `GitHub.editLabels` carries no `Config` of
+    * its own to read the names out of. Reading `Labels()` defaults instead would hard code the
+    * reference names into the fake, so a repository that renames `ready` to `todo` would watch every
+    * fold silently stop firing while `calls` still recorded the flip.
+    */
+  var labelNames: Labels = Labels()
+
   // ---- derived state the fakes maintain ---------------------------------------------------
   var appliedPatches: List[String] = Nil
   var staged: Boolean              = false
@@ -275,14 +287,75 @@ final class TestWorld:
       record(s"gh issue view $issue --json labels"); labels
     def issueState(issue: Int): String =
       record(s"gh issue view $issue --json state"); issueStates.getOrElse(issue, "CLOSED")
+    /** Folds a SUCCESSFUL flip back into every field a later read derives from labels, and leaves a
+      * failed one changing absolutely nothing.
+      *
+      * Same principle `issueComment` above states in full: a fake that records a write but never
+      * lets a later read see it cannot prove any WORLD fact, and parking is a world fact by
+      * construction (RFC #26 decision 6: never a stored position, always re-derived from what `gh`
+      * reports). Without the fold every tick-boundary scenario had to hand write the labels `gh`
+      * would now report, which is the test inventing the very state it then asserts on rather than
+      * the loop producing it.
+      *
+      * The failure scripting is what decides whether anything folds at all. `labelEditSucceeds` and
+      * `labelEditResults` exist so a test can make one flip fail, and the loop treats a failed flip
+      * as a warning rather than a stop, so the world it presses on into is the world where the flip
+      * NEVER HAPPENED. Folding a false return would erase the only difference those two knobs exist
+      * to express.
+      *
+      * What a fold means per field, since each answers a different `gh` query:
+      *
+      *   - `labels` answers `issueLabels`, the direct read of this write, so it takes the add and
+      *     the remove literally, whatever the string. That is also where `needs-review`,
+      *     `needs-human` and `class-1` land: they are free strings in `Machine`, not members of
+      *     `Labels`, and they get NO derived field of their own, because the `GitHub` capability has
+      *     no query that asks for them the way `parkedIssues` asks for `parked`. Inventing a
+      *     `needsReview` list here would model a read nothing performs. One caveat this fake cannot
+      *     design away: `labels` is a single list answering for EVERY issue, so the fold applies it
+      *     whatever issue was named, and a scenario juggling two issues that must carry different
+      *     labels still scripts the field by hand.
+      *   - `inProgress` answers `inProgressIssue()`. Adding `labelNames.active` to #i makes #i the
+      *     in flight issue; removing it clears the slot only when the slot names #i, since removing
+      *     `in-progress` from some other issue says nothing about the one in flight. A single slot
+      *     is faithful here rather than lossy: the loop's own "one US at a time" invariant means
+      *     there is never a second in progress issue to hold.
+      *   - `parked` answers `parkedIssues()`, oldest first. Adding `labelNames.parked` appends #i
+      *     when it is not already there, which is what "the newly parked issue is the newest one"
+      *     means for that ordering; removing drops it.
+      *   - `blockedIssues` answers `openBlockedIssues()` and is the same shape of fact as `parked`,
+      *     issues carrying one label, so it folds the same way for `labelNames.blocked`. That is the
+      *     read `flipBlocked` walks, and its flip is the one place the loop clears that label.
+      *   - `ready` answers `oldestReadyIssue()`, and folds the REMOVE only: a pick that takes #i off
+      *     the ready queue empties the slot when the slot names #i. An ADD deliberately does not
+      *     fold. The field is one `Option`, meaning the OLDEST ready issue, and this fake holds
+      *     neither a queue nor any issue ordering, so it cannot decide whether a freshly readied
+      *     issue sorts ahead of one already held. `flipBlocked` is the only add site, and a scenario
+      *     that then wants the flipped issue picked scripts `ready` itself, the same way one that
+      *     wants a human to label a fresh US ready already does.
+      *   - `issueStates` is OUT OF SCOPE entirely. It answers `issueState`, OPEN or CLOSED, and no
+      *     label edit can move that: an issue closes on a merge or by a human, never on
+      *     `gh issue edit --add-label`. Folding into it would invent a causal link GitHub does not
+      *     have, which is a worse lie than the missing fold this method exists to fix.
+      */
     def editLabels(issue: Int, add: List[String], remove: List[String]): Boolean =
       val a = add.map(l => s" --add-label $l").mkString
       val r = remove.map(l => s" --remove-label $l").mkString
       record(s"gh issue edit $issue$a$r")
-      labelEditResults match
+      val ok = labelEditResults match
         case Nil      => labelEditSucceeds
         case h :: Nil => h
         case h :: t   => labelEditResults = t; h
+      if ok then
+        labels = labels.filterNot(remove.contains) ++ add.filterNot(labels.contains)
+        if add.contains(labelNames.active) then inProgress = Some(issue)
+        if remove.contains(labelNames.active) && inProgress.contains(issue) then inProgress = None
+        if add.contains(labelNames.parked) && !parked.contains(issue) then parked = parked :+ issue
+        if remove.contains(labelNames.parked) then parked = parked.filterNot(_ == issue)
+        if add.contains(labelNames.blocked) && !blockedIssues.contains(issue) then
+          blockedIssues = blockedIssues :+ issue
+        if remove.contains(labelNames.blocked) then blockedIssues = blockedIssues.filterNot(_ == issue)
+        if remove.contains(labelNames.ready) && ready.contains(issue) then ready = None
+      ok
     def openBlockedIssues(): List[Int] =
       record("gh issue list --label blocked"); blockedIssues
     def createPr(branch: String, title: String, body: String): String =
@@ -480,6 +553,7 @@ final class TestWorld:
     */
   def runGraph(graph: LoopGraph, cfg: Config = Config(), iteration: Int = 1): LoopExit =
     models = cfg.models
+    labelNames = cfg.labels
     Machine.runOnce(iteration, graph)(using
       cfg,
       github,
@@ -545,6 +619,7 @@ final class TestWorld:
   ): Either[LoopExit, NodeRun[O]] =
     val ledger = Runner.Ledger(dispatchBudget)
     models = cfg.models
+    labelNames = cfg.labels
     val caps   = buildCaps(this).copy(cfg = cfg)
     withFaulting:
       val outcome = Runner.step(node, input)(using caps, summon[Faulting], ledger)

@@ -77,11 +77,17 @@ final case class PrRequest(work: Work, needsHuman: Boolean)
 final case class PrOpened(pr: Int, needsHuman: Boolean)
 
 // ---------------------------------------------------------------------------------------------
-// Helpers. `Machine.renderTemplate` is `private[litterbox]`, so `splice` below restates it. The
-// patch guard is NOT restated: `PatchGuard.stage` is public library API, and calling it is the
-// point. An earlier version of this file rewrote the guard by hand and got it weaker (prefix
-// matching where the real guard runs a JDK glob), which is exactly what a consumer copying this
-// file would have inherited.
+// Helpers. Three of them restate a `private[litterbox]` member, unreachable from a package this
+// library does not own: `splice` restates `Machine.renderTemplate`, `protectedList` restates
+// `Machine.protectedList`, and `sanitizeDetail` restates `Machine.sanitizeDetail`. A restatement is
+// only ever allowed to be EXACT, and nothing in the compiler holds one, which is why each carries a
+// scaladoc naming what it mirrors and why `test/ReviewFixLoopExampleSpec.scala` asserts all three
+// against the originals from inside the library's own package.
+//
+// The patch guard is NOT restated at all, and that is the better answer where it is available. An
+// earlier version of this file rewrote it by hand and got it weaker (prefix matching where the real
+// guard runs a JDK glob), which is exactly what a consumer copying this file would have inherited;
+// the guard is kit API now, so `PatchGuard.stage` is called instead of copied.
 // ---------------------------------------------------------------------------------------------
 
 val MaxRounds = 3
@@ -112,6 +118,31 @@ def splice(template: String, values: (String, String)*): String =
     )
     .mkString("\n")
 
+/** `Machine.protectedList`, restated for the same reason `splice` restates `renderTemplate`.
+  *
+  * The backticks are the whole point of naming this rather than mapping over `protect` inline. Every
+  * prompt this repository ships names a protected path in code font, so a worker and a cold reviewer
+  * meet ONE vocabulary across the shipped loop and a consumer's own graph alike. A copy that drops
+  * them teaches the agent a second spelling for the one list it is forbidden to touch, and an agent
+  * that cannot tell a path from ordinary prose is one that argues with the guard instead of
+  * respecting it.
+  */
+def protectedList(protect: List[String]): String =
+  protect.map(p => s"- `$p`").mkString("\n")
+
+/** `Machine.sanitizeDetail`, restated for the same reason again.
+  *
+  * Restated rather than dropped because `detail` is the one `StatusEvent` field this graph fills
+  * from text it did not write, a cold reviewer's finding, and `status.jsonl` is one JSON object per
+  * line that `watch.sh` reads with `jq`. A double quote or a newline arriving unscrubbed does not
+  * spoil one event, it breaks the line every reader of the run parses. The shipped loop scrubs where
+  * the event is CONSTRUCTED, before any handler sees it, so the protection survives a consumer
+  * swapping in a `StatusLog` of their own instead of resting on the one this library happens to
+  * install.
+  */
+def sanitizeDetail(detail: String): String =
+  detail.replace("\\", "").replace("\"", "").replace("\n", " ")
+
 /** The review prompt: the shared template, spliced with everything a cold reviewer is allowed to
   * see, plus the answer shape `parseFindings` below reads back. The two sit next to each other so
   * that a change to either is read against the other.
@@ -120,7 +151,7 @@ def reviewPrompt(work: Work, diff: String)(using caps: Caps): String =
   val cfg = caps.cfg
   splice(
     caps.fs.readTemplate(Template.Review),
-    "PROTECTED"   -> cfg.protect.map(p => s"- $p").mkString("\n"),
+    "PROTECTED"   -> protectedList(cfg.protect),
     "GATE"        -> cfg.gateCmd,
     "CONVENTIONS" -> caps.fs.conventions(),
     "ISSUE"       -> caps.fs.read(work.bodyFile),
@@ -161,7 +192,7 @@ def emit(
       pass = round,
       budget = caps.cfg.repairBudget,
       logfile = logFile,
-      detail = detail
+      detail = sanitizeDetail(detail)
     )
   )
 
@@ -225,7 +256,7 @@ val Setup: Node[Int, Work] = Node(
             artifact(issue, ".impl.prompt.txt"),
             splice(
               caps.fs.readTemplate(Template.Iterate),
-              "PROTECTED"   -> cfg.protect.map(p => s"- $p").mkString("\n"),
+              "PROTECTED"   -> protectedList(cfg.protect),
               "GATE"        -> cfg.gateCmd,
               "CONVENTIONS" -> caps.fs.conventions(),
               "ISSUE"       -> caps.fs.read(bodyFile)
@@ -368,7 +399,7 @@ val Fix: Node[FixRound, ReviewRound] = Node(
         promptFile,
         splice(
           caps.fs.readTemplate(Template.Fix),
-          "PROTECTED"   -> cfg.protect.map(p => s"- $p").mkString("\n"),
+          "PROTECTED"   -> protectedList(cfg.protect),
           "GATE"        -> cfg.gateCmd,
           "CONVENTIONS" -> caps.fs.conventions(),
           "ISSUE"       -> caps.fs.read(work.bodyFile),

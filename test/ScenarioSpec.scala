@@ -101,6 +101,11 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
       w.events should not be empty // PICK ok is this tick's own first status event
 
       w.events.clear() // isolate the second tick's own "before any event" check to itself
+      // Tick 1 took #999 off the ready queue for real now (`TestWorld.editLabels` folds its own
+      // pick-time flip), so queue a US for tick 2 to pick: an Idle tick would still declare, but it
+      // would emit no status event for the declaration to precede, leaving the ordering claim below
+      // vacuously true on the very tick it is meant to prove.
+      w.ready = Some(999)
       w.runLoop(iteration = 2)
 
       w.declaredStages shouldBe List(Machine.shippedStages, Machine.shippedStages)
@@ -857,15 +862,11 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
       w.staged shouldBe false
       w.postedIssueComments shouldBe empty // the fix: nothing posted, alice's reply survives untouched
 
-      // Tick 2: model what a real `gh` now reports after tick 1's own label flip (`TestWorld`'s
-      // `parked`/`inProgress` are independently scripted, never derived from `editLabels` calls, the
-      // same manual update every other tick-boundary scenario in this file already needs). The
-      // comment thread itself needs NO manual update at all (issue #44 review MAJOR, round 2, and E2
-      // of the fix): tick 1 posted nothing, so `issueCommentBodies` is exactly what it always was,
-      // alice's ORIGINAL reply still the newest thing after the original marker.
-      w.inProgress = None
-      w.ready = None
-      w.parked = List(999)
+      // Tick 2 reads the world tick 1 actually left behind, with nothing hand set: `TestWorld`'s
+      // `editLabels` folds tick 1's own park flip into `parked`/`inProgress`, and its pick-time flip
+      // into `ready`. The comment thread needs no update either (issue #44 review MAJOR, round 2,
+      // and E2 of the fix): tick 1 posted nothing, so alice's ORIGINAL reply is still the newest
+      // thing after the original marker.
       w.fixScripts = List(WorkerScript.Produces("1\t0\tsrc/main/scala/Fix3.scala"))
 
       val second = w.runLoop()
@@ -909,9 +910,6 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
       // every comment's TEXT regardless of who wrote it, so neither assertion below could actually
       // distinguish "one reply counted" from "both replies counted" with alice replying twice; only
       // the identity of the SECOND author can.
-      w.inProgress = None
-      w.ready = None
-      w.parked = List(999)
       w.issueCommentBodies = Map(
         999 -> List(
           s"@litter-box (OWNER):\n${Machine.ParkMarker}\nparked, awaiting a reply",
@@ -967,6 +965,7 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
       w.inProgress = None
       w.ready = None
       w.parked = List(999)
+      w.labels = List("parked") // the labels a genuinely parked #999 carries at the start of tick 1
       w.issueCommentBodies = Map(
         999 -> List(
           s"@litter-box (OWNER):\n${Machine.ParkMarker}\nparked, awaiting a reply",
@@ -985,12 +984,10 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
       first shouldBe LoopExit.InfraFault
       w.postedIssueComments should contain(999 -> Machine.ReplyConsumedBody)
 
-      // Tick 2: model what `gh` now reports (issue #50's own merge case: #999 is BOTH in-progress,
-      // from tick 1's own pick-time flip, AND still parked, since only a successful terminal removes
-      // it). The comment thread needs no manual update at all: `TestWorld.issueComment`'s own fold
-      // (E2) already put `ReplyConsumedBody` after alice's reply during tick 1.
-      w.inProgress = Some(999)
-      w.labels = List("parked", "in-progress")
+      // Tick 2 reads what tick 1 left (issue #50's own merge case: #999 is BOTH in-progress, from
+      // tick 1's own pick-time flip, AND still parked, since only a successful terminal removes it),
+      // with nothing hand set: `TestWorld.editLabels`'s fold carries that flip over, and
+      // `TestWorld.issueComment`'s fold (E2) already put `ReplyConsumedBody` after alice's reply.
       w.implScript = WorkerScript.Produces("1\t0\tsrc/main/scala/Fix2.scala")
 
       val second = w.runLoop(Config(repairBudget = 2))
@@ -1513,6 +1510,7 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     w.inProgress = None
     w.ready = None
     w.parked = List(777)
+    w.labels = List("parked") // the labels a genuinely parked #777 carries at the start of tick 1
     w.fixScripts = List(WorkerScript.TimedOut) // infra-faults the resumed FIX round
     w.issueCommentBodies =
       Map(777 -> List(markerEntry, "@alice (OWNER):\ntry using a HashMap instead"))
@@ -1526,12 +1524,9 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     w.called("gh issue edit 777 --add-label in-progress") shouldBe true
     w.calls.exists(c => c.startsWith("gh issue edit 777") && c.contains("remove-label parked")) shouldBe false
 
-    // Model what `gh` now reports on the next tick: the pick-time flip already ran, so #777 is
-    // in-progress AND still parked (issue #50 review finding: a hand set world has to carry the
-    // same labels a real `gh issue list` would report, not just the ones this particular test
-    // happens to read); the comment thread is untouched by the fault.
-    w.inProgress = Some(777)
-    w.labels = List("parked", "in-progress")
+    // The next tick reads what this one left, nothing hand set: `TestWorld.editLabels` folded the
+    // pick-time flip, so #777 is in-progress AND still parked, exactly what the two assertions
+    // above just pinned about which flips ran; the comment thread is untouched by the fault.
     w.fixScripts = List(WorkerScript.Produces(newFilePatch))
 
     val second = w.runLoop()
@@ -1609,20 +1604,21 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     // the review traced at `finish`'s `Route.Parked`). Tick 2 crash-resumes #777: no reply follows
     // the new marker, so this is an ordinary IMPL, not a FIX, and it succeeds. The fixed predicate
     // must still strip `parked` at that terminal even though tick 2 itself never saw a fresh reply.
-    // Tick 3 models what a real `gh` now reports (#777 neither in-progress nor parked) to show the
-    // issue genuinely never comes back, rather than merely asserting the removal call fired.
+    // Tick 3 shows the issue genuinely never comes back, rather than merely asserting the removal
+    // call fired: nothing about its world is hand set, so #777 is absent from the ready, parked and
+    // in-progress queues only because tick 2's terminal flip actually took it off all three.
     //
     // The pick-time flip and the re-park flip are scripted to succeed and fail RESPECTIVELY, via
     // `labelEditResults` rather than the single `labelEditSucceeds` flag (issue #50 review finding
     // 3): a single flag would fail BOTH of tick 1's `editLabels` calls, including the pick-time
-    // flip, so a real `gh` would never have added `in-progress` to #777 at all, making the tick 2
-    // world this test used to hand-set (`#777` in-progress) unreachable from what tick 1 actually
-    // did. Scripting the two calls independently keeps the scenario this test is actually named
-    // for: a re-park attempt whose OWN flip fails, not a pick that never took effect.
+    // flip, so a real `gh` would never have added `in-progress` to #777 at all, and the tick 2 world
+    // would never reach the shape this test is named for. Scripting the two calls independently
+    // keeps that scenario: a re-park attempt whose OWN flip fails, not a pick that never took effect.
     val w = TestWorld()
     w.inProgress = None
     w.ready = None
     w.parked = List(777)
+    w.labels = List("parked") // the labels a genuinely parked #777 carries at the start of tick 1
     w.fixScripts = List(WorkerScript.Produces(newFilePatch))
     w.gateResults = List(GateResult.Red)
     w.issueCommentBodies =
@@ -1636,17 +1632,13 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
     w.called("gh issue edit 777 --add-label in-progress") shouldBe true // pick-time flip: attempted, OK
     w.called("gh issue edit 777 --add-label parked --remove-label in-progress") shouldBe true // re-park: attempted, failed
 
-    // Tick 2: `gh` now reports #777 in-progress (the pick-time flip DID succeed) AND still parked
-    // (the re-park flip failed, so it changed nothing), with the freshly posted marker as the
-    // newest comment and nothing after it, exactly what tick 1's two recorded `editLabels`
-    // outcomes imply, not a hand-picked state disconnected from them.
-    w.inProgress = Some(777)
-    w.labels = List("parked", "in-progress")
+    // Tick 2 inherits that world rather than being told it: #777 is in-progress because the
+    // pick-time flip succeeded and `editLabels` folded it, and still parked because the re-park flip
+    // failed and a failed flip changes nothing, which is exactly the distinction `labelEditResults`
+    // is scripted for. The freshly posted marker is already the newest comment with nothing after
+    // it, folded in by `TestWorld.issueComment` when tick 1 posted it.
     w.labelEditResults = Nil // tick 2's own edits (the terminal removal) should succeed normally
     w.implScript = WorkerScript.Produces(newFilePatch)
-    w.issueCommentBodies = Map(
-      777 -> List(markerEntry, "@alice (OWNER):\ntry using a HashMap instead", markerEntry)
-    )
 
     val second = w.runLoop()
 
@@ -1657,10 +1649,8 @@ class ScenarioSpec extends AnyFlatSpec with Matchers:
       "gh issue edit 777 --add-label needs-review --remove-label in-progress --remove-label parked"
     ) shouldBe true
 
-    // Tick 3: a real `gh` would now report neither label on #777. Idle, not a re-pick of #777.
-    w.inProgress = None
-    w.parked = Nil
-
+    // Tick 3: neither label is on #777 any more, because tick 2's own terminal flip removed both.
+    // Idle, not a re-pick of #777.
     val third = w.runLoop()
 
     third shouldBe LoopExit.Idle

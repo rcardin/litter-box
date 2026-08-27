@@ -207,3 +207,66 @@ class ReviewFixLoopExampleSpec extends AnyFlatSpec with Matchers:
     w.prBodies.head should include("ran out after 3 rounds with findings still open")
     w.prBodies.head should include("NEEDS HUMAN")
   }
+
+  // ---- parity with the helpers the example is forced to restate ----------------------------
+
+  /** Both tests below assert against `Machine`'s OWN member rather than against a literal, and they
+    * can, because of an asymmetry that is the whole reason they exist: this spec is declared inside
+    * `in.rcard.litterbox`, so a `private[litterbox]` helper is reachable from here, while the example
+    * it drives is declared in `com.example.reviewfix`, where the same helper is not reachable at all
+    * and has to be written out by hand. Nothing the compiler does can hold a restatement in a foreign
+    * package to its original, and this one has now drifted twice: once on the patch guard, recorded
+    * in ADR 0001's first amendment and answered by moving the guard into the kit, and once on these
+    * two, which have no kit spelling to move to. A spec that can see both copies at once is the only
+    * remaining place the two can be held together.
+    *
+    * Each test pins the parity AND the resulting behaviour, because parity alone would still pass if
+    * the example scrubbed correctly and then forgot to CALL the scrub, which is exactly the shape the
+    * first of the two defects had.
+    */
+  it should "scrub a status detail the way Machine.emit scrubs one, and actually call the scrub" in {
+    val raw = "a \\ backslash, a \" quote and a\nnewline"
+    com.example.reviewfix.sanitizeDetail(raw) shouldBe Machine.sanitizeDetail(raw)
+    com.example.reviewfix.sanitizeDetail(raw) shouldBe "a  backslash, a  quote and a newline"
+
+    // The one detail this graph fills from text it did not write: a cold reviewer's finding, carried
+    // into the FIX start event. Read off the recorded event, never off the helper, so the assertion
+    // fails if `emit` stops routing `detail` through the scrub.
+    val hostile = """Slice.scala prints "raw" input and breaks the \ log line"""
+    val w       = TestWorld()
+    w.implScript = patchTouching("src/Slice.scala")
+    w.reviewScripts = List(
+      ReviewScript.Says(s"FINDING: $hostile"),
+      ReviewScript.Says(approveReview)
+    )
+    w.fixScripts = List(patchTouching("src/Slice.scala"))
+
+    w.runGraph(com.example.reviewfix.graph) shouldBe LoopExit.Success
+
+    val fixStarts = w.events.filter(e => e.phase == "FIX" && e.state == "start").toList
+    fixStarts should have size 1
+    fixStarts.head.detail shouldBe Machine.sanitizeDetail(hostile)
+    fixStarts.head.detail should not include "\""
+    fixStarts.head.detail should not include "\\"
+  }
+
+  it should "name the protected paths in the backticked shape Machine.protectedList renders" in {
+    val protect = Config().protect
+    com.example.reviewfix.protectedList(protect) shouldBe Machine.protectedList(protect)
+    com.example.reviewfix.protectedList(protect) should include("- `.litter-box/**`")
+
+    // And in a prompt the example actually wrote. The FIX skeleton is the one default `TestWorld`
+    // template carrying a `{{PROTECTED}}` slot, so it is the reachable end to end witness that the
+    // splice feeds the helper rather than an inline copy of it.
+    val w = TestWorld()
+    w.implScript = patchTouching("src/Slice.scala")
+    w.reviewScripts = List(
+      ReviewScript.Says("FINDING: the error branch is still untested"),
+      ReviewScript.Says(approveReview)
+    )
+    w.fixScripts = List(patchTouching("test/SliceSpec.scala"))
+
+    w.runGraph(com.example.reviewfix.graph) shouldBe LoopExit.Success
+
+    w.files(s"$logDir/issue-999-r1-f0.fix.prompt.txt") should include(Machine.protectedList(protect))
+  }
